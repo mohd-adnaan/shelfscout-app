@@ -1,97 +1,119 @@
-This is a new [**React Native**](https://reactnative.dev) project, bootstrapped using [`@react-native-community/cli`](https://github.com/react-native-community/cli).
+# ShelfScout - CyberSight Mobile Client
 
-# Getting Started
+**Status:** Active Development | **Platform:** Cross-Platform (iOS & Android) | **Focus:** Accessibility & Navigation
 
-> **Note**: Make sure you have completed the [Set Up Your Environment](https://reactnative.dev/docs/set-up-your-environment) guide before proceeding.
+ShelfScout serves as the mobile companion to the [CyberSight AI Platform](https://github.com/Shared-Reality-Lab/cybersight), delivering computer vision, spatial awareness, and intelligent navigation assistance directly to iOS and Android devices.
 
-## Step 1: Start Metro
+---
 
-First, you will need to run **Metro**, the JavaScript build tool for React Native.
+## Overview
 
-To start the Metro dev server, run the following command from the root of your React Native project:
+ShelfScout is the native mobile client for the CyberSight accessibility ecosystem, enabling users to:
 
-```sh
-# Using npm
+-  Access real-time object detection and scene analysis on mobile devices
+-  Navigate using voice commands and audio feedback
+-  Receive spatial awareness and navigation assistance
+-  Connect to the CyberSight SLIV backend for advanced AI services
+
+### Relationship to CyberSight Platform
+
+```
+┌─────────────────────────────────────────┐
+│     CyberSight AI Platform (SLIV)       │
+│  ┌────────────┐  ┌──────────────┐      │
+│  │ Vision API │  │ Speech (TTS) │      │
+│  └────────────┘  └──────────────┘      │
+│  ┌────────────┐  ┌──────────────┐      │
+│  │  N8N Flow  │  │  PostgreSQL  │      │
+│  └────────────┘  └──────────────┘      │
+└─────────────────────────────────────────┘
+              ↕ REST API / WebSocket
+┌─────────────────────────────────────────┐
+│      ShelfScout Mobile Client           │
+│           (This Repository)              │
+│  ┌─────────────────────────────────┐   │
+│  │    React Native Application      │   │
+│  │  • iOS (Swift native modules)    │   │
+│  │  • Android (Kotlin/Java native)  │   │
+│  └─────────────────────────────────┘   │
+└─────────────────────────────────────────┘
+```
+
+### Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/Shared-Reality-Lab/shelfscout.git
+cd shelfscout
+
+# Install JavaScript dependencies
+npm install
+
+## Running the App
+
+### Standard Development Cycle
+
+```bash
+# Terminal 1: Start Metro bundler
 npm start
 
-# OR using Yarn
-yarn start
-```
-
-## Step 2: Build and run your app
-
-With Metro running, open a new terminal window/pane from the root of your React Native project, and use one of the following commands to build and run your Android or iOS app:
-
-### Android
-
-```sh
-# Using npm
-npm run android
-
-# OR using Yarn
-yarn android
-```
-
-### iOS
-
-For iOS, remember to install CocoaPods dependencies (this only needs to be run on first clone or after updating native deps).
-
-The first time you create a new project, run the Ruby bundler to install CocoaPods itself:
-
-```sh
-bundle install
-```
-
-Then, and every time you update your native dependencies, run:
-
-```sh
-bundle exec pod install
-```
-
-For more information, please visit [CocoaPods Getting Started guide](https://guides.cocoapods.org/using/getting-started.html).
-
-```sh
-# Using npm
+# Terminal 2: Run on iOS
 npm run ios
 
-# OR using Yarn
-yarn ios
+# Terminal 3: Run on Android
+npm run android
+
+```
+---
+
+## 🐛 Troubleshooting
+
+### iOS Build Failures
+
+**Module map file errors:**
+```bash
+# Clean DerivedData and rebuild
+rm -rf ~/Library/Developer/Xcode/DerivedData
+cd ios
+rm -rf Pods Podfile.lock build
+bundle exec pod install
+cd ..
 ```
 
-If everything is set up correctly, you should see your new app running in the Android Emulator, iOS Simulator, or your connected device.
+**"Unable to find module dependency" errors:**
+```bash
+# Ensure you're opening .xcworkspace, not .xcodeproj
+open ios/shelfscout.xcworkspace
+```
 
-This is one way to run your app — you can also build it directly from Android Studio or Xcode.
+### Android Build Failures
 
-## Step 3: Modify your app
+**Gradle sync issues:**
+```bash
+cd android
+./gradlew clean
+./gradlew --stop
+cd ..
+rm -rf android/.gradle
+npm run android
+```
 
-Now that you have successfully run the app, let's make changes!
+### General Issues
 
-Open `App.tsx` in your text editor of choice and make some changes. When you save, your app will automatically update and reflect these changes — this is powered by [Fast Refresh](https://reactnative.dev/docs/fast-refresh).
+**App not updating after changes:**
+```bash
+# Full reset
+rm -rf node_modules
+npm install
+npm start -- --reset-cache
+```
 
-When you want to forcefully reload, for example to reset the state of your app, you can perform a full reload:
+**Project:** ShelfScout Mobile Client  
+**Organization:** Shared Reality Lab, McGill University  
 
-- **Android**: Press the <kbd>R</kbd> key twice or select **"Reload"** from the **Dev Menu**, accessed via <kbd>Ctrl</kbd> + <kbd>M</kbd> (Windows/Linux) or <kbd>Cmd ⌘</kbd> + <kbd>M</kbd> (macOS).
-- **iOS**: Press <kbd>R</kbd> in iOS Simulator.
+## 📄 License
 
-## Congratulations! :tada:
+This project is developed by the Shared Reality Lab at McGill University, focused on creating accessible AI technologies for users with visual impairments.
 
-You've successfully run and modified your React Native App. :partying_face:
 
-### Now what?
-
-- If you want to add this new React Native code to an existing application, check out the [Integration guide](https://reactnative.dev/docs/integration-with-existing-apps).
-- If you're curious to learn more about React Native, check out the [docs](https://reactnative.dev/docs/getting-started).
-
-# Troubleshooting
-
-If you're having issues getting the above steps to work, see the [Troubleshooting](https://reactnative.dev/docs/troubleshooting) page.
-
-# Learn More
-
-To learn more about React Native, take a look at the following resources:
-
-- [React Native Website](https://reactnative.dev) - learn more about React Native.
-- [Getting Started](https://reactnative.dev/docs/environment-setup) - an **overview** of React Native and how setup your environment.
-- [Learn the Basics](https://reactnative.dev/docs/getting-started) - a **guided tour** of the React Native **basics**.
-- [Blog](https://reactnative.dev/blog) - read the latest official React Native **Blog** posts.
-- [`@facebook/react-native`](https://github.com/facebook/react-native) - the Open Source; GitHub **repository** for React Native.
+**Building accessible technology for everyone.**
