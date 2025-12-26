@@ -10,8 +10,6 @@
 	<string>shelfscout</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
-	<key>CFBundleIdentifier</key>
-	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -33,8 +31,14 @@
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
+	<key>NSCameraUsageDescription</key>
+	<string>ShelfScout needs camera access to capture environment images</string>
 	<key>NSLocationWhenInUseUsageDescription</key>
-	<string></string>
+	<string>ShelfScout needs location for guidance</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>ShelfScout needs microphone access for voice commands</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>ShelfScout needs speech recognition for voice commands</string>
 	<key>RCTNewArchEnabled</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>

@@ -39,6 +39,22 @@ ShelfScout is the native mobile client for the CyberSight accessibility ecosyste
 └─────────────────────────────────────────┘
 ```
 
+## Architecture Comparison
+
+### Web App Flow (Current)
+```
+User Speech → Speaches API (STT) → Workflow Webhook → n8n Backend → Speaches API (TTS) → User
+                     ↓
+              Camera Capture
+```
+
+### Mobile App Flow (Target)
+```
+User Speech → Native STT → Workflow Webhook → n8n Backend → Native TTS → User
+                  ↓
+          Native Camera (Double Tap)
+```
+
 ### Installation
 
 ```bash
