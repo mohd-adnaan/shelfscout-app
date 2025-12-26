@@ -1,6 +1,5 @@
 import { useRef } from 'react';
 import { Camera, useCameraDevice, useCameraPermission } from 'react-native-vision-camera';
-import { CameraPhoto } from '../utils/types';
 
 export const useCamera = () => {
   const device = useCameraDevice('back');
