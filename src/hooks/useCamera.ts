@@ -25,7 +25,9 @@ export const useCamera = () => {
       });
 
       console.log('Photo captured:', photo.path);
-      return `file://${photo.path}`;
+      return photo.path.startsWith('file://') 
+        ? photo.path 
+        : `file://${photo.path}`;
     } catch (error) {
       console.error('Photo capture error:', error);
       throw error;

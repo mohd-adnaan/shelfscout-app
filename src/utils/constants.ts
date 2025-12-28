@@ -1,6 +1,4 @@
 // API endpoints, config
-export const WEBHOOK_URL = 'https://cybersight.cim.mcgill.ca/api/webhook/29ee1345-f789-4738-997f-ffdae65bba74';
-
 export const CONFIG = {
   DEFAULT_LANGUAGE: 'en-US',
   PHOTO_QUALITY: 0.8,
@@ -16,3 +14,5 @@ export const COLORS = {
   BACKGROUND: '#000000',
   WHITE: '#FFFFFF',
 };
+
+export const WORKFLOW_URL =  'http://cybersight.cim.mcgill.ca/api/webhook/29ee1345-f789-4738-997f-ffdae65bba74';

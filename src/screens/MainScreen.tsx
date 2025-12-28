@@ -14,7 +14,7 @@ import { useVoiceRecognition } from '../hooks/useVoiceRecognition';
 import { useCamera } from '../hooks/useCamera';
 import { useTTS } from '../hooks/useTTS';
 import { sendToWorkflow } from '../services/WorkflowService';
-import { checkAndRequestPermissions } from '../services/PermissionService';
+import { requestPermissions } from '../services/PermissionService';
 import { COLORS } from '../utils/constants';
 
 const MainScreen: React.FC = () => {
@@ -32,7 +32,7 @@ const MainScreen: React.FC = () => {
   }, []);
 
   const initializePermissions = async () => {
-    const granted = await checkAndRequestPermissions();
+    const granted = await requestPermissions();
     setHasPermissions(granted);
     
     if (!granted) {

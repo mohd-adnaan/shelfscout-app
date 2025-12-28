@@ -2,12 +2,10 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CADisableMinimumFrameDurationOnPhone</key>
-	<true/>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
 	<key>CFBundleDisplayName</key>
-	<string>shelfscout</string>
+	<string>ShelfScout</string>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
 	<key>CFBundleIdentifier</key>
@@ -29,25 +27,23 @@
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<key>NSAllowsArbitraryLoads</key>
-		<false/>
-		<key>NSAllowsLocalNetworking</key>
 		<true/>
 	</dict>
 	<key>NSCameraUsageDescription</key>
-	<string>ShelfScout needs camera access to capture environment images</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>ShelfScout needs location for guidance</string>
+	<string>ShelfScout needs camera access to capture images of products and shelves for visual identification and navigation assistance.</string>
 	<key>NSMicrophoneUsageDescription</key>
-	<string>ShelfScout needs microphone access for voice commands</string>
+	<string>ShelfScout needs microphone access to receive voice commands and provide audio feedback for hands-free navigation.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>ShelfScout may save captured images to your photo library for reference.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>ShelfScout needs speech recognition for voice commands</string>
+	<string>ShelfScout uses speech recognition to understand voice commands for accessible navigation and product search.</string>
 	<key>RCTNewArchEnabled</key>
 	<true/>
 	<key>UILaunchStoryboardName</key>
 	<string>LaunchScreen</string>
 	<key>UIRequiredDeviceCapabilities</key>
 	<array>
-		<string>arm64</string>
+		<string>armv7</string>
 	</array>
 	<key>UISupportedInterfaceOrientations</key>
 	<array>
