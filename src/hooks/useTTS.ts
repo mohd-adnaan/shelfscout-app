@@ -1,133 +1,97 @@
-import { useEffect } from 'react';
-import { Platform } from 'react-native';
-import Tts from 'react-native-tts';
+// src/hooks/useTTS.ts
+// ----------------------------------------------------------------------
+// Text-to-Speech Hook using Speaches API
+// Matches N8N workflow TTS configuration
+// ----------------------------------------------------------------------
 
+import { useEffect } from 'react';
+import { speachesTTS } from '../services/speachesTtsClient';
+
+/**
+ * Text-to-Speech Hook
+ * 
+ * Provides TTS functionality using the Speaches API, matching the exact
+ * configuration used in your N8N workflow. This ensures consistent voice
+ * quality across web app, mobile app, and backend workflows.
+ * 
+ * Usage:
+ * ```typescript
+ * const { speak, stop, isPlaying } = useTTS();
+ * 
+ * // Speak some text
+ * await speak("Hello, world!");
+ * 
+ * // Stop current speech
+ * await stop();
+ * 
+ * // Check if playing
+ * if (isPlaying()) {
+ *   console.log("TTS is speaking");
+ * }
+ * ```
+ */
 export const useTTS = () => {
   useEffect(() => {
-    const initTTS = async () => {
-      try {
-        // ✅ Configure TTS settings
-        await Tts.setDefaultLanguage('en-US');
-        await Tts.setDefaultRate(0.52);
-        await Tts.setDefaultPitch(1.0);
-        
-        // ✅ iOS: Select best quality voice
-        if (Platform.OS === 'ios') {
-          try {
-            const voices = await Tts.voices();
-            console.log(`🎤 Found ${voices.length} voices`);
-            
-            const usVoices = voices.filter(v => v.language === 'en-US');
-            console.log(`🇺🇸 US English voices: ${usVoices.length}`);
-            
-            // ✅ Priority: Samantha > Ava > Enhanced > Any US
-            let bestVoice = usVoices.find(v => 
-              v.id.toLowerCase().includes('samantha') || 
-              v.name?.toLowerCase().includes('samantha')
-            );
-            
-            if (!bestVoice) {
-              bestVoice = usVoices.find(v => 
-                v.id.toLowerCase().includes('ava') ||
-                v.name?.toLowerCase().includes('ava')
-              );
-            }
-            
-            if (!bestVoice) {
-              bestVoice = usVoices.find(v => 
-                v.id.toLowerCase().includes('enhanced') ||
-                v.id.toLowerCase().includes('premium')
-              );
-            }
-            
-            if (bestVoice) {
-              await Tts.setDefaultVoice(bestVoice.id);
-              console.log(`✅ Voice: ${bestVoice.name || bestVoice.id}`);
-            } else if (usVoices[0]) {
-              await Tts.setDefaultVoice(usVoices[0].id);
-              console.log(`⚠️ Fallback voice: ${usVoices[0].name || usVoices[0].id}`);
-            }
-          } catch (voiceError) {
-            console.error('⚠️ Voice selection failed:', voiceError);
-          }
-        }
-        
-        // ✅ Suppress annoying warnings
-        Tts.addEventListener('tts-start', () => {});
-        Tts.addEventListener('tts-progress', () => {});
-        Tts.addEventListener('tts-finish', () => {});
-        Tts.addEventListener('tts-cancel', () => {});
-        
-        console.log('✅ TTS initialized');
-      } catch (error) {
-        console.error('❌ TTS init error:', error);
-      }
-    };
+    console.log('✅ Speaches TTS ready (N8N config)');
 
-    initTTS();
-
+    // ✅ Cleanup on unmount
     return () => {
-      try {
-        Tts.removeAllListeners('tts-start');
-        Tts.removeAllListeners('tts-progress');
-        Tts.removeAllListeners('tts-finish');
-        Tts.removeAllListeners('tts-cancel');
-        Tts.stop();
-      } catch (e) {}
+      speachesTTS.stop().catch((err) => {
+        console.warn('TTS cleanup error:', err);
+      });
     };
   }, []);
 
+  /**
+   * Speak the given text using Speaches TTS API
+   * 
+   * This function:
+   * 1. Stops any currently playing speech
+   * 2. Sends text to Speaches API (https://cybersight.cim.mcgill.ca/audio/speech)
+   * 3. Downloads the MP3 audio
+   * 4. Plays the audio
+   * 
+   * @param text - Text to convert to speech
+   * @returns Promise that resolves when audio starts playing
+   * @throws Error if TTS request fails
+   */
   const speak = async (text: string): Promise<void> => {
     try {
-      console.log('🔊 Speaking:', text.substring(0, 50) + '...');
-      
-      // ✅ Stop any current speech
-      await forceStop();
-      
-      // ✅ Wait for iOS to process
-      await new Promise(resolve => setTimeout(resolve, 200));
-      
-      // ✅ Speak
-      await Tts.speak(text);
-      console.log('✅ TTS started');
-      
+      console.log('🔊 Speaking with Speaches TTS (N8N config)...');
+      await speachesTTS.synthesizeSpeech(text);
     } catch (error) {
-      console.error('❌ TTS error:', error);
+      console.error('❌ TTS speak error:', error);
+      throw error;
     }
   };
+
+  /**
+   * Stop current speech playback
+   * 
+   * This immediately stops any audio that is currently playing.
+   * Unlike native iOS TTS, this stop method is reliable and fast.
+   * 
+   * @returns Promise that resolves when audio is stopped
+   */
 
   const stop = async (): Promise<void> => {
-    await forceStop();
-  };
-
-  // ✅ NUCLEAR: Force stop TTS
-  const forceStop = async (): Promise<void> => {
     try {
-      console.log('🛑 Force stopping TTS...');
-      
-      if (Platform.OS === 'ios') {
-        // ✅ Call stop 3x to be sure
-        Tts.stop();
-        await new Promise(resolve => setTimeout(resolve, 50));
-        Tts.stop();
-        await new Promise(resolve => setTimeout(resolve, 50));
-        Tts.stop();
-        
-        // ✅ Nuclear: Speak empty to interrupt
-        try {
-          await Tts.speak('');
-        } catch (e) {}
-        
-      } else {
-        await Tts.stop();
-      }
-      
-      console.log('✅ TTS stopped');
-      
+      console.log('🛑 Stopping Speaches TTS...');
+      await speachesTTS.stop();
     } catch (error) {
-      console.log('🛑 Stop complete');
+      console.error('❌ Stop error:', error);
     }
   };
 
-  return { speak, stop };
+  /**
+   * Check if TTS is currently playing
+   * 
+   * @returns true if audio is currently playing, false otherwise
+   */
+
+  const isPlaying = (): boolean => {
+    return speachesTTS.isCurrentlyPlaying();
+  };
+
+  return { speak, stop, isPlaying };
 };

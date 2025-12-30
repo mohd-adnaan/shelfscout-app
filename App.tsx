@@ -12,7 +12,7 @@ import {
 } from 'react-native';
 import { Camera, useCameraDevice, useCameraPermission, useMicrophonePermission } from 'react-native-vision-camera';
 import Voice from '@react-native-voice/voice';
-import { useSpeachesTTS } from './src/hooks/useTTSSpeaches';
+import { useTTS } from './src/hooks/useTTS';
 import { sendToWorkflow } from './src/services/WorkflowService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import { playSound } from './src/utils/soundEffects';
@@ -30,7 +30,7 @@ function App(): React.JSX.Element {
   const { hasPermission: hasMicPermission, requestPermission: requestMicPermission } = useMicrophonePermission();
   
   const cameraRef = useRef<Camera>(null);
-  const { speak, stop: stopTTS } = useSpeachesTTS(); // ✅ Using Speaches TTS
+  const { speak, stop: stopTTS } = useTTS();
   
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const opacityAnim = useRef(new Animated.Value(0.3)).current;
