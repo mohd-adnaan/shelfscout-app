@@ -1,1 +1,0 @@
-// Native STT integration

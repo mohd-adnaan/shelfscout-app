@@ -9,36 +9,43 @@ export const sendToWorkflow = async (request: WorkflowRequest): Promise<Workflow
     console.log('Text:', request.text);
     console.log('Image URI:', request.imageUri);
 
-    // Read image as base64
+    // Clean URI
     const imageUri = request.imageUri.replace('file://', '');
-    const base64Image = await RNFS.readFile(imageUri, 'base64');
-    console.log('✅ Image read, size:', base64Image.length);
+    
+    // Create FormData like Postman
+    const formData = new FormData();
+    formData.append('text', request.text);
+    formData.append('image', {
+      uri: imageUri,
+      type: 'image/jpeg',
+      name: 'photo.jpg',
+    } as any);
 
-    // Send as JSON 
-    const response = await axios.post(
-      WORKFLOW_URL,
-      {
-        transcript: request.text,  // Field name from n8n
-        image: base64Image,        // Base64 string
-        continuousMode: false
+    console.log('📤 Sending FormData to server...');
+
+    const response = await axios.post(WORKFLOW_URL, formData, {
+      headers: {
+        'Content-Type': 'multipart/form-data',
+        'Accept': 'application/json',
       },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Accept': 'application/json',
-        },
-        timeout: 30000,
-      }
-    );
+      timeout: 30000,
+    });
 
-    console.log('✅ SUCCESS! Response:', response.data);
+    console.log('✅✅ SUCCESS! Full response:', JSON.stringify(response.data));
+    
+    const responseText = response.data.text || 
+                        response.data.message || 
+                        response.data.response ||
+                        (typeof response.data === 'string' ? response.data : null);
+    
+    console.log('Parsed text:', responseText);
     
     return {
-      text: response.data.text || response.data.transcript || '',
+      text: responseText || 'No response from server',
     };
     
   } catch (error) {
-    console.error('❌ Request failed:', error);
+    console.error('❌❌ Request failed:', error);
     if (axios.isAxiosError(error)) {
       console.error('Status:', error.response?.status);
       console.error('Data:', error.response?.data);
