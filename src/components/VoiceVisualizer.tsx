@@ -6,10 +6,10 @@ import {
   Animated,
   Dimensions,
 } from 'react-native';
-import { Mic, MicOff, Loader } from './Icons';
+import { Mic, MicOff, Speaker, Brain } from './Icons';
 
 const { width, height } = Dimensions.get('window');
-const CIRCLE_SIZE = width * 0.6;
+const CIRCLE_SIZE = width * 0.55;  
 
 interface VoiceVisualizerProps {
   isListening: boolean;
@@ -31,7 +31,7 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   const rotateAnim = useRef(new Animated.Value(0)).current;
   const dotsOpacity = useRef(new Animated.Value(0)).current;
 
-  // Rotating animation for processing state
+  // Rotating animation for processing state ONLY
   useEffect(() => {
     if (isProcessing) {
       Animated.loop(
@@ -91,7 +91,7 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
 
   const getStatusText = () => {
     if (isSpeaking) return 'Speaking...';
-    if (isProcessing) return 'Processing...';
+    if (isProcessing) return 'Thinking...';
     if (isListening) return 'Listening...';
     return 'Ready';
   };
@@ -115,50 +115,56 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
 
   return (
     <View style={styles.container}>
-      {/* Main animated circle */}
-      <Animated.View
-        style={[
-          styles.circleContainer,
-          {
-            transform: [
-              { scale: pulseAnim },
-              { rotate: rotation },
-            ],
-          },
-        ]}
-      >
-        {/* Dotted circle */}
-        <Animated.View 
-          style={[
-            styles.dotsCircle,
-            { opacity: dotsOpacity }
-          ]}
-        >
-          {renderDots()}
-        </Animated.View>
-        
-        {/* Solid circle background */}
+      {/* Wrapper for circle and icon - ensures perfect centering */}
+      <View style={styles.circleWrapper}>
+        {/* Main animated circle - ONLY rotates during processing */}
         <Animated.View
           style={[
-            styles.circle,
+            styles.circleContainer,
             {
-              opacity: opacityAnim,
-              borderColor: getStatusColor(),
+              transform: [
+                { scale: pulseAnim },
+                // ✅ ONLY rotate during processing
+                { rotate: isProcessing ? rotation : '0deg' },
+              ],
             },
           ]}
-        />
-        
-        {/* Center icon */}
+        >
+          {/* Dotted circle */}
+          <Animated.View 
+            style={[
+              styles.dotsCircle,
+              { opacity: dotsOpacity }
+            ]}
+          >
+            {renderDots()}
+          </Animated.View>
+          
+          {/* Solid circle background */}
+          <Animated.View
+            style={[
+              styles.circle,
+              {
+                opacity: opacityAnim,
+                borderColor: getStatusColor(),
+              },
+            ]}
+          />
+        </Animated.View>
+
+        {/* Center icon - PERFECTLY centered */}
         <View style={styles.centerIcon}>
-          {isProcessing ? (
-            <Loader size={60} color="#FFC107" />
+          {isSpeaking ? (
+            <Speaker size={80} color="#4CAF50" />
+          ) : isProcessing ? (
+            <Brain size={80} color="#FFC107" />
           ) : isListening ? (
-            <Mic size={60} color="#2196F3" />
+            <Mic size={80} color="#2196F3" />
           ) : (
-            <MicOff size={60} color="#666" />
+            <MicOff size={80} color="#666" />
           )}
         </View>
-      </Animated.View>
+      </View>
 
       {/* Status text */}
       <Text style={[styles.statusText, { color: getStatusColor() }]}>
@@ -186,7 +192,14 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+  circleWrapper: {
+    width: CIRCLE_SIZE,
+    height: CIRCLE_SIZE,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
   circleContainer: {
+    position: 'absolute',
     width: CIRCLE_SIZE,
     height: CIRCLE_SIZE,
     justifyContent: 'center',
@@ -217,6 +230,13 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255, 255, 255, 0.05)',
   },
   centerIcon: {
+    position: 'absolute',
+    top: '50%',
+    left: '50%',
+    transform: [
+      { translateX: -40 },  // ✅ Half of icon size (80/2)
+      { translateY: -40 },  // ✅ Half of icon size (80/2)
+    ],
     zIndex: 10,
   },
   statusText: {

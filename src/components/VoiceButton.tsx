@@ -12,6 +12,7 @@ import { COLORS } from '../utils/constants';
 interface VoiceButtonProps {
   isRecording: boolean;
   isProcessing: boolean;
+  isSpeaking: boolean;
   onPress: () => void;
   onDoubleTap: () => void;
 }
@@ -19,6 +20,7 @@ interface VoiceButtonProps {
 const VoiceButton: React.FC<VoiceButtonProps> = ({
   isRecording,
   isProcessing,
+  isSpeaking,
   onPress,
   onDoubleTap,
 }) => {
@@ -26,8 +28,8 @@ const VoiceButton: React.FC<VoiceButtonProps> = ({
   const doubleTapRef = useRef(null);
 
   useEffect(() => {
-    if (isRecording) {
-      // Pulse animation
+    if (isRecording || isSpeaking) {
+      // Pulse animation for recording and speaking
       Animated.loop(
         Animated.sequence([
           Animated.timing(scaleAnim, {
@@ -45,7 +47,7 @@ const VoiceButton: React.FC<VoiceButtonProps> = ({
     } else {
       scaleAnim.setValue(1);
     }
-  }, [isRecording, scaleAnim]);
+  }, [isRecording, isSpeaking, scaleAnim]);
 
   const handleDoubleTap = ({ nativeEvent }: any) => {
     if (nativeEvent.state === State.ACTIVE) {
@@ -55,15 +57,22 @@ const VoiceButton: React.FC<VoiceButtonProps> = ({
   };
 
   const handlePress = () => {
+    // Don't allow press during processing
+    if (isProcessing) {
+      console.log('⚠️ Button press ignored - currently processing');
+      return;
+    }
+    
     Vibration.vibrate(50); // Haptic feedback
     onPress();
   };
 
-  const backgroundColor = isProcessing
-    ? COLORS.PROCESSING
-    : isRecording
-    ? COLORS.RECORDING
-    : COLORS.PRIMARY;
+  const getBackgroundColor = () => {
+    if (isProcessing) return COLORS.PROCESSING;
+    if (isSpeaking) return COLORS.SPEAKING;
+    if (isRecording) return COLORS.RECORDING;
+    return COLORS.PRIMARY;
+  };
 
   return (
     <TapGestureHandler
@@ -73,9 +82,10 @@ const VoiceButton: React.FC<VoiceButtonProps> = ({
     >
       <Animated.View style={{ transform: [{ scale: scaleAnim }] }}>
         <TouchableOpacity
-          style={[styles.button, { backgroundColor }]}
+          style={[styles.button, { backgroundColor: getBackgroundColor() }]}
           onPress={handlePress}
-          activeOpacity={0.7}
+          activeOpacity={isProcessing ? 1 : 0.7}
+          disabled={isProcessing}
         >
           <View style={styles.innerCircle} />
         </TouchableOpacity>

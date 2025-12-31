@@ -20,10 +20,11 @@ import { COLORS } from '../utils/constants';
 const MainScreen: React.FC = () => {
   const [isRecording, setIsRecording] = useState(false);
   const [isProcessing, setIsProcessing] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
   const [hasPermissions, setHasPermissions] = useState(false);
   const [currentTranscript, setCurrentTranscript] = useState('');
   
-  const { startRecognition, stopRecognition } = useVoiceRecognition();
+  const { startRecognition, stopRecognition, cancelRecognition } = useVoiceRecognition();
   const { device, cameraRef, capturePhoto } = useCamera();
   const { speak, stop: stopTTS } = useTTS();
 
@@ -52,8 +53,23 @@ const MainScreen: React.FC = () => {
       return;
     }
 
+    // If currently speaking, stop TTS and return to ready state
+    if (isSpeaking) {
+      console.log('🛑 Tap during speaking - stopping TTS');
+      await stopTTS();
+      setIsSpeaking(false);
+      return;
+    }
+
+    // If currently processing, ignore tap
+    if (isProcessing) {
+      console.log('⚠️ Ignoring tap - currently processing');
+      return;
+    }
+
     if (isRecording) {
       // Stop recording and process
+      console.log('🛑 Stop & process');
       setIsRecording(false);
       await stopRecognition();
       if (currentTranscript) {
@@ -61,50 +77,69 @@ const MainScreen: React.FC = () => {
       }
     } else {
       // Start recording
+      console.log('🎤 Start listening');
       setIsRecording(true);
       setCurrentTranscript('');
       startRecognition(
         handleSpeechResult,
         handleSpeechError,
-        () => console.log('Speech started'),
-        () => console.log('Speech ended')
+        () => console.log('🎤 Speech started'),
+        () => console.log('🎤 Speech ended')
       );
     }
   };
 
   const handleDoubleTap = async () => {
+    console.log('👆👆 DOUBLE TAP');
+    
+    // Emergency stop - works in any state
+    if (isSpeaking) {
+      console.log('🚨 EMERGENCY STOP - Stopping TTS');
+      await stopTTS();
+      setIsSpeaking(false);
+      return;
+    }
+
+    if (isProcessing) {
+      console.log('⚠️ Cannot interrupt during processing');
+      return;
+    }
+
     if (isRecording) {
-      console.log('Double tap detected - capturing photo');
-      // Just capture and store, will use when processing
+      console.log('📸 Double tap while recording - capturing photo');
       try {
         await capturePhoto();
-        Alert.alert('Photo Captured', 'Photo captured successfully');
+        console.log('✅ Photo captured during recording');
       } catch (error) {
-        console.error('Photo capture error:', error);
+        console.error('❌ Photo capture error:', error);
       }
     }
   };
 
   const handleSpeechResult = (transcript: string) => {
-    console.log('Transcript received:', transcript);
+    console.log('📝 Transcript:', transcript);
     setCurrentTranscript(transcript);
   };
 
   const handleSpeechError = (error: any) => {
-    console.error('Speech recognition error:', error);
+    console.error('❌ Speech error:', error);
     setIsRecording(false);
-    Alert.alert('Error', 'Speech recognition failed. Please try again.');
+    
+    // Only show alert if it's a real error, not "already started"
+    if (!error?.error?.message?.includes('already started')) {
+      Alert.alert('Error', 'Speech recognition failed. Please try again.');
+    }
   };
 
   const processVoiceCommand = async (transcript: string) => {
     setIsProcessing(true);
     
     try {
-      console.log('Processing voice command:', transcript);
+      console.log('⚡ Processing command:', transcript);
       
       // Capture photo
       const photoUri = await capturePhoto();
-      console.log('Photo captured:', photoUri);
+      console.log('📸 Photo:', photoUri);
       
       // Send to backend
       const response = await sendToWorkflow({
@@ -112,23 +147,31 @@ const MainScreen: React.FC = () => {
         imageUri: photoUri,
       });
 
-      console.log('Response received:', response);
+      console.log('✅ Response:', response.text.substring(0, 50) + '...');
+
+      // Transition from processing to speaking
+      setIsProcessing(false);
+      setIsSpeaking(true);
 
       // Speak response
       if (response.text) {
         await speak(response.text);
+        // Speaking finished naturally
+        setIsSpeaking(false);
       } else {
+        setIsSpeaking(false);
         Alert.alert('No Response', 'No response received from server');
       }
       
     } catch (error) {
-      console.error('Processing error:', error);
+      console.error('❌ Processing error:', error);
+      setIsProcessing(false);
+      setIsSpeaking(false);
       Alert.alert(
         'Error',
         'Failed to process request. Please check your internet connection and try again.'
       );
     } finally {
-      setIsProcessing(false);
       setCurrentTranscript('');
     }
   };
@@ -142,6 +185,22 @@ const MainScreen: React.FC = () => {
     );
   }
 
+  // Determine what to show
+  const getStatusInfo = () => {
+    if (isSpeaking) {
+      return { text: 'Speaking...', color: COLORS.SPEAKING };
+    }
+    if (isProcessing) {
+      return { text: 'Thinking...', color: COLORS.PROCESSING };
+    }
+    if (isRecording) {
+      return { text: 'Listening...', color: COLORS.RECORDING };
+    }
+    return { text: 'Ready', color: COLORS.PRIMARY };
+  };
+
+  const statusInfo = getStatusInfo();
+
   return (
     <View style={styles.container}>
       <Camera
@@ -152,23 +211,41 @@ const MainScreen: React.FC = () => {
         photo={true}
       />
 
-      <VisualFeedback isActive={isRecording || isProcessing} />
+      <VisualFeedback 
+        isActive={isRecording || isProcessing || isSpeaking}
+        isRecording={isRecording}
+        isProcessing={isProcessing}
+        isSpeaking={isSpeaking}
+      />
       
       <View style={styles.buttonContainer}>
         <VoiceButton
           isRecording={isRecording}
           isProcessing={isProcessing}
+          isSpeaking={isSpeaking}
           onPress={handlePress}
           onDoubleTap={handleDoubleTap}
         />
         
-        {isRecording && (
-          <Text style={styles.recordingText}>Listening...</Text>
+        <Text style={[styles.statusText, { color: statusInfo.color }]}>
+          {statusInfo.text}
+        </Text>
+
+        {/* Show transcript while listening */}
+        {isRecording && currentTranscript && (
+          <View style={styles.transcriptContainer}>
+            <Text style={styles.transcriptText}>{currentTranscript}</Text>
+          </View>
         )}
-        
-        {isProcessing && (
-          <Text style={styles.recordingText}>Processing...</Text>
-        )}
+
+        {/* Show instructions */}
+        <Text style={styles.instructionText}>
+          {isSpeaking || isProcessing
+            ? 'Double-tap to interrupt'
+            : isRecording
+            ? 'Tap to stop & process'
+            : 'Tap to speak'}
+        </Text>
       </View>
 
       {!hasPermissions && (
@@ -206,11 +283,33 @@ const styles = StyleSheet.create({
     right: 0,
     alignItems: 'center',
   },
-  recordingText: {
+  statusText: {
+    fontSize: 24,
+    fontWeight: '600',
+    marginTop: 20,
+  },
+  transcriptContainer: {
+    position: 'absolute',
+    bottom: 200,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(33, 150, 243, 0.2)',
+    padding: 20,
+    borderRadius: 15,
+    borderLeftWidth: 4,
+    borderLeftColor: COLORS.RECORDING,
+  },
+  transcriptText: {
     color: COLORS.WHITE,
     fontSize: 18,
-    fontWeight: '600',
-    marginTop: 16,
+    lineHeight: 24,
+  },
+  instructionText: {
+    position: 'absolute',
+    bottom: -40,
+    color: '#999',
+    fontSize: 14,
+    textAlign: 'center',
   },
   permissionButton: {
     position: 'absolute',

@@ -10,45 +10,28 @@ import { Buffer } from 'buffer';
 
 /**
  * Configuration matching N8N TTS workflow
- * 
- * N8N Workflow URL (internal): http://speaches:8000/v1/audio/speech
- * Public URL (mobile app): https://cybersight.cim.mcgill.ca/audio/speech
- * 
- * Model: Kokoro-82M-v1.0-ONNX-int8 (8-bit quantized for faster inference)
- * Voice: af_heart (natural, expressive female voice)
- * Language: en-us (English - US)
- * Format: MP3 at 24kHz sample rate
- * Speed: 1x (normal playback)
  */
 const SPEACHES_CONFIG = {
   ttsUrl: 'https://cybersight.cim.mcgill.ca/speaches/v1/audio/speech',
-  
-  // ✅ REMOVE -int8 SUFFIX
-  model: 'speaches-ai/Kokoro-82M-v1.0-ONNX',  // ← No -int8!
-  
+  model: 'speaches-ai/Kokoro-82M-v1.0-ONNX',
   voice: 'af_heart',
   language: 'en-us',
   responseFormat: 'mp3',
   speed: 1,
   sampleRate: 24000,
-  
-  // ✅ ADD YOUR API KEY
   apiKey: 'dev-test-key-change-in-production',
 };
 
 /**
  * Speaches TTS Client
- * 
- * Synthesizes speech using the same Speaches API as your N8N workflow.
- * Downloads MP3 audio and plays it using react-native-sound for reliable
- * playback control (stop, pause, etc.)
  */
 class SpeachesTTSClient {
   private currentSound: Sound | null = null;
   private isPlaying: boolean = false;
+  private currentTempPath: string | null = null;
+  private playbackCancelled: boolean = false;  // ✅ Track if playback was cancelled
 
   constructor() {
-    // ✅ Configure Sound to play even in iOS silent mode
     Sound.setCategory('Playback');
     console.log('✅ Speaches TTS Client initialized');
   }
@@ -57,7 +40,7 @@ class SpeachesTTSClient {
    * Synthesize speech from text using Speaches API
    * 
    * @param text - Text to convert to speech
-   * @returns Promise that resolves when audio starts playing
+   * @returns Promise that resolves when audio FINISHES playing
    */
   async synthesizeSpeech(text: string): Promise<void> {
     const trimmed = (text || '').trim();
@@ -72,7 +55,6 @@ class SpeachesTTSClient {
 
       console.log('🎤 Synthesizing speech:', trimmed.substring(0, 50) + '...');
 
-      // ✅ Build request payload (EXACT match to N8N workflow)
       const payload = {
         model: SPEACHES_CONFIG.model,
         input: trimmed,
@@ -83,13 +65,11 @@ class SpeachesTTSClient {
         sample_rate: SPEACHES_CONFIG.sampleRate,
       };
 
-      // ✅ Build headers (matches N8N workflow)
       const headers: Record<string, string> = {
         'accept': 'audio/mpeg',
         'Content-Type': 'application/json',
       };
 
-      // ✅ Add API key if configured
       if (SPEACHES_CONFIG.apiKey) {
         headers['Authorization'] = `Bearer ${SPEACHES_CONFIG.apiKey}`;
         headers['X-API-Key'] = SPEACHES_CONFIG.apiKey;
@@ -98,24 +78,21 @@ class SpeachesTTSClient {
       console.log('📤 Sending TTS request to:', SPEACHES_CONFIG.ttsUrl);
       console.log('📝 Payload:', JSON.stringify(payload, null, 2));
 
-      // ✅ Make API request
       const response = await fetch(SPEACHES_CONFIG.ttsUrl, {
         method: 'POST',
         headers,
         body: JSON.stringify(payload),
       });
 
-      // ✅ Check response status
       if (!response.ok) {
         const errorBody = await response.text().catch(() => '');
         throw new Error(`Speaches TTS failed: ${response.status} ${errorBody}`);
       }
 
-      // ✅ Get audio blob from response
       const blob = await response.blob();
       console.log('✅ Received audio blob:', blob.size, 'bytes');
 
-      // ✅ Convert blob to file and play
+      // ✅ Convert blob to file and play - NOW WAITS UNTIL FINISHED!
       await this.playAudioBlob(blob);
 
     } catch (error) {
@@ -127,67 +104,103 @@ class SpeachesTTSClient {
   /**
    * Convert audio blob to file and play it
    * 
-   * @param blob - Audio blob from Speaches API
+   * ✅ Returns a Promise that resolves when audio FINISHES playing
    */
   private async playAudioBlob(blob: Blob): Promise<void> {
-    try {
-      // ✅ Convert blob to base64 for file writing
-      const base64 = await this.blobToBase64(blob);
+    return new Promise(async (resolve, reject) => {
+      try {
+        this.playbackCancelled = false;  // ✅ Reset cancellation flag
+        
+        const base64 = await this.blobToBase64(blob);
+        const tempPath = `${RNFS.DocumentDirectoryPath}/tts_speech_${Date.now()}.mp3`;
+        this.currentTempPath = tempPath;  // ✅ Store temp path for cleanup
+        
+        await RNFS.writeFile(tempPath, base64, 'base64');
+        console.log('💾 Saved audio to:', tempPath);
 
-      // ✅ Create temporary file path
-      const tempPath = `${RNFS.DocumentDirectoryPath}/tts_speech_${Date.now()}.mp3`;
-      
-      // ✅ Write audio data to file
-      await RNFS.writeFile(tempPath, base64, 'base64');
-      console.log('💾 Saved audio to:', tempPath);
-
-      // ✅ Load audio file with react-native-sound
-      this.currentSound = new Sound(tempPath, '', (error) => {
-        if (error) {
-          console.error('❌ Failed to load sound:', error);
-          this.cleanup(tempPath);
-          return;
-        }
-
-        console.log('▶️ Playing audio...');
-        this.isPlaying = true;
-
-        // ✅ Play the audio
-        this.currentSound?.play((success) => {
-          this.isPlaying = false;
-          if (success) {
-            console.log('✅ Playback finished');
-          } else {
-            console.log('❌ Playback failed');
+        this.currentSound = new Sound(tempPath, '', (error) => {
+          if (error) {
+            console.error('❌ Failed to load sound:', error);
+            this.cleanup();
+            reject(error);
+            return;
           }
 
-          // ✅ Cleanup after playback
-          this.cleanup(tempPath);
-        });
-      });
+          // ✅ Check if cancelled before playing
+          if (this.playbackCancelled) {
+            console.log('⚠️ Playback cancelled before start');
+            this.cleanup();
+            resolve();
+            return;
+          }
 
-    } catch (error) {
-      console.error('❌ Error playing audio:', error);
-      throw error;
-    }
+          console.log('▶️ Playing audio...');
+          this.isPlaying = true;
+
+          // ✅ Play and wait for completion
+          this.currentSound?.play((success) => {
+            this.isPlaying = false;
+            
+            // ✅ Check if cancelled during playback
+            if (this.playbackCancelled) {
+              console.log('⚠️ Playback was cancelled');
+              this.cleanup();
+              resolve();
+              return;
+            }
+            
+            if (success) {
+              console.log('✅ Playback finished');
+            } else {
+              console.log('❌ Playback failed');
+            }
+
+            this.cleanup();
+            resolve();
+          });
+        });
+
+      } catch (error) {
+        console.error('❌ Error playing audio:', error);
+        this.cleanup();
+        reject(error);
+      }
+    });
   }
 
   /**
    * Stop current speech playback
    * 
-   * @returns Promise that resolves when audio is stopped
+   * ✅ FIXED: Now properly stops audio without restarting
    */
   async stop(): Promise<void> {
     return new Promise((resolve) => {
-      if (this.currentSound && this.isPlaying) {
-        console.log('🛑 Stopping TTS playback...');
-        
-        this.currentSound.stop(() => {
-          this.isPlaying = false;
-          console.log('✅ TTS stopped');
+      if (!this.currentSound && !this.isPlaying) {
+        resolve();
+        return;
+      }
+
+      console.log('🛑 Stopping TTS playback...');
+      this.playbackCancelled = true;  // ✅ Set cancellation flag
+      this.isPlaying = false;
+      
+      if (this.currentSound) {
+        try {
+          // ✅ Stop the sound immediately
+          this.currentSound.stop(() => {
+            // Callback after stop
+            this.cleanup();
+            console.log('✅ TTS stopped');
+            resolve();
+          });
+        } catch (error) {
+          // If stop() fails, still cleanup
+          console.warn('⚠️ Error stopping sound:', error);
+          this.cleanup();
           resolve();
-        });
+        }
       } else {
+        this.cleanup();
         resolve();
       }
     });
@@ -195,27 +208,29 @@ class SpeachesTTSClient {
 
   /**
    * Cleanup - release sound and delete temporary file
-   * 
-   * @param tempPath - Path to temporary audio file
    */
-  private cleanup(tempPath: string): void {
+  private cleanup(): void {
     // ✅ Release sound resources
     if (this.currentSound) {
-      this.currentSound.release();
+      try {
+        this.currentSound.release();
+      } catch (error) {
+        console.warn('⚠️ Error releasing sound:', error);
+      }
       this.currentSound = null;
     }
 
     // ✅ Delete temporary audio file
-    RNFS.unlink(tempPath).catch((err) => {
-      console.warn('⚠️ Could not delete temp file:', err);
-    });
+    if (this.currentTempPath) {
+      RNFS.unlink(this.currentTempPath).catch((err) => {
+        console.warn('⚠️ Could not delete temp file:', err);
+      });
+      this.currentTempPath = null;
+    }
   }
 
   /**
    * Convert Blob to Base64 string
-   * 
-   * @param blob - Audio blob to convert
-   * @returns Promise resolving to base64 string
    */
   private blobToBase64(blob: Blob): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -223,7 +238,6 @@ class SpeachesTTSClient {
       
       reader.onload = () => {
         if (typeof reader.result === 'string') {
-          // ✅ Extract base64 data (remove data URL prefix)
           const base64 = reader.result.split(',')[1];
           resolve(base64);
         } else {
@@ -238,8 +252,6 @@ class SpeachesTTSClient {
 
   /**
    * Check if TTS is currently playing
-   * 
-   * @returns true if audio is playing, false otherwise
    */
   isCurrentlyPlaying(): boolean {
     return this.isPlaying;
