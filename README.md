@@ -1,4 +1,4 @@
-# ShelfScout - CyberSight Mobile Client
+# ShelfScout <img src="src/assets/icons/shelfscout-rbg.png" alt="ShelfScout App Icon" width="60" align="right" style="border-radius: 12px;"/>
 
 **Status:** Active Development | **Platform:** Cross-Platform (iOS & Android) | **Focus:** Accessibility & Navigation
 
@@ -105,12 +105,18 @@ open ios/shelfscout.xcworkspace
 
 **Gradle sync issues:**
 ```bash
+rm -rf ~/.gradle/caches/
+or
+rm -rf ~/.gradle/caches/
+rm -rf ~/.gradle/wrapper/
+rm -rf android/.gradle
+rm -rf android/app/build
+rm -rf android/build
+
 cd android
 ./gradlew clean
-./gradlew --stop
 cd ..
-rm -rf android/.gradle
-npm run android
+npx react-native run-android
 ```
 
 ### General Issues

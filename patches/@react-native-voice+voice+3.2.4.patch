@@ -1,0 +1,135 @@
+diff --git a/node_modules/@react-native-voice/voice/android/.project b/node_modules/@react-native-voice/voice/android/.project
+new file mode 100644
+index 0000000..69e6e99
+--- /dev/null
++++ b/node_modules/@react-native-voice/voice/android/.project
+@@ -0,0 +1,34 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<projectDescription>
++	<name>react-native-voice_voice</name>
++	<comment>Project react-native-voice_voice created by Buildship.</comment>
++	<projects>
++	</projects>
++	<buildSpec>
++		<buildCommand>
++			<name>org.eclipse.jdt.core.javabuilder</name>
++			<arguments>
++			</arguments>
++		</buildCommand>
++		<buildCommand>
++			<name>org.eclipse.buildship.core.gradleprojectbuilder</name>
++			<arguments>
++			</arguments>
++		</buildCommand>
++	</buildSpec>
++	<natures>
++		<nature>org.eclipse.jdt.core.javanature</nature>
++		<nature>org.eclipse.buildship.core.gradleprojectnature</nature>
++	</natures>
++	<filteredResources>
++		<filter>
++			<id>1767037778943</id>
++			<name></name>
++			<type>30</type>
++			<matcher>
++				<id>org.eclipse.core.resources.regexFilterMatcher</id>
++				<arguments>node_modules|\.git|__CREATED_BY_JAVA_LANGUAGE_SERVER__</arguments>
++			</matcher>
++		</filter>
++	</filteredResources>
++</projectDescription>
+diff --git a/node_modules/@react-native-voice/voice/android/build.gradle b/node_modules/@react-native-voice/voice/android/build.gradle
+index 8fce879..bf7c277 100644
+--- a/node_modules/@react-native-voice/voice/android/build.gradle
++++ b/node_modules/@react-native-voice/voice/android/build.gradle
+@@ -1,67 +1,48 @@
+-apply plugin: 'com.android.library'
+-
+-repositories {
+-    mavenLocal()
+-    jcenter()
+-    maven {
+-        // For developing the library outside the context of the example app, expect `react-native`
+-        // to be installed at `./node_modules`.
+-        url "$projectDir/../node_modules/react-native/android"
++buildscript {
++    repositories {
++        google()
++        mavenCentral()
+     }
+-    maven {
+-        // For developing the example app.
+-        url "$projectDir/../../react-native/android"
++
++    dependencies {
++        classpath 'com.android.tools.build:gradle:8.0.0'
+     }
+ }
+ 
+-def DEFAULT_COMPILE_SDK_VERSION = 28
+-def DEFAULT_BUILD_TOOLS_VERSION = "28.0.3"
+-def DEFAULT_TARGET_SDK_VERSION = 28
+-def DEFAULT_SUPPORT_LIB_VERSION = "28.0.0"
++apply plugin: 'com.android.library'
++
++def safeExtGet(prop, fallback) {
++    rootProject.ext.has(prop) ? rootProject.ext.get(prop) : fallback
++}
+ 
+ android {
+-    compileSdkVersion rootProject.hasProperty('compileSdkVersion') ? rootProject.compileSdkVersion : DEFAULT_COMPILE_SDK_VERSION
+-    buildToolsVersion rootProject.hasProperty('buildToolsVersion') ? rootProject.buildToolsVersion : DEFAULT_BUILD_TOOLS_VERSION
++    compileSdk safeExtGet('compileSdkVersion', 34)
++    
++    namespace 'com.wenkesj.voice'
+     
+     defaultConfig {
+-        minSdkVersion 15
+-        targetSdkVersion rootProject.hasProperty('targetSdkVersion') ? rootProject.targetSdkVersion : DEFAULT_TARGET_SDK_VERSION
++        minSdkVersion safeExtGet('minSdkVersion', 21)
++        targetSdkVersion safeExtGet('targetSdkVersion', 34)
+         versionCode 1
+         versionName "1.0"
+     }
++    
+     buildTypes {
+         release {
+             minifyEnabled false
+-            proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
+         }
+     }
+-}
+-
+-buildscript {
+-    if (project == rootProject) {
+-        repositories {
+-            jcenter()
+-        }
+-        dependencies {
+-            classpath 'com.android.tools.build:gradle:3.3.2'
+     
+-            // NOTE: Do not place your application dependencies here; they belong
+-            // in the individual module build.gradle files
+-        }
++    lintOptions {
++        abortOnError false
+     }
+ }
+ 
+-allprojects {
+-    repositories {
+-        jcenter()
+-    }
++repositories {
++    google()
++    mavenCentral()
+ }
+ 
+-def supportVersion = rootProject.hasProperty('supportLibVersion') ? rootProject.supportLibVersion : DEFAULT_SUPPORT_LIB_VERSION
+-
+ dependencies {
+-    implementation fileTree(dir: 'libs', include: ['*.jar'])
+-    testImplementation 'junit:junit:4.12'
+-    implementation "com.android.support:appcompat-v7:${supportVersion}"
+     implementation 'com.facebook.react:react-native:+'
+ }

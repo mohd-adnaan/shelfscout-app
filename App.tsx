@@ -154,8 +154,66 @@ function App(): React.JSX.Element {
     };
   }, []);
 
+const requestMicrophonePermission = async () => {
+  if (Platform.OS === 'android') {
+    try {
+      const granted = await PermissionsAndroid.request(
+        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+        {
+          title: 'Microphone Permission',
+          message: 'ShelfScout needs access to your microphone for voice commands',
+          buttonNeutral: 'Ask Me Later',
+          buttonNegative: 'Cancel',
+          buttonPositive: 'OK',
+        }
+      );
+      if (granted === PermissionsAndroid.RESULTS.GRANTED) {
+        console.log('🎤 Microphone permission granted');
+        return true;
+      } else {
+        console.log('❌ Microphone permission denied');
+        return false;
+      }
+    } catch (err) {
+      console.warn('❌ Permission error:', err);
+      return false;
+    }
+  }
+  return true; // iOS handles permissions differently
+};
+
+// const startListening = async () => {
+//   try {
+//     isEmergencyStopped.current = false;
+    
+//     await stopTTS();
+//     setTranscript('');
+//     setIsSpeaking(false);
+//     finalTranscriptRef.current = '';
+    
+//     // ✅ FIX #1: Haptic FIRST before anything else
+//     audioFeedback.playEarcon('listening');
+    
+//     playSound('start');
+//     await Voice.start('en-US');
+//     console.log('✅ Voice recognition started');
+    
+//     // ✅ Then announce "Listening"
+//     await audioFeedback.announceState('listening', false);
+    
+//   } catch (error) {
+//     console.error('❌ Start listening error:', error);
+//   }
+// };
+
 const startListening = async () => {
   try {
+    const hasPermission = await requestMicrophonePermission();
+    if (!hasPermission) {
+      Alert.alert('Permission Required', 'Microphone access is required for voice commands');
+      return;
+    }
+
     isEmergencyStopped.current = false;
     
     await stopTTS();
@@ -163,14 +221,12 @@ const startListening = async () => {
     setIsSpeaking(false);
     finalTranscriptRef.current = '';
     
-    // ✅ FIX #1: Haptic FIRST before anything else
     audioFeedback.playEarcon('listening');
-    
     playSound('start');
+    
     await Voice.start('en-US');
     console.log('✅ Voice recognition started');
     
-    // ✅ Then announce "Listening"
     await audioFeedback.announceState('listening', false);
     
   } catch (error) {
@@ -178,11 +234,8 @@ const startListening = async () => {
   }
 };
 
-
 const stopListeningAndProcess = async () => {
   try {
-    // ✅ FIX #2: Take photo BEFORE stopping voice recognition
-    // This way photo happens during "Listening", not "Thinking"
     console.log('📸 Capturing photo while listening...');
     
     let photoPath = '';

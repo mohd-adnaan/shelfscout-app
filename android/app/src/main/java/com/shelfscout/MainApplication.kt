@@ -32,11 +32,12 @@ class MainApplication : Application(), ReactApplication {
   override val reactHost: ReactHost
     get() = getDefaultReactHost(applicationContext, reactNativeHost)
 
-  override fun onCreate() {
+override fun onCreate() {
     super.onCreate()
     SoLoader.init(this, OpenSourceMergedSoMapping)
     if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) {
-      load()
+      // FORCE Bridgeless Mode OFF so the Voice library works
+      load(bridgelessEnabled = false)
     }
   }
 }
