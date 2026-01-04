@@ -16,4 +16,4 @@ export const COLORS = {
   WHITE: '#FFFFFF',
 };
 
-export const WORKFLOW_URL =  'http://cybersight.cim.mcgill.ca/api/webhook/29ee1345-f789-4738-997f-ffdae65bba74';
+export const WORKFLOW_URL =  'https://cybersight.cim.mcgill.ca/api/webhook/29ee1345-f789-4738-997f-ffdae65bba74';

@@ -1,4 +1,4 @@
-# ShelfScout <img src="src/assets/icons/shelfscout-rbg.png" alt="ShelfScout App Icon" width="60" align="right" style="border-radius: 12px;"/>
+# ShelfScout <img src="src/assets/icons/shelfscout-rbg.png" alt="ShelfScout App Icon" width="60" style="vertical-align: middle; margin-left: 8px; border-radius: 11px;" />
 
 **Status:** Active Development | **Platform:** Cross-Platform (iOS & Android) | **Focus:** Accessibility & Navigation
 

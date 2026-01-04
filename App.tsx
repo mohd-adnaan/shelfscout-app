@@ -11,17 +11,16 @@ import {
   StatusBar,
 } from 'react-native';
 import { Camera, useCameraDevice, useCameraPermission, useMicrophonePermission } from 'react-native-vision-camera';
-import Voice from '@react-native-voice/voice';
 import { useTTS } from './src/hooks/useTTS';
+import { useSTT } from './src/hooks/useSTT';  
 import { sendToWorkflow } from './src/services/WorkflowService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import { playSound } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
+
 const { width, height } = Dimensions.get('window');
 
 function App(): React.JSX.Element {
-  const [isListening, setIsListening] = useState(false);
-  const [transcript, setTranscript] = useState('');
   const [isProcessing, setIsProcessing] = useState(false);
   const [isSpeaking, setIsSpeaking] = useState(false);
 
@@ -31,6 +30,15 @@ function App(): React.JSX.Element {
 
   const cameraRef = useRef<Camera>(null);
   const { speak, stop: stopTTS } = useTTS();
+  
+  // ✅ NEW: Platform-specific STT hook
+  const { 
+    startListening: startSTT, 
+    stopListening: stopSTT, 
+    cancelListening: cancelSTT,
+    isListening, 
+    transcript 
+  } = useSTT();
 
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const opacityAnim = useRef(new Animated.Value(0.3)).current;
@@ -42,20 +50,21 @@ function App(): React.JSX.Element {
   const lastTapRef = useRef(0);
   const DOUBLE_TAP_DELAY = 300;
 
+  // ✅ Sync transcript to ref for access in other functions
+  useEffect(() => {
+    if (transcript) {
+      finalTranscriptRef.current = transcript;
+    }
+  }, [transcript]);
+
   useEffect(() => {
     const requestAndroidPermissions = async () => {
       if (Platform.OS === 'android') {
         try {
-          await PermissionsAndroid.request(
+          await PermissionsAndroid.requestMultiple([
             PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-            {
-              title: 'Microphone Permission',
-              message: 'This app needs access to your microphone for voice commands',
-              buttonNeutral: 'Ask Me Later',
-              buttonNegative: 'Cancel',
-              buttonPositive: 'OK',
-            }
-          );
+            PermissionsAndroid.PERMISSIONS.CAMERA,
+          ]);
         } catch (err) {
           console.warn('Permission error:', err);
         }
@@ -124,304 +133,238 @@ function App(): React.JSX.Element {
     }
   }, [isListening]);
 
-  useEffect(() => {
-    Voice.onSpeechStart = () => {
-      console.log('🎤 Speech started');
-      setIsListening(true);
-    };
-
-    Voice.onSpeechEnd = () => {
-      console.log('🎤 Speech ended');
-      setIsListening(false);
-    };
-
-    Voice.onSpeechResults = (e) => {
-      if (e.value && e.value[0]) {
-        const newTranscript = e.value[0];
-        console.log('📝 Transcript:', newTranscript);
-        setTranscript(newTranscript);
-        finalTranscriptRef.current = newTranscript;
-      }
-    };
-
-    Voice.onSpeechError = (e) => {
-      console.error('❌ Speech error:', e);
-      setIsListening(false);
-    };
-
-    return () => {
-      Voice.destroy().then(Voice.removeAllListeners);
-    };
-  }, []);
-
-const requestMicrophonePermission = async () => {
-  if (Platform.OS === 'android') {
-    try {
-      const granted = await PermissionsAndroid.request(
-        PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
-        {
-          title: 'Microphone Permission',
-          message: 'ShelfScout needs access to your microphone for voice commands',
-          buttonNeutral: 'Ask Me Later',
-          buttonNegative: 'Cancel',
-          buttonPositive: 'OK',
+  const requestMicrophonePermission = async () => {
+    if (Platform.OS === 'android') {
+      try {
+        const granted = await PermissionsAndroid.request(
+          PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
+          {
+            title: 'Microphone Permission',
+            message: 'ShelfScout needs access to your microphone for voice commands',
+            buttonNeutral: 'Ask Me Later',
+            buttonNegative: 'Cancel',
+            buttonPositive: 'OK',
+          }
+        );
+        if (granted === PermissionsAndroid.RESULTS.GRANTED) {
+          console.log('🎤 Microphone permission granted');
+          return true;
+        } else {
+          console.log('❌ Microphone permission denied');
+          return false;
         }
-      );
-      if (granted === PermissionsAndroid.RESULTS.GRANTED) {
-        console.log('🎤 Microphone permission granted');
-        return true;
-      } else {
-        console.log('❌ Microphone permission denied');
+      } catch (err) {
+        console.warn('❌ Permission error:', err);
         return false;
       }
-    } catch (err) {
-      console.warn('❌ Permission error:', err);
-      return false;
     }
-  }
-  return true; // iOS handles permissions differently
-};
+    return true; // iOS handles permissions differently
+  };
 
-// const startListening = async () => {
-//   try {
-//     isEmergencyStopped.current = false;
-    
-//     await stopTTS();
-//     setTranscript('');
-//     setIsSpeaking(false);
-//     finalTranscriptRef.current = '';
-    
-//     // ✅ FIX #1: Haptic FIRST before anything else
-//     audioFeedback.playEarcon('listening');
-    
-//     playSound('start');
-//     await Voice.start('en-US');
-//     console.log('✅ Voice recognition started');
-    
-//     // ✅ Then announce "Listening"
-//     await audioFeedback.announceState('listening', false);
-    
-//   } catch (error) {
-//     console.error('❌ Start listening error:', error);
-//   }
-// };
-
-const startListening = async () => {
-  try {
-    const hasPermission = await requestMicrophonePermission();
-    if (!hasPermission) {
-      Alert.alert('Permission Required', 'Microphone access is required for voice commands');
-      return;
-    }
-
-    isEmergencyStopped.current = false;
-    
-    await stopTTS();
-    setTranscript('');
-    setIsSpeaking(false);
-    finalTranscriptRef.current = '';
-    
-    audioFeedback.playEarcon('listening');
-    playSound('start');
-    
-    await Voice.start('en-US');
-    console.log('✅ Voice recognition started');
-    
-    await audioFeedback.announceState('listening', false);
-    
-  } catch (error) {
-    console.error('❌ Start listening error:', error);
-  }
-};
-
-const stopListeningAndProcess = async () => {
-  try {
-    console.log('📸 Capturing photo while listening...');
-    
-    let photoPath = '';
-    if (cameraRef.current) {
-      try {
-        const photo = await cameraRef.current.takePhoto({
-          qualityPrioritization: 'speed',
-        });
-        photoPath = photo.path;
-        console.log('✅ Photo captured:', photoPath);
-      } catch (photoError) {
-        console.error('❌ Photo error:', photoError);
+  const startListening = async () => {
+    try {
+      const hasPermission = await requestMicrophonePermission();
+      if (!hasPermission) {
+        Alert.alert('Permission Required', 'Microphone access is required for voice commands');
+        return;
       }
+
+      isEmergencyStopped.current = false;
+
+      await stopTTS();
+      finalTranscriptRef.current = '';
+
+      audioFeedback.playEarcon('listening');
+      playSound('start');
+
+      // ✅ Use platform-specific STT
+      await startSTT();
+      console.log('✅ Voice recognition started');
+
+      await audioFeedback.announceState('listening', false);
+
+    } catch (error) {
+      console.error('❌ Start listening error:', error);
     }
-    
-    await Voice.stop();
-    console.log('🛑 Voice recognition stopped');
-    
-    const finalText = finalTranscriptRef.current.trim();
-    if (finalText && !isProcessingRef.current && !isEmergencyStopped.current) {
-      await handleVoiceCommand(finalText, photoPath);
+  };
+
+  const stopListeningAndProcess = async () => {
+    try {
+      console.log('📸 Capturing photo while listening...');
+
+      let photoPath = '';
+      if (cameraRef.current) {
+        try {
+          const photo = await cameraRef.current.takePhoto({
+            qualityPrioritization: 'speed',
+          });
+          photoPath = photo.path;
+          console.log('✅ Photo captured:', photoPath);
+        } catch (photoError) {
+          console.error('❌ Photo error:', photoError);
+        }
+      }
+
+      // ✅ Stop STT and get transcript
+      const finalTranscript = await stopSTT();
+      console.log('🛑 Voice recognition stopped');
+      console.log('📝 Final transcript:', finalTranscript);
+
+      const finalText = finalTranscript.trim();
+      if (finalText && !isProcessingRef.current && !isEmergencyStopped.current) {
+        await handleVoiceCommand(finalText, photoPath);
+      }
+    } catch (error) {
+      console.error('❌ Stop listening error:', error);
     }
-  } catch (error) {
-    console.error('❌ Stop listening error:', error);
-  }
-};
+  };
 
-const handleVoiceCommand = async (command: string, photoPath: string) => {
-  if (isProcessingRef.current || isEmergencyStopped.current) {
-    console.log('⚠️ Blocked - processing or emergency stopped');
-    return;
-  }
-
-  try {
-    console.log('⚡ Processing command:', command);
-    isProcessingRef.current = true;
-    setIsProcessing(true);
-    
-    // ✅ FIX #3: Haptic FIRST, then announce
-    audioFeedback.playEarcon('thinking');
-    
-    playSound('processing');
-    
-    // ✅ Then announce "Thinking" (non-blocking)
-    audioFeedback.announceState('thinking', false);
-
-    // ✅ Photo already captured - just use it
-    if (!photoPath) {
-      throw new Error('No photo available');
-    }
-
-    if (isEmergencyStopped.current) {
-      console.log('⚠️ Emergency stopped before request');
+  const handleVoiceCommand = async (command: string, photoPath: string) => {
+    if (isProcessingRef.current || isEmergencyStopped.current) {
+      console.log('⚠️ Blocked - processing or emergency stopped');
       return;
     }
 
-    const result = await sendToWorkflow({
-      text: command,
-      imageUri: photoPath,
-    });
+    try {
+      console.log('⚡ Processing command:', command);
+      isProcessingRef.current = true;
+      setIsProcessing(true);
 
-    if (isEmergencyStopped.current) {
-      console.log('⚠️ Emergency stopped - not speaking');
-      return;
+      audioFeedback.playEarcon('thinking');
+      playSound('processing');
+      audioFeedback.announceState('thinking', false);
+
+      if (!photoPath) {
+        throw new Error('No photo available');
+      }
+
+      if (isEmergencyStopped.current) {
+        console.log('⚠️ Emergency stopped before request');
+        return;
+      }
+
+      const result = await sendToWorkflow({
+        text: command,
+        imageUri: photoPath,
+      });
+
+      if (isEmergencyStopped.current) {
+        console.log('⚠️ Emergency stopped - not speaking');
+        return;
+      }
+
+      console.log('✅ Response:', result.text.substring(0, 50) + '...');
+
+      setIsProcessing(false);
+      setIsSpeaking(true);
+
+      audioFeedback.playEarcon('speaking');
+
+      await speak(result.text);
+
+      setIsSpeaking(false);
+      audioFeedback.playEarcon('ready');
+
+    } catch (error) {
+      if (!isEmergencyStopped.current) {
+        console.error('❌ Error:', error);
+        await audioFeedback.announceError('Error processing request', true);
+        Alert.alert('Error', 'Failed to process');
+      }
+    } finally {
+      setIsProcessing(false);
+      isProcessingRef.current = false;
     }
+  };
 
-    console.log('✅ Response:', result.text.substring(0, 50) + '...');
-    
-    // Transition to speaking
+  const emergencyStop = async () => {
+    console.log('🚨 EMERGENCY STOP');
+
+    isEmergencyStopped.current = true;
+
+    try {
+      await stopTTS();
+    } catch (e) { }
+
+    try {
+      // ✅ Cancel platform-specific STT
+      await cancelSTT();
+    } catch (e) { }
+
+    await new Promise(resolve => setTimeout(resolve, 300));
+
     setIsProcessing(false);
-    setIsSpeaking(true);
-    
-    // Vibration for speaking
-    audioFeedback.playEarcon('speaking');
-    
-    // Speak response
-    await speak(result.text);
-    
     setIsSpeaking(false);
-    
-    // Quick vibration when ready
-    audioFeedback.playEarcon('ready');
-    
-  } catch (error) {
-    if (!isEmergencyStopped.current) {
-      console.error('❌ Error:', error);
-      await audioFeedback.announceError('Error processing request', true);
-      Alert.alert('Error', 'Failed to process');
-    }
-  } finally {
-    setIsProcessing(false);
     isProcessingRef.current = false;
-  }
-};
+    finalTranscriptRef.current = '';
 
-const emergencyStop = async () => {
-  console.log('🚨 EMERGENCY STOP');
+    audioFeedback.playEarcon('ready');
 
-  isEmergencyStopped.current = true;
+    console.log('✅ Emergency stop complete');
+  };
 
-  try {
-    await stopTTS();
-  } catch (e) { }
+  const handleScreenTap = async () => {
+    const now = Date.now();
+    const timeSinceLastTap = now - lastTapRef.current;
 
-  try {
-    await Voice.stop();
-    await Voice.destroy();
-  } catch (e) { }
+    if (timeSinceLastTap < DOUBLE_TAP_DELAY) {
+      console.log('👆👆 DOUBLE TAP');
+      await emergencyStop();
+      lastTapRef.current = 0;
+      return;
+    }
 
-  await new Promise(resolve => setTimeout(resolve, 300));
+    lastTapRef.current = now;
 
-  setIsListening(false);
-  setIsProcessing(false);
-  setIsSpeaking(false);
-  setTranscript('');
-  isProcessingRef.current = false;
-  finalTranscriptRef.current = '';
+    if (isSpeaking || isProcessing) {
+      console.log('⚠️ Busy - double-tap to stop');
+      return;
+    }
 
-  // Quick vibration
-  audioFeedback.playEarcon('ready');
+    if (isListening) {
+      console.log('🛑 Stop & process');
+      await stopListeningAndProcess();
+      return;
+    }
 
-  console.log('✅ Emergency stop complete');
-};
+    console.log('🎤 Start listening');
+    await startListening();
+  };
 
-const handleScreenTap = async () => {
-  const now = Date.now();
-  const timeSinceLastTap = now - lastTapRef.current;
-
-  if (timeSinceLastTap < DOUBLE_TAP_DELAY) {
-    console.log('👆👆 DOUBLE TAP');
-    await emergencyStop();
-    lastTapRef.current = 0;
-    return;
-  }
-
-  lastTapRef.current = now;
-
-  if (isSpeaking || isProcessing) {
-    console.log('⚠️ Busy - double-tap to stop');
-    return;
+  if (!hasCameraPermission || !device) {
+    return (
+      <View style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#000" />
+      </View>
+    );
   }
 
-  if (isListening) {
-    console.log('🛑 Stop & process');
-    await stopListeningAndProcess();
-    return;
-  }
-
-  console.log('🎤 Start listening');
-  await startListening();
-};
-
-if (!hasCameraPermission || !device) {
   return (
-    <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#000" />
-    </View>
+    <TouchableWithoutFeedback onPress={handleScreenTap}>
+      <View style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#000" />
+
+        <Camera
+          ref={cameraRef}
+          style={StyleSheet.absoluteFill}
+          device={device}
+          isActive={true}
+          photo={true}
+        />
+
+        <View style={styles.darkOverlay} />
+
+        <VoiceVisualizer
+          isListening={isListening}
+          isProcessing={isProcessing}
+          isSpeaking={isSpeaking}
+          transcript={transcript}
+          pulseAnim={pulseAnim}
+          opacityAnim={opacityAnim}
+        />
+      </View>
+    </TouchableWithoutFeedback>
   );
-}
-
-return (
-  <TouchableWithoutFeedback onPress={handleScreenTap}>
-    <View style={styles.container}>
-      <StatusBar barStyle="light-content" backgroundColor="#000" />
-
-      <Camera
-        ref={cameraRef}
-        style={StyleSheet.absoluteFill}
-        device={device}
-        isActive={true}
-        photo={true}
-      />
-
-      <View style={styles.darkOverlay} />
-
-      <VoiceVisualizer
-        isListening={isListening}
-        isProcessing={isProcessing}
-        isSpeaking={isSpeaking}
-        transcript={transcript}
-        pulseAnim={pulseAnim}
-        opacityAnim={opacityAnim}
-      />
-    </View>
-  </TouchableWithoutFeedback>
-);
 }
 
 const styles = StyleSheet.create({

@@ -36,8 +36,7 @@ override fun onCreate() {
     super.onCreate()
     SoLoader.init(this, OpenSourceMergedSoMapping)
     if (BuildConfig.IS_NEW_ARCHITECTURE_ENABLED) {
-      // FORCE Bridgeless Mode OFF so the Voice library works
-      load(bridgelessEnabled = false)
+      load() 
     }
   }
 }
