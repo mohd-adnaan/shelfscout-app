@@ -112,7 +112,16 @@ rm -rf ~/.gradle/wrapper/
 rm -rf android/.gradle
 rm -rf android/app/build
 rm -rf android/build
+```
+**Stop all running Gradle daemons:**
+```bash
+cd android
+./gradlew --stop
+rm -rf ~/.gradle/caches/8.13/kotlin-dsl
+```
 
+**Clean the project build & run app again:**
+```bash
 cd android
 ./gradlew clean
 cd ..
