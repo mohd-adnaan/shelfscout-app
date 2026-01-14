@@ -1,35 +1,29 @@
 // src/hooks/useSTT.ts
-
-import { useState, useEffect, useCallback } from 'react';
+// Platform-specific Speech-to-Text hook
+import { useState, useRef, useEffect } from 'react';
 import { Platform } from 'react-native';
 import Voice from '@react-native-voice/voice';
-import { speachesSTT } from '../services/speachesSttClient';
+import { SPEACHES_CONFIG } from '../utils/constants';
 
-/**
- * Platform-specific STT hook
- * 
- * iOS: Native voice recognition (fast, reliable)
- * Android: Speaches API (works when native doesn't)
- * 
- * Usage:
- * ```typescript
- * const { 
- *   startListening, 
- *   stopListening, 
- *   isListening, 
- *   transcript 
- * } = useSTT();
- * ```
- */
-export const useSTT = () => {
+interface UseSTTReturn {
+  isListening: boolean;
+  transcript: string;
+  startListening: () => Promise<void>;
+  stopListening: () => Promise<string>;
+  cancelListening: () => Promise<void>;
+}
+
+export const useSTT = (): UseSTTReturn => {
   const [isListening, setIsListening] = useState(false);
   const [transcript, setTranscript] = useState('');
+  
+  const finalTranscriptRef = useRef('');
+  const isProcessingRef = useRef(false);
 
+  // iOS Voice Recognition Setup
   useEffect(() => {
     if (Platform.OS === 'ios') {
-      // ✅ iOS: Setup native Voice recognition
-      console.log('🍎 Using native iOS Voice recognition');
-
+      // Voice event handlers for iOS
       Voice.onSpeechStart = () => {
         console.log('🎤 Speech started (iOS)');
         setIsListening(true);
@@ -37,112 +31,128 @@ export const useSTT = () => {
 
       Voice.onSpeechEnd = () => {
         console.log('🎤 Speech ended (iOS)');
-        setIsListening(false);
       };
 
-      Voice.onSpeechResults = (e) => {
-        if (e.value && e.value[0]) {
-          const newTranscript = e.value[0];
-          console.log('📝 Transcript (iOS):', newTranscript);
-          setTranscript(newTranscript);
+      Voice.onSpeechResults = (event) => {
+        if (event.value && event.value.length > 0) {
+          const text = event.value[0];
+          console.log("📝 Transcript (iOS):", text);
+          setTranscript(text);
+          finalTranscriptRef.current = text;
         }
       };
 
-      Voice.onSpeechError = (e) => {
-        console.error('❌ Speech error (iOS):', e);
+      Voice.onSpeechPartialResults = (event) => {
+        if (event.value && event.value.length > 0) {
+          const text = event.value[0];
+          console.log("📝 Transcript (iOS):", text);
+          setTranscript(text);
+          finalTranscriptRef.current = text;
+        }
+      };
+
+      Voice.onSpeechError = (event) => {
+        console.error('❌ Speech recognition error (iOS):', event.error);
         setIsListening(false);
       };
-
-      return () => {
-        Voice.destroy().then(Voice.removeAllListeners);
-      };
-    } else {
-      // ✅ Android: Using Speaches STT
-      console.log('🤖 Using Speaches STT for Android');
     }
+
+    return () => {
+      // Cleanup
+      if (Platform.OS === 'ios') {
+        Voice.destroy().then(Voice.removeAllListeners);
+      }
+    };
   }, []);
 
-  /**
-   * Start listening for speech
-   * 
-   * iOS: Starts native voice recognition
-   * Android: Starts audio recording
-   */
-  const startListening = useCallback(async () => {
+  const startListening = async () => {
     try {
+      // Reset state
       setTranscript('');
+      finalTranscriptRef.current = '';
+      isProcessingRef.current = false;
 
       if (Platform.OS === 'ios') {
-        // ✅ iOS: Use native Voice
+        // Use iOS native voice recognition
         console.log('🎤 Starting iOS voice recognition...');
         await Voice.start('en-US');
-      } else {
-        // ✅ Android: Start recording with Speaches
-        console.log('🎤 Starting Android audio recording...');
-        await speachesSTT.startRecording();
         setIsListening(true);
+      } else {
+        // Android - use Speaches API
+        console.log('🎤 Starting Android STT (Speaches)...');
+        setIsListening(true);
+        await startSpeachesSTT();
       }
     } catch (error) {
-      console.error('❌ Start listening error:', error);
+      console.error('❌ Error starting STT:', error);
       setIsListening(false);
       throw error;
     }
-  }, []);
+  };
 
-  /**
-   * Stop listening and get transcript
-   * 
-   * iOS: Stops native voice recognition, transcript comes via callback
-   * Android: Stops recording and transcribes via Speaches API
-   * 
-   * @returns Promise that resolves with transcript (Android only, iOS uses callback)
-   */
-  const stopListening = useCallback(async (): Promise<string> => {
+  const stopListening = async (): Promise<string> => {
     try {
       if (Platform.OS === 'ios') {
-        // ✅ iOS: Stop native Voice
         console.log('🛑 Stopping iOS voice recognition...');
         await Voice.stop();
-        // Transcript will come via onSpeechResults callback
-        return transcript;
-      } else {
-        // ✅ Android: Stop recording and transcribe
-        console.log('🛑 Stopping Android recording and transcribing...');
-        const androidTranscript = await speachesSTT.stopRecordingAndTranscribe();
         setIsListening(false);
-        setTranscript(androidTranscript);
-        return androidTranscript;
+        
+        // Return final transcript
+        return finalTranscriptRef.current;
+      } else {
+        // Android - stop Speaches recording
+        console.log('🛑 Stopping Android STT...');
+        const finalText = await stopSpeachesSTT();
+        setIsListening(false);
+        return finalText;
       }
     } catch (error) {
-      console.error('❌ Stop listening error:', error);
+      console.error('❌ Error stopping STT:', error);
       setIsListening(false);
-      throw error;
+      return finalTranscriptRef.current;
     }
-  }, [transcript]);
+  };
 
-  /**
-   * Cancel current listening session
-   */
-  const cancelListening = useCallback(async () => {
+  const cancelListening = async () => {
     try {
+      console.log('🛑 Canceling STT...');
+      
       if (Platform.OS === 'ios') {
+        await Voice.cancel();
         await Voice.stop();
-        await Voice.destroy();
       } else {
-        await speachesSTT.cancelRecording();
+        // Android - cancel Speaches recording
+        // Implementation depends on your Speaches setup
       }
+      
       setIsListening(false);
       setTranscript('');
+      finalTranscriptRef.current = '';
     } catch (error) {
-      console.error('❌ Cancel listening error:', error);
+      console.error('❌ Error canceling STT:', error);
+      setIsListening(false);
     }
-  }, []);
+  };
+
+  // Android Speaches STT functions
+  const startSpeachesSTT = async () => {
+    // TODO: Implement Speaches STT recording start
+    // This would involve starting audio recording and preparing for streaming
+    console.log('📱 Speaches STT start - implement recording');
+  };
+
+  const stopSpeachesSTT = async (): Promise<string> => {
+    // TODO: Implement Speaches STT stop and transcription
+    // This would send the recorded audio to Speaches API
+    console.log('📱 Speaches STT stop - implement transcription');
+    return finalTranscriptRef.current;
+  };
 
   return {
+    isListening,
+    transcript,
     startListening,
     stopListening,
     cancelListening,
-    isListening,
-    transcript,
   };
 };

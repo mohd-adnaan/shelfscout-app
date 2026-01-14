@@ -17,6 +17,7 @@ import { sendToWorkflow } from './src/services/WorkflowService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import { playSound } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
+import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
 
 const { width, height } = Dimensions.get('window');
 
@@ -31,7 +32,7 @@ function App(): React.JSX.Element {
   const cameraRef = useRef<Camera>(null);
   const { speak, stop: stopTTS } = useTTS();
   
-  // ✅ NEW: Platform-specific STT hook
+  // Platform-specific STT hook
   const { 
     startListening: startSTT, 
     stopListening: stopSTT, 
@@ -50,7 +51,7 @@ function App(): React.JSX.Element {
   const lastTapRef = useRef(0);
   const DOUBLE_TAP_DELAY = 300;
 
-  // ✅ Sync transcript to ref for access in other functions
+  // Sync transcript to ref for access in other functions
   useEffect(() => {
     if (transcript) {
       finalTranscriptRef.current = transcript;
@@ -140,7 +141,7 @@ function App(): React.JSX.Element {
           PermissionsAndroid.PERMISSIONS.RECORD_AUDIO,
           {
             title: 'Microphone Permission',
-            message: 'ShelfScout needs access to your microphone for voice commands',
+            message: 'CyberSight needs access to your microphone for voice commands',
             buttonNeutral: 'Ask Me Later',
             buttonNegative: 'Cancel',
             buttonPositive: 'OK',
@@ -158,7 +159,7 @@ function App(): React.JSX.Element {
         return false;
       }
     }
-    return true; // iOS handles permissions differently
+    return true;
   };
 
   const startListening = async () => {
@@ -177,7 +178,6 @@ function App(): React.JSX.Element {
       audioFeedback.playEarcon('listening');
       playSound('start');
 
-      // ✅ Use platform-specific STT
       await startSTT();
       console.log('✅ Voice recognition started');
 
@@ -205,7 +205,6 @@ function App(): React.JSX.Element {
         }
       }
 
-      // ✅ Stop STT and get transcript
       const finalTranscript = await stopSTT();
       console.log('🛑 Voice recognition stopped');
       console.log('📝 Final transcript:', finalTranscript);
@@ -229,9 +228,10 @@ function App(): React.JSX.Element {
       console.log('⚡ Processing command:', command);
       isProcessingRef.current = true;
       setIsProcessing(true);
-
+      
       audioFeedback.playEarcon('thinking');
       playSound('processing');
+      
       audioFeedback.announceState('thinking', false);
 
       if (!photoPath) {
@@ -243,6 +243,8 @@ function App(): React.JSX.Element {
         return;
       }
 
+      // Send to N8N (gets full text response)
+      console.log('📤 Sending to N8N workflow...');
       const result = await sendToWorkflow({
         text: command,
         imageUri: photoPath,
@@ -253,18 +255,23 @@ function App(): React.JSX.Element {
         return;
       }
 
-      console.log('✅ Response:', result.text.substring(0, 50) + '...');
-
+      console.log('✅ N8N Response received:', result.text.substring(0, 50) + '...');
+      
+      // Transition to speaking
       setIsProcessing(false);
       setIsSpeaking(true);
-
+      
       audioFeedback.playEarcon('speaking');
-
-      await speak(result.text);
-
+      
+      // ✅ SENTENCE-BY-SENTENCE TTS - Fast perceived response
+      // Splits response into chunks and plays them sequentially
+      // First chunk starts playing immediately
+      await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+      
       setIsSpeaking(false);
+      
       audioFeedback.playEarcon('ready');
-
+      
     } catch (error) {
       if (!isEmergencyStopped.current) {
         console.error('❌ Error:', error);
@@ -279,27 +286,29 @@ function App(): React.JSX.Element {
 
   const emergencyStop = async () => {
     console.log('🚨 EMERGENCY STOP');
-
+    
     isEmergencyStopped.current = true;
-
+    
+    // Stop sentence chunker
+    await speachesSentenceChunker.stop();
+    
+    // Cancel STT
     try {
-      await stopTTS();
-    } catch (e) { }
-
-    try {
-      // ✅ Cancel platform-specific STT
       await cancelSTT();
-    } catch (e) { }
-
+    } catch (e) {
+      console.warn('⚠️ Error canceling STT:', e);
+    }
+    
     await new Promise(resolve => setTimeout(resolve, 300));
-
+    
+    // Reset state
     setIsProcessing(false);
     setIsSpeaking(false);
     isProcessingRef.current = false;
     finalTranscriptRef.current = '';
-
+    
     audioFeedback.playEarcon('ready');
-
+    
     console.log('✅ Emergency stop complete');
   };
 
