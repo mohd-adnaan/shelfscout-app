@@ -1,3 +1,4 @@
+// src/utils/types.ts
 export interface WorkflowRequest {
   text: string;
   imageUri: string;

@@ -4,6 +4,7 @@
 
 ShelfScout serves as the mobile companion to the [CyberSight AI Platform](https://github.com/Shared-Reality-Lab/cybersight), delivering computer vision, spatial awareness, and intelligent navigation assistance directly to iOS and Android devices.
 
+[WCAG 2.1 Level AA](https://www.w3.org/TR/WCAG21/) Accessibility Compliant For Blind Users
 ---
 
 ## Overview

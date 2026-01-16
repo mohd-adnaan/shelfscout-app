@@ -1,3 +1,16 @@
+/**
+ * src/components/VoiceVisualizer.tsx
+ * 
+ * WCAG 2.1 AA Compliant Voice Visualizer
+ * 
+ * Compliance Features:
+ * - 1.1.1 Non-text Content: Status conveyed via text AND accessibility labels
+ * - 1.3.1 Info and Relationships: Proper semantic structure with roles
+ * - 4.1.2 Name, Role, Value: All elements have proper accessibility props
+ * - 4.1.3 Status Messages: Live regions announce status changes
+ * - Decorative animations hidden from screen readers
+ */
+
 import React, { useEffect, useRef } from 'react';
 import {
   View,
@@ -5,11 +18,12 @@ import {
   StyleSheet,
   Animated,
   Dimensions,
+  AccessibilityInfo,
 } from 'react-native';
 import { Mic, MicOff, Speaker, Brain } from './Icons';
 
 const { width, height } = Dimensions.get('window');
-const CIRCLE_SIZE = width * 0.55;  
+const CIRCLE_SIZE = width * 0.55;
 
 interface VoiceVisualizerProps {
   isListening: boolean;
@@ -30,6 +44,23 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
 }) => {
   const rotateAnim = useRef(new Animated.Value(0)).current;
   const dotsOpacity = useRef(new Animated.Value(0)).current;
+  const previousState = useRef<string>('');
+
+  // ============================================================================
+  // WCAG 4.1.3: Announce Status Changes
+  // ============================================================================
+  useEffect(() => {
+    const currentState = getStatusText();
+    
+    // Only announce if state actually changed
+    if (currentState !== previousState.current && previousState.current !== '') {
+      AccessibilityInfo.announceForAccessibility(
+        `${currentState}. ${getInstructionText()}`
+      );
+    }
+    
+    previousState.current = currentState;
+  }, [isListening, isProcessing, isSpeaking]);
 
   // Rotating animation for processing state ONLY
   useEffect(() => {
@@ -62,7 +93,7 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     outputRange: ['0deg', '360deg'],
   });
 
-  // Generate dots for the circle
+  // Generate dots for the circle (PURELY DECORATIVE)
   const renderDots = () => {
     const dots = [];
     const numberOfDots = 60;
@@ -73,6 +104,8 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
       dots.push(
         <View
           key={i}
+          // WCAG 1.1.1: Decorative element
+          accessible={false}
           style={[
             styles.dot,
             {
@@ -90,9 +123,9 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   };
 
   const getStatusText = () => {
-    if (isSpeaking) return 'Speaking...';
-    if (isProcessing) return 'Thinking...';
-    if (isListening) return 'Listening...';
+    if (isSpeaking) return 'Speaking';
+    if (isProcessing) return 'Thinking';
+    if (isListening) return 'Listening';
     return 'Ready';
   };
 
@@ -108,15 +141,42 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
       return 'Double-tap to interrupt';
     }
     if (isListening) {
-      return 'Tap to stop & process';
+      return 'Tap to stop and process';
     }
     return 'Tap to speak';
   };
 
+  // WCAG 4.1.2: Generate comprehensive accessibility label
+  const getAccessibilityLabel = () => {
+    const status = getStatusText();
+    const instruction = getInstructionText();
+    
+    if (transcript && isListening) {
+      return `${status}. You said: ${transcript}. ${instruction}`;
+    }
+    
+    return `${status}. ${instruction}`;
+  };
+
   return (
-    <View style={styles.container}>
-      {/* Wrapper for circle and icon - ensures perfect centering */}
-      <View style={styles.circleWrapper}>
+    <View 
+      style={styles.container}
+      // WCAG 4.1.2: Main container has comprehensive label
+      accessible={true}
+      accessibilityLabel={getAccessibilityLabel()}
+      accessibilityRole="text"
+      // WCAG 4.1.3: Status updates announced
+      accessibilityLiveRegion="polite"
+    >
+      {/* ================================================================ */}
+      {/* DECORATIVE VISUAL ELEMENTS - HIDDEN FROM SCREEN READERS */}
+      {/* WCAG 1.1.1: Pure decoration, not needed for blind users */}
+      {/* ================================================================ */}
+      <View 
+        style={styles.circleWrapper}
+        accessible={false}
+        importantForAccessibility="no-hide-descendants"
+      >
         {/* Main animated circle - ONLY rotates during processing */}
         <Animated.View
           style={[
@@ -124,11 +184,11 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
             {
               transform: [
                 { scale: pulseAnim },
-                // ✅ ONLY rotate during processing
                 { rotate: isProcessing ? rotation : '0deg' },
               ],
             },
           ]}
+          accessible={false}
         >
           {/* Dotted circle */}
           <Animated.View 
@@ -136,6 +196,7 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
               styles.dotsCircle,
               { opacity: dotsOpacity }
             ]}
+            accessible={false}
           >
             {renderDots()}
           </Animated.View>
@@ -149,37 +210,62 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
                 borderColor: getStatusColor(),
               },
             ]}
+            accessible={false}
           />
         </Animated.View>
 
-        {/* Center icon - PERFECTLY centered */}
-        <View style={styles.centerIcon}>
+        {/* Center icon - DECORATIVE, status conveyed by text */}
+        <View 
+          style={styles.centerIcon}
+          accessible={false}
+        >
           {isSpeaking ? (
-            <Speaker size={80} color="#4CAF50" />
+            <Speaker size={80} color="#4CAF50" accessible={false} />
           ) : isProcessing ? (
-            <Brain size={80} color="#FFC107" />
+            <Brain size={80} color="#FFC107" accessible={false} />
           ) : isListening ? (
-            <Mic size={80} color="#2196F3" />
+            <Mic size={80} color="#2196F3" accessible={false} />
           ) : (
-            <MicOff size={80} color="#666" />
+            <MicOff size={80} color="#666" accessible={false} />
           )}
         </View>
       </View>
 
-      {/* Status text */}
-      <Text style={[styles.statusText, { color: getStatusColor() }]}>
+      {/* ================================================================ */}
+      {/* ACCESSIBLE TEXT ELEMENTS - READ BY SCREEN READERS */}
+      {/* ================================================================ */}
+
+      {/* Status text - WCAG 4.1.2, 4.1.3 */}
+      <Text 
+        style={[styles.statusText, { color: getStatusColor() }]}
+        accessible={true}
+        accessibilityRole="text"
+        accessibilityLabel={`Status: ${getStatusText()}`}
+      >
         {getStatusText()}
       </Text>
 
-      {/* Transcript display */}
+      {/* Transcript display - WCAG 4.1.3 (Live Region) */}
       {transcript && isListening && (
-        <View style={styles.transcriptContainer}>
+        <View 
+          style={styles.transcriptContainer}
+          accessible={true}
+          accessibilityRole="text"
+          // WCAG 4.1.3: Live region for transcript updates
+          accessibilityLiveRegion="polite"
+          accessibilityLabel={`Transcript: ${transcript}`}
+        >
           <Text style={styles.transcriptText}>{transcript}</Text>
         </View>
       )}
 
-      {/* Instruction text */}
-      <Text style={styles.instructionText}>
+      {/* Instruction text - WCAG 3.3.2 (Labels or Instructions) */}
+      <Text 
+        style={styles.instructionText}
+        accessible={true}
+        accessibilityRole="text"
+        accessibilityLabel={`Instructions: ${getInstructionText()}`}
+      >
         {getInstructionText()}
       </Text>
     </View>
@@ -192,6 +278,10 @@ const styles = StyleSheet.create({
     justifyContent: 'center',
     alignItems: 'center',
   },
+  
+  // ============================================================
+  // DECORATIVE ELEMENTS (Hidden from screen readers)
+  // ============================================================
   circleWrapper: {
     width: CIRCLE_SIZE,
     height: CIRCLE_SIZE,
@@ -234,16 +324,21 @@ const styles = StyleSheet.create({
     top: '50%',
     left: '50%',
     transform: [
-      { translateX: -40 },  // ✅ Half of icon size (80/2)
-      { translateY: -40 },  // ✅ Half of icon size (80/2)
+      { translateX: -40 },
+      { translateY: -40 },
     ],
     zIndex: 10,
   },
+  
+  // ============================================================
+  // ACCESSIBLE TEXT ELEMENTS
+  // WCAG 1.4.3: Minimum 4.5:1 contrast for text
+  // ============================================================
   statusText: {
     marginTop: 40,
     fontSize: 24,
     fontWeight: '600',
-    color: '#fff',
+    color: '#fff', // Will be overridden by dynamic color
   },
   transcriptContainer: {
     position: 'absolute',
