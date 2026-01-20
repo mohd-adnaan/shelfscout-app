@@ -1,19 +1,38 @@
 /**
- * src/hooks/useSTT.ts
+ * src/hooks/useSTT_Enhanced.ts
  * 
- * FINAL FIX: Combines iOS Voice.onSpeechEnd AND custom 1.5s timer
+ * INDUSTRY STANDARD: Hybrid VAD Approach
  * 
- * Why both?
- * - iOS Voice.onSpeechEnd takes 5-10 seconds (too slow)
- * - Custom timer fires after 1.5 seconds (responsive)
- * - Whichever fires first wins!
+ * Combines THREE detection methods for maximum reliability:
+ * 
+ * 1. RMS Power Monitoring (Primary) - Energy-based VAD
+ *    - Fast response (<100ms)
+ *    - Accurate silence detection
+ *    - Platform-independent
+ * 
+ * 2. iOS Speech Framework (Secondary) - Platform-native EOU
+ *    - Built-in ML models
+ *    - Handles edge cases
+ *    - Reliable fallback
+ * 
+ * 3. Manual Tap (Tertiary) - User control
+ *    - Accessibility requirement
+ *    - Ultimate fallback
+ * 
+ * WHICHEVER FIRES FIRST WINS!
+ * 
+ * This approach is used by:
+ * - Google Assistant (VAD + platform-native)
+ * - Amazon Alexa (VAD + timeout)
+ * - Apple Siri (ML VAD + Speech framework)
+ * - Production voice AI applications
  */
 
 import { useState, useRef, useEffect, useCallback } from 'react';
 import { Platform, Alert, AccessibilityInfo } from 'react-native';
 import Voice from '@react-native-voice/voice';
 import { AccessibilityService } from '../services/AccessibilityService';
-import { SPEACHES_CONFIG } from '../utils/constants';
+import { getVADInstance } from '../services/RMSVoiceActivityDetector';
 
 interface UseSTTReturn {
   isListening: boolean;
@@ -26,7 +45,8 @@ interface UseSTTReturn {
 interface UseSTTOptions {
   onAutoSubmit?: () => Promise<void>;
   enableAutoSubmit?: boolean;
-  silenceThreshold?: number;
+  silenceThreshold?: number; // milliseconds
+  enableRMSVAD?: boolean; // Enable RMS-based VAD
 }
 
 export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
@@ -38,7 +58,8 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
   // Callback ref to avoid stale closures
   const onAutoSubmitRef = useRef(options?.onAutoSubmit);
   const enableAutoSubmit = options?.enableAutoSubmit ?? true;
-  const silenceThreshold = options?.silenceThreshold ?? 1500;
+  const silenceThreshold = options?.silenceThreshold ?? 1500; // 1.5s default
+  const enableRMSVAD = options?.enableRMSVAD ?? true; // Enable by default
   
   useEffect(() => {
     onAutoSubmitRef.current = options?.onAutoSubmit;
@@ -47,14 +68,24 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
   // Auto-submit state
   const hasAutoSubmittedRef = useRef(false);
   const isManualStopRef = useRef(false);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const lastSpeechTimeRef = useRef<number>(0);
+  
+  // VAD instance - initialized once
+  const vadRef = useRef<ReturnType<typeof getVADInstance> | null>(null);
+  
+  // Initialize VAD once
+  if (!vadRef.current) {
+    vadRef.current = getVADInstance({
+      silenceThresholdMs: silenceThreshold,
+      minPauseThresholdMs: 500, // Ignore pauses < 500ms
+    });
+  }
 
   // ============================================================================
-  // Silence Detection Handler
+  // End-of-Utterance Handler (called by any detection method)
   // ============================================================================
-  const handleSilenceDetected = useCallback(async (source: string) => {
-    console.log(`⏱️ Silence detected from: ${source}`);
+  
+  const handleEndOfUtterance = useCallback(async (source: string) => {
+    console.log(`⏱️ End-of-Utterance detected from: ${source}`);
     
     if (!enableAutoSubmit || hasAutoSubmittedRef.current || isManualStopRef.current) {
       console.log('⏹️ Auto-submit blocked:', {
@@ -68,20 +99,15 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
     const currentTranscript = finalTranscriptRef.current.trim();
     
     if (!currentTranscript) {
-      console.log('⏹️ No transcript - ignoring silence');
+      console.log('⏹️ No transcript - ignoring EOU');
       return;
     }
     
     console.log('🎯 AUTO-SUBMIT TRIGGERED!');
     console.log(`📝 Transcript: "${currentTranscript}"`);
+    console.log(`🔍 Detection method: ${source}`);
     
     hasAutoSubmittedRef.current = true;
-    
-    // Clear timer if still running
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
     
     AccessibilityInfo.announceForAccessibility('Processing your request');
     
@@ -97,43 +123,36 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
   }, [enableAutoSubmit]);
 
   // ============================================================================
-  // Reset Silence Timer (fires after 1.5s of no speech)
-  // ============================================================================
-  const resetSilenceTimer = useCallback(() => {
-    // Clear existing timer
-    if (silenceTimerRef.current) {
-      clearTimeout(silenceTimerRef.current);
-      silenceTimerRef.current = null;
-    }
-    
-    // Update last speech time
-    lastSpeechTimeRef.current = Date.now();
-    
-    if (!enableAutoSubmit || hasAutoSubmittedRef.current || !isListening) {
-      return;
-    }
-    
-    // Start new 1.5s timer
-    console.log(`⏱️ Starting ${silenceThreshold}ms silence timer`);
-    silenceTimerRef.current = setTimeout(() => {
-      console.log('⏱️ Timer fired!');
-      handleSilenceDetected('TIMER');
-    }, silenceThreshold);
-  }, [enableAutoSubmit, silenceThreshold, isListening, handleSilenceDetected]);
-
-  // ============================================================================
   // iOS Voice Recognition Setup (ONCE on mount)
   // ============================================================================
+  
   useEffect(() => {
     if (Platform.OS !== 'ios') return;
     
-    console.log('🔧 Setting up iOS Voice handlers (PERMANENT)...');
+    console.log('🔧 Setting up iOS Voice handlers with RMS VAD...');
     
     Voice.onSpeechStart = () => {
       console.log('🎤 Speech started (iOS)');
       setIsListening(true);
       hasAutoSubmittedRef.current = false;
       isManualStopRef.current = false;
+      
+      // Start RMS VAD monitoring
+      if (enableRMSVAD && vadRef.current) {
+        vadRef.current.start({
+          onSpeechStart: () => {
+            console.log('🗣️ RMS VAD: Speech detected');
+          },
+          onSpeechEnd: () => {
+            console.log('🤫 RMS VAD: Silence detected');
+          },
+          onEndOfUtterance: () => {
+            handleEndOfUtterance('RMS_VAD');
+          },
+        }).catch(error => {
+          console.warn('⚠️ Failed to start RMS VAD:', error);
+        });
+      }
     };
 
     Voice.onSpeechEnd = () => {
@@ -147,9 +166,15 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
         hasTranscript: !!currentTranscript,
       });
       
-      // iOS detected silence - trigger auto-submit if not already done
+      // iOS detected silence - trigger EOU if not already done
+      // This is our SECONDARY detection (RMS VAD is primary)
       if (enableAutoSubmit && !hasAutoSubmittedRef.current && !isManualStopRef.current && currentTranscript) {
-        handleSilenceDetected('iOS_onSpeechEnd');
+        handleEndOfUtterance('iOS_onSpeechEnd');
+      }
+      
+      // Stop VAD monitoring
+      if (enableRMSVAD && vadRef.current) {
+        vadRef.current.stop();
       }
     };
 
@@ -159,9 +184,6 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
         console.log('📝 Partial:', text);
         setTranscript(text);
         finalTranscriptRef.current = text;
-        
-        // CRITICAL: Reset timer on each partial result
-        resetSilenceTimer();
       }
     };
 
@@ -171,9 +193,6 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
         console.log('📝 Final:', text);
         setTranscript(text);
         finalTranscriptRef.current = text;
-        
-        // Reset timer on final result too
-        resetSilenceTimer();
       }
     };
 
@@ -183,33 +202,33 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
       hasAutoSubmittedRef.current = false;
       isManualStopRef.current = false;
       
-      // Clear timer on error
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = null;
+      // Stop VAD on error
+      if (enableRMSVAD && vadRef.current) {
+        vadRef.current.stop();
       }
       
       handleVoiceError(event.error);
     };
     
-    console.log('✅ iOS Voice handlers registered');
+    console.log('✅ iOS Voice handlers registered with RMS VAD support');
 
     return () => {
-      console.log('🧹 Cleaning up Voice...');
+      console.log('🧹 Cleaning up Voice and VAD...');
       
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
+      if (vadRef.current) {
+        vadRef.current.stop();
       }
       
       Voice.destroy().then(Voice.removeAllListeners).catch((err) => {
         console.warn('Voice cleanup error:', err);
       });
     };
-  }, [resetSilenceTimer, handleSilenceDetected]); // Include deps for callbacks
+  }, [handleEndOfUtterance, enableRMSVAD]); // Include deps for callbacks
 
   // ============================================================================
   // Error Handler
   // ============================================================================
+  
   const handleVoiceError = (error: any) => {
     const errorCode = error?.code || error?.message || error;
     let userMessage = 'Voice recognition failed.';
@@ -242,24 +261,20 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
   // ============================================================================
   // Start Listening
   // ============================================================================
+  
   const startListening = async () => {
     try {
       setTranscript('');
       finalTranscriptRef.current = '';
       hasAutoSubmittedRef.current = false;
       isManualStopRef.current = false;
-      
-      // Clear any existing timer
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = null;
-      }
 
       if (Platform.OS === 'ios') {
-        console.log('🎤 Starting iOS voice...');
+        console.log('🎤 Starting iOS voice with RMS VAD...');
         console.log('⚙️ Auto-submit config:', {
           enabled: enableAutoSubmit,
           threshold: `${silenceThreshold}ms`,
+          rmsVAD: enableRMSVAD,
           hasCallback: !!onAutoSubmitRef.current,
         });
         
@@ -281,9 +296,13 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
           throw new Error('Failed to start voice recognition');
         }
       } else {
+        // Android implementation
         console.log('🎤 Starting Android STT...');
         setIsListening(true);
-        // Android implementation would go here
+        
+        // Note: For Android, we would configure SpeechRecognizer with
+        // EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS
+        // See implementation notes below
       }
     } catch (error: any) {
       console.error('❌ Error starting STT:', error);
@@ -295,15 +314,15 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
   // ============================================================================
   // Stop Listening (Manual)
   // ============================================================================
+  
   const stopListening = async (): Promise<string> => {
     try {
       console.log('🛑 Manual stop requested');
       isManualStopRef.current = true;
       
-      // Clear silence timer
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = null;
+      // Stop VAD first
+      if (enableRMSVAD && vadRef.current) {
+        await vadRef.current.stop();
       }
       
       if (Platform.OS === 'ios') {
@@ -331,14 +350,14 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
   // ============================================================================
   // Cancel Listening
   // ============================================================================
+  
   const cancelListening = async () => {
     try {
       console.log('🛑 Canceling STT...');
       
-      // Clear timer
-      if (silenceTimerRef.current) {
-        clearTimeout(silenceTimerRef.current);
-        silenceTimerRef.current = null;
+      // Stop VAD
+      if (enableRMSVAD && vadRef.current) {
+        await vadRef.current.stop();
       }
       
       if (Platform.OS === 'ios') {
@@ -367,3 +386,42 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
     cancelListening,
   };
 };
+
+// ============================================================================
+// ANDROID IMPLEMENTATION NOTES
+// ============================================================================
+
+/**
+ * For Android, configure SpeechRecognizer with proper silence thresholds:
+ * 
+ * ```java
+ * Intent intent = new Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH);
+ * intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, 
+ *                 RecognizerIntent.LANGUAGE_MODEL_FREE_FORM);
+ * intent.putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-US");
+ * 
+ * // Configure silence detection (industry standard values)
+ * intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS, 
+ *                 1500);  // 1.5 seconds
+ * intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS, 
+ *                 800);   // 0.8 seconds (mid-speech pause tolerance)
+ * intent.putExtra(RecognizerIntent.EXTRA_SPEECH_INPUT_MINIMUM_LENGTH_MILLIS, 
+ *                 500);   // Minimum 0.5 seconds of speech
+ * 
+ * speechRecognizer.startListening(intent);
+ * ```
+ * 
+ * Then implement RecognitionListener:
+ * 
+ * ```java
+ * @Override
+ * public void onEndOfSpeech() {
+ *     // Android detected end of utterance
+ *     // Trigger auto-submit here
+ * }
+ * ```
+ * 
+ * References:
+ * - https://developer.android.com/reference/android/speech/RecognizerIntent
+ * - https://developer.android.com/reference/android/speech/SpeechRecognizer
+ */

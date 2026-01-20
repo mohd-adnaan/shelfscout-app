@@ -28,6 +28,7 @@ interface AudioChunk {
 }
 
 class SpeachesStreamingTTSClient {
+  private currentSound: Sound | null = null;
   private audioQueue: AudioChunk[] = [];
   private isProcessing: boolean = false;
   private isStopped: boolean = false;
@@ -36,8 +37,17 @@ class SpeachesStreamingTTSClient {
   private processingPromise: Promise<void> | null = null;
 
   constructor() {
-    Sound.setCategory('Playback');
-    console.log('✅ Speaches Streaming TTS Client initialized (React Native Compatible)');
+    // ========================================================================
+    // CRITICAL FIX #1: Set audio category in constructor
+    // ========================================================================
+    try {
+      Sound.setCategory('Playback', false); // Don't mix with others
+      console.log('✅ Audio category set to Playback in TTS constructor');
+    } catch (error: any) {
+      console.warn('⚠️ Failed to set audio category:', error);
+    }
+    
+    console.log('✅ Speaches TTS Client initialized');
   }
 
   /**
@@ -290,46 +300,37 @@ class SpeachesStreamingTTSClient {
    * Stop streaming and all playback
    */
   async stop(): Promise<void> {
-    console.log('🛑 Stopping Speaches streaming TTS...');
+    console.log('🛑 Stopping Speaches TTS...');
 
     this.isStopped = true;
-    this.isProcessing = false;
 
-    // Abort XHR request
-    if (this.xhr) {
-      this.xhr.abort();
-      this.xhr = null;
-    }
-
-    // Stop all playing chunks
-    for (const chunk of this.audioQueue) {
-      if (chunk.sound) {
-        try {
-          chunk.sound.stop();
-          chunk.sound.release();
-        } catch (e) {
-          // Ignore errors during cleanup
-        }
-      }
-      
-      // Delete temp files
-      if (chunk.filePath) {
-        RNFS.unlink(chunk.filePath).catch(() => {});
+    if (this.currentSound) {
+      try {
+        this.currentSound.stop();
+        this.currentSound.release();
+        this.currentSound = null;
+      } catch (error: any) {
+        console.warn('⚠️ Error stopping sound:', error);
       }
     }
 
-    // Clear queue
-    this.audioQueue = [];
-    this.currentIndex = 0;
+    // CRITICAL: Reset audio category to allow Voice Recognition
+    try {
+      Sound.setCategory('Ambient');
+      console.log('✅ Audio category reset to Ambient');
+    } catch (error: any) {
+      console.warn('⚠️ Failed to reset audio category:', error);
+    }
 
-    console.log('✅ Speaches streaming TTS stopped');
+    console.log('✅ TTS stopped successfully');
   }
 
-  /**
-   * Check if currently playing
-   */
-  isCurrentlyPlaying(): boolean {
-    return this.audioQueue.some(chunk => chunk.isPlaying) || this.isProcessing;
+  isPlaying(): boolean {
+    return this.currentSound !== null;
+  }
+
+  reset(): void {
+    this.isStopped = false;
   }
 }
 

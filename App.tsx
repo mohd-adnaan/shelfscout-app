@@ -1,14 +1,20 @@
 /**
  * App.tsx
  * 
- * WCAG 2.1 Level AA Compliant Main Application
+ * WCAG 2.1 Level AA Compliant Main Application with Natural Conversation Flow
+ * 
+ * NEW FEATURE: Automatic Silence Detection
+ * - Users speak naturally without needing to tap again
+ * - App auto-detects when user finishes speaking
+ * - Mental model: Talk to app like talking to a person
+ * - WCAG compliant with proper announcements
  * 
  * Critical Accessibility Features:
  * - 1.1.1 Non-text Content: All visual elements have text alternatives
  * - 1.3.1 Info and Relationships: Proper semantic structure
  * - 2.1.1 Keyboard: Full screen reader operability
  * - 2.4.3 Focus Order: Logical navigation sequence
- * - 2.5.1 Pointer Gestures: Single-tap AND double-tap work
+ * - 2.5.1 Pointer Gestures: Natural conversation flow, double-tap to interrupt
  * - 2.5.2 Pointer Cancellation: Actions on release, can cancel
  * - 3.2.1 On Focus: No unexpected changes
  * - 3.2.2 On Input: Predictable behavior
@@ -21,7 +27,7 @@
  * This app serves blind users who depend entirely on audio feedback
  */
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
   StyleSheet,
   View,
@@ -37,7 +43,7 @@ import {
 } from 'react-native';
 import { Camera, useCameraDevice, useCameraPermission, useMicrophonePermission } from 'react-native-vision-camera';
 import { useTTS } from './src/hooks/useTTS';
-import { useSTT } from './src/hooks/useSTT';  
+import { useSTT } from './src/hooks/useSTT_Enhanced';
 import { sendToWorkflow } from './src/services/WorkflowService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import { playSound } from './src/utils/soundEffects';
@@ -70,20 +76,6 @@ function App(): React.JSX.Element {
   // ============================================================================
   const { speak, stop: stopTTS } = useTTS();
   
-  const { 
-    startListening: startSTT, 
-    stopListening: stopSTT, 
-    cancelListening: cancelSTT,
-    isListening, 
-    transcript 
-  } = useSTT();
-
-  // ============================================================================
-  // Animation Values (respect reduce motion)
-  // ============================================================================
-  const pulseAnim = useRef(new Animated.Value(1)).current;
-  const opacityAnim = useRef(new Animated.Value(0.3)).current;
-
   // ============================================================================
   // Internal State Management
   // ============================================================================
@@ -94,6 +86,93 @@ function App(): React.JSX.Element {
   const previousStateRef = useRef<string>('');
   
   const DOUBLE_TAP_DELAY = 300;
+
+  // ============================================================================
+  // Auto-Submit Handler
+  // ============================================================================
+  
+  /**
+   * Handle automatic submission when silence is detected
+   * This is called by useSTT when user stops speaking
+   */
+  const handleAutoSubmit = useCallback(async () => {
+    console.log('🎯 Auto-submit triggered by silence detection');
+    
+    // Capture photo and process
+    try {
+      console.log('📸 Capturing photo after silence detected...');
+
+      let photoPath = '';
+      if (cameraRef.current) {
+        try {
+          const photo = await cameraRef.current.takePhoto({
+            qualityPrioritization: 'speed',
+          });
+          photoPath = photo.path;
+          console.log('✅ Photo captured:', photoPath);
+          
+          // Subtle success sound
+          audioFeedback.playEarcon('success');
+        } catch (photoError) {
+          console.error('❌ Photo error:', photoError);
+          
+          // WCAG 3.3.1: Announce error
+          AccessibilityInfo.announceForAccessibility(
+            'Warning: Failed to capture photo. Continuing with voice command only.'
+          );
+        }
+      }
+
+      // Get current transcript
+      const finalText = finalTranscriptRef.current.trim();
+      
+      if (finalText && !isProcessingRef.current && !isEmergencyStopped.current) {
+        // Announce auto-processing
+        AccessibilityInfo.announceForAccessibility('Processing your request');
+        
+        await handleVoiceCommand(finalText, photoPath);
+      } else if (!finalText) {
+        // WCAG 3.3.1: No voice input detected
+        AccessibilityInfo.announceForAccessibility(
+          'No voice input detected. Tap to try again.'
+        );
+        
+        audioFeedback.playEarcon('error');
+      }
+    } catch (error) {
+      console.error('❌ Auto-submit error:', error);
+      
+      // WCAG 3.3.1: Error announcement
+      const errorMessage = error instanceof Error 
+        ? error.message 
+        : 'Failed to process voice command';
+      
+      AccessibilityInfo.announceForAccessibility(
+        `Error: ${errorMessage}`
+      );
+    }
+  }, []);
+
+  // ============================================================================
+  // STT Hook with Auto-Submit
+  // ============================================================================
+  const { 
+    startListening: startSTT, 
+    stopListening: stopSTT, 
+    cancelListening: cancelSTT,
+    isListening, 
+    transcript 
+  } = useSTT({
+    onAutoSubmit: handleAutoSubmit,
+    enableAutoSubmit: true, // Enable automatic submission on silence
+    silenceThreshold: 1500, // 1.5 seconds of silence before auto-submit
+  });
+
+  // ============================================================================
+  // Animation Values (respect reduce motion)
+  // ============================================================================
+  const pulseAnim = useRef(new Animated.Value(1)).current;
+  const opacityAnim = useRef(new Animated.Value(0.3)).current;
 
   // ============================================================================
   // WCAG 2.3.3 & 1.4.13: Check Accessibility Preferences
@@ -118,7 +197,7 @@ function App(): React.JSX.Element {
         if (isScreenReaderOn) {
           setTimeout(() => {
             AccessibilityInfo.announceForAccessibility(
-              'CyberSight activated. Tap anywhere on the screen to start voice recording. Double tap to take a photo or interrupt.'
+              'CyberSight activated. Tap anywhere to start speaking. Speak your question naturally - the app will detect when you finish. Double tap to interrupt.'
             );
           }, 1000);
         }
@@ -330,9 +409,9 @@ function App(): React.JSX.Element {
       return 'CyberSight is processing your request. Double tap anywhere to interrupt.';
     }
     if (isListening) {
-      return `CyberSight is listening. ${transcript ? `You said: ${transcript}. ` : ''}Tap anywhere to stop recording and process your command.`;
+      return `CyberSight is listening. ${transcript ? `You said: ${transcript}. ` : ''}Speak your question - the app will automatically detect when you finish. Or double tap to stop now.`;
     }
-    return 'CyberSight is ready. Tap anywhere to start voice recording. Double tap to take a photo.';
+    return 'CyberSight is ready. Tap anywhere to start speaking.';
   };
 
   // ============================================================================
@@ -343,9 +422,9 @@ function App(): React.JSX.Element {
       return 'Double tap to stop and return to ready state';
     }
     if (isListening) {
-      return 'Tap once to finish recording, or double tap to take photo while recording';
+      return 'Speak naturally. App will detect when you finish speaking and process automatically. Double tap to stop immediately.';
     }
-    return 'Tap once to start recording your voice command, or double tap to take a photo immediately';
+    return 'Tap once to start speaking your question to CyberSight';
   };
 
   // ============================================================================
@@ -416,9 +495,10 @@ function App(): React.JSX.Element {
       audioFeedback.playEarcon('listening');
       playSound('start');
 
-      // Start voice recognition
+      // Start voice recognition 
+      await new Promise(resolve => setTimeout(resolve, 100));
       await startSTT();
-      console.log('✅ Voice recognition started');
+      console.log('✅ Voice recognition started with auto-submit');
 
       // WCAG 4.1.3: Announce state (handled by VoiceVisualizer)
       await audioFeedback.announceState('listening', false);
@@ -444,59 +524,44 @@ function App(): React.JSX.Element {
   };
 
   // ============================================================================
-  // Stop Listening and Process
+  // Manual Stop (if user taps while listening)
   // ============================================================================
-  const stopListeningAndProcess = async () => {
+  const stopListeningManually = async () => {
     try {
-      console.log('📸 Capturing photo while listening...');
-
-      let photoPath = '';
-      if (cameraRef.current) {
-        try {
-          const photo = await cameraRef.current.takePhoto({
-            qualityPrioritization: 'speed',
-          });
-          photoPath = photo.path;
-          console.log('✅ Photo captured:', photoPath);
-          
-          // Announce successful photo capture
-          audioFeedback.playEarcon('success');
-        } catch (photoError) {
-          console.error('❌ Photo error:', photoError);
-          
-          // WCAG 3.3.1: Announce error
-          AccessibilityInfo.announceForAccessibility(
-            'Warning: Failed to capture photo. Continuing with voice command only.'
-          );
-        }
-      }
-
+      console.log('🛑 Manual stop requested');
+      
       const finalTranscript = await stopSTT();
-      console.log('🛑 Voice recognition stopped');
-      console.log('📝 Final transcript:', finalTranscript);
+      console.log('📝 Manual stop - Final transcript:', finalTranscript);
 
+      // Process immediately (don't wait for auto-submit)
       const finalText = finalTranscript.trim();
       if (finalText && !isProcessingRef.current && !isEmergencyStopped.current) {
+        // Capture photo
+        let photoPath = '';
+        if (cameraRef.current) {
+          try {
+            const photo = await cameraRef.current.takePhoto({
+              qualityPrioritization: 'speed',
+            });
+            photoPath = photo.path;
+            console.log('✅ Photo captured (manual):', photoPath);
+            audioFeedback.playEarcon('success');
+          } catch (photoError) {
+            console.error('❌ Photo error:', photoError);
+          }
+        }
+        
         await handleVoiceCommand(finalText, photoPath);
       } else if (!finalText) {
         // WCAG 3.3.1: No voice input detected
         AccessibilityInfo.announceForAccessibility(
-          'No voice input detected. Please try again.'
+          'No voice input detected. Tap to try again.'
         );
         
         audioFeedback.playEarcon('error');
       }
     } catch (error) {
-      console.error('❌ Stop listening error:', error);
-      
-      // WCAG 3.3.1: Error announcement
-      const errorMessage = error instanceof Error 
-        ? error.message 
-        : 'Failed to process voice command';
-      
-      AccessibilityInfo.announceForAccessibility(
-        `Error: ${errorMessage}`
-      );
+      console.error('❌ Manual stop error:', error);
     }
   };
 
@@ -629,7 +694,7 @@ function App(): React.JSX.Element {
   };
 
   // ============================================================================
-  // WCAG 2.5.1: Handle Screen Tap (both single and double tap)
+  // WCAG 2.5.1: Handle Screen Tap
   // ============================================================================
   const handleScreenTap = async () => {
     const now = Date.now();
@@ -661,16 +726,17 @@ function App(): React.JSX.Element {
     }
 
     if (isListening) {
-      console.log('🛑 Stop & process');
+      console.log('🛑 Manual stop while listening');
       
+      // User wants to stop manually (not wait for auto-submit)
       // Announce action
-      AccessibilityInfo.announceForAccessibility('Stopping recording and processing.');
+      AccessibilityInfo.announceForAccessibility('Stopping and processing now.');
       
-      await stopListeningAndProcess();
+      await stopListeningManually();
       return;
     }
 
-    console.log('🎤 Start listening');
+    console.log('🎤 Start listening (with auto-submit)');
     
     // Announce action (handled by startListening)
     await startListening();

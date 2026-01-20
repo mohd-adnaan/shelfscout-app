@@ -37,6 +37,58 @@ export const CONFIG = {
 } as const;
 
 // ============================================================================
+// Silence Detection Configuration (NEW)
+// ============================================================================
+
+/**
+ * Automatic silence detection settings for natural conversation flow
+ * 
+ * These settings control when the app auto-submits voice commands
+ * after detecting the user has finished speaking.
+ * 
+ * WCAG 2.5.1: Supports natural conversation without requiring manual submission
+ */
+export const SILENCE_DETECTION_CONFIG = {
+  /**
+   * Silence threshold - time to wait before auto-submitting
+   * 
+   * After the user stops speaking, the app waits this long before
+   * automatically processing their command.
+   * 
+   * - Too short (< 1000ms): Cuts off users mid-thought
+   * - Too long (> 2000ms): Feels unresponsive
+   * - Sweet spot: 1500ms (1.5 seconds)
+   * 
+   * Default: 1500ms (1.5 seconds)
+   */
+  SILENCE_THRESHOLD: 1500,
+  
+  /**
+   * Minimum pause threshold - ignore brief pauses
+   * 
+   * Natural speech includes brief pauses like "umm", "ahh", finding words.
+   * Pauses shorter than this are ignored to prevent cutting users off.
+   * 
+   * - 500ms: Might cut off natural pauses
+   * - 800ms: Good balance for natural speech
+   * - 1000ms+: Too long, delays might feel like user is done
+   * 
+   * Default: 800ms (0.8 seconds)
+   */
+  MIN_PAUSE_THRESHOLD: 800,
+  
+  /**
+   * Enable auto-submit by default
+   * 
+   * Set to false to require manual tap after speaking (old behavior)
+   * Set to true for natural conversation flow (recommended for blind users)
+   * 
+   * Default: true
+   */
+  ENABLE_AUTO_SUBMIT: true,
+} as const;
+
+// ============================================================================
 // WCAG 2.1 Level AA Compliant Colors
 // ============================================================================
 
@@ -166,6 +218,11 @@ export type ColorName = keyof typeof COLORS;
  */
 export type ConfigKey = keyof typeof CONFIG;
 
+/**
+ * Silence detection config keys type for type safety
+ */
+export type SilenceDetectionConfigKey = keyof typeof SILENCE_DETECTION_CONFIG;
+
 // ============================================================================
 // Helper Functions
 // ============================================================================
@@ -188,6 +245,16 @@ export const getColor = (colorName: ColorName): string => {
  */
 export const getConfig = (configKey: ConfigKey): any => {
   return CONFIG[configKey];
+};
+
+/**
+ * Get silence detection config value by key
+ * 
+ * @param configKey - Silence detection configuration key
+ * @returns Configuration value
+ */
+export const getSilenceDetectionConfig = (configKey: SilenceDetectionConfigKey): any => {
+  return SILENCE_DETECTION_CONFIG[configKey];
 };
 
 /**
@@ -232,7 +299,9 @@ export default {
   COLORS,
   WORKFLOW_URL,
   SPEACHES_CONFIG,
+  SILENCE_DETECTION_CONFIG,
   getColor,
   getConfig,
+  getSilenceDetectionConfig,
   getContrastInfo,
 };
