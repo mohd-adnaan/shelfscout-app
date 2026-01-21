@@ -138,6 +138,10 @@ export class RMSVoiceActivityDetector {
   private soundLevelMonitor: any = null;
   private isMonitoring: boolean = false;
   
+  // Adaptive noise floor for noisy environments
+  private noiseFloor: number = -60; // Baseline
+  private recentRMS: number[] = []; // Track last 20 samples (2 seconds)
+  
   constructor(config?: Partial<VADConfig>) {
     this.config = { ...DEFAULT_CONFIG, ...config };
     console.log('🎙️ RMS VAD initialized:', this.config);
@@ -265,6 +269,51 @@ export class RMSVoiceActivityDetector {
   }
   
   /**
+   * Calibrate noise floor based on ambient sound
+   * This enables adaptive thresholds for noisy environments
+   */
+  private calibrateNoiseFloor(rmsDb: number): void {
+    // Track recent RMS levels (last 20 samples = 2 seconds at 10 Hz)
+    this.recentRMS.push(rmsDb);
+    if (this.recentRMS.length > 20) {
+      this.recentRMS.shift();
+    }
+    
+    // Calculate noise floor (10th percentile of recent levels)
+    if (this.recentRMS.length >= 20) {
+      const sorted = [...this.recentRMS].sort((a, b) => a - b);
+      const newNoiseFloor = sorted[Math.floor(sorted.length * 0.1)];
+      
+      // Only update if change is significant (>3dB)
+      if (Math.abs(newNoiseFloor - this.noiseFloor) > 3) {
+        this.noiseFloor = newNoiseFloor;
+        console.log(`🔊 Noise floor updated: ${this.noiseFloor.toFixed(1)} dB`);
+      }
+    }
+  }
+  
+  /**
+   * Get adaptive thresholds based on current noise floor
+   */
+  private getAdaptiveThresholds(): { speechThreshold: number; silenceThreshold: number } {
+    // In noisy environments, adapt thresholds relative to noise floor
+    const adaptiveSpeechThreshold = Math.max(
+      this.config.speechThresholdDb,
+      this.noiseFloor + 10 // Speech must be 10dB above noise
+    );
+    
+    const adaptiveSilenceThreshold = Math.max(
+      this.config.silenceThresholdDb,
+      this.noiseFloor + 3 // Silence is 3dB above noise floor
+    );
+    
+    return {
+      speechThreshold: adaptiveSpeechThreshold,
+      silenceThreshold: adaptiveSilenceThreshold
+    };
+  }
+  
+  /**
    * Process each audio frame
    * This is called ~10 times per second (100ms interval)
    */
@@ -274,21 +323,27 @@ export class RMSVoiceActivityDetector {
     const rmsDb = data.value; // RMS power in decibels
     const now = Date.now();
     
-    // DISABLED: Verbose logging (uncomment for debugging)
-    // console.log(`🎚️ RMS: ${rmsDb.toFixed(1)} dB, State: ${this.state}`);
+    // Calibrate noise floor continuously
+    this.calibrateNoiseFloor(rmsDb);
     
-    // State machine logic
+    // Get adaptive thresholds for noisy environments
+    const { speechThreshold, silenceThreshold } = this.getAdaptiveThresholds();
+    
+    // DISABLED: Verbose logging (uncomment for debugging)
+    // console.log(`🎚️ RMS: ${rmsDb.toFixed(1)} dB, State: ${this.state}, Speech: ${speechThreshold.toFixed(1)} dB, Silence: ${silenceThreshold.toFixed(1)} dB`);
+    
+    // State machine logic with adaptive thresholds
     switch (this.state) {
       case VADState.LISTENING:
         // Waiting for speech to start
-        if (rmsDb > this.config.speechThresholdDb) {
+        if (rmsDb > speechThreshold) {
           this.handleSpeechDetected(now);
         }
         break;
         
       case VADState.SPEAKING:
         // Speech is active
-        if (rmsDb > this.config.speechThresholdDb) {
+        if (rmsDb > speechThreshold) {
           // Still speaking - update timestamp
           this.lastSpeechTimestamp = now;
           
@@ -297,7 +352,7 @@ export class RMSVoiceActivityDetector {
             clearTimeout(this.silenceTimer);
             this.silenceTimer = null;
           }
-        } else if (rmsDb < this.config.silenceThresholdDb) {
+        } else if (rmsDb < silenceThreshold) {
           // Dropped to silence
           this.handleSilenceDetected(now);
         }
@@ -305,7 +360,7 @@ export class RMSVoiceActivityDetector {
         
       case VADState.SILENCE:
         // In silence period, waiting for EOU
-        if (rmsDb > this.config.speechThresholdDb) {
+        if (rmsDb > speechThreshold) {
           // User started speaking again - resume
           console.log('🔊 User resumed speaking (false alarm)');
           this.state = VADState.SPEAKING;

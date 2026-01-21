@@ -1,30 +1,11 @@
 /**
- * App.tsx
+ * App.tsx - FIXED VERSION v2
  * 
- * WCAG 2.1 Level AA Compliant Main Application with Natural Conversation Flow
- * 
- * NEW FEATURE: Automatic Silence Detection
- * - Users speak naturally without needing to tap again
- * - App auto-detects when user finishes speaking
- * - Mental model: Talk to app like talking to a person
- * - WCAG compliant with proper announcements
- * 
- * Critical Accessibility Features:
- * - 1.1.1 Non-text Content: All visual elements have text alternatives
- * - 1.3.1 Info and Relationships: Proper semantic structure
- * - 2.1.1 Keyboard: Full screen reader operability
- * - 2.4.3 Focus Order: Logical navigation sequence
- * - 2.5.1 Pointer Gestures: Natural conversation flow, double-tap to interrupt
- * - 2.5.2 Pointer Cancellation: Actions on release, can cancel
- * - 3.2.1 On Focus: No unexpected changes
- * - 3.2.2 On Input: Predictable behavior
- * - 3.3.1 Error Identification: Clear error descriptions
- * - 3.3.2 Labels or Instructions: Complete guidance
- * - 4.1.2 Name, Role, Value: Complete accessibility props
- * - 4.1.3 Status Messages: Live status announcements
- * 
- * ZERO TOLERANCE FOR ACCESSIBILITY ERRORS
- * This app serves blind users who depend entirely on audio feedback
+ * FIXES:
+ * 1. Single tap to interrupt (removed double-tap requirement)
+ * 2. Proper request cancellation using AbortController
+ * 3. Emergency stop now cancels in-flight HTTP requests
+ * 4. Old responses won't play after starting new query
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -82,10 +63,12 @@ function App(): React.JSX.Element {
   const isEmergencyStopped = useRef(false);
   const isProcessingRef = useRef(false);
   const finalTranscriptRef = useRef('');
-  const lastTapRef = useRef(0);
-  const previousStateRef = useRef<string>('');
   
-  const DOUBLE_TAP_DELAY = 300;
+  // ✅ NEW: AbortController for cancelling HTTP requests
+  const abortControllerRef = useRef<AbortController | null>(null);
+  
+  // ✅ REMOVED: lastTapRef (no longer needed - single tap only)
+  const previousStateRef = useRef<string>('');
 
   // ============================================================================
   // Auto-Submit Handler
@@ -107,19 +90,20 @@ function App(): React.JSX.Element {
         try {
           const photo = await cameraRef.current.takePhoto({
             qualityPrioritization: 'speed',
+            enableShutterSound: true,
           });
           photoPath = photo.path;
           console.log('✅ Photo captured:', photoPath);
           
-          // Subtle success sound
           audioFeedback.playEarcon('success');
         } catch (photoError) {
-          console.error('❌ Photo error:', photoError);
+          console.error('❌ Photo capture failed:', photoError);
           
-          // WCAG 3.3.1: Announce error
           AccessibilityInfo.announceForAccessibility(
             'Warning: Failed to capture photo. Continuing with voice command only.'
           );
+          
+          photoPath = '';
         }
       }
 
@@ -127,12 +111,9 @@ function App(): React.JSX.Element {
       const finalText = finalTranscriptRef.current.trim();
       
       if (finalText && !isProcessingRef.current && !isEmergencyStopped.current) {
-        // Announce auto-processing
         AccessibilityInfo.announceForAccessibility('Processing your request');
-        
         await handleVoiceCommand(finalText, photoPath);
       } else if (!finalText) {
-        // WCAG 3.3.1: No voice input detected
         AccessibilityInfo.announceForAccessibility(
           'No voice input detected. Tap to try again.'
         );
@@ -142,7 +123,6 @@ function App(): React.JSX.Element {
     } catch (error) {
       console.error('❌ Auto-submit error:', error);
       
-      // WCAG 3.3.1: Error announcement
       const errorMessage = error instanceof Error 
         ? error.message 
         : 'Failed to process voice command';
@@ -164,8 +144,9 @@ function App(): React.JSX.Element {
     transcript 
   } = useSTT({
     onAutoSubmit: handleAutoSubmit,
-    enableAutoSubmit: true, // Enable automatic submission on silence
-    silenceThreshold: 1500, // 1.5 seconds of silence before auto-submit
+    enableAutoSubmit: true,
+    silenceThreshold: 1500,
+    enableRMSVAD: true,
   });
 
   // ============================================================================
@@ -193,11 +174,10 @@ function App(): React.JSX.Element {
           reduceMotion: isReduceMotionOn,
         });
 
-        // WCAG 4.1.3: Welcome announcement for screen reader users
         if (isScreenReaderOn) {
           setTimeout(() => {
             AccessibilityInfo.announceForAccessibility(
-              'CyberSight activated. Tap anywhere to start speaking. Speak your question naturally - the app will detect when you finish. Double tap to interrupt.'
+              'CyberSight activated. Tap anywhere to start speaking. Speak your question naturally - the app will detect when you finish. Tap to interrupt.'
             );
           }, 1000);
         }
@@ -208,7 +188,6 @@ function App(): React.JSX.Element {
 
     checkAccessibilityPreferences();
 
-    // Listen for accessibility setting changes
     const screenReaderSubscription = AccessibilityInfo.addEventListener(
       'screenReaderChanged',
       setScreenReaderEnabled
@@ -241,14 +220,12 @@ function App(): React.JSX.Element {
           const cameraGranted = results['android.permission.CAMERA'] === 'granted';
           
           if (!audioGranted || !cameraGranted) {
-            // WCAG 3.3.1: Clear error identification
             const missingPermissions = [];
             if (!audioGranted) missingPermissions.push('Microphone');
             if (!cameraGranted) missingPermissions.push('Camera');
             
             const errorMessage = `${missingPermissions.join(' and ')} permission required for CyberSight to function.`;
             
-            // Announce to screen reader
             AccessibilityInfo.announceForAccessibility(
               `Error: ${errorMessage} Please grant permissions in your device settings.`
             );
@@ -262,7 +239,6 @@ function App(): React.JSX.Element {
         } catch (err) {
           console.warn('❌ Permission error:', err);
           
-          // WCAG 3.3.1: Announce error
           AccessibilityInfo.announceForAccessibility(
             'Error requesting permissions. Please try again or check your device settings.'
           );
@@ -320,7 +296,6 @@ function App(): React.JSX.Element {
   // ============================================================================
   useEffect(() => {
     if (isListening && !reduceMotionEnabled) {
-      // Only animate if reduce motion is NOT enabled
       Animated.loop(
         Animated.sequence([
           Animated.parallel([
@@ -350,7 +325,6 @@ function App(): React.JSX.Element {
         ])
       ).start();
     } else {
-      // Reset animation
       Animated.parallel([
         Animated.timing(pulseAnim, {
           toValue: 1,
@@ -372,10 +346,7 @@ function App(): React.JSX.Element {
   useEffect(() => {
     const currentState = getStateDescription();
     
-    // Only announce if state changed and not the initial state
     if (currentState !== previousStateRef.current && previousStateRef.current !== '') {
-      // Don't announce every state - VoiceVisualizer handles most
-      // Only announce major transitions
       if (isProcessing && !previousStateRef.current.includes('processing')) {
         // Thinking state is announced by VoiceVisualizer
       } else if (isSpeaking && !previousStateRef.current.includes('speaking')) {
@@ -403,13 +374,13 @@ function App(): React.JSX.Element {
     const state = getStateDescription();
     
     if (isSpeaking) {
-      return 'CyberSight is speaking. Double tap anywhere to interrupt.';
+      return 'CyberSight is speaking. Tap anywhere to interrupt.';
     }
     if (isProcessing) {
-      return 'CyberSight is processing your request. Double tap anywhere to interrupt.';
+      return 'CyberSight is processing your request. Tap anywhere to interrupt.';
     }
     if (isListening) {
-      return `CyberSight is listening. ${transcript ? `You said: ${transcript}. ` : ''}Speak your question - the app will automatically detect when you finish. Or double tap to stop now.`;
+      return `CyberSight is listening. ${transcript ? `You said: ${transcript}. ` : ''}Speak your question - the app will automatically detect when you finish. Or tap to stop now.`;
     }
     return 'CyberSight is ready. Tap anywhere to start speaking.';
   };
@@ -419,10 +390,10 @@ function App(): React.JSX.Element {
   // ============================================================================
   const getAccessibilityHint = () => {
     if (isSpeaking || isProcessing) {
-      return 'Double tap to stop and return to ready state';
+      return 'Tap to stop and return to ready state';
     }
     if (isListening) {
-      return 'Speak naturally. App will detect when you finish speaking and process automatically. Double tap to stop immediately.';
+      return 'Speak naturally. App will detect when you finish speaking and process automatically. Tap to stop immediately.';
     }
     return 'Tap once to start speaking your question to CyberSight';
   };
@@ -450,7 +421,6 @@ function App(): React.JSX.Element {
         } else {
           console.log('❌ Microphone permission denied');
           
-          // WCAG 3.3.1: Announce error
           AccessibilityInfo.announceForAccessibility(
             'Microphone permission denied. CyberSight cannot record your voice without microphone access.'
           );
@@ -459,7 +429,6 @@ function App(): React.JSX.Element {
       } catch (err) {
         console.warn('❌ Permission error:', err);
         
-        // WCAG 3.3.1: Announce error
         AccessibilityInfo.announceForAccessibility(
           'Error requesting microphone permission. Please check your device settings.'
         );
@@ -474,7 +443,6 @@ function App(): React.JSX.Element {
   // ============================================================================
   const startListening = async () => {
     try {
-      // Check permission first
       const hasPermission = await requestMicrophonePermission();
       if (!hasPermission) {
         Alert.alert(
@@ -485,28 +453,24 @@ function App(): React.JSX.Element {
         return;
       }
 
+      // ✅ NEW: Reset emergency stop flag
       isEmergencyStopped.current = false;
 
-      // Stop any existing TTS
       await stopTTS();
       finalTranscriptRef.current = '';
 
-      // Audio feedback
       audioFeedback.playEarcon('listening');
       playSound('start');
 
-      // Start voice recognition 
       await new Promise(resolve => setTimeout(resolve, 100));
       await startSTT();
       console.log('✅ Voice recognition started with auto-submit');
 
-      // WCAG 4.1.3: Announce state (handled by VoiceVisualizer)
       await audioFeedback.announceState('listening', false);
 
     } catch (error) {
       console.error('❌ Start listening error:', error);
       
-      // WCAG 3.3.1: Clear error identification
       const errorMessage = error instanceof Error 
         ? error.message 
         : 'Failed to start voice recognition';
@@ -533,27 +497,26 @@ function App(): React.JSX.Element {
       const finalTranscript = await stopSTT();
       console.log('📝 Manual stop - Final transcript:', finalTranscript);
 
-      // Process immediately (don't wait for auto-submit)
       const finalText = finalTranscript.trim();
       if (finalText && !isProcessingRef.current && !isEmergencyStopped.current) {
-        // Capture photo
         let photoPath = '';
         if (cameraRef.current) {
           try {
             const photo = await cameraRef.current.takePhoto({
               qualityPrioritization: 'speed',
+              enableShutterSound: true,
             });
             photoPath = photo.path;
             console.log('✅ Photo captured (manual):', photoPath);
             audioFeedback.playEarcon('success');
           } catch (photoError) {
-            console.error('❌ Photo error:', photoError);
+            console.error('❌ Photo capture failed:', photoError);
+            photoPath = '';
           }
         }
         
         await handleVoiceCommand(finalText, photoPath);
       } else if (!finalText) {
-        // WCAG 3.3.1: No voice input detected
         AccessibilityInfo.announceForAccessibility(
           'No voice input detected. Tap to try again.'
         );
@@ -574,36 +537,50 @@ function App(): React.JSX.Element {
       return;
     }
 
+    // ✅ NEW: Create AbortController for this request
+    const abortController = new AbortController();
+    abortControllerRef.current = abortController;
+
     try {
       console.log('⚡ Processing command:', command);
       isProcessingRef.current = true;
       setIsProcessing(true);
       
+      await cancelSTT();
+      console.log('🛑 STT stopped to prevent TTS feedback');
+      
       audioFeedback.playEarcon('thinking');
       playSound('processing');
       
-      // WCAG 4.1.3: Announce processing state
       audioFeedback.announceState('thinking', false);
 
       if (!photoPath) {
-        // WCAG 3.3.1: Missing photo error
-        throw new Error('No photo available. Please ensure camera is working.');
+        console.warn('⚠️ No photo available - continuing with voice-only mode');
+        AccessibilityInfo.announceForAccessibility(
+          'Processing voice command without photo.'
+        );
       }
 
+      // ✅ CRITICAL: Check if stopped before network request
       if (isEmergencyStopped.current) {
         console.log('⚠️ Emergency stopped before request');
         return;
       }
 
-      // Send to N8N workflow
       console.log('📤 Sending to N8N workflow...');
-      const result = await sendToWorkflow({
-        text: command,
-        imageUri: photoPath,
-      });
+      
+      // ✅ NEW: Pass abort signal to sendToWorkflow
+      const result = await sendToWorkflow(
+        {
+          text: command,
+          imageUri: photoPath || '',
+        },
+        abortController.signal // Pass abort signal
+      );
 
+      // ✅ CRITICAL: Check if stopped after network request
       if (isEmergencyStopped.current) {
-        console.log('⚠️ Emergency stopped - not speaking');
+        console.log('⚠️ Emergency stopped - discarding response');
         return;
       }
 
@@ -615,23 +592,39 @@ function App(): React.JSX.Element {
       
       audioFeedback.playEarcon('speaking');
       
-      // Sentence-by-sentence TTS for fast perceived response
+      // ✅ CRITICAL: Check again before TTS
+      if (isEmergencyStopped.current) {
+        console.log('⚠️ Emergency stopped - not speaking');
+        return;
+      }
+      
       await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
       
+      // ✅ CRITICAL: Check after TTS complete
+      if (isEmergencyStopped.current) {
+        console.log('⚠️ Emergency stopped after TTS');
+        return;
+      }
+      
       setIsSpeaking(false);
+      finalTranscriptRef.current = '';
       
       audioFeedback.playEarcon('ready');
       
-      // WCAG 4.1.3: Announce ready state
       AccessibilityInfo.announceForAccessibility(
         'Response complete. CyberSight is ready. Tap to speak.'
       );
       
-    } catch (error) {
+    } catch (error: any) {
+      // ✅ NEW: Check if error is due to abort
+      if (error.name === 'AbortError' || error.message?.includes('aborted')) {
+        console.log('✅ Request cancelled successfully');
+        return;
+      }
+      
       if (!isEmergencyStopped.current) {
         console.error('❌ Error:', error);
         
-        // WCAG 3.3.1: Detailed error message
         const errorMessage = error instanceof Error 
           ? error.message 
           : 'An unknown error occurred';
@@ -642,7 +635,6 @@ function App(): React.JSX.Element {
           ? 'Request timed out. The server took too long to respond. Please try again.'
           : `Error: ${errorMessage}. Please try again.`;
         
-        // Announce error
         await audioFeedback.announceError(userMessage, true);
         
         Alert.alert(
@@ -654,16 +646,28 @@ function App(): React.JSX.Element {
     } finally {
       setIsProcessing(false);
       isProcessingRef.current = false;
+      finalTranscriptRef.current = '';
+      
+      // ✅ NEW: Clear abort controller
+      abortControllerRef.current = null;
     }
   };
 
   // ============================================================================
-  // Emergency Stop Function
+  // Emergency Stop Function (Single Tap)
   // ============================================================================
   const emergencyStop = async () => {
-    console.log('🚨 EMERGENCY STOP');
+    console.log('🚨 EMERGENCY STOP (Single Tap)');
     
+    // ✅ NEW: Set flag FIRST to prevent any ongoing operations
     isEmergencyStopped.current = true;
+    
+    // ✅ NEW: Cancel in-flight HTTP request
+    if (abortControllerRef.current) {
+      console.log('🛑 Cancelling in-flight HTTP request');
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
     
     // Stop sentence chunker
     await speachesSentenceChunker.stop();
@@ -683,9 +687,11 @@ function App(): React.JSX.Element {
     isProcessingRef.current = false;
     finalTranscriptRef.current = '';
     
+    // ✅ NEW: Clear emergency flag AFTER cleanup
+    isEmergencyStopped.current = false;
+    
     audioFeedback.playEarcon('ready');
     
-    // WCAG 4.1.3: Announce stopped state
     AccessibilityInfo.announceForAccessibility(
       'Stopped. CyberSight is ready. Tap to speak.'
     );
@@ -694,42 +700,24 @@ function App(): React.JSX.Element {
   };
 
   // ============================================================================
-  // WCAG 2.5.1: Handle Screen Tap
+  // ✅ NEW: Handle Screen Tap (Single Tap Only)
   // ============================================================================
   const handleScreenTap = async () => {
-    const now = Date.now();
-    const timeSinceLastTap = now - lastTapRef.current;
-
-    // WCAG 2.5.1: Double-tap detection
-    if (timeSinceLastTap < DOUBLE_TAP_DELAY) {
-      console.log('👆👆 DOUBLE TAP');
+    console.log('👆 SINGLE TAP');
+    
+    // ✅ NEW: Single tap = immediate stop when busy
+    if (isSpeaking || isProcessing) {
+      console.log('🛑 Busy - stopping immediately (single tap)');
       
-      // Announce action
-      AccessibilityInfo.announceForAccessibility('Double tap detected. Stopping.');
+      AccessibilityInfo.announceForAccessibility('Stopping.');
       
       await emergencyStop();
-      lastTapRef.current = 0;
-      return;
-    }
-
-    lastTapRef.current = now;
-
-    // WCAG 3.2.1: Predictable behavior - busy states require double-tap
-    if (isSpeaking || isProcessing) {
-      console.log('⚠️ Busy - double-tap to stop');
-      
-      // Inform user
-      AccessibilityInfo.announceForAccessibility(
-        'CyberSight is busy. Double tap to interrupt.'
-      );
       return;
     }
 
     if (isListening) {
       console.log('🛑 Manual stop while listening');
       
-      // User wants to stop manually (not wait for auto-submit)
-      // Announce action
       AccessibilityInfo.announceForAccessibility('Stopping and processing now.');
       
       await stopListeningManually();
@@ -738,7 +726,6 @@ function App(): React.JSX.Element {
 
     console.log('🎤 Start listening (with auto-submit)');
     
-    // Announce action (handled by startListening)
     await startListening();
   };
 
@@ -768,9 +755,7 @@ function App(): React.JSX.Element {
       accessibilityLabel={getAccessibilityLabel()}
       accessibilityHint={getAccessibilityHint()}
       accessibilityRole="button"
-      // WCAG 4.1.3: Live region for status updates
       accessibilityLiveRegion="polite"
-      // WCAG 4.1.2: State information
       accessibilityState={{
         busy: isProcessing,
         disabled: false,
@@ -779,31 +764,27 @@ function App(): React.JSX.Element {
       <View 
         ref={containerRef}
         style={styles.container}
-        accessible={false} // Parent handles accessibility
+        accessible={false}
         importantForAccessibility="no-hide-descendants"
       >
         <StatusBar barStyle="light-content" backgroundColor="#000" />
 
-        {/* Camera - WCAG 1.1.1: Decorative for blind users */}
         <Camera
           ref={cameraRef}
           style={StyleSheet.absoluteFill}
           device={device}
           isActive={true}
           photo={true}
-          // Camera is decorative for blind users
           accessible={false}
           accessibilityElementsHidden={true}
         />
 
-        {/* Dark overlay - purely visual, hidden from screen readers */}
         <View 
           style={styles.darkOverlay}
           accessible={false}
           importantForAccessibility="no-hide-descendants"
         />
 
-        {/* Voice Visualizer - handles its own accessibility */}
         <VoiceVisualizer
           isListening={isListening}
           isProcessing={isProcessing}
@@ -829,3 +810,6 @@ const styles = StyleSheet.create({
 });
 
 export default App;
+
+
+
