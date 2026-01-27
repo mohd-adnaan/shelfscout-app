@@ -125,8 +125,8 @@ function App(): React.JSX.Element {
   const reactivateCameraAndCapture = async (): Promise<string> => {
     console.log('📷 Reactivating camera for capture...');
 
-    console.log('📷 Camera ref exists:', !!cameraRef.current);  
-    console.log('📷 Camera active state:', isCameraActive); 
+    console.log('📷 Camera ref exists:', !!cameraRef.current);
+    console.log('📷 Camera active state:', isCameraActive);
 
     // Step 1: Make sure camera is active
     setIsCameraActive(true);
@@ -574,98 +574,102 @@ function App(): React.JSX.Element {
   // ============================================================================
   // Auto-Submit Handler (Silence Detection)
   // ============================================================================
-const handleAutoSubmit = useCallback(async () => {
-  console.log('🎯 Auto-submit triggered by silence detection');
+  const handleAutoSubmit = useCallback(async () => {
+    console.log('🎯 Auto-submit triggered by silence detection');
 
-  if (isCapturingPhotoRef.current) {
-    console.log('⚠️ Photo capture already in progress');
-    return;
-  }
-
-  if (isProcessingRef.current || isEmergencyStopped.current) {
-    console.log('⚠️ Already processing or stopped');
-    return;
-  }
-
-  const finalText = finalTranscriptRef.current.trim();
-  if (!finalText) {
-    console.log('⚠️ No transcript available');
-    AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
-    audioFeedback.playEarcon('error');
-    return;
-  }
-
-  console.log('⚡ Processing:', finalText);
-  setIsProcessing(true);
-  isProcessingRef.current = true;
-  isCapturingPhotoRef.current = true;
-
-  audioFeedback.playEarcon('thinking');
-  AccessibilityInfo.announceForAccessibility('Processing your request');
-
-  try {
-    console.log('🛑 Stopping STT...');
-    try {
-      await cancelSTT();
-      console.log('✅ STT cancelled');
-    } catch (e) {
-      console.warn('⚠️ STT cancel error (may already be stopped)');
-    }
-
-    console.log(`⏳ Waiting ${AUDIO_SESSION_RELEASE_DELAY_MS}ms for audio session to release...`);
-    await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
-
-    console.log('✅ Audio session wait complete');  // NEW LOG
-
-    if (isEmergencyStopped.current) {
-      console.log('⚠️ Emergency stopped during wait');
-      setIsProcessing(false);
-      isProcessingRef.current = false;
-      isCapturingPhotoRef.current = false;
+    if (isCapturingPhotoRef.current) {
+      console.log('⚠️ Photo capture already in progress');
       return;
     }
 
-    console.log('📷 About to call reactivateCameraAndCapture...');  // NEW LOG
-
-    let photoPath = '';
-    try {
-      photoPath = await reactivateCameraAndCapture();
-      console.log('✅ Camera reactivation complete, photo:', photoPath ? 'captured' : 'failed');
-    } catch (cameraError) {
-      console.error('❌ Camera reactivation error:', cameraError);
-      photoPath = '';
-    }
-
-    if (!photoPath) {
-      console.warn('⚠️ No photo captured, continuing voice-only');
-      AccessibilityInfo.announceForAccessibility(
-        'Warning: Failed to capture photo. Continuing with voice command only.'
-      );
-    }
-
-    if (isEmergencyStopped.current) {
-      console.log('⚠️ Emergency stopped after photo');
-      setIsProcessing(false);
-      isProcessingRef.current = false;
-      isCapturingPhotoRef.current = false;
+    if (isProcessingRef.current || isEmergencyStopped.current) {
+      console.log('⚠️ Already processing or stopped');
       return;
     }
 
-    console.log('📤 About to call handleVoiceCommand...');  // NEW LOG
-    await handleVoiceCommand(finalText, photoPath);
-    console.log('✅ handleVoiceCommand complete');  // NEW LOG
+    const finalText = finalTranscriptRef.current.trim();
+    if (!finalText) {
+      console.log('⚠️ No transcript available');
+      AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
+      audioFeedback.playEarcon('error');
+      return;
+    }
 
-  } catch (error) {
-    console.error('❌ Auto-submit error:', error);
-    console.error('❌ Error stack:', error.stack);  // NEW: Full stack trace
-    AccessibilityInfo.announceForAccessibility(`Error: ${error.message || error}`);
-    setIsProcessing(false);
-    isProcessingRef.current = false;
-  } finally {
-    isCapturingPhotoRef.current = false;
-    console.log('✅ Auto-submit finally block complete');  // NEW LOG
-  }
-}, [handleVoiceCommand]);  
+    console.log('⚡ Processing:', finalText);
+
+    // Only set UI state, NOT the ref
+    setIsProcessing(true);
+    // isProcessingRef.current = true;  // Let handleVoiceCommand set this!
+    isCapturingPhotoRef.current = true;
+
+    audioFeedback.playEarcon('thinking');
+    AccessibilityInfo.announceForAccessibility('Processing your request');
+
+    try {
+      console.log('🛑 Stopping STT...');
+      try {
+        await cancelSTT();
+        console.log('✅ STT cancelled');
+      } catch (e) {
+        console.warn('⚠️ STT cancel error (may already be stopped)');
+      }
+
+      console.log(`⏳ Waiting ${AUDIO_SESSION_RELEASE_DELAY_MS}ms for audio session to release...`);
+      await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
+
+      console.log('✅ Audio session wait complete');
+
+      if (isEmergencyStopped.current) {
+        console.log('⚠️ Emergency stopped during wait');
+        setIsProcessing(false);
+        // ✅ No need to reset isProcessingRef since we didn't set it
+        isCapturingPhotoRef.current = false;
+        return;
+      }
+
+      console.log('📷 About to call reactivateCameraAndCapture...');
+
+      let photoPath = '';
+      try {
+        photoPath = await reactivateCameraAndCapture();
+        console.log('✅ Camera reactivation complete, photo:', photoPath ? 'captured' : 'failed');
+      } catch (cameraError) {
+        console.error('❌ Camera reactivation error:', cameraError);
+        photoPath = '';
+      }
+
+      if (!photoPath) {
+        console.warn('⚠️ No photo captured, continuing voice-only');
+        AccessibilityInfo.announceForAccessibility(
+          'Warning: Failed to capture photo. Continuing with voice command only.'
+        );
+      }
+
+      if (isEmergencyStopped.current) {
+        console.log('⚠️ Emergency stopped after photo');
+        setIsProcessing(false);
+        isCapturingPhotoRef.current = false;
+        return;
+      }
+
+      console.log('📤 About to call handleVoiceCommand...');
+
+      // ✅ handleVoiceCommand will set isProcessingRef.current = true itself
+      await handleVoiceCommand(finalText, photoPath);
+
+      console.log('✅ handleVoiceCommand complete');
+
+    } catch (error) {
+      console.error('❌ Auto-submit error:', error);
+      console.error('❌ Error stack:', error.stack);
+      AccessibilityInfo.announceForAccessibility(`Error: ${error.message || error}`);
+      setIsProcessing(false);
+      // ✅ No need to reset isProcessingRef - handleVoiceCommand manages it
+    } finally {
+      isCapturingPhotoRef.current = false;
+      console.log('✅ Auto-submit finally block complete');
+    }
+  }, [handleVoiceCommand]);
 
   // ============================================================================
   // STT Hook
@@ -853,75 +857,82 @@ const handleAutoSubmit = useCallback(async () => {
   // ============================================================================
   // Manual Stop
   // ============================================================================
-const stopListeningManually = async () => {
-  try {
-    console.log('🛑 Manual stop requested');
+  const stopListeningManually = async () => {
+    try {
+      console.log('🛑 Manual stop requested');
 
-    if (isCapturingPhotoRef.current) {
-      console.log('⚠️ Already capturing');
-      return;
-    }
+      if (isCapturingPhotoRef.current) {
+        console.log('⚠️ Already capturing');
+        return;
+      }
 
-    if (isProcessingRef.current || isEmergencyStopped.current) {
-      return;
-    }
+      if (isProcessingRef.current || isEmergencyStopped.current) {
+        return;
+      }
 
-    const finalTranscript = await stopSTT();
-    console.log('📝 Final transcript:', finalTranscript);
+      const finalTranscript = await stopSTT();
+      console.log('📝 Final transcript:', finalTranscript);
 
-    const finalText = finalTranscript.trim();
-    if (!finalText) {
-      AccessibilityInfo.announceForAccessibility('No voice input. Tap to try again.');
-      audioFeedback.playEarcon('error');
-      return;
-    }
+      const finalText = finalTranscript.trim();
+      if (!finalText) {
+        AccessibilityInfo.announceForAccessibility('No voice input. Tap to try again.');
+        audioFeedback.playEarcon('error');
+        return;
+      }
 
-    // ✅ FIX: Set processing state IMMEDIATELY
-    console.log('⚡ Processing:', finalText);
-    setIsProcessing(true);
-    isProcessingRef.current = true;
-    isCapturingPhotoRef.current = true;
+      // ✅ FIX: Set processing state IMMEDIATELY
+      console.log('⚡ Processing:', finalText);
+      setIsProcessing(true);
+      isProcessingRef.current = true;
+      isCapturingPhotoRef.current = true;
 
-    // ✅ FIX: Play thinking earcon immediately
-    audioFeedback.playEarcon('thinking');
-    AccessibilityInfo.announceForAccessibility('Processing your request');
+      // ✅ FIX: Play thinking earcon immediately
+      audioFeedback.playEarcon('thinking');
+      AccessibilityInfo.announceForAccessibility('Processing your request');
 
-    // Wait for audio session
-    console.log(`⏳ Waiting ${AUDIO_SESSION_RELEASE_DELAY_MS}ms for audio session...`);
-    await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
+      // Wait for audio session
+      console.log(`⏳ Waiting ${AUDIO_SESSION_RELEASE_DELAY_MS}ms for audio session...`);
+      await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
 
-    if (isEmergencyStopped.current) {
+      if (isEmergencyStopped.current) {
+        isCapturingPhotoRef.current = false;
+        setIsProcessing(false);
+        isProcessingRef.current = false;
+        return;
+      }
+
+      // Reactivate camera and capture
+      const photoPath = await reactivateCameraAndCapture();
+
+      // ✅ FIX: No success earcon
+      if (!photoPath) {
+        AccessibilityInfo.announceForAccessibility(
+          'Warning: Failed to capture photo. Continuing with voice only.'
+        );
+      }
+
+      isCapturingPhotoRef.current = false;
+      await handleVoiceCommand(finalText, photoPath);
+    } catch (error) {
+      console.error('❌ Manual stop error:', error);
       isCapturingPhotoRef.current = false;
       setIsProcessing(false);
       isProcessingRef.current = false;
-      return;
     }
-
-    // Reactivate camera and capture
-    const photoPath = await reactivateCameraAndCapture();
-
-    // ✅ FIX: No success earcon
-    if (!photoPath) {
-      AccessibilityInfo.announceForAccessibility(
-        'Warning: Failed to capture photo. Continuing with voice only.'
-      );
-    }
-
-    isCapturingPhotoRef.current = false;
-    await handleVoiceCommand(finalText, photoPath);
-  } catch (error) {
-    console.error('❌ Manual stop error:', error);
-    isCapturingPhotoRef.current = false;
-    setIsProcessing(false);
-    isProcessingRef.current = false;
-  }
-};
+  };
 
   // ============================================================================
   // Handle Voice Command
   // ============================================================================
   const handleVoiceCommand = async (command: string, photoPath: string) => {
     if (isProcessingRef.current || isEmergencyStopped.current) return;
+
+    const wasInContinuousMode = isContinuousModeActive();
+    if (wasInContinuousMode) {
+      console.log('🔄 Previous continuous mode detected, resetting session for new command');
+      const newSessionId = resetSessionId();
+      console.log('🆔 New session started:', newSessionId);
+    }
 
     const abortController = new AbortController();
     abortControllerRef.current = abortController;
@@ -996,8 +1007,17 @@ const stopListeningManually = async () => {
         setIsNavigation(navigationActive);
         setIsReaching(reachingActive);
 
-        // Set up loop state
+        // ✅ FIX: Reset the continuous mode state BEFORE starting
+        // This clears any counters/timers from the initial request
+        stopContinuousMode('resetting for new loop', false);  // false = don't reset session
+
+        // Small delay to ensure clean state
+        await new Promise(resolve => setTimeout(resolve, 100));
+
+        // Set up loop state (now with fresh counters)
         startContinuousMode(mode, result.loopDelay);
+
+        console.log('🔄 Starting fresh continuous loop...');
 
         // Run the continuous loop
         await runContinuousLoop();

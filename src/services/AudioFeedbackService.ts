@@ -36,13 +36,14 @@ class AudioFeedbackService {
    * 
    * @param state - Current app state
    */
-  playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error'): void {
+playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'cancel'): void {
     const patterns: Record<string, number[]> = {
       ready: [50],                      // Single short
       listening: [50, 100, 50],         // Two short
       thinking: [100],                  // Single medium
       speaking: [150],                  // Single long
       error: [100, 100, 100, 100, 100], // Three short bursts
+      cancel: [75, 100, 75],
     };
 
     try {

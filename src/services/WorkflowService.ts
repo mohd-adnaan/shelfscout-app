@@ -106,16 +106,23 @@ export const getCurrentLoopDelay = (): number => {
 /**
  * Start continuous mode (navigation OR reaching)
  */
-export const startContinuousMode = (mode: 'navigation' | 'reaching', loopDelay?: number): void => {
-  continuousModeState = {
-    isActive: true,
-    mode,
-    iterationCount: 0,
-    lastRequestTime: Date.now(),
-    currentLoopDelay: loopDelay || NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
-  };
-  console.log(`🔄 [${mode}] Continuous mode STARTED`);
-  console.log(`🔄 [${mode}] Loop delay:`, continuousModeState.currentLoopDelay, 'ms');
+export const startContinuousMode = (
+  mode: 'navigation' | 'reaching',
+  loopDelay?: number
+): void => {
+  console.log(`🔄 [${mode}] Continuous mode STARTED - RESETTING COUNTERS`);
+  
+  continuousModeState.isActive = true;
+  continuousModeState.mode = mode;
+  continuousModeState.iterationCount = 0;
+  
+  continuousModeState.lastRequestTime = Date.now() - 5000;
+  
+  continuousModeState.currentLoopDelay = loopDelay || NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS;
+  
+  console.log(`🔄 [${mode}] Loop delay: ${continuousModeState.currentLoopDelay}ms`);
+  console.log(`🔄 [${mode}] Counters reset - ready for loop`);
+  console.log(`🔄 [${mode}] lastRequestTime set to 5s ago to allow first iteration`);
 };
 
 /**
