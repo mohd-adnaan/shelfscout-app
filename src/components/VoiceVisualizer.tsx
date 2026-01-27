@@ -3,6 +3,8 @@
  * 
  * WCAG 2.1 AA Compliant Voice Visualizer
  * 
+ * UPDATED: Added isReaching prop for reaching/guidance mode (Jan 26, 2026)
+ * 
  * Compliance Features:
  * - 1.1.1 Non-text Content: Status conveyed via text AND accessibility labels
  * - 1.3.1 Info and Relationships: Proper semantic structure with roles
@@ -21,6 +23,7 @@ import {
   AccessibilityInfo,
 } from 'react-native';
 import { Mic, MicOff, Speaker, Brain } from './Icons';
+import { COLORS } from '../utils/constants';
 
 const { width, height } = Dimensions.get('window');
 const CIRCLE_SIZE = width * 0.55;
@@ -29,15 +32,112 @@ interface VoiceVisualizerProps {
   isListening: boolean;
   isProcessing: boolean;
   isSpeaking: boolean;
+  /** Navigation loop active state */
+  isNavigation?: boolean;
+  /** Reaching/guidance loop active state (NEW) */
+  isReaching?: boolean;
   transcript: string;
   pulseAnim: Animated.Value;
   opacityAnim: Animated.Value;
 }
 
+// Navigation icon component
+const NavigationIcon: React.FC<{ size: number; color: string; accessible?: boolean }> = ({ 
+  size, 
+  color, 
+  accessible = false 
+}) => {
+  return (
+    <View 
+      style={{
+        width: size,
+        height: size,
+        justifyContent: 'center',
+        alignItems: 'center',
+      }}
+      accessible={accessible}
+    >
+      <View
+        style={{
+          width: 0,
+          height: 0,
+          borderLeftWidth: size * 0.35,
+          borderRightWidth: size * 0.35,
+          borderBottomWidth: size * 0.7,
+          borderLeftColor: 'transparent',
+          borderRightColor: 'transparent',
+          borderBottomColor: color,
+          transform: [{ rotate: '0deg' }],
+        }}
+      />
+      <View
+        style={{
+          width: size * 0.15,
+          height: size * 0.3,
+          backgroundColor: color,
+          marginTop: -5,
+        }}
+      />
+    </View>
+  );
+};
+
+// Reaching/Target icon component (NEW)
+const ReachingIcon: React.FC<{ size: number; color: string; accessible?: boolean }> = ({ 
+  size, 
+  color, 
+  accessible = false 
+}) => {
+  return (
+    <View 
+      style={{
+        width: size,
+        height: size,
+        justifyContent: 'center',
+        alignItems: 'center',
+      }}
+      accessible={accessible}
+    >
+      {/* Concentric circles representing target/reaching */}
+      <View
+        style={{
+          width: size * 0.8,
+          height: size * 0.8,
+          borderRadius: (size * 0.8) / 2,
+          borderWidth: 3,
+          borderColor: color,
+          position: 'absolute',
+        }}
+      />
+      <View
+        style={{
+          width: size * 0.5,
+          height: size * 0.5,
+          borderRadius: (size * 0.5) / 2,
+          borderWidth: 3,
+          borderColor: color,
+          position: 'absolute',
+        }}
+      />
+      <View
+        style={{
+          width: size * 0.2,
+          height: size * 0.2,
+          borderRadius: (size * 0.2) / 2,
+          backgroundColor: color,
+          position: 'absolute',
+        }}
+      />
+    </View>
+  );
+};
+
 export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   isListening,
   isProcessing,
   isSpeaking,
+  isNavigation = false,
+  isReaching = false,
   transcript,
   pulseAnim,
   opacityAnim,
@@ -52,7 +152,6 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   useEffect(() => {
     const currentState = getStatusText();
     
-    // Only announce if state actually changed
     if (currentState !== previousState.current && previousState.current !== '') {
       AccessibilityInfo.announceForAccessibility(
         `${currentState}. ${getInstructionText()}`
@@ -60,15 +159,18 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     }
     
     previousState.current = currentState;
-  }, [isListening, isProcessing, isSpeaking]);
+  }, [isListening, isProcessing, isSpeaking, isNavigation, isReaching]);
 
-  // Rotating animation for processing state ONLY
+  // Rotating animation for processing, navigation, or reaching states
   useEffect(() => {
-    if (isProcessing) {
+    if (isProcessing || isNavigation || isReaching) {
+      // Different rotation speeds for different modes
+      const duration = isReaching ? 2500 : isNavigation ? 3000 : 2000;
+      
       Animated.loop(
         Animated.timing(rotateAnim, {
           toValue: 1,
-          duration: 2000,
+          duration,
           useNativeDriver: true,
         })
       ).start();
@@ -86,7 +188,7 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
         useNativeDriver: true,
       }).start();
     }
-  }, [isProcessing]);
+  }, [isProcessing, isNavigation, isReaching]);
 
   const rotation = rotateAnim.interpolate({
     inputRange: [0, 1],
@@ -104,7 +206,6 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
       dots.push(
         <View
           key={i}
-          // WCAG 1.1.1: Decorative element
           accessible={false}
           style={[
             styles.dot,
@@ -113,6 +214,11 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
                 { rotate: `${angle}deg` },
                 { translateY: -CIRCLE_SIZE / 2 },
               ],
+              backgroundColor: isReaching 
+                ? COLORS.REACHING 
+                : isNavigation 
+                ? COLORS.NAVIGATION 
+                : '#fff',
             },
           ]}
         />
@@ -123,6 +229,8 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   };
 
   const getStatusText = () => {
+    if (isReaching) return 'Reaching';
+    if (isNavigation) return 'Navigating';
     if (isSpeaking) return 'Speaking';
     if (isProcessing) return 'Thinking';
     if (isListening) return 'Listening';
@@ -130,6 +238,8 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   };
 
   const getStatusColor = () => {
+    if (isReaching) return COLORS.REACHING;
+    if (isNavigation) return COLORS.NAVIGATION;
     if (isSpeaking) return '#4CAF50';
     if (isProcessing) return '#FFC107';
     if (isListening) return '#2196F3';
@@ -137,12 +247,10 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   };
 
   const getInstructionText = () => {
-    if (isSpeaking || isProcessing) {
-      return 'Double-tap to interrupt';
-    }
-    if (isListening) {
-      return 'Tap to stop and process';
-    }
+    if (isReaching) return 'Tap to stop reaching';
+    if (isNavigation) return 'Tap to stop navigation';
+    if (isSpeaking || isProcessing) return 'Tap to interrupt';
+    if (isListening) return 'Speak naturally, tap to stop';
     return 'Tap to speak';
   };
 
@@ -151,6 +259,14 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     const status = getStatusText();
     const instruction = getInstructionText();
     
+    if (isReaching) {
+      return `${status}. Guiding you to the object. ${instruction}`;
+    }
+    
+    if (isNavigation) {
+      return `${status}. Guiding you to your destination. ${instruction}`;
+    }
+    
     if (transcript && isListening) {
       return `${status}. You said: ${transcript}. ${instruction}`;
     }
@@ -158,39 +274,54 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     return `${status}. ${instruction}`;
   };
 
+  // Get the appropriate icon based on state
+  const renderIcon = () => {
+    if (isReaching) {
+      return <ReachingIcon size={80} color={COLORS.REACHING} accessible={false} />;
+    }
+    if (isNavigation) {
+      return <NavigationIcon size={80} color={COLORS.NAVIGATION} accessible={false} />;
+    }
+    if (isSpeaking) {
+      return <Speaker size={80} color="#4CAF50" accessible={false} />;
+    }
+    if (isProcessing) {
+      return <Brain size={80} color="#FFC107" accessible={false} />;
+    }
+    if (isListening) {
+      return <Mic size={80} color="#2196F3" accessible={false} />;
+    }
+    return <MicOff size={80} color="#666" accessible={false} />;
+  };
+
   return (
     <View 
       style={styles.container}
-      // WCAG 4.1.2: Main container has comprehensive label
       accessible={true}
       accessibilityLabel={getAccessibilityLabel()}
       accessibilityRole="text"
-      // WCAG 4.1.3: Status updates announced
       accessibilityLiveRegion="polite"
     >
       {/* ================================================================ */}
-      {/* DECORATIVE VISUAL ELEMENTS - HIDDEN FROM SCREEN READERS */}
-      {/* WCAG 1.1.1: Pure decoration, not needed for blind users */}
+      {/* DECORATIVE VISUAL ELEMENTS */}
       {/* ================================================================ */}
       <View 
         style={styles.circleWrapper}
         accessible={false}
         importantForAccessibility="no-hide-descendants"
       >
-        {/* Main animated circle - ONLY rotates during processing */}
         <Animated.View
           style={[
             styles.circleContainer,
             {
               transform: [
                 { scale: pulseAnim },
-                { rotate: isProcessing ? rotation : '0deg' },
+                { rotate: (isProcessing || isNavigation || isReaching) ? rotation : '0deg' },
               ],
             },
           ]}
           accessible={false}
         >
-          {/* Dotted circle */}
           <Animated.View 
             style={[
               styles.dotsCircle,
@@ -201,7 +332,6 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
             {renderDots()}
           </Animated.View>
           
-          {/* Solid circle background */}
           <Animated.View
             style={[
               styles.circle,
@@ -214,28 +344,19 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
           />
         </Animated.View>
 
-        {/* Center icon - DECORATIVE, status conveyed by text */}
         <View 
           style={styles.centerIcon}
           accessible={false}
         >
-          {isSpeaking ? (
-            <Speaker size={80} color="#4CAF50" accessible={false} />
-          ) : isProcessing ? (
-            <Brain size={80} color="#FFC107" accessible={false} />
-          ) : isListening ? (
-            <Mic size={80} color="#2196F3" accessible={false} />
-          ) : (
-            <MicOff size={80} color="#666" accessible={false} />
-          )}
+          {renderIcon()}
         </View>
       </View>
 
       {/* ================================================================ */}
-      {/* ACCESSIBLE TEXT ELEMENTS - READ BY SCREEN READERS */}
+      {/* ACCESSIBLE TEXT ELEMENTS */}
       {/* ================================================================ */}
 
-      {/* Status text - WCAG 4.1.2, 4.1.3 */}
+      {/* Status text */}
       <Text 
         style={[styles.statusText, { color: getStatusColor() }]}
         accessible={true}
@@ -245,13 +366,40 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
         {getStatusText()}
       </Text>
 
-      {/* Transcript display - WCAG 4.1.3 (Live Region) */}
-      {transcript && isListening && (
+      {/* Reaching indicator */}
+      {isReaching && (
+        <View 
+          style={styles.reachingIndicator}
+          accessible={true}
+          accessibilityRole="text"
+          accessibilityLabel="Object guidance in progress"
+        >
+          <Text style={styles.reachingText}>
+            Reaching...
+          </Text>
+        </View>
+      )}
+
+      {/* Navigation indicator */}
+      {isNavigation && (
+        <View 
+          style={styles.navigationIndicator}
+          accessible={true}
+          accessibilityRole="text"
+          accessibilityLabel="Navigation in progress"
+        >
+          <Text style={styles.navigationText}>
+            Guiding you...
+          </Text>
+        </View>
+      )}
+
+      {/* Transcript display */}
+      {transcript && isListening && !isNavigation && !isReaching && (
         <View 
           style={styles.transcriptContainer}
           accessible={true}
           accessibilityRole="text"
-          // WCAG 4.1.3: Live region for transcript updates
           accessibilityLiveRegion="polite"
           accessibilityLabel={`Transcript: ${transcript}`}
         >
@@ -259,7 +407,7 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
         </View>
       )}
 
-      {/* Instruction text - WCAG 3.3.2 (Labels or Instructions) */}
+      {/* Instruction text */}
       <Text 
         style={styles.instructionText}
         accessible={true}
@@ -279,9 +427,7 @@ const styles = StyleSheet.create({
     alignItems: 'center',
   },
   
-  // ============================================================
-  // DECORATIVE ELEMENTS (Hidden from screen readers)
-  // ============================================================
+  // Decorative elements
   circleWrapper: {
     width: CIRCLE_SIZE,
     height: CIRCLE_SIZE,
@@ -330,16 +476,46 @@ const styles = StyleSheet.create({
     zIndex: 10,
   },
   
-  // ============================================================
-  // ACCESSIBLE TEXT ELEMENTS
-  // WCAG 1.4.3: Minimum 4.5:1 contrast for text
-  // ============================================================
+  // Accessible text elements
   statusText: {
     marginTop: 40,
     fontSize: 24,
     fontWeight: '600',
-    color: '#fff', // Will be overridden by dynamic color
+    color: '#fff',
   },
+  
+  // Reaching indicator styles
+  reachingIndicator: {
+    marginTop: 10,
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+    backgroundColor: 'rgba(155, 89, 182, 0.2)',
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: COLORS.REACHING,
+  },
+  reachingText: {
+    color: COLORS.REACHING,
+    fontSize: 16,
+    fontWeight: '500',
+  },
+  
+  // Navigation indicator styles
+  navigationIndicator: {
+    marginTop: 10,
+    paddingHorizontal: 20,
+    paddingVertical: 8,
+    backgroundColor: 'rgba(255, 107, 53, 0.2)',
+    borderRadius: 20,
+    borderWidth: 1,
+    borderColor: COLORS.NAVIGATION,
+  },
+  navigationText: {
+    color: COLORS.NAVIGATION,
+    fontSize: 16,
+    fontWeight: '500',
+  },
+  
   transcriptContainer: {
     position: 'absolute',
     bottom: 100,
@@ -364,3 +540,5 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
 });
+
+export default VoiceVisualizer;
