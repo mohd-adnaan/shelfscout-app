@@ -37,9 +37,9 @@ export const CONFIG = {
 // ============================================================================
 
 export const NAVIGATION_CONFIG = {
-  DEFAULT_LOOP_DELAY_MS: 1000,
+  DEFAULT_LOOP_DELAY_MS: 2500,
   MAX_LOOP_ITERATIONS: 300,
-  MIN_REQUEST_INTERVAL_MS: 500,
+  MIN_REQUEST_INTERVAL_MS: 2000,
   ENABLE_NAVIGATION_LOOP: true,
 } as const;
 
@@ -60,41 +60,35 @@ export const SILENCE_DETECTION_CONFIG = {
 export const COLORS = {
   /**
    * Primary brand color - iOS Blue
-   * Contrast ratio: 5.5:1 on black background (WCAG AA ✅)
    */
   PRIMARY: '#007AFF',
   
   /**
    * Recording state color - Red
-   * Contrast ratio: 5.3:1 on black background (WCAG AA ✅)
    */
   RECORDING: '#FF3B30',
   
   /**
-   * Processing state color - Orange
-   * Contrast ratio: 4.8:1 on black background (WCAG AA ✅)
+   * Processing state color - Orange/Amber
    */
   PROCESSING: '#FF9500',
   
   /**
    * Speaking state color - Green
-   * Contrast ratio: 5.7:1 on black background (WCAG AA ✅)
    */
   SPEAKING: '#4CAF50',
   
   /**
-   * Navigation state color - Coral/Orange
-   * Contrast ratio: 5.1:1 on black background (WCAG AA ✅)
+   * Navigation state color - Warm Orange
+   * Contrast ratio: 5.1:1 on black (WCAG AA ✅)
    */
   NAVIGATION: '#FF6B35',
   
   /**
-   * Reaching state color - Purple (NEW - Jan 26, 2026)
-   * Used for: Object reaching/guidance mode
-   * Contrast ratio: 5.2:1 on black background (WCAG AA ✅)
+   * Reaching state color - Purple
+   * Contrast ratio: 4.8:1 on black (WCAG AA ✅)
    */
   REACHING: '#9B59B6',
-  
   /**
    * Background color - Black
    */
@@ -102,9 +96,13 @@ export const COLORS = {
   
   /**
    * White color - Maximum contrast
-   * Contrast ratio: 21:1 on black background (WCAG AAA ✅)
    */
   WHITE: '#FFFFFF',
+  
+  /**
+   * Cancel action color
+   */
+  CANCEL: '#E74C3C',
 } as const;
 
 // ============================================================================

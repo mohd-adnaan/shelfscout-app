@@ -1,17 +1,18 @@
 /**
- * src/components/VoiceVisualizer.tsx
- * 
- * WCAG 2.1 AA Compliant Voice Visualizer
- * 
- * UPDATED: Added isReaching prop for reaching/guidance mode (Jan 26, 2026)
- * 
- * Compliance Features:
- * - 1.1.1 Non-text Content: Status conveyed via text AND accessibility labels
- * - 1.3.1 Info and Relationships: Proper semantic structure with roles
- * - 4.1.2 Name, Role, Value: All elements have proper accessibility props
- * - 4.1.3 Status Messages: Live regions announce status changes
- * - Decorative animations hidden from screen readers
- */
+//  * src/components/VoiceVisualizer.tsx
+//  * 
+//  * WCAG 2.1 AA Compliant Voice Visualizer
+//  * 
+//  * UPDATED: Added isReaching prop for reaching/guidance mode (Jan 26, 2026)
+//  * 
+//  * Compliance Features:
+//  * - 1.1.1 Non-text Content: Status conveyed via text AND accessibility labels
+//  * - 1.3.1 Info and Relationships: Proper semantic structure with roles
+//  * - 4.1.2 Name, Role, Value: All elements have proper accessibility props
+//  * - 4.1.3 Status Messages: Live regions announce status changes
+//  * - Decorative animations hidden from screen readers
+//  
+*/
 
 import React, { useEffect, useRef } from 'react';
 import {
@@ -21,116 +22,49 @@ import {
   Animated,
   Dimensions,
   AccessibilityInfo,
+  Easing,
 } from 'react-native';
 import { Mic, MicOff, Speaker, Brain } from './Icons';
 import { COLORS } from '../utils/constants';
 
-const { width, height } = Dimensions.get('window');
-const CIRCLE_SIZE = width * 0.55;
+const { width } = Dimensions.get('window');
+const CIRCLE_SIZE = width * 0.62;
+const NUM_BARS = 56;
+const INNER_RADIUS = CIRCLE_SIZE * 0.36;
+const MAX_BAR_LENGTH = 42;
+const BAR_WIDTH = 3.5;
 
 interface VoiceVisualizerProps {
   isListening: boolean;
   isProcessing: boolean;
   isSpeaking: boolean;
-  /** Navigation loop active state */
   isNavigation?: boolean;
-  /** Reaching/guidance loop active state (NEW) */
   isReaching?: boolean;
   transcript: string;
   pulseAnim: Animated.Value;
   opacityAnim: Animated.Value;
+  audioLevel?: number;
 }
 
-// Navigation icon component
-const NavigationIcon: React.FC<{ size: number; color: string; accessible?: boolean }> = ({ 
-  size, 
-  color, 
-  accessible = false 
-}) => {
-  return (
-    <View 
-      style={{
-        width: size,
-        height: size,
-        justifyContent: 'center',
-        alignItems: 'center',
-      }}
-      accessible={accessible}
-    >
-      <View
-        style={{
-          width: 0,
-          height: 0,
-          borderLeftWidth: size * 0.35,
-          borderRightWidth: size * 0.35,
-          borderBottomWidth: size * 0.7,
-          borderLeftColor: 'transparent',
-          borderRightColor: 'transparent',
-          borderBottomColor: color,
-          transform: [{ rotate: '0deg' }],
-        }}
-      />
-      <View
-        style={{
-          width: size * 0.15,
-          height: size * 0.3,
-          backgroundColor: color,
-          marginTop: -5,
-        }}
-      />
-    </View>
-  );
-};
+// Simple icons
+const NavigationIcon = ({ size, color }: { size: number; color: string }) => (
+  <View style={{ width: size, height: size, justifyContent: 'center', alignItems: 'center' }}>
+    <View style={{
+      width: 0, height: 0,
+      borderLeftWidth: size * 0.28, borderRightWidth: size * 0.28, borderBottomWidth: size * 0.55,
+      borderLeftColor: 'transparent', borderRightColor: 'transparent', borderBottomColor: color,
+    }} />
+    <View style={{ width: size * 0.11, height: size * 0.22, backgroundColor: color, marginTop: -3 }} />
+  </View>
+);
 
-// Reaching/Target icon component (NEW)
-const ReachingIcon: React.FC<{ size: number; color: string; accessible?: boolean }> = ({ 
-  size, 
-  color, 
-  accessible = false 
-}) => {
-  return (
-    <View 
-      style={{
-        width: size,
-        height: size,
-        justifyContent: 'center',
-        alignItems: 'center',
-      }}
-      accessible={accessible}
-    >
-      {/* Concentric circles representing target/reaching */}
-      <View
-        style={{
-          width: size * 0.8,
-          height: size * 0.8,
-          borderRadius: (size * 0.8) / 2,
-          borderWidth: 3,
-          borderColor: color,
-          position: 'absolute',
-        }}
-      />
-      <View
-        style={{
-          width: size * 0.5,
-          height: size * 0.5,
-          borderRadius: (size * 0.5) / 2,
-          borderWidth: 3,
-          borderColor: color,
-          position: 'absolute',
-        }}
-      />
-      <View
-        style={{
-          width: size * 0.2,
-          height: size * 0.2,
-          borderRadius: (size * 0.2) / 2,
-          backgroundColor: color,
-          position: 'absolute',
-        }}
-      />
-    </View>
-  );
-};
+const ReachingIcon = ({ size, color }: { size: number; color: string }) => (
+  <View style={{ width: size, height: size, justifyContent: 'center', alignItems: 'center' }}>
+    <View style={{ width: size * 0.75, height: size * 0.75, borderRadius: size * 0.375, borderWidth: 2, borderColor: color, position: 'absolute' }} />
+    <View style={{ width: size * 0.45, height: size * 0.45, borderRadius: size * 0.225, borderWidth: 2, borderColor: color, position: 'absolute' }} />
+    <View style={{ width: size * 0.18, height: size * 0.18, borderRadius: size * 0.09, backgroundColor: color, position: 'absolute' }} />
+  </View>
+);
 
 export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   isListening,
@@ -141,92 +75,17 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   transcript,
   pulseAnim,
   opacityAnim,
+  audioLevel = 0,
 }) => {
   const rotateAnim = useRef(new Animated.Value(0)).current;
-  const dotsOpacity = useRef(new Animated.Value(0)).current;
-  const previousState = useRef<string>('');
-
-  // ============================================================================
-  // WCAG 4.1.3: Announce Status Changes
-  // ============================================================================
-  useEffect(() => {
-    const currentState = getStatusText();
-    
-    if (currentState !== previousState.current && previousState.current !== '') {
-      AccessibilityInfo.announceForAccessibility(
-        `${currentState}. ${getInstructionText()}`
-      );
-    }
-    
-    previousState.current = currentState;
-  }, [isListening, isProcessing, isSpeaking, isNavigation, isReaching]);
-
-  // Rotating animation for processing, navigation, or reaching states
-  useEffect(() => {
-    if (isProcessing || isNavigation || isReaching) {
-      // Different rotation speeds for different modes
-      const duration = isReaching ? 2500 : isNavigation ? 3000 : 2000;
-      
-      Animated.loop(
-        Animated.timing(rotateAnim, {
-          toValue: 1,
-          duration,
-          useNativeDriver: true,
-        })
-      ).start();
-      
-      Animated.timing(dotsOpacity, {
-        toValue: 1,
-        duration: 300,
-        useNativeDriver: true,
-      }).start();
-    } else {
-      rotateAnim.setValue(0);
-      Animated.timing(dotsOpacity, {
-        toValue: 0,
-        duration: 300,
-        useNativeDriver: true,
-      }).start();
-    }
-  }, [isProcessing, isNavigation, isReaching]);
-
-  const rotation = rotateAnim.interpolate({
-    inputRange: [0, 1],
-    outputRange: ['0deg', '360deg'],
-  });
-
-  // Generate dots for the circle (PURELY DECORATIVE)
-  const renderDots = () => {
-    const dots = [];
-    const numberOfDots = 60;
-    
-    for (let i = 0; i < numberOfDots; i++) {
-      const angle = (i * 360) / numberOfDots;
-      
-      dots.push(
-        <View
-          key={i}
-          accessible={false}
-          style={[
-            styles.dot,
-            {
-              transform: [
-                { rotate: `${angle}deg` },
-                { translateY: -CIRCLE_SIZE / 2 },
-              ],
-              backgroundColor: isReaching 
-                ? COLORS.REACHING 
-                : isNavigation 
-                ? COLORS.NAVIGATION 
-                : '#fff',
-            },
-          ]}
-        />
-      );
-    }
-    
-    return dots;
-  };
+  const previousState = useRef('');
+  
+  // Animated scale for each bar (0 to 1)
+  const barScales = useRef<Animated.Value[]>(
+    Array.from({ length: NUM_BARS }, () => new Animated.Value(0.15))
+  ).current;
+  
+  const animFrameRef = useRef<number | null>(null);
 
   const getStatusText = () => {
     if (isReaching) return 'Reaching';
@@ -238,307 +97,219 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   };
 
   const getStatusColor = () => {
-    if (isReaching) return COLORS.REACHING;
-    if (isNavigation) return COLORS.NAVIGATION;
+    if (isReaching) return COLORS.REACHING || '#9B59B6';
+    if (isNavigation) return COLORS.NAVIGATION || '#FF6B35';
     if (isSpeaking) return '#4CAF50';
     if (isProcessing) return '#FFC107';
     if (isListening) return '#2196F3';
-    return '#666';
+    return '#555';
   };
 
   const getInstructionText = () => {
-    if (isReaching) return 'Tap to stop reaching';
-    if (isNavigation) return 'Tap to stop navigation';
+    if (isReaching || isNavigation) return 'Tap to stop';
     if (isSpeaking || isProcessing) return 'Tap to interrupt';
     if (isListening) return 'Speak naturally, tap to stop';
     return 'Tap to speak';
   };
 
-  // WCAG 4.1.2: Generate comprehensive accessibility label
-  const getAccessibilityLabel = () => {
-    const status = getStatusText();
-    const instruction = getInstructionText();
-    
-    if (isReaching) {
-      return `${status}. Guiding you to the object. ${instruction}`;
+  // Announce state changes
+  useEffect(() => {
+    const currentState = getStatusText();
+    if (currentState !== previousState.current && previousState.current !== '') {
+      AccessibilityInfo.announceForAccessibility(`${currentState}. ${getInstructionText()}`);
     }
-    
-    if (isNavigation) {
-      return `${status}. Guiding you to your destination. ${instruction}`;
-    }
-    
-    if (transcript && isListening) {
-      return `${status}. You said: ${transcript}. ${instruction}`;
-    }
-    
-    return `${status}. ${instruction}`;
-  };
+    previousState.current = currentState;
+  }, [isListening, isProcessing, isSpeaking, isNavigation, isReaching]);
 
-  // Get the appropriate icon based on state
+  // Slow rotation for processing/navigation/reaching
+  useEffect(() => {
+    if (isProcessing || isNavigation || isReaching) {
+      Animated.loop(
+        Animated.timing(rotateAnim, {
+          toValue: 1,
+          duration: isReaching ? 8000 : isNavigation ? 10000 : 6000,
+          easing: Easing.linear,
+          useNativeDriver: true,
+        })
+      ).start();
+    } else {
+      rotateAnim.stopAnimation();
+      rotateAnim.setValue(0);
+    }
+  }, [isProcessing, isNavigation, isReaching, rotateAnim]);
+
+  // Bar animation loop
+  useEffect(() => {
+    const isActive = isListening || isProcessing || isSpeaking || isNavigation || isReaching;
+    
+    if (!isActive) {
+      barScales.forEach(scale => {
+        Animated.timing(scale, { toValue: 0.15, duration: 400, useNativeDriver: true }).start();
+      });
+      if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
+      return;
+    }
+
+    const animate = () => {
+      const t = Date.now() * 0.001;
+      
+      barScales.forEach((scale, i) => {
+        const angle = (i / NUM_BARS) * Math.PI * 2;
+        let value = 0.15;
+        
+        if (isListening) {
+          // Organic, voice-reactive pattern
+          value = 0.25 + 
+            Math.sin(t * 4 + angle * 3) * 0.22 +
+            Math.sin(t * 7 + i * 0.4) * 0.18 +
+            Math.sin(t * 2.5 + angle * 2) * 0.15;
+        } else if (isProcessing) {
+          // Smooth wave traveling around
+          value = 0.35 + Math.sin(angle - t * 2.5) * 0.35;
+        } else if (isSpeaking) {
+          // Rhythmic pulse
+          value = 0.4 + Math.sin(t * 5 + angle * 2) * 0.28 + Math.sin(t * 2) * 0.12;
+        } else if (isNavigation) {
+          // Directional with forward emphasis
+          value = 0.3 + Math.cos(angle) * 0.2 + Math.sin(angle - t * 1.8) * 0.22;
+        } else if (isReaching) {
+          // Radar ping sweep
+          const sweep = (t * 1.5) % (Math.PI * 2);
+          const diff = Math.min(Math.abs(angle - sweep), Math.PI * 2 - Math.abs(angle - sweep));
+          value = 0.2 + Math.max(0, 1 - diff / 0.7) * 0.55;
+        }
+        
+        scale.setValue(Math.max(0.1, Math.min(1, value)));
+      });
+      
+      animFrameRef.current = requestAnimationFrame(animate);
+    };
+    
+    animate();
+    return () => { if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current); };
+  }, [isListening, isProcessing, isSpeaking, isNavigation, isReaching, barScales]);
+
+  const rotation = rotateAnim.interpolate({
+    inputRange: [0, 1],
+    outputRange: ['0deg', '360deg'],
+  });
+
+  const statusColor = getStatusColor();
+
+  // Pre-calculate bar positions - bars are positioned at their CENTER along the radial line
+  const barPositions = React.useMemo(() => {
+    const centerX = CIRCLE_SIZE / 2;
+    const centerY = CIRCLE_SIZE / 2;
+    
+    return Array.from({ length: NUM_BARS }, (_, i) => {
+      const angleDeg = (i / NUM_BARS) * 360;
+      const angleRad = (angleDeg - 90) * (Math.PI / 180);
+      
+      // Position where the bar's CENTER should be
+      // This is at INNER_RADIUS + half of MAX_BAR_LENGTH from the visualization center
+      const barCenterDist = INNER_RADIUS + MAX_BAR_LENGTH / 2;
+      const barCenterX = centerX + Math.cos(angleRad) * barCenterDist;
+      const barCenterY = centerY + Math.sin(angleRad) * barCenterDist;
+      
+      return { 
+        // Position so bar's center is at the calculated point
+        // Since RN positions from top-left, we offset by half width and half height
+        x: barCenterX - BAR_WIDTH / 2,
+        y: barCenterY - MAX_BAR_LENGTH / 2,
+        angleDeg 
+      };
+    });
+  }, []);
+
   const renderIcon = () => {
-    if (isReaching) {
-      return <ReachingIcon size={80} color={COLORS.REACHING} accessible={false} />;
-    }
-    if (isNavigation) {
-      return <NavigationIcon size={80} color={COLORS.NAVIGATION} accessible={false} />;
-    }
-    if (isSpeaking) {
-      return <Speaker size={80} color="#4CAF50" accessible={false} />;
-    }
-    if (isProcessing) {
-      return <Brain size={80} color="#FFC107" accessible={false} />;
-    }
-    if (isListening) {
-      return <Mic size={80} color="#2196F3" accessible={false} />;
-    }
-    return <MicOff size={80} color="#666" accessible={false} />;
+    const size = 65;
+    if (isReaching) return <ReachingIcon size={size} color={COLORS.REACHING || '#9B59B6'} />;
+    if (isNavigation) return <NavigationIcon size={size} color={COLORS.NAVIGATION || '#FF6B35'} />;
+    if (isSpeaking) return <Speaker size={size} color="#4CAF50" />;
+    if (isProcessing) return <Brain size={size} color="#FFC107" />;
+    if (isListening) return <Mic size={size} color="#2196F3" />;
+    return <MicOff size={size} color="#555" />;
   };
 
   return (
-    <View 
-      style={styles.container}
-      accessible={true}
-      accessibilityLabel={getAccessibilityLabel()}
-      accessibilityRole="text"
-      accessibilityLiveRegion="polite"
-    >
-      {/* ================================================================ */}
-      {/* DECORATIVE VISUAL ELEMENTS */}
-      {/* ================================================================ */}
-      <View 
-        style={styles.circleWrapper}
-        accessible={false}
-        importantForAccessibility="no-hide-descendants"
-      >
-        <Animated.View
-          style={[
-            styles.circleContainer,
-            {
-              transform: [
-                { scale: pulseAnim },
-                { rotate: (isProcessing || isNavigation || isReaching) ? rotation : '0deg' },
-              ],
-            },
-          ]}
-          accessible={false}
-        >
-          <Animated.View 
-            style={[
-              styles.dotsCircle,
-              { opacity: dotsOpacity }
-            ]}
-            accessible={false}
-          >
-            {renderDots()}
-          </Animated.View>
-          
-          <Animated.View
-            style={[
-              styles.circle,
-              {
-                opacity: opacityAnim,
-                borderColor: getStatusColor(),
-              },
-            ]}
-            accessible={false}
-          />
+    <View style={styles.container} accessible accessibilityLabel={`${getStatusText()}. ${getInstructionText()}`} accessibilityRole="text" accessibilityLiveRegion="polite">
+      
+      <View style={styles.visualizer} accessible={false} importantForAccessibility="no-hide-descendants">
+        
+        {/* Outer glow */}
+        <Animated.View style={[styles.outerGlow, { borderColor: statusColor, opacity: opacityAnim, transform: [{ scale: pulseAnim }] }]} />
+        
+        {/* Bars container */}
+        <Animated.View style={[styles.barsContainer, { transform: [{ rotate: (isProcessing || isNavigation || isReaching) ? rotation : '0deg' }] }]}>
+          {barPositions.map((pos, i) => (
+            <Animated.View
+              key={i}
+              style={{
+                position: 'absolute',
+                width: BAR_WIDTH,
+                height: MAX_BAR_LENGTH,
+                left: pos.x,
+                top: pos.y,
+                backgroundColor: statusColor,
+                borderRadius: BAR_WIDTH / 2,
+                opacity: 0.88,
+                transform: [
+                  { scaleY: barScales[i] }, // Scale FIRST (along bar's length)
+                  { rotate: `${pos.angleDeg}deg` }, // Then rotate to face outward
+                ],
+              }}
+            />
+          ))}
         </Animated.View>
-
-        <View 
-          style={styles.centerIcon}
-          accessible={false}
-        >
-          {renderIcon()}
-        </View>
+        
+        {/* Inner circle */}
+        <View style={[styles.innerCircle, { borderColor: statusColor }]} />
+        
+        {/* Icon */}
+        <View style={styles.iconContainer}>{renderIcon()}</View>
       </View>
 
-      {/* ================================================================ */}
-      {/* ACCESSIBLE TEXT ELEMENTS */}
-      {/* ================================================================ */}
+      <Text style={[styles.statusText, { color: statusColor }]}>{getStatusText()}</Text>
 
-      {/* Status text */}
-      <Text 
-        style={[styles.statusText, { color: getStatusColor() }]}
-        accessible={true}
-        accessibilityRole="text"
-        accessibilityLabel={`Status: ${getStatusText()}`}
-      >
-        {getStatusText()}
-      </Text>
-
-      {/* Reaching indicator */}
-      {isReaching && (
-        <View 
-          style={styles.reachingIndicator}
-          accessible={true}
-          accessibilityRole="text"
-          accessibilityLabel="Object guidance in progress"
-        >
-          <Text style={styles.reachingText}>
-            Reaching...
-          </Text>
-        </View>
-      )}
-
-      {/* Navigation indicator */}
-      {isNavigation && (
-        <View 
-          style={styles.navigationIndicator}
-          accessible={true}
-          accessibilityRole="text"
-          accessibilityLabel="Navigation in progress"
-        >
-          <Text style={styles.navigationText}>
-            Guiding you...
-          </Text>
-        </View>
-      )}
-
-      {/* Transcript display */}
       {transcript && isListening && !isNavigation && !isReaching && (
-        <View 
-          style={styles.transcriptContainer}
-          accessible={true}
-          accessibilityRole="text"
-          accessibilityLiveRegion="polite"
-          accessibilityLabel={`Transcript: ${transcript}`}
-        >
+        <View style={styles.transcriptBox}>
           <Text style={styles.transcriptText}>{transcript}</Text>
         </View>
       )}
 
-      {/* Instruction text */}
-      <Text 
-        style={styles.instructionText}
-        accessible={true}
-        accessibilityRole="text"
-        accessibilityLabel={`Instructions: ${getInstructionText()}`}
-      >
-        {getInstructionText()}
-      </Text>
+      <Text style={styles.instructionText}>{getInstructionText()}</Text>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
-  container: {
-    flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  
-  // Decorative elements
-  circleWrapper: {
-    width: CIRCLE_SIZE,
-    height: CIRCLE_SIZE,
-    justifyContent: 'center',
-    alignItems: 'center',
-  },
-  circleContainer: {
+  container: { flex: 1, justifyContent: 'center', alignItems: 'center' },
+  visualizer: { width: CIRCLE_SIZE, height: CIRCLE_SIZE, justifyContent: 'center', alignItems: 'center' },
+  outerGlow: {
     position: 'absolute',
-    width: CIRCLE_SIZE,
-    height: CIRCLE_SIZE,
-    justifyContent: 'center',
-    alignItems: 'center',
+    width: CIRCLE_SIZE + 25,
+    height: CIRCLE_SIZE + 25,
+    borderRadius: (CIRCLE_SIZE + 25) / 2,
+    borderWidth: 1.5,
   },
-  dotsCircle: {
+  barsContainer: { position: 'absolute', width: CIRCLE_SIZE, height: CIRCLE_SIZE },
+  innerCircle: {
     position: 'absolute',
-    width: CIRCLE_SIZE,
-    height: CIRCLE_SIZE,
+    width: INNER_RADIUS * 2,
+    height: INNER_RADIUS * 2,
+    borderRadius: INNER_RADIUS,
+    borderWidth: 1.5,
+    backgroundColor: 'rgba(0,0,0,0.5)',
   },
-  dot: {
-    position: 'absolute',
-    width: 4,
-    height: 4,
-    borderRadius: 2,
-    backgroundColor: '#fff',
-    top: '50%',
-    left: '50%',
-    marginLeft: -2,
-    marginTop: -2,
+  iconContainer: { position: 'absolute' },
+  statusText: { marginTop: 28, fontSize: 26, fontWeight: '600', letterSpacing: 1.2 },
+  transcriptBox: {
+    position: 'absolute', bottom: 105, left: 20, right: 20,
+    backgroundColor: 'rgba(33,150,243,0.12)', padding: 16, borderRadius: 12,
+    borderLeftWidth: 3, borderLeftColor: '#2196F3',
   },
-  circle: {
-    position: 'absolute',
-    width: CIRCLE_SIZE,
-    height: CIRCLE_SIZE,
-    borderRadius: CIRCLE_SIZE / 2,
-    borderWidth: 2,
-    backgroundColor: 'rgba(255, 255, 255, 0.05)',
-  },
-  centerIcon: {
-    position: 'absolute',
-    top: '50%',
-    left: '50%',
-    transform: [
-      { translateX: -40 },
-      { translateY: -40 },
-    ],
-    zIndex: 10,
-  },
-  
-  // Accessible text elements
-  statusText: {
-    marginTop: 40,
-    fontSize: 24,
-    fontWeight: '600',
-    color: '#fff',
-  },
-  
-  // Reaching indicator styles
-  reachingIndicator: {
-    marginTop: 10,
-    paddingHorizontal: 20,
-    paddingVertical: 8,
-    backgroundColor: 'rgba(155, 89, 182, 0.2)',
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: COLORS.REACHING,
-  },
-  reachingText: {
-    color: COLORS.REACHING,
-    fontSize: 16,
-    fontWeight: '500',
-  },
-  
-  // Navigation indicator styles
-  navigationIndicator: {
-    marginTop: 10,
-    paddingHorizontal: 20,
-    paddingVertical: 8,
-    backgroundColor: 'rgba(255, 107, 53, 0.2)',
-    borderRadius: 20,
-    borderWidth: 1,
-    borderColor: COLORS.NAVIGATION,
-  },
-  navigationText: {
-    color: COLORS.NAVIGATION,
-    fontSize: 16,
-    fontWeight: '500',
-  },
-  
-  transcriptContainer: {
-    position: 'absolute',
-    bottom: 100,
-    left: 20,
-    right: 20,
-    backgroundColor: 'rgba(33, 150, 243, 0.2)',
-    padding: 20,
-    borderRadius: 15,
-    borderLeftWidth: 4,
-    borderLeftColor: '#2196F3',
-  },
-  transcriptText: {
-    color: '#fff',
-    fontSize: 18,
-    lineHeight: 24,
-  },
-  instructionText: {
-    position: 'absolute',
-    bottom: 40,
-    color: '#999',
-    fontSize: 14,
-    textAlign: 'center',
-  },
+  transcriptText: { color: '#fff', fontSize: 17, lineHeight: 23 },
+  instructionText: { position: 'absolute', bottom: 42, color: '#777', fontSize: 15, letterSpacing: 0.4 },
 });
 
 export default VoiceVisualizer;

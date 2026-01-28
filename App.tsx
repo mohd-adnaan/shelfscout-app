@@ -119,9 +119,30 @@ function App(): React.JSX.Element {
     console.log('🔄 Navigation loop enabled:', NAVIGATION_CONFIG.ENABLE_NAVIGATION_LOOP);
   }, []);
 
-  // ============================================================================
-  // Reactivate Camera and Capture Photo
-  // ============================================================================
+// ============================================================================
+// Pre-warm TTS Service on App Launch (Fix first-tap delay)
+// ============================================================================
+useEffect(() => {
+  const prewarmTTS = async () => {
+    try {
+      console.log('Pre-warming TTS service...');
+      // Use the actual TTS service that's already imported
+      await speachesSentenceChunker.synthesizeSpeechChunked('.');
+      console.log('TTS service pre-warmed and ready');
+    } catch (error) {
+      console.warn('⚠️ TTS pre-warm failed (non-critical):', error);
+      // Non-critical - will initialize on first real use
+    }
+  };
+
+  // Pre-warm after 1 second delay (let app fully load first)
+  const timer = setTimeout(prewarmTTS, 1000);
+  return () => clearTimeout(timer);
+}, []);
+
+// ============================================================================
+// Reactivate Camera and Capture Photo
+// ============================================================================
   const reactivateCameraAndCapture = async (): Promise<string> => {
     console.log('📷 Reactivating camera for capture...');
 
