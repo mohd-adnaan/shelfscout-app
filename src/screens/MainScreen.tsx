@@ -42,6 +42,7 @@ import { useTTS } from '../hooks/useTTS';
 import { sendToWorkflow } from '../services/WorkflowService';
 import { requestPermissions } from '../services/PermissionService';
 import { COLORS } from '../utils/constants';
+import { ReachingBridge, ReachingEvents } from '../native/ReachingModule';
 
 const MainScreen: React.FC = () => {
   // ============================================================================

@@ -59,6 +59,10 @@ export interface WorkflowResponse {
    * Default: 1000ms (from NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS)
    */
   loopDelay?: number;
+  reaching_ios: boolean;      
+  bbox?: [number, number, number, number];  
+  object?: string;           
+  session_id: string;
 }
 
 // =============================================================================
