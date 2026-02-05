@@ -127,7 +127,7 @@ useEffect(() => {
     try {
       console.log('Pre-warming TTS service...');
       // Use the actual TTS service that's already imported
-      await speachesSentenceChunker.synthesizeSpeechChunked('.');
+      await speachesSentenceChunker.synthesizeSpeechChunked('');
       console.log('TTS service pre-warmed and ready');
     } catch (error) {
       console.warn('⚠️ TTS pre-warm failed (non-critical):', error);

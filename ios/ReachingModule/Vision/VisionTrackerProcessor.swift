@@ -206,4 +206,4 @@ class VisionTrackerProcessor {
         didInitialize = false
         centerDetectionActive = false
     }
-}
+} 
