@@ -1,4 +1,4 @@
 source 'https://rubygems.org'
 
 gem 'cocoapods', '~> 1.16'
-gem 'xcodeproj', github: 'CocoaPods/Xcodeproj', branch: 'master'
+gem 'xcodeproj', git: 'https://github.com/CocoaPods/Xcodeproj.git', branch: 'master'
