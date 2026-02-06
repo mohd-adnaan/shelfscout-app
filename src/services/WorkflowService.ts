@@ -3,22 +3,73 @@
  * 
  * WCAG 2.1 Level AA Compliant Workflow Service
  * 
- * UPDATED: Three-Flag System with iOS Reaching Support (Feb 3, 2026)
+ * UPDATED: Feb 6, 2026 - Priority for reaching_ios over reaching_flag
+ * 
+ * THREE-FLAG SYSTEM with iOS PRIORITY:
  * - navigation flag: Navigation loop control
  * - reaching_flag: Object guidance/reaching control (Android LLM-based)
- * - reaching_ios: iOS native ARKit reaching trigger
+ * - reaching_ios: iOS native ARKit reaching trigger (TAKES PRIORITY)
  * 
- * When reaching_ios=true, the response includes:
- * - bbox: [xmin, ymin, xmax, ymax] from Qwen detection
- * - object: Name of the detected object
- * - Session ends and native iOS module takes over
+ * PRIORITY ORDER:
+ * 1. reaching_ios=true → Trigger iOS ARKit (stops here, no continuous loop)
+ * 2. reaching_flag=true → Start reaching continuous loop (Android-style)
+ * 3. navigation=true → Start navigation continuous loop
  */
 
 import axios, { AxiosError } from 'axios';
-import { Platform, Alert } from 'react-native';
+import { Platform, Alert, NativeModules } from 'react-native';
 import { WORKFLOW_URL, CONFIG, NAVIGATION_CONFIG } from '../utils/constants';
 import { WorkflowRequest, WorkflowResponse, ContinuousModeState } from '../utils/types';
 import { AccessibilityService } from './AccessibilityService';
+
+// =============================================================================
+// iOS ARKit Native Module Bridge (Nicolas's CybsGuidance)
+// =============================================================================
+
+// This will be the bridge to Nicolas's Swift ViewController
+const { CybsGuidanceModule } = NativeModules;
+
+/**
+ * Trigger iOS ARKit reaching with bounding box data
+ * 
+ * @param bbox - [xmin, ymin, xmax, ymax] from Qwen detection
+ * @param objectName - Name of the detected object
+ */
+export const triggerIOSReaching = async (
+  bbox: [number, number, number, number],
+  objectName: string
+): Promise<boolean> => {
+  if (Platform.OS !== 'ios') {
+    console.warn('🚫 triggerIOSReaching called on non-iOS platform');
+    return false;
+  }
+
+  try {
+    console.log('🎯 [iOS ARKit] Triggering reaching for:', objectName);
+    console.log('📦 [iOS ARKit] Bounding box:', bbox);
+
+    // If the native module exists, call it
+    if (CybsGuidanceModule?.startReaching) {
+      await CybsGuidanceModule.startReaching({
+        bbox: bbox,
+        object: objectName,
+      });
+      console.log('✅ [iOS ARKit] Reaching started successfully');
+      return true;
+    } else {
+      console.warn('⚠️ CybsGuidanceModule not available - is the native module linked?');
+      
+      // Fallback: Announce to user
+      AccessibilityService.announceForAccessibility(
+        `Guiding you to ${objectName}. ARKit module initializing.`
+      );
+      return false;
+    }
+  } catch (error) {
+    console.error('❌ [iOS ARKit] Failed to start reaching:', error);
+    return false;
+  }
+};
 
 // =============================================================================
 // RESETTABLE PERSISTENT SESSION ID
@@ -237,7 +288,7 @@ export const sendToWorkflow = async (
       navigation: parsedResponse.navigation,
       reaching_flag: parsedResponse.reaching_flag,
       reaching_ios: parsedResponse.reaching_ios,
-      hasBbox: !!parsedResponse.bbox,
+      bbox: !!parsedResponse.bbox,
       object: parsedResponse.object,
     });
 
@@ -352,7 +403,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   }
 
   // =========================================================================
-  // NEW: reaching_ios flag (iOS native ARKit)
+  // reaching_ios flag (iOS native ARKit) - HIGHEST PRIORITY
   // =========================================================================
   let reaching_ios = false;
   if (typeof innerPayload.reaching_ios === 'boolean') {
@@ -375,9 +426,14 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
       bbox = innerPayload.bbox.map((v: any) => Number(v)) as [number, number, number, number];
     } else if (typeof innerPayload.bbox === 'string') {
       try {
-        const parsed = JSON.parse(innerPayload.bbox);
-        if (Array.isArray(parsed) && parsed.length === 4) {
-          bbox = parsed.map((v: any) => Number(v)) as [number, number, number, number];
+        // Handle both "[1,2,3,4]" and "1,2,3,4" formats
+        let bboxString = innerPayload.bbox.trim();
+        if (bboxString.startsWith('[') && bboxString.endsWith(']')) {
+          bboxString = bboxString.slice(1, -1);
+        }
+        const parts = bboxString.split(',').map((v: string) => Number(v.trim()));
+        if (parts.length === 4 && parts.every((n: number) => !isNaN(n))) {
+          bbox = parts as [number, number, number, number];
         }
       } catch (e) {
         console.warn('⚠️ Failed to parse bbox string:', innerPayload.bbox);
@@ -426,6 +482,67 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
 }
 
 // =============================================================================
+// ★★★ NEW: Determine action mode with PRIORITY for reaching_ios ★★★
+// =============================================================================
+
+export type ActionMode = 
+  | { type: 'reaching_ios'; bbox: [number, number, number, number]; object: string }
+  | { type: 'reaching'; loopDelay: number }
+  | { type: 'navigation'; loopDelay: number }
+  | { type: 'none' };
+
+/**
+ * Determine what action to take based on response flags
+ * 
+ * PRIORITY ORDER:
+ * 1. reaching_ios (iOS ARKit) - HIGHEST PRIORITY
+ * 2. reaching_flag (Android LLM loop)
+ * 3. navigation (Navigation loop)
+ * 4. none (No continuous action)
+ */
+export const determineActionMode = (response: WorkflowResponse): ActionMode => {
+  // =========================================================================
+  // PRIORITY 1: iOS ARKit Reaching (only on iOS, requires bbox)
+  // =========================================================================
+  if (Platform.OS === 'ios' && response.reaching_ios && response.bbox) {
+    console.log('🎯 [Priority] iOS ARKit reaching takes priority');
+    return {
+      type: 'reaching_ios',
+      bbox: response.bbox,
+      object: response.object || 'object',
+    };
+  }
+
+  // =========================================================================
+  // PRIORITY 2: Reaching flag (continuous loop)
+  // =========================================================================
+  if (response.reaching_flag) {
+    console.log('🔄 [Priority] Reaching continuous mode');
+    return {
+      type: 'reaching',
+      loopDelay: response.loopDelay || NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
+    };
+  }
+
+  // =========================================================================
+  // PRIORITY 3: Navigation flag (continuous loop)
+  // =========================================================================
+  if (response.navigation) {
+    console.log('🗺️ [Priority] Navigation continuous mode');
+    return {
+      type: 'navigation',
+      loopDelay: response.loopDelay || NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
+    };
+  }
+
+  // =========================================================================
+  // PRIORITY 4: No continuous action
+  // =========================================================================
+  console.log('✅ [Priority] No continuous mode needed');
+  return { type: 'none' };
+};
+
+// =============================================================================
 // EXPORT
 // =============================================================================
 
@@ -442,4 +559,6 @@ export default {
   incrementContinuousMode,
   updateLoopDelay,
   shouldPreventInfiniteLoop,
+  determineActionMode,
+  triggerIOSReaching,
 };

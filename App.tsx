@@ -119,30 +119,30 @@ function App(): React.JSX.Element {
     console.log('🔄 Navigation loop enabled:', NAVIGATION_CONFIG.ENABLE_NAVIGATION_LOOP);
   }, []);
 
-// ============================================================================
-// Pre-warm TTS Service on App Launch (Fix first-tap delay)
-// ============================================================================
-useEffect(() => {
-  const prewarmTTS = async () => {
-    try {
-      console.log('Pre-warming TTS service...');
-      // Use the actual TTS service that's already imported
-      await speachesSentenceChunker.synthesizeSpeechChunked('');
-      console.log('TTS service pre-warmed and ready');
-    } catch (error) {
-      console.warn('⚠️ TTS pre-warm failed (non-critical):', error);
-      // Non-critical - will initialize on first real use
-    }
-  };
+  // ============================================================================
+  // Pre-warm TTS Service on App Launch (Fix first-tap delay)
+  // ============================================================================
+  useEffect(() => {
+    const prewarmTTS = async () => {
+      try {
+        console.log('Pre-warming TTS service...');
+        // Use the actual TTS service that's already imported
+        await speachesSentenceChunker.synthesizeSpeechChunked('');
+        console.log('TTS service pre-warmed and ready');
+      } catch (error) {
+        console.warn('⚠️ TTS pre-warm failed (non-critical):', error);
+        // Non-critical - will initialize on first real use
+      }
+    };
 
-  // Pre-warm after 1 second delay (let app fully load first)
-  const timer = setTimeout(prewarmTTS, 1000);
-  return () => clearTimeout(timer);
-}, []);
+    // Pre-warm after 1 second delay (let app fully load first)
+    const timer = setTimeout(prewarmTTS, 1000);
+    return () => clearTimeout(timer);
+  }, []);
 
-// ============================================================================
-// Reactivate Camera and Capture Photo
-// ============================================================================
+  // ============================================================================
+  // Reactivate Camera and Capture Photo
+  // ============================================================================
   const reactivateCameraAndCapture = async (): Promise<string> => {
     console.log('📷 Reactivating camera for capture...');
 
@@ -460,6 +460,9 @@ useEffect(() => {
           text: result.text.substring(0, 50),
           navigation: result.navigation,
           reaching_flag: result.reaching_flag,
+          reaching_ios: result.reaching_ios,
+          bbox: result.bbox,
+          object: result.object,
           loopDelay: result.loopDelay,
         });
 
@@ -467,6 +470,79 @@ useEffect(() => {
         if (result.loopDelay) {
           updateLoopDelay(result.loopDelay);
         }
+
+        // ======================================================================
+        // ★★★ iOS ARKit PRIORITY CHECK - Must be FIRST ★★★
+        // ======================================================================
+        if (Platform.OS === 'ios' && result.reaching_ios === true) {
+          // Parse bbox from string to array
+          let bbox: number[] | null = null;
+
+          if (result.bbox) {
+            if (Array.isArray(result.bbox)) {
+              bbox = result.bbox;
+            } else if (typeof result.bbox === 'string') {
+              try {
+                const s = result.bbox.replace('[', '').replace(']', '');
+                bbox = s.split(',').map((v: string) => Number(v.trim()));
+              } catch (e) {
+                console.warn('Failed to parse bbox');
+              }
+            }
+          }
+
+          if (bbox && bbox.length === 4) {
+            console.log('🎯 [iOS ARKit] TAKING OVER - PRIORITY!');
+            console.log('📦 [iOS ARKit] bbox:', bbox);
+            console.log('🏷️ [iOS ARKit] object:', result.object);
+
+            // 1. Speak the response first
+            if (result.text) {
+              console.log('🔊 Speaking before ARKit handover...');
+              setIsSpeaking(true);
+              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+              setIsSpeaking(false);
+            }
+
+            // 2. Stop the continuous loop
+            console.log('🛑 Stopping continuous loop for ARKit takeover');
+            isContinuousModeRunning.current = false;
+            continuousModeAbortRef.current = true;
+            stopContinuousMode('iOS ARKit takeover', false);
+
+            // 3. Announce to user
+            AccessibilityInfo.announceForAccessibility(
+              `Guiding you to ${result.object || 'object'}. Follow the audio cues.`
+            );
+
+            // 4. Trigger Nicolas's native module
+            // TODO: Uncomment when CybsGuidanceModule is linked
+            // const { CybsGuidanceModule } = NativeModules;
+            // if (CybsGuidanceModule?.startReaching) {
+            //   await CybsGuidanceModule.startReaching({
+            //     bbox: bbox,
+            //     object: result.object || 'object',
+            //     xmin: bbox[0],
+            //     ymin: bbox[1], 
+            //     xmax: bbox[2],
+            //     ymax: bbox[3],
+            //   });
+            // }
+
+            // 5. Update UI state
+            setIsNavigation(false);
+            setIsReaching(false);
+            setIsProcessing(false);
+            setIsCameraActive(true);
+
+            audioFeedback.playEarcon('ready');
+
+            return; // ★★★ EXIT THE LOOP - ARKit takes over ★★★
+          }
+        }
+        // ======================================================================
+        // END iOS ARKit Priority Check
+        // ======================================================================
 
         // ======================================================================
         // CRITICAL: Check BOTH flags
