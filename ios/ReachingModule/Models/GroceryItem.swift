@@ -13,7 +13,7 @@ import Foundation
  * Used by the reaching system to estimate real-world distances
  * based on apparent size in camera frame.
  *
- * Note: With Qwen backend detection, these are approximations.
+ * Note: With Qwen bdackend detection, these are approximations.
  * The system primarily relies on ARKit depth estimation now.
  */
 struct GroceryItem {

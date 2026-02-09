@@ -31,6 +31,7 @@ import {
   Dimensions,
   StatusBar,
   AccessibilityInfo,
+  NativeModules,
 } from 'react-native';
 import { Camera, useCameraDevice, useCameraPermission, useMicrophonePermission } from 'react-native-vision-camera';
 import { useTTS } from './src/hooks/useTTS';
@@ -47,6 +48,7 @@ import {
   updateLoopDelay,
   getSessionId,
   resetSessionId,
+  determineActionMode,
 } from './src/services/WorkflowService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import { playSound } from './src/utils/soundEffects';
@@ -109,6 +111,13 @@ function App(): React.JSX.Element {
   // ============================================================================
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const opacityAnim = useRef(new Animated.Value(0.3)).current;
+
+  useEffect(() => {
+    const { ReachingModule } = NativeModules;
+    console.log('🔍 NativeModules keys:', Object.keys(NativeModules));
+    console.log('🔍 ReachingModule:', ReachingModule);
+    console.log('🔍 ReachingModule.startReaching:', ReachingModule?.startReaching);
+  }, []);
 
   // ============================================================================
   // Log session info on mount
@@ -472,10 +481,10 @@ function App(): React.JSX.Element {
         }
 
         // ======================================================================
-        // ★★★ iOS ARKit PRIORITY CHECK - Must be FIRST ★★★
+        // ★★★ iOS REACHING PRIORITY CHECK - Must be FIRST ★★★
         // ======================================================================
+
         if (Platform.OS === 'ios' && result.reaching_ios === true) {
-          // Parse bbox from string to array
           let bbox: number[] | null = null;
 
           if (result.bbox) {
@@ -483,7 +492,7 @@ function App(): React.JSX.Element {
               bbox = result.bbox;
             } else if (typeof result.bbox === 'string') {
               try {
-                const s = result.bbox.replace('[', '').replace(']', '');
+                const s = (result.bbox as string).replace('[', '').replace(']', '');
                 bbox = s.split(',').map((v: string) => Number(v.trim()));
               } catch (e) {
                 console.warn('Failed to parse bbox');
@@ -492,56 +501,87 @@ function App(): React.JSX.Element {
           }
 
           if (bbox && bbox.length === 4) {
-            console.log('🎯 [iOS ARKit] TAKING OVER - PRIORITY!');
-            console.log('📦 [iOS ARKit] bbox:', bbox);
-            console.log('🏷️ [iOS ARKit] object:', result.object);
+            console.log('🎯 [iOS Reaching] TAKING OVER - PRIORITY!');
+            console.log('📦 [iOS Reaching] bbox:', bbox);
+            console.log('🏷️ [iOS Reaching] object:', result.object);
 
             // 1. Speak the response first
             if (result.text) {
-              console.log('🔊 Speaking before ARKit handover...');
+              console.log('🔊 Speaking before reaching handover...');
               setIsSpeaking(true);
               await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
               setIsSpeaking(false);
             }
 
             // 2. Stop the continuous loop
-            console.log('🛑 Stopping continuous loop for ARKit takeover');
+            console.log('🛑 Stopping continuous loop for iOS reaching takeover');
             isContinuousModeRunning.current = false;
             continuousModeAbortRef.current = true;
-            stopContinuousMode('iOS ARKit takeover', false);
+            stopContinuousMode('iOS reaching takeover', false);
 
             // 3. Announce to user
             AccessibilityInfo.announceForAccessibility(
-              `Guiding you to ${result.object || 'object'}. Follow the audio cues.`
+              `Guiding you to ${result.object || 'object'}. Follow the audio beeps.`
             );
 
-            // 4. Trigger Nicolas's native module
-            // TODO: Uncomment when CybsGuidanceModule is linked
-            // const { CybsGuidanceModule } = NativeModules;
-            // if (CybsGuidanceModule?.startReaching) {
-            //   await CybsGuidanceModule.startReaching({
-            //     bbox: bbox,
-            //     object: result.object || 'object',
-            //     xmin: bbox[0],
-            //     ymin: bbox[1], 
-            //     xmax: bbox[2],
-            //     ymax: bbox[3],
-            //   });
-            // }
+            // 4. ★★★ DEACTIVATE RN CAMERA + CALL THE NATIVE MODULE ★★★
+            // CRITICAL: RN VisionCamera and native AVCaptureSession conflict
+            setIsCameraActive(false);
+            await new Promise(resolve => setTimeout(resolve, 500));
 
-            // 5. Update UI state
+            try {
+              const { ReachingModule } = NativeModules;
+
+              if (ReachingModule?.startReaching) {
+                console.log('🎯 [iOS Reaching] Calling native ReachingModule.startReaching...');
+
+                const reachingResult = await ReachingModule.startReaching({
+                  bbox: bbox,
+                  object: result.object || 'object',
+                });
+
+                console.log('✅ [iOS Reaching] Native module result:', reachingResult);
+
+                if (reachingResult?.success) {
+                  // Success! Object was reached
+                  AccessibilityInfo.announceForAccessibility(
+                    `${result.object || 'Object'} reached successfully!`
+                  );
+                } else {
+                  // Reaching was cancelled or failed
+                  AccessibilityInfo.announceForAccessibility(
+                    'Reaching guidance ended.'
+                  );
+                }
+              } else {
+                console.warn('⚠️ ReachingModule not available - native module not linked');
+                AccessibilityInfo.announceForAccessibility(
+                  'Reaching module not available. Please rebuild the app.'
+                );
+              }
+            } catch (reachingError: any) {
+              console.error('❌ [iOS Reaching] Native module error:', reachingError);
+              AccessibilityInfo.announceForAccessibility(
+                `Reaching error: ${reachingError.message || 'Unknown error'}`
+              );
+            }
+
+            // 5. Reset session and update UI state
+            resetSessionId();
             setIsNavigation(false);
             setIsReaching(false);
             setIsProcessing(false);
             setIsCameraActive(true);
 
             audioFeedback.playEarcon('ready');
+            AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
 
-            return; // ★★★ EXIT THE LOOP - ARKit takes over ★★★
+            return; // ★★★ EXIT THE LOOP ★★★
           }
         }
+
         // ======================================================================
-        // END iOS ARKit Priority Check
+        // END iOS Reaching Priority Check
         // ======================================================================
 
         // ======================================================================
@@ -1090,6 +1130,72 @@ function App(): React.JSX.Element {
       setIsSpeaking(false);
       finalTranscriptRef.current = '';
 
+
+      // =========================================================================
+      // ★★★ CHECK FOR iOS REACHING ON FIRST RESPONSE ★★★
+      // =========================================================================
+      if (Platform.OS === 'ios' && result.reaching_ios === true && result.bbox) {
+        let bbox: number[] | null = null;
+
+        if (Array.isArray(result.bbox)) {
+          bbox = result.bbox;
+        } else if (typeof result.bbox === 'string') {
+          try {
+            const s = (result.bbox as string).replace('[', '').replace(']', '');
+            bbox = s.split(',').map((v: string) => Number(v.trim()));
+          } catch (e) {
+            console.warn('Failed to parse bbox');
+          }
+        }
+
+        if (bbox && bbox.length === 4) {
+          console.log('🎯 [iOS Reaching] First response has reaching_ios=true!');
+
+          AccessibilityInfo.announceForAccessibility(
+            `Guiding you to ${result.object || 'object'}. Follow the audio beeps.`
+          );
+
+          // CRITICAL: Deactivate RN camera BEFORE native VC takes over
+          setIsCameraActive(false);
+          setIsReaching(true);
+          await new Promise(resolve => setTimeout(resolve, 500));
+
+          try {
+            const { ReachingModule } = NativeModules;
+
+            if (ReachingModule?.startReaching) {
+              console.log('🎯 [iOS Reaching] Calling native ReachingModule.startReaching...');
+
+              const reachingResult = await ReachingModule.startReaching({
+                bbox: bbox,
+                object: result.object || 'object',
+              });
+
+              console.log('✅ [iOS Reaching] Result:', reachingResult);
+
+              if (reachingResult?.success) {
+                AccessibilityInfo.announceForAccessibility(
+                  `${result.object || 'Object'} reached successfully!`
+                );
+              } else {
+                AccessibilityInfo.announceForAccessibility('Reaching guidance ended.');
+              }
+            } else {
+              console.warn('⚠️ ReachingModule not available');
+            }
+          } catch (reachingError: any) {
+            console.error('❌ [iOS Reaching] Error:', reachingError);
+          }
+
+          // Reset and return to ready
+          resetSessionId();
+          setIsReaching(false);
+          setIsCameraActive(true);
+          audioFeedback.playEarcon('ready');
+          AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+          return;  // Don't enter continuous loop
+        }
+      }
       // =========================================================================
       // CHECK FOR CONTINUOUS MODE ACTIVATION (either flag true)
       // =========================================================================

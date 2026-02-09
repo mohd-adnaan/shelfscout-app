@@ -1,7 +1,29 @@
 GIT
+  remote: https://github.com/CocoaPods/CocoaPods.git
+  revision: 458dd19585c03d706c2dc23238afd3845a4c6000
+  specs:
+    cocoapods (1.16.2)
+      addressable (~> 2.8)
+      claide (>= 1.0.2, < 2.0)
+      cocoapods-core (= 1.16.2)
+      cocoapods-deintegrate (>= 1.0.3, < 2.0)
+      cocoapods-downloader (>= 2.1, < 3.0)
+      cocoapods-plugins (>= 1.0.0, < 2.0)
+      cocoapods-search (>= 1.0.0, < 2.0)
+      cocoapods-trunk (>= 1.6.0, < 2.0)
+      cocoapods-try (>= 1.1.0, < 2.0)
+      colored2 (~> 3.1)
+      escape (~> 0.0.4)
+      fourflusher (>= 2.3.0, < 3.0)
+      gh_inspector (~> 1.0)
+      molinillo (~> 0.8.0)
+      nap (~> 1.0)
+      ruby-macho (~> 4.1.0)
+      xcodeproj (>= 1.27.0, < 2.0)
+
+GIT
   remote: https://github.com/CocoaPods/Xcodeproj.git
   revision: 2cf6a2263d2b164b87c1fdaed340667046b4e44d
-  branch: master
   specs:
     xcodeproj (1.27.0)
       CFPropertyList (>= 2.3.3, < 4.0)
@@ -37,24 +59,6 @@ GEM
     benchmark (0.5.0)
     bigdecimal (4.0.1)
     claide (1.1.0)
-    cocoapods (1.16.2)
-      addressable (~> 2.8)
-      claide (>= 1.0.2, < 2.0)
-      cocoapods-core (= 1.16.2)
-      cocoapods-deintegrate (>= 1.0.3, < 2.0)
-      cocoapods-downloader (>= 2.1, < 3.0)
-      cocoapods-plugins (>= 1.0.0, < 2.0)
-      cocoapods-search (>= 1.0.0, < 2.0)
-      cocoapods-trunk (>= 1.6.0, < 2.0)
-      cocoapods-try (>= 1.1.0, < 2.0)
-      colored2 (~> 3.1)
-      escape (~> 0.0.4)
-      fourflusher (>= 2.3.0, < 3.0)
-      gh_inspector (~> 1.0)
-      molinillo (~> 0.8.0)
-      nap (~> 1.0)
-      ruby-macho (>= 2.3.0, < 3.0)
-      xcodeproj (>= 1.27.0, < 2.0)
     cocoapods-core (1.16.2)
       activesupport (>= 5.0, < 8)
       addressable (~> 2.8)
@@ -111,7 +115,7 @@ GEM
     prism (1.9.0)
     public_suffix (4.0.7)
     rexml (3.4.4)
-    ruby-macho (2.5.1)
+    ruby-macho (4.1.0)
     securerandom (0.4.1)
     typhoeus (1.5.0)
       ethon (>= 0.9.0, < 0.16.0)
@@ -132,7 +136,7 @@ PLATFORMS
   x86_64-linux-musl
 
 DEPENDENCIES
-  cocoapods (~> 1.16)
+  cocoapods!
   xcodeproj!
 
 CHECKSUMS
@@ -145,7 +149,7 @@ CHECKSUMS
   benchmark (0.5.0) sha256=465df122341aedcb81a2a24b4d3bd19b6c67c1530713fd533f3ff034e419236c
   bigdecimal (4.0.1) sha256=8b07d3d065a9f921c80ceaea7c9d4ae596697295b584c296fe599dd0ad01c4a7
   claide (1.1.0) sha256=6d3c5c089dde904d96aa30e73306d0d4bd444b1accb9b3125ce14a3c0183f82e
-  cocoapods (1.16.2) sha256=0ff1c860f32df3db8b16df09b58da1a6bb2a12fe55f6d5e8be994a74fadd1e5e
+  cocoapods (1.16.2)
   cocoapods-core (1.16.2) sha256=4bb1b5c420691e60cf36fa227dec6bc48c096c34c97bb7aa512ea7f3246fc12b
   cocoapods-deintegrate (1.0.5) sha256=517c2a448ef563afe99b6e7668704c27f5de9e02715a88ee9de6974dc1b3f6a2
   cocoapods-downloader (2.1) sha256=bb6ebe1b3966dc4055de54f7a28b773485ac724fdf575d9bee2212d235e7b6d1
@@ -186,7 +190,7 @@ CHECKSUMS
   prism (1.9.0) sha256=7b530c6a9f92c24300014919c9dcbc055bf4cdf51ec30aed099b06cd6674ef85
   public_suffix (4.0.7) sha256=8be161e2421f8d45b0098c042c06486789731ea93dc3a896d30554ee38b573b8
   rexml (3.4.4) sha256=19e0a2c3425dfbf2d4fc1189747bdb2f849b6c5e74180401b15734bc97b5d142
-  ruby-macho (2.5.1) sha256=9075e52e0f9270b552a90b24fcc6219ad149b0d15eae1bc364ecd0ac8984f5c9
+  ruby-macho (4.1.0) sha256=23dab37f7de0fe1e14f3bfa73bebc423ae8cd1d4fdb3e5585abc45a841eca920
   securerandom (0.4.1) sha256=cc5193d414a4341b6e225f0cb4446aceca8e50d5e1888743fac16987638ea0b1
   typhoeus (1.5.0) sha256=120b67ed1ef515e6c0e938176db880f15b0916f038e78ce2a66290f3f1de3e3b
   tzinfo (2.0.6) sha256=8daf828cc77bcf7d63b0e3bdb6caa47e2272dcfaf4fbfe46f8c3a9df087a829b

@@ -3,15 +3,17 @@
 	archiveVersion = 1;
 	classes = {
 	};
-	objectVersion = 56;
+	objectVersion = 70;
 	objects = {
 
 /* Begin PBXBuildFile section */
-		12D80ADB42C497D72F1E98E8 /* libPods-shelfscout.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 88584D4881FA74B243E1FCF2 /* libPods-shelfscout.a */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
+		168CFD6491C44B6C7AB12AA2 /* libPods-shelfscout.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 17E209EAA22CCC460541DB60 /* libPods-shelfscout.a */; };
 		4D9BFE671FF22FC33CC01744 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
 		5F5055AA2F341971000B8156 /* srlLogo.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 5F5055A92F341971000B8156 /* srlLogo.mp4 */; };
 		5F5055B42F34217C000B8156 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 5F5055B32F34217C000B8156 /* LaunchScreen.storyboard */; };
+		5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263892F395B19006AEE6F /* ReachingModule.swift */; };
+		5FC2638C2F395B19006AEE6F /* ReachingModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263882F395B19006AEE6F /* ReachingModule.m */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
 /* End PBXBuildFile section */
 
@@ -20,27 +22,20 @@
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = shelfscout/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = shelfscout/Info.plist; sourceTree = "<group>"; };
 		13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = PrivacyInfo.xcprivacy; path = shelfscout/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		17E209EAA22CCC460541DB60 /* libPods-shelfscout.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-shelfscout.a"; sourceTree = BUILT_PRODUCTS_DIR; };
+		5144E27FECB6AFF99AEE8B7F /* Pods-shelfscout.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.release.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.release.xcconfig"; sourceTree = "<group>"; };
 		5F5055A92F341971000B8156 /* srlLogo.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = srlLogo.mp4; sourceTree = "<group>"; };
 		5F5055B32F34217C000B8156 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		5FC263882F395B19006AEE6F /* ReachingModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ReachingModule.m; sourceTree = "<group>"; };
+		5FC263892F395B19006AEE6F /* ReachingModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReachingModule.swift; sourceTree = "<group>"; };
+		5FC2638A2F395B19006AEE6F /* shelfscout-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "shelfscout-Bridging-Header.h"; sourceTree = "<group>"; };
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = shelfscout/AppDelegate.swift; sourceTree = "<group>"; };
-		7F62D44642DED15BF1AB4ED1 /* Pods-shelfscout.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.release.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.release.xcconfig"; sourceTree = "<group>"; };
-		88584D4881FA74B243E1FCF2 /* libPods-shelfscout.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-shelfscout.a"; sourceTree = BUILT_PRODUCTS_DIR; };
-		925AA4B4CFF7A6C1B0EA9D30 /* Pods-shelfscout.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.debug.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.debug.xcconfig"; sourceTree = "<group>"; };
+		DCCA6945BA638C8CB86E94A9 /* Pods-shelfscout.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.debug.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.debug.xcconfig"; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedRootGroup section */
-		5F6F6E7D2F3287440055114A /* ReachingModule */ = {
-			isa = PBXFileSystemSynchronizedRootGroup;
-			exceptions = (
-			);
-			explicitFileTypes = {
-			};
-			explicitFolders = (
-			);
-			path = ReachingModule;
-			sourceTree = "<group>";
-		};
+		5F6F6E7D2F3287440055114A /* ReachingModule */ = {isa = PBXFileSystemSynchronizedRootGroup; explicitFileTypes = {}; explicitFolders = (); path = ReachingModule; sourceTree = "<group>"; };
 /* End PBXFileSystemSynchronizedRootGroup section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -48,7 +43,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				12D80ADB42C497D72F1E98E8 /* libPods-shelfscout.a in Frameworks */,
+				168CFD6491C44B6C7AB12AA2 /* libPods-shelfscout.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -58,6 +53,9 @@
 		13B07FAE1A68108700A75B9A /* shelfscout */ = {
 			isa = PBXGroup;
 			children = (
+				5FC263882F395B19006AEE6F /* ReachingModule.m */,
+				5FC263892F395B19006AEE6F /* ReachingModule.swift */,
+				5FC2638A2F395B19006AEE6F /* shelfscout-Bridging-Header.h */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				761780EC2CA45674006654EE /* AppDelegate.swift */,
 				5F5055B32F34217C000B8156 /* LaunchScreen.storyboard */,
@@ -72,7 +70,7 @@
 			isa = PBXGroup;
 			children = (
 				ED297162215061F000B7C4FE /* JavaScriptCore.framework */,
-				88584D4881FA74B243E1FCF2 /* libPods-shelfscout.a */,
+				17E209EAA22CCC460541DB60 /* libPods-shelfscout.a */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -110,8 +108,8 @@
 		BBD78D7AC51CEA395F1C20DB /* Pods */ = {
 			isa = PBXGroup;
 			children = (
-				925AA4B4CFF7A6C1B0EA9D30 /* Pods-shelfscout.debug.xcconfig */,
-				7F62D44642DED15BF1AB4ED1 /* Pods-shelfscout.release.xcconfig */,
+				DCCA6945BA638C8CB86E94A9 /* Pods-shelfscout.debug.xcconfig */,
+				5144E27FECB6AFF99AEE8B7F /* Pods-shelfscout.release.xcconfig */,
 			);
 			path = Pods;
 			sourceTree = "<group>";
@@ -123,13 +121,13 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 13B07F931A680F5B00A75B9A /* Build configuration list for PBXNativeTarget "shelfscout" */;
 			buildPhases = (
-				D04468258BE68237A8AB98E2 /* [CP] Check Pods Manifest.lock */,
+				FCCDE60BA5FF41C42BA6B3C6 /* [CP] Check Pods Manifest.lock */,
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
 				00DD1BFF1BD5951E006B06BC /* Bundle React Native code and images */,
-				1EBFB5F27C1265EEF239ED71 /* [CP] Embed Pods Frameworks */,
-				E4FC8B997F14688B55CF65B1 /* [CP] Copy Pods Resources */,
+				541ED4D026FBD7B8104A17DA /* [CP] Embed Pods Frameworks */,
+				FBCAA54A2BAECED2E297DCD9 /* [CP] Copy Pods Resources */,
 			);
 			buildRules = (
 			);
@@ -149,7 +147,7 @@
 				LastUpgradeCheck = 1210;
 				TargetAttributes = {
 					13B07F861A680F5B00A75B9A = {
-						LastSwiftMigration = 1120;
+						LastSwiftMigration = 2620;
 					};
 				};
 			};
@@ -202,7 +200,7 @@
 			shellPath = /bin/sh;
 			shellScript = "set -e\n\nWITH_ENVIRONMENT=\"$REACT_NATIVE_PATH/scripts/xcode/with-environment.sh\"\nREACT_NATIVE_XCODE=\"$REACT_NATIVE_PATH/scripts/react-native-xcode.sh\"\n\n/bin/sh -c \"\\\"$WITH_ENVIRONMENT\\\" \\\"$REACT_NATIVE_XCODE\\\"\"\n";
 		};
-		1EBFB5F27C1265EEF239ED71 /* [CP] Embed Pods Frameworks */ = {
+		541ED4D026FBD7B8104A17DA /* [CP] Embed Pods Frameworks */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -210,16 +208,41 @@
 			inputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks-${CONFIGURATION}-input-files.xcfilelist",
 			);
+			inputPaths = (
+			);
 			name = "[CP] Embed Pods Frameworks";
 			outputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
-		D04468258BE68237A8AB98E2 /* [CP] Check Pods Manifest.lock */ = {
+		FBCAA54A2BAECED2E297DCD9 /* [CP] Copy Pods Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			inputPaths = (
+			);
+			name = "[CP] Copy Pods Resources";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		FCCDE60BA5FF41C42BA6B3C6 /* [CP] Check Pods Manifest.lock */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -241,23 +264,6 @@
 			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
 			showEnvVarsInLog = 0;
 		};
-		E4FC8B997F14688B55CF65B1 /* [CP] Copy Pods Resources */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-input-files.xcfilelist",
-			);
-			name = "[CP] Copy Pods Resources";
-			outputFileListPaths = (
-				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-output-files.xcfilelist",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources.sh\"\n";
-			showEnvVarsInLog = 0;
-		};
 /* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
@@ -265,6 +271,8 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */,
+				5FC2638C2F395B19006AEE6F /* ReachingModule.m in Sources */,
 				761780ED2CA45674006654EE /* AppDelegate.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -274,7 +282,7 @@
 /* Begin XCBuildConfiguration section */
 		13B07F941A680F5B00A75B9A /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 925AA4B4CFF7A6C1B0EA9D30 /* Pods-shelfscout.debug.xcconfig */;
+			baseConfigurationReference = DCCA6945BA638C8CB86E94A9 /* Pods-shelfscout.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
@@ -284,7 +292,7 @@
 				INFOPLIST_FILE = shelfscout/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = shelfShout;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.navigation";
-				IPHONEOS_DEPLOYMENT_TARGET = 13.4;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -301,6 +309,8 @@
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = "shelfscout-Bridging-Header.h";
+				"SWIFT_OBJC_BRIDGING_HEADER[arch=*]" = "shelfscout-Bridging-Header.h";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
@@ -310,7 +320,7 @@
 		};
 		13B07F951A680F5B00A75B9A /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 7F62D44642DED15BF1AB4ED1 /* Pods-shelfscout.release.xcconfig */;
+			baseConfigurationReference = 5144E27FECB6AFF99AEE8B7F /* Pods-shelfscout.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
@@ -319,7 +329,7 @@
 				INFOPLIST_FILE = shelfscout/Info.plist;
 				INFOPLIST_KEY_CFBundleDisplayName = shelfShout;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.navigation";
-				IPHONEOS_DEPLOYMENT_TARGET = 13.4;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -336,6 +346,7 @@
 				SUPPORTS_MACCATALYST = NO;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
+				SWIFT_OBJC_BRIDGING_HEADER = "shelfscout-Bridging-Header.h";
 				SWIFT_VERSION = 5.0;
 				TARGETED_DEVICE_FAMILY = 1;
 				VERSIONING_SYSTEM = "apple-generic";
@@ -391,7 +402,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					/usr/lib/swift,
 					"$(inherited)",
@@ -461,7 +472,7 @@
 				GCC_WARN_UNINITIALIZED_AUTOS = YES_AGGRESSIVE;
 				GCC_WARN_UNUSED_FUNCTION = YES;
 				GCC_WARN_UNUSED_VARIABLE = YES;
-				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
+				IPHONEOS_DEPLOYMENT_TARGET = 15.6;
 				LD_RUNPATH_SEARCH_PATHS = (
 					/usr/lib/swift,
 					"$(inherited)",
