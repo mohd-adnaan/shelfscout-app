@@ -17,6 +17,7 @@ export interface WorkflowResponse {
   reaching_ios: boolean;
   bbox?: [number, number, number, number];  // [xmin, ymin, xmax, ymax] from Qwen detection
   object?: string;                           // Name of detected object
+  depth?: string;
   
   // Loop control
   loopDelay: number;
@@ -41,6 +42,7 @@ export interface ContinuousModeState {
 export interface IOSReachingParams {
   bbox: [number, number, number, number];
   object: string;
+  depth?: string;
 }
 
 export interface IOSReachingResult {

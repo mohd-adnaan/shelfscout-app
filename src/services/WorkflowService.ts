@@ -3,17 +3,6 @@
  * 
  * WCAG 2.1 Level AA Compliant Workflow Service
  * 
- * UPDATED: Feb 6, 2026 - Priority for reaching_ios over reaching_flag
- * 
- * THREE-FLAG SYSTEM with iOS PRIORITY:
- * - navigation flag: Navigation loop control
- * - reaching_flag: Object guidance/reaching control (Android LLM-based)
- * - reaching_ios: iOS native ARKit reaching trigger (TAKES PRIORITY)
- * 
- * PRIORITY ORDER:
- * 1. reaching_ios=true → Trigger iOS ARKit (stops here, no continuous loop)
- * 2. reaching_flag=true → Start reaching continuous loop (Android-style)
- * 3. navigation=true → Start navigation continuous loop
  */
 
 import axios, { AxiosError } from 'axios';
@@ -23,10 +12,10 @@ import { WorkflowRequest, WorkflowResponse, ContinuousModeState } from '../utils
 import { AccessibilityService } from './AccessibilityService';
 
 // =============================================================================
-// iOS ARKit Native Module Bridge (Nicolas's CybsGuidance)
+// iOS ARKit Native Module Bridge
 // =============================================================================
 
-// This will be the bridge to Nicolas's Swift ViewController
+// This will be the bridge toSwift ViewController
 const { CybsGuidanceModule } = NativeModules;
 
 /**
@@ -451,6 +440,12 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     object = innerPayload.objectName.trim();
   }
 
+  // Depth from backend (meters)
+  let depth: string | undefined;
+  if (innerPayload.depth !== undefined && innerPayload.depth !== null) {
+    depth = String(innerPayload.depth);
+  }
+
   // Loop delay
   let loopDelay = NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS;
   if (typeof innerPayload.loopDelay === 'number' && innerPayload.loopDelay > 0) {
@@ -467,6 +462,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     reaching_ios,
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
     object,
+    depth,
   });
 
   return { 
@@ -476,6 +472,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     reaching_ios,
     bbox,
     object,
+    depth,
     loopDelay,
     session_id,
   };

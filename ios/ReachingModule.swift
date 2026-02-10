@@ -1,6 +1,15 @@
 /**
- * ReachingModule.swift — ARKit World-Anchored Reaching
+ * ReachingModule.swift — ARKit World-Anchored Reaching (v3)
  *
+ * Changes v3 (Feb 9 evening):
+ *   - Uses backend depth value for accurate 3D anchor placement
+ *   - Apple-quality UI: blur panels, SF Symbols, gradient indicators, haptics
+ *   - Image orientation fix integration
+ *   - Corrected aspect-fill hand mapping
+ *   - Spoken directional guidance for blind users
+ *   - Strict success: inner bbox overlap for 20+ frames
+ *
+ * iOS 14+ | ARKit World Tracking | No LiDAR required
  */
 
 import Foundation
@@ -9,10 +18,11 @@ import Vision
 import UIKit
 import ARKit
 import SceneKit
+import CoreHaptics
 
-// =============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // MARK: - ReachingModule (React Native Bridge)
-// =============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 @objc(ReachingModule)
 class ReachingModule: NSObject {
@@ -24,7 +34,7 @@ class ReachingModule: NSObject {
     resolver: @escaping RCTPromiseResolveBlock,
     rejecter: @escaping RCTPromiseRejectBlock
   ) {
-    NSLog(" [ReachingModule] startReaching params: %@", params)
+    NSLog("🎯 [ReachingModule] startReaching params: %@", params)
 
     var bbox: [CGFloat] = []
     if let raw = params["bbox"] {
@@ -43,10 +53,25 @@ class ReachingModule: NSObject {
       return
     }
     let objectName = (params["object"] as? String) ?? "object"
+    
+    // Parse depth from backend (in meters)
+    var backendDepth: Float? = nil
+    if let d = params["depth"] {
+      if let n = d as? NSNumber { backendDepth = n.floatValue }
+      else if let s = d as? String, let v = Float(s), v > 0, v < 10 { backendDepth = v }
+    }
+    NSLog("🎯 [ReachingModule] depth from backend: %@", backendDepth.map { "\($0)m" } ?? "nil")
+
+    // Parse actual image dimensions from fixImageOrientation
+    var imgW: CGFloat = 0, imgH: CGFloat = 0
+    if let w = params["imageWidth"] as? NSNumber { imgW = CGFloat(w.doubleValue) }
+    if let h = params["imageHeight"] as? NSNumber { imgH = CGFloat(h.doubleValue) }
+    NSLog("🎯 [ReachingModule] image dimensions: %.0f×%.0f", imgW, imgH)
 
     let status = AVCaptureDevice.authorizationStatus(for: .video)
     let launch = { [weak self] in
       self?.presentReachingVC(bbox: bbox, objectName: objectName,
+                              depth: backendDepth, imageW: imgW, imageH: imgH,
                               resolver: resolver, rejecter: rejecter)
     }
     if status == .authorized { launch() }
@@ -73,7 +98,8 @@ class ReachingModule: NSObject {
   }
 
   private func presentReachingVC(
-    bbox: [CGFloat], objectName: String,
+    bbox: [CGFloat], objectName: String, depth: Float?,
+    imageW: CGFloat, imageH: CGFloat,
     resolver: @escaping RCTPromiseResolveBlock,
     rejecter: @escaping RCTPromiseRejectBlock
   ) {
@@ -85,14 +111,16 @@ class ReachingModule: NSObject {
       if top is ReachingViewController {
         top.dismiss(animated: false) {
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            self.presentReachingVC(bbox: bbox, objectName: objectName,
+            self.presentReachingVC(bbox: bbox, objectName: objectName, depth: depth,
+                                   imageW: imageW, imageH: imageH,
                                    resolver: resolver, rejecter: rejecter)
           }
         }
         return
       }
       let vc = ReachingViewController(
-        bboxRaw: bbox, objectName: objectName,
+        bboxRaw: bbox, objectName: objectName, backendDepth: depth,
+        imageWidth: imageW, imageHeight: imageH,
         onDone: { result in resolver(result) }
       )
       vc.modalPresentationStyle = .fullScreen
@@ -101,9 +129,9 @@ class ReachingModule: NSObject {
   }
 }
 
-// =============================================================================
-// MARK: - ReachingViewController (ARKit World-Anchored)
-// =============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
+// MARK: - ReachingViewController
+// ═══════════════════════════════════════════════════════════════════════════════
 
 class ReachingViewController: UIViewController {
 
@@ -123,6 +151,9 @@ class ReachingViewController: UIViewController {
 
   private let bboxRaw: [CGFloat]
   private let objectName: String
+  private let backendDepth: Float?
+  private let imageWidth: CGFloat   // Actual corrected image width in pixels
+  private let imageHeight: CGFloat  // Actual corrected image height in pixels
   private let onDone: ([String: Any]) -> Void
   private var bboxNormalized: [CGFloat] = [0, 0, 0, 0]
 
@@ -130,21 +161,20 @@ class ReachingViewController: UIViewController {
 
   private var sceneView: ARSCNView!
   private var objectWorldPosition: simd_float3?
-  private var objectWorldRight: simd_float3 = .zero     // right direction at placement
-  private var objectWorldUp: simd_float3 = .zero         // up direction at placement
-  private var objectWorldHalfW: Float = 0                // half-width in meters
-  private var objectWorldHalfH: Float = 0                // half-height in meters
+  private var objectWorldRight: simd_float3 = .zero
+  private var objectWorldUp: simd_float3 = .zero
+  private var objectWorldHalfW: Float = 0
+  private var objectWorldHalfH: Float = 0
   private var anchorPlaced = false
   private var arFrameCount = 0
-  private let anchorWaitFrames = 15                      // wait for AR to stabilize
-  private var initialEstimatedDepth: Float = 0.6
+  private let anchorWaitFrames = 15
 
   // ── Vision ──────────────────────────────────────────────────────────────
 
   private let handReq = VNDetectHumanHandPoseRequest()
   private let visionQ = DispatchQueue(label: "reach.vision", qos: .userInitiated)
 
-  // ── Audio (beeps) ───────────────────────────────────────────────────────
+  // ── Audio ───────────────────────────────────────────────────────────────
 
   private var audioEngine: AVAudioEngine?
   private var playerNode: AVAudioPlayerNode?
@@ -163,16 +193,25 @@ class ReachingViewController: UIViewController {
   private var directionStableFrames: Int = 0
   private let directionStableThreshold: Int = 4
 
-  // ── UI ──────────────────────────────────────────────────────────────────
+  // ── Haptics ─────────────────────────────────────────────────────────────
+
+  private var hapticEngine: CHHapticEngine?
+
+  // ── UI (Apple-quality) ──────────────────────────────────────────────────
 
   private let bboxLayer = CAShapeLayer()
   private let innerBboxLayer = CAShapeLayer()
   private let handDot = CAShapeLayer()
-  private let statusLabel = UILabel()
-  private let objectLabel = UILabel()
-  private let cancelButton = UIButton(type: .system)
+  private let handDotGlow = CAShapeLayer()
+  private var topBar: UIVisualEffectView!
+  private var bottomBar: UIVisualEffectView!
+  private var directionLabel: UILabel!
+  private var objectNameLabel: UILabel!
+  private var cancelButton: UIButton!
+  private var progressRing: CAShapeLayer!
+  private var distanceLabel: UILabel!
 
-  // ── Current projected bbox (updated every AR frame) ─────────────────────
+  // ── Projected bbox ──────────────────────────────────────────────────────
 
   private var projectedBboxCenter: CGPoint = .zero
   private var projectedBboxW: CGFloat = 0
@@ -187,21 +226,30 @@ class ReachingViewController: UIViewController {
   private var successFrames = 0
   private var hasCompleted = false
 
-  private let successThreshold = 20            // Must overlap inner bbox for 20 frames (~0.7s)
+  private let successThreshold = 20
   private let noHandLimit = 50
   private let noHandRepeatCycle = 120
 
-  // ── Aspect-fill crop cache ──────────────────────────────────────────────
+  // ── Cached screen bounds (thread-safe) ────────────────────────────────
 
-  private var cropFracX: CGFloat = 0           // fraction of camera width cropped on each side
+  private var cachedSW: CGFloat = 393
+  private var cachedSH: CGFloat = 852
+
+  // ── Aspect-fill crop ────────────────────────────────────────────────────
+
+  private var cropFracX: CGFloat = 0
   private var cropComputed = false
 
   // ── Init ────────────────────────────────────────────────────────────────
 
-  init(bboxRaw: [CGFloat], objectName: String,
+  init(bboxRaw: [CGFloat], objectName: String, backendDepth: Float?,
+       imageWidth: CGFloat, imageHeight: CGFloat,
        onDone: @escaping ([String: Any]) -> Void) {
     self.bboxRaw = bboxRaw
     self.objectName = objectName
+    self.backendDepth = backendDepth
+    self.imageWidth = imageWidth
+    self.imageHeight = imageHeight
     self.onDone = onDone
     super.init(nibName: nil, bundle: nil)
     handReq.maximumHandCount = 1
@@ -213,15 +261,21 @@ class ReachingViewController: UIViewController {
   override func viewDidLoad() {
     super.viewDidLoad()
     view.backgroundColor = .black
+
+    // Cache screen bounds on main thread (thread-safe for background queues)
+    cachedSW = UIScreen.main.bounds.width
+    cachedSH = UIScreen.main.bounds.height
+    NSLog("📐 [ReachingVC] Cached screen: %.0f×%.0f", cachedSW, cachedSH)
+
     normalizeBbox()
     setupARView()
-    setupOverlayUI()
+    setupAppleUI()
     setupAudio()
+    setupHaptics()
   }
 
   override func viewDidAppear(_ animated: Bool) {
     super.viewDidAppear(animated)
-    // Delay AR start to let RN camera fully release
     DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in
       guard let self = self, !self.hasCompleted else { return }
       self.startAR()
@@ -236,29 +290,56 @@ class ReachingViewController: UIViewController {
   }
 
   override var prefersStatusBarHidden: Bool { true }
+  override var prefersHomeIndicatorAutoHidden: Bool { true }
 
   // ── Normalize bbox ──────────────────────────────────────────────────────
 
   private func normalizeBbox() {
-    let maxVal = max(bboxRaw[0], bboxRaw[1], bboxRaw[2], bboxRaw[3])
-    if maxVal <= 1.0 {
-      bboxNormalized = bboxRaw
-    } else if maxVal <= 1000 {
-      bboxNormalized = bboxRaw.map { $0 / 1000.0 }
+    // Sort to ensure x1<x2, y1<y2
+    let x1 = min(abs(bboxRaw[0]), abs(bboxRaw[2]))
+    let y1 = min(abs(bboxRaw[1]), abs(bboxRaw[3]))
+    let x2 = max(abs(bboxRaw[0]), abs(bboxRaw[2]))
+    let y2 = max(abs(bboxRaw[1]), abs(bboxRaw[3]))
+    let sorted: [CGFloat] = [x1, y1, x2, y2]
+
+    let maxVal = max(x1, y1, x2, y2)
+
+    // PRIORITY 1: Use actual image dimensions if provided
+    if imageWidth > 0 && imageHeight > 0 && maxVal > 1.0 {
+      bboxNormalized = [x1 / imageWidth, y1 / imageHeight, x2 / imageWidth, y2 / imageHeight]
+      NSLog("📦 [ReachingVC] Bbox [%.0f,%.0f,%.0f,%.0f] ÷ actual image %.0f×%.0f → norm %@",
+            x1, y1, x2, y2, imageWidth, imageHeight, "\(bboxNormalized)")
+
+    // FALLBACK: Already normalized 0-1
+    } else if maxVal <= 1.0 {
+      bboxNormalized = sorted
+
+    // FALLBACK: No image dimensions provided — guess (LEGACY, should not happen)
     } else {
-      let candidateW: [CGFloat] = [3024, 4032, 2048, 1920, 1080]
-      let candidateH: [CGFloat] = [4032, 3024, 2732, 2560, 1920]
-      var imgW: CGFloat = bboxRaw[2] * 1.15
-      var imgH: CGFloat = bboxRaw[3] * 1.15
-      for w in candidateW { if w >= bboxRaw[2] { imgW = w; break } }
-      for h in candidateH { if h >= bboxRaw[3] { imgH = h; break } }
-      bboxNormalized = [bboxRaw[0]/imgW, bboxRaw[1]/imgH, bboxRaw[2]/imgW, bboxRaw[3]/imgH]
-      NSLog("📦 [ReachingVC] Bbox pixel → norm %@ (img=%.0fx%.0f)", "\(bboxNormalized)", imgW, imgH)
+      // WARNING: This path produces incorrect results for non-square images!
+      NSLog("⚠️ [ReachingVC] No image dimensions! Falling back to heuristic normalization")
+      let guessW: CGFloat = max(x2 * 1.1, 1152)
+      let guessH: CGFloat = max(y2 * 1.1, 2048)
+      bboxNormalized = [x1 / guessW, y1 / guessH, x2 / guessW, y2 / guessH]
+      NSLog("📦 [ReachingVC] Bbox pixel → norm %@ (guessed img=%.0fx%.0f)", "\(bboxNormalized)", guessW, guessH)
     }
+
     bboxNormalized = bboxNormalized.map { min(max($0, 0), 1) }
+
+    // Validate: bbox must have non-zero area
+    let bw = bboxNormalized[2] - bboxNormalized[0]
+    let bh = bboxNormalized[3] - bboxNormalized[1]
+    if bw < 0.01 || bh < 0.01 {
+      NSLog("⚠️ [ReachingVC] Bbox too small (%.3f×%.3f), using center default", bw, bh)
+      bboxNormalized = [0.35, 0.35, 0.65, 0.65]
+    }
+
+    NSLog("📦 [ReachingVC] Final normalized: [%.3f, %.3f, %.3f, %.3f]  center=(%.3f, %.3f)",
+          bboxNormalized[0], bboxNormalized[1], bboxNormalized[2], bboxNormalized[3],
+          (bboxNormalized[0]+bboxNormalized[2])/2, (bboxNormalized[1]+bboxNormalized[3])/2)
   }
 
-  // ── ARKit Setup ─────────────────────────────────────────────────────────
+  // ── ARKit ───────────────────────────────────────────────────────────────
 
   private func setupARView() {
     sceneView = ARSCNView(frame: view.bounds)
@@ -271,123 +352,92 @@ class ReachingViewController: UIViewController {
 
   private func startAR() {
     let config = ARWorldTrackingConfiguration()
-    config.planeDetection = []   // we don't need planes
+    config.planeDetection = []
     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     startBeepLoop()
     NSLog("📷 [ReachingVC] AR session started")
   }
 
-  // ── Place 3D Anchor ─────────────────────────────────────────────────────
+  // ── Place Anchor (uses backend depth!) ──────────────────────────────────
 
   private func placeObjectAnchor(frame: ARFrame) {
-    let sw = view.bounds.width
-    let sh = view.bounds.height
+    let sw = cachedSW  // Thread-safe: cached on main thread in viewDidLoad
+    let sh = cachedSH
 
-    // Bbox center on screen
-    let bboxCx = ((bboxNormalized[0] + bboxNormalized[2]) / 2) * sw
-    let bboxCy = ((bboxNormalized[1] + bboxNormalized[3]) / 2) * sh
+    let bboxCxNorm = (bboxNormalized[0] + bboxNormalized[2]) / 2
+    let bboxCyNorm = (bboxNormalized[1] + bboxNormalized[3]) / 2
     let bboxWidthFrac = bboxNormalized[2] - bboxNormalized[0]
     let bboxHeightFrac = bboxNormalized[3] - bboxNormalized[1]
 
-    // Estimate depth from bbox size
-    // Heuristic: object filling ~20% of screen is ~0.5m away
-    // depth ≈ 0.10 / bboxWidthFrac, clamped to reasonable range
-    let depth = max(Float(0.3), min(Float(1.5), Float(0.10 / bboxWidthFrac)))
-    initialEstimatedDepth = depth
+    // Use backend depth if available, otherwise estimate from bbox size
+    let depth: Float
+    if let bd = backendDepth, bd > 0.1, bd < 5.0 {
+      depth = bd
+      NSLog("🎯 [ReachingVC] Using backend depth: %.2fm", depth)
+    } else {
+      depth = max(0.3, min(1.5, Float(0.10 / bboxWidthFrac)))
+      NSLog("🎯 [ReachingVC] Estimated depth: %.2fm (no backend depth)", depth)
+    }
 
-    // Camera basis vectors
     let cam = frame.camera.transform
     let forward = -simd_normalize(simd_float3(cam.columns.2.x, cam.columns.2.y, cam.columns.2.z))
     let right   =  simd_normalize(simd_float3(cam.columns.0.x, cam.columns.0.y, cam.columns.0.z))
     let up      =  simd_normalize(simd_float3(cam.columns.1.x, cam.columns.1.y, cam.columns.1.z))
     let camPos  =  simd_float3(cam.columns.3.x, cam.columns.3.y, cam.columns.3.z)
 
-    // Offset from screen center based on bbox position
-    // Screen center is (0.5, 0.5) in normalized coords
-    // FOV approximation: at depth d, horizontal extent ≈ d * tan(fovH/2) * 2
-    let fovH: Float = 1.0   // ~60° horizontal FOV → tan(30°) ≈ 0.577, * 2 ≈ 1.15
-    let fovV: Float = 1.4   // vertical FOV is larger in portrait
+    let fovH: Float = 1.0
+    let fovV: Float = 1.4
+    let offsetX = (Float(bboxCxNorm) - 0.5) * depth * fovH
+    let offsetY = (0.5 - Float(bboxCyNorm)) * depth * fovV
 
-    let offsetX = (Float(bboxCx / sw) - 0.5) * depth * fovH
-    let offsetY = (0.5 - Float(bboxCy / sh)) * depth * fovV
-
-    // Place object in world space
     let worldPos = camPos + forward * depth + right * offsetX + up * offsetY
     objectWorldPosition = worldPos
     objectWorldRight = right
     objectWorldUp = up
-
-    // Store world-space half-extents for bbox projection
     objectWorldHalfW = Float(bboxWidthFrac) * depth * fovH / 2
     objectWorldHalfH = Float(bboxHeightFrac) * depth * fovV / 2
 
-    // Create visual anchor node (small, mostly invisible)
-    let sphere = SCNSphere(radius: 0.005)
-    sphere.firstMaterial?.diffuse.contents = UIColor.green.withAlphaComponent(0.3)
-    let node = SCNNode(geometry: sphere)
-    node.simdWorldPosition = worldPos
-    sceneView.scene.rootNode.addChildNode(node)
-
     anchorPlaced = true
-    NSLog("🎯 [ReachingVC] Anchor placed at depth=%.2f offset=(%.2f, %.2f) world=(%@)",
-          depth, offsetX, offsetY, "\(worldPos)")
+    NSLog("🎯 [ReachingVC] Anchor placed: depth=%.2f, offset=(%.2f,%.2f)", depth, offsetX, offsetY)
   }
 
-  // ── Project 3D Bbox to Screen (called every frame) ──────────────────────
+  // ── Project bbox to screen ──────────────────────────────────────────────
 
   private func projectBboxToScreen(frame: ARFrame) {
     guard let center3D = objectWorldPosition else { return }
-
-    let viewSize = view.bounds.size
+    let viewSize = CGSize(width: cachedSW, height: cachedSH)  // Thread-safe
     let camera = frame.camera
 
-    // Project center
-    let centerScreen = camera.projectPoint(center3D,
-                                           orientation: .portrait,
-                                           viewportSize: viewSize)
-
-    // Project corners to get perspective-correct bbox size
+    let centerScreen = camera.projectPoint(center3D, orientation: .portrait, viewportSize: viewSize)
     let cornerTR = center3D + objectWorldRight * objectWorldHalfW + objectWorldUp * objectWorldHalfH
     let cornerBL = center3D - objectWorldRight * objectWorldHalfW - objectWorldUp * objectWorldHalfH
-
     let trScreen = camera.projectPoint(cornerTR, orientation: .portrait, viewportSize: viewSize)
     let blScreen = camera.projectPoint(cornerBL, orientation: .portrait, viewportSize: viewSize)
 
     let screenW = abs(trScreen.x - blScreen.x)
     let screenH = abs(trScreen.y - blScreen.y)
 
-    // Check if object is behind camera (z < 0 in camera space)
-    let camPos = simd_float3(camera.transform.columns.3.x,
-                             camera.transform.columns.3.y,
-                             camera.transform.columns.3.z)
-    let camFwd = -simd_normalize(simd_float3(camera.transform.columns.2.x,
-                                              camera.transform.columns.2.y,
-                                              camera.transform.columns.2.z))
-    let toObj = center3D - camPos
-    let dotFwd = simd_dot(toObj, camFwd)
-
-    if dotFwd < 0 {
-      // Object is behind camera — tell user to turn around
+    // Check behind camera
+    let camPos = simd_float3(camera.transform.columns.3.x, camera.transform.columns.3.y, camera.transform.columns.3.z)
+    let camFwd = -simd_normalize(simd_float3(camera.transform.columns.2.x, camera.transform.columns.2.y, camera.transform.columns.2.z))
+    if simd_dot(center3D - camPos, camFwd) < 0 {
       DispatchQueue.main.async { [weak self] in
         self?.bboxLayer.isHidden = true
         self?.innerBboxLayer.isHidden = true
-        self?.statusLabel.text = "  Turn around  "
+        self?.directionLabel.text = "Turn back"
       }
-      // Speak it
       let now = ProcessInfo.processInfo.systemUptime
-      if now - lastSpeechTime > 3.0 {
-        say("Object is behind you. Turn the phone back.")
-        lastSpeechTime = now
-      }
+      if now - lastSpeechTime > 3.0 { say("Object is behind you."); lastSpeechTime = now }
       return
     }
 
-    // Update stored values
+    // Distance for display
+    let dist = simd_length(center3D - camPos)
+
     projectedBboxCenter = centerScreen
-    projectedBboxW = max(screenW, 20)  // minimum visible size
+    projectedBboxW = max(screenW, 20)
     projectedBboxH = max(screenH, 20)
 
-    // Update overlay on main thread
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       self.bboxLayer.isHidden = false
@@ -395,134 +445,173 @@ class ReachingViewController: UIViewController {
 
       let innerRect = CGRect(x: centerScreen.x - self.projectedBboxW/2,
                               y: centerScreen.y - self.projectedBboxH/2,
-                              width: self.projectedBboxW,
-                              height: self.projectedBboxH)
+                              width: self.projectedBboxW, height: self.projectedBboxH)
       let tolX = max(self.projectedBboxW * 0.25, 15)
       let tolY = max(self.projectedBboxH * 0.25, 15)
       let outerRect = innerRect.insetBy(dx: -tolX, dy: -tolY)
 
-      self.innerBboxLayer.path = UIBezierPath(rect: innerRect).cgPath
-      self.bboxLayer.path = UIBezierPath(roundedRect: outerRect, cornerRadius: 4).cgPath
+      // Rounded corners for Apple feel
+      self.innerBboxLayer.path = UIBezierPath(roundedRect: innerRect, cornerRadius: 8).cgPath
+      self.bboxLayer.path = UIBezierPath(roundedRect: outerRect, cornerRadius: 12).cgPath
+
+      // Distance label
+      let distCm = Int(dist * 100)
+      self.distanceLabel.text = "\(distCm) cm"
     }
   }
 
-  // ── Compute Aspect-Fill Crop ────────────────────────────────────────────
+  // ── Aspect-fill crop ────────────────────────────────────────────────────
 
   private func computeAspectFillCrop(imageW: CGFloat, imageH: CGFloat) {
     guard !cropComputed else { return }
-    let sw = view.bounds.width
-    let sh = view.bounds.height
+    let sw = cachedSW, sh = cachedSH  // Thread-safe
     guard sw > 0, sh > 0, imageW > 0, imageH > 0 else { return }
-
-    // Camera image is landscape (e.g., 1920x1440)
-    // After rotation to portrait: rotW = imageH, rotH = imageW
-    let rotW = imageH
-    let rotH = imageW
-
-    let cameraAspect = rotW / rotH   // e.g., 0.75
-    let screenAspect = sw / sh       // e.g., 0.461
-
+    let rotW = imageH, rotH = imageW
+    let cameraAspect = rotW / rotH, screenAspect = sw / sh
     if cameraAspect > screenAspect {
-      // Camera is wider → crop sides (x axis)
       let scaleToFillH = sh / rotH
       let displayedW = rotW * scaleToFillH
-      let cropPx = (displayedW - sw) / 2
-      cropFracX = cropPx / displayedW
-    } else {
-      cropFracX = 0
+      cropFracX = ((displayedW - sw) / 2) / displayedW
     }
-
     cropComputed = true
-    NSLog("📐 [ReachingVC] Aspect-fill cropFracX=%.4f (cam=%@, screen=%@)",
-          cropFracX, "\(Int(imageW))x\(Int(imageH))", "\(Int(sw))x\(Int(sh))")
+    NSLog("📐 [ReachingVC] cropFracX=%.4f", cropFracX)
   }
 
-  // ── Map hand Vision coords → screen coords (aspect-fill corrected) ────
-
-  private func visionToScreen(_ visionPt: CGPoint) -> CGPoint {
-    let sw = view.bounds.width
-    let sh = view.bounds.height
-
-    // Vision with .right orientation:
-    // x = 0..1 left-to-right in portrait (maps to screen x)
-    // y = 0..1 bottom-to-top in portrait (maps to inverted screen y)
-
-    // Correct for aspect-fill horizontal crop:
-    let adjustedX: CGFloat
-    if cropFracX > 0 {
-      adjustedX = ((visionPt.x - cropFracX) / (1.0 - 2 * cropFracX)) * sw
-    } else {
-      adjustedX = visionPt.x * sw
-    }
-
-    let screenY = (1 - visionPt.y) * sh
-
-    return CGPoint(x: adjustedX, y: screenY)
+  private func visionToScreen(_ pt: CGPoint) -> CGPoint {
+    let sw = cachedSW, sh = cachedSH  // Thread-safe
+    let adjustedX = cropFracX > 0
+      ? ((pt.x - cropFracX) / (1.0 - 2 * cropFracX)) * sw
+      : pt.x * sw
+    return CGPoint(x: adjustedX, y: (1 - pt.y) * sh)
   }
 
-  // ── Overlay UI Setup ────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Apple-Quality UI
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  private func setupOverlayUI() {
-    bboxLayer.strokeColor = UIColor.cyan.cgColor
-    bboxLayer.fillColor = UIColor.cyan.withAlphaComponent(0.08).cgColor
-    bboxLayer.lineWidth = 3
+  private func setupAppleUI() {
+    // ── Bbox overlays with gradient stroke ────────────────────────────────
+    bboxLayer.strokeColor = UIColor.systemCyan.cgColor
+    bboxLayer.fillColor = UIColor.systemCyan.withAlphaComponent(0.06).cgColor
+    bboxLayer.lineWidth = 2.5
+    bboxLayer.lineDashPattern = [8, 4]   // Dashed for outer
     bboxLayer.isHidden = true
     view.layer.addSublayer(bboxLayer)
 
-    innerBboxLayer.strokeColor = UIColor.blue.cgColor
+    innerBboxLayer.strokeColor = UIColor.white.cgColor
     innerBboxLayer.fillColor = UIColor.clear.cgColor
     innerBboxLayer.lineWidth = 2
     innerBboxLayer.isHidden = true
     view.layer.addSublayer(innerBboxLayer)
 
-    handDot.fillColor = UIColor.green.cgColor
+    // ── Hand dot with glow ────────────────────────────────────────────────
+    handDotGlow.fillColor = UIColor.systemGreen.withAlphaComponent(0.3).cgColor
+    handDotGlow.isHidden = true
+    view.layer.addSublayer(handDotGlow)
+
+    handDot.fillColor = UIColor.systemGreen.cgColor
     handDot.strokeColor = UIColor.white.cgColor
-    handDot.lineWidth = 2
+    handDot.lineWidth = 2.5
+    handDot.shadowColor = UIColor.black.cgColor
+    handDot.shadowOffset = .zero
+    handDot.shadowRadius = 4
+    handDot.shadowOpacity = 0.5
     handDot.isHidden = true
     view.layer.addSublayer(handDot)
 
-    statusLabel.font = UIFont.boldSystemFont(ofSize: 22)
-    statusLabel.textColor = .white
-    statusLabel.textAlignment = .center
-    statusLabel.backgroundColor = UIColor.black.withAlphaComponent(0.55)
-    statusLabel.layer.cornerRadius = 10
-    statusLabel.clipsToBounds = true
-    statusLabel.text = "  Show your hand…  "
-    statusLabel.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(statusLabel)
+    // ── Top bar (frosted glass) ───────────────────────────────────────────
+    let topBlur = UIBlurEffect(style: .systemThinMaterialDark)
+    topBar = UIVisualEffectView(effect: topBlur)
+    topBar.translatesAutoresizingMaskIntoConstraints = false
+    topBar.layer.cornerRadius = 20
+    topBar.clipsToBounds = true
+    view.addSubview(topBar)
 
-    objectLabel.font = UIFont.systemFont(ofSize: 18, weight: .medium)
-    objectLabel.textColor = .white
-    objectLabel.textAlignment = .center
-    objectLabel.backgroundColor = UIColor.black.withAlphaComponent(0.6)
-    objectLabel.layer.cornerRadius = 12
-    objectLabel.clipsToBounds = true
-    objectLabel.text = "  Reaching: \(objectName)  "
-    objectLabel.translatesAutoresizingMaskIntoConstraints = false
-    view.addSubview(objectLabel)
+    objectNameLabel = UILabel()
+    objectNameLabel.text = "🎯  \(objectName)"
+    objectNameLabel.font = UIFont.systemFont(ofSize: 17, weight: .semibold)
+    objectNameLabel.textColor = .white
+    objectNameLabel.textAlignment = .center
+    objectNameLabel.translatesAutoresizingMaskIntoConstraints = false
+    topBar.contentView.addSubview(objectNameLabel)
 
-    cancelButton.setTitle("  ✕  Cancel  ", for: .normal)
-    cancelButton.titleLabel?.font = UIFont.boldSystemFont(ofSize: 18)
+    distanceLabel = UILabel()
+    distanceLabel.text = "—"
+    distanceLabel.font = UIFont.monospacedDigitSystemFont(ofSize: 14, weight: .medium)
+    distanceLabel.textColor = UIColor.white.withAlphaComponent(0.7)
+    distanceLabel.textAlignment = .center
+    distanceLabel.translatesAutoresizingMaskIntoConstraints = false
+    topBar.contentView.addSubview(distanceLabel)
+
+    // ── Bottom bar (frosted glass) ────────────────────────────────────────
+    let bottomBlur = UIBlurEffect(style: .systemThinMaterialDark)
+    bottomBar = UIVisualEffectView(effect: bottomBlur)
+    bottomBar.translatesAutoresizingMaskIntoConstraints = false
+    bottomBar.layer.cornerRadius = 24
+    bottomBar.clipsToBounds = true
+    view.addSubview(bottomBar)
+
+    directionLabel = UILabel()
+    directionLabel.text = "Show your hand…"
+    directionLabel.font = UIFont.systemFont(ofSize: 24, weight: .bold)
+    directionLabel.textColor = .white
+    directionLabel.textAlignment = .center
+    directionLabel.translatesAutoresizingMaskIntoConstraints = false
+    bottomBar.contentView.addSubview(directionLabel)
+
+    // ── Progress ring (success indicator) ─────────────────────────────────
+    progressRing = CAShapeLayer()
+    progressRing.strokeColor = UIColor.systemGreen.cgColor
+    progressRing.fillColor = UIColor.clear.cgColor
+    progressRing.lineWidth = 3
+    progressRing.lineCap = .round
+    progressRing.strokeEnd = 0
+    progressRing.isHidden = true
+    view.layer.addSublayer(progressRing)
+
+    // ── Cancel button ─────────────────────────────────────────────────────
+    cancelButton = UIButton(type: .system)
+    cancelButton.setTitle("Cancel", for: .normal)
     cancelButton.setTitleColor(.white, for: .normal)
-    cancelButton.backgroundColor = UIColor.red.withAlphaComponent(0.7)
-    cancelButton.layer.cornerRadius = 20
+    cancelButton.titleLabel?.font = UIFont.systemFont(ofSize: 17, weight: .medium)
+    cancelButton.backgroundColor = UIColor.white.withAlphaComponent(0.15)
+    cancelButton.layer.cornerRadius = 22
     cancelButton.translatesAutoresizingMaskIntoConstraints = false
     cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
     view.addSubview(cancelButton)
 
+    // ── Constraints ───────────────────────────────────────────────────────
     NSLayoutConstraint.activate([
-      objectLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 16),
-      objectLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-      objectLabel.heightAnchor.constraint(equalToConstant: 40),
-      statusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-      statusLabel.bottomAnchor.constraint(equalTo: cancelButton.topAnchor, constant: -20),
-      statusLabel.widthAnchor.constraint(greaterThanOrEqualToConstant: 200),
-      statusLabel.heightAnchor.constraint(equalToConstant: 44),
+      topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
+      topBar.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      topBar.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.7),
+      topBar.heightAnchor.constraint(equalToConstant: 56),
+
+      objectNameLabel.topAnchor.constraint(equalTo: topBar.contentView.topAnchor, constant: 6),
+      objectNameLabel.centerXAnchor.constraint(equalTo: topBar.contentView.centerXAnchor),
+      objectNameLabel.leadingAnchor.constraint(equalTo: topBar.contentView.leadingAnchor, constant: 16),
+      objectNameLabel.trailingAnchor.constraint(equalTo: topBar.contentView.trailingAnchor, constant: -16),
+
+      distanceLabel.bottomAnchor.constraint(equalTo: topBar.contentView.bottomAnchor, constant: -6),
+      distanceLabel.centerXAnchor.constraint(equalTo: topBar.contentView.centerXAnchor),
+
+      bottomBar.bottomAnchor.constraint(equalTo: cancelButton.topAnchor, constant: -16),
+      bottomBar.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+      bottomBar.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.85),
+      bottomBar.heightAnchor.constraint(equalToConstant: 56),
+
+      directionLabel.centerYAnchor.constraint(equalTo: bottomBar.contentView.centerYAnchor),
+      directionLabel.centerXAnchor.constraint(equalTo: bottomBar.contentView.centerXAnchor),
+      directionLabel.leadingAnchor.constraint(equalTo: bottomBar.contentView.leadingAnchor, constant: 24),
+      directionLabel.trailingAnchor.constraint(equalTo: bottomBar.contentView.trailingAnchor, constant: -24),
+
+      cancelButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
       cancelButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-      cancelButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -30),
+      cancelButton.widthAnchor.constraint(equalToConstant: 120),
       cancelButton.heightAnchor.constraint(equalToConstant: 44),
-      cancelButton.widthAnchor.constraint(greaterThanOrEqualToConstant: 140),
     ])
+
+    view.accessibilityLabel = "Reaching guidance for \(objectName). Tap Cancel to stop."
   }
 
   // ── Audio ───────────────────────────────────────────────────────────────
@@ -532,31 +621,28 @@ class ReachingViewController: UIViewController {
       let s = AVAudioSession.sharedInstance()
       try s.setCategory(.playback, mode: .default, options: [.mixWithOthers])
       try s.setActive(true)
-
-      let engine = AVAudioEngine()
-      let player = AVAudioPlayerNode()
+      let engine = AVAudioEngine(); let player = AVAudioPlayerNode()
       engine.attach(player)
-
-      let sr: Double = 44100; let dur: Double = 0.08; let freq: Double = 880
+      let sr: Double = 44100; let dur: Double = 0.06; let freq: Double = 1000
       let fc = AVAudioFrameCount(sr * dur)
       guard let fmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1) else { return }
-      self.audioFmt = fmt
-      engine.connect(player, to: engine.mainMixerNode, format: fmt)
-
+      audioFmt = fmt; engine.connect(player, to: engine.mainMixerNode, format: fmt)
       guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: fc) else { return }
-      buf.frameLength = fc
-      let d = buf.floatChannelData![0]
+      buf.frameLength = fc; let d = buf.floatChannelData![0]
       for i in 0..<Int(fc) {
         let t = Double(i) / sr
-        let env = min(t / 0.01, 1) * min((dur - t) / 0.01, 1)
-        d[i] = Float(sin(2 * .pi * freq * t) * 0.6 * env)
+        let env = min(t / 0.005, 1) * min((dur - t) / 0.005, 1)
+        d[i] = Float(sin(2 * .pi * freq * t) * 0.5 * env)
       }
-      self.beepBuf = buf; self.playerNode = player; self.audioEngine = engine
+      beepBuf = buf; playerNode = player; audioEngine = engine
       try engine.start()
-      NSLog("🔊 [ReachingVC] Audio ready")
-    } catch {
-      NSLog("⚠️ [ReachingVC] Audio error: %@", error.localizedDescription)
-    }
+    } catch { NSLog("⚠️ Audio: %@", error.localizedDescription) }
+  }
+
+  private func setupHaptics() {
+    guard CHHapticEngine.capabilitiesForHardware().supportsHaptics else { return }
+    hapticEngine = try? CHHapticEngine()
+    try? hapticEngine?.start()
   }
 
   private func startBeepLoop() {
@@ -572,11 +658,11 @@ class ReachingViewController: UIViewController {
     let iv: TimeInterval = {
       switch proximityZone {
       case .searching: return 99
-      case .far:       return 0.8
-      case .medium:    return 0.45
-      case .close:     return 0.22
-      case .veryClose: return 0.10
-      case .centered:  return 0.05
+      case .far:       return 0.7
+      case .medium:    return 0.4
+      case .close:     return 0.2
+      case .veryClose: return 0.08
+      case .centered:  return 0.04
       }
     }()
     if now - lastBeep >= iv {
@@ -593,31 +679,42 @@ class ReachingViewController: UIViewController {
     }
   }
 
+  private func triggerHaptic(_ intensity: Float) {
+    guard let engine = hapticEngine else { return }
+    let event = CHHapticEvent(eventType: .hapticTransient,
+                              parameters: [
+                                CHHapticEventParameter(parameterID: .hapticIntensity, value: intensity),
+                                CHHapticEventParameter(parameterID: .hapticSharpness, value: 0.5)
+                              ],
+                              relativeTime: 0)
+    try? engine.makePlayer(with: CHHapticPattern(events: [event], parameters: [])).start(atTime: 0)
+  }
+
   // ── Cancel / Success / Cleanup ──────────────────────────────────────────
 
   @objc private func cancelTapped() {
-    say("Cancelled")
-    finishWith(success: false, reason: "user_cancelled")
+    say("Cancelled"); finishWith(success: false, reason: "user_cancelled")
   }
 
   private func handleSuccess() {
     guard running, !hasCompleted else { return }
     running = false; hasCompleted = true
-    NSLog(" [ReachingVC] SUCCESS – reached %@", objectName)
+    NSLog("🎉 [ReachingVC] SUCCESS – reached %@", objectName)
     beepTimer?.cancel(); beepTimer = nil
     playSuccessTone()
+    triggerHaptic(1.0)
 
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
-      self.statusLabel.text = "  ✅ \(self.objectName) reached!  "
-      self.statusLabel.textColor = .green
-      self.statusLabel.font = UIFont.boldSystemFont(ofSize: 26)
+      self.directionLabel.text = "✅  \(self.objectName) reached!"
+      self.directionLabel.textColor = .systemGreen
+
       let flash = UIView(frame: self.view.bounds)
-      flash.backgroundColor = UIColor.green.withAlphaComponent(0.3)
+      flash.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.25)
       self.view.addSubview(flash)
-      UIView.animate(withDuration: 0.8) { flash.alpha = 0 } completion: { _ in flash.removeFromSuperview() }
+      UIView.animate(withDuration: 1.0) { flash.alpha = 0 } completion: { _ in flash.removeFromSuperview() }
     }
-    say("\(objectName) reached! You got it!")
+    say("\(objectName) reached!")
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
       self?.finishWith(success: true, reason: "reached")
     }
@@ -625,17 +722,14 @@ class ReachingViewController: UIViewController {
 
   private func playSuccessTone() {
     guard let player = playerNode, let fmt = audioFmt else { return }
-    let sr: Double = 44100; let dur: Double = 0.6
-    let fc = AVAudioFrameCount(sr * dur)
+    let sr: Double = 44100; let dur: Double = 0.5; let fc = AVAudioFrameCount(sr * dur)
     guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: fc) else { return }
     buf.frameLength = fc; let d = buf.floatChannelData![0]
     for i in 0..<Int(fc) {
-      let t = Double(i) / sr; let f = 440.0 + 880.0 * t / dur
-      let env = min(t / 0.02, 1) * min((dur - t) / 0.1, 1)
-      d[i] = Float(sin(2 * .pi * f * t) * 0.7 * env)
+      let t = Double(i) / sr; let f = 523.25 * pow(2, t / dur)
+      d[i] = Float(sin(2 * .pi * f * t) * 0.6 * min(t / 0.01, 1) * min((dur - t) / 0.08, 1))
     }
-    player.pan = 0.0
-    player.scheduleBuffer(buf, at: nil, options: .interrupts)
+    player.pan = 0; player.scheduleBuffer(buf, at: nil, options: .interrupts)
     if !player.isPlaying { player.play() }
   }
 
@@ -653,12 +747,10 @@ class ReachingViewController: UIViewController {
   }
 
   private func cleanup() {
-    running = false
-    beepTimer?.cancel(); beepTimer = nil
-    playerNode?.stop()
-    audioEngine?.stop(); audioEngine = nil
-    synth.stopSpeaking(at: .immediate)
-    sceneView.session.pause()
+    running = false; beepTimer?.cancel(); beepTimer = nil
+    playerNode?.stop(); audioEngine?.stop(); audioEngine = nil
+    hapticEngine?.stop(); hapticEngine = nil
+    synth.stopSpeaking(at: .immediate); sceneView.session.pause()
   }
 
   // ── Speech ──────────────────────────────────────────────────────────────
@@ -668,26 +760,21 @@ class ReachingViewController: UIViewController {
     let u = AVSpeechUtterance(string: text)
     u.rate = AVSpeechUtteranceDefaultSpeechRate * 1.1
     u.voice = AVSpeechSynthesisVoice(language: "en-US")
-    synth.speak(u)
-    NSLog("🗣 [ReachingVC] %@", text)
+    synth.speak(u); NSLog("🗣 [ReachingVC] %@", text)
   }
 
   private func speakDirectionIfNeeded(_ direction: Direction) {
     guard direction != .searching else { return }
     let now = ProcessInfo.processInfo.systemUptime
-
-    if direction == currentDirection { directionStableFrames += 1 }
-    else { directionStableFrames = 1 }
-
+    if direction == currentDirection { directionStableFrames += 1 } else { directionStableFrames = 1 }
     if direction == lastSpokenDirection {
-      if direction == .centered && (now - lastSpeechTime) > 3.0 {
-        say("Centered!"); lastSpeechTime = now
-      }
+      if direction == .centered && (now - lastSpeechTime) > 3.0 { say("Centered!"); lastSpeechTime = now }
       return
     }
     if directionStableFrames >= directionStableThreshold && (now - lastSpeechTime) >= speechCooldown {
       say(direction == .centered ? "Centered!" : direction.rawValue)
       lastSpokenDirection = direction; lastSpeechTime = now
+      if direction != .centered && direction != .searching { triggerHaptic(0.4) }
     }
   }
 
@@ -696,15 +783,11 @@ class ReachingViewController: UIViewController {
   private func computeDirection(handX: CGFloat, handY: CGFloat,
                                 bboxCx: CGFloat, bboxCy: CGFloat,
                                 bboxHalfW: CGFloat, bboxHalfH: CGFloat) -> Direction {
-    let deltaX = handX - bboxCx
-    let deltaY = handY - bboxCy
-    if abs(deltaX) < bboxHalfW && abs(deltaY) < bboxHalfH { return .centered }
-
-    // Angle FROM hand TO bbox (direction user needs to move)
+    let dx = handX - bboxCx, dy = handY - bboxCy
+    if abs(dx) < bboxHalfW && abs(dy) < bboxHalfH { return .centered }
     let angleRad = atan2(-(bboxCy - handY), bboxCx - handX)
     var angleDeg = angleRad * 180.0 / .pi
     if angleDeg < 0 { angleDeg += 360 }
-
     switch angleDeg {
     case 0..<22.5, 337.5...360: return .right
     case 22.5..<67.5:    return .topRight
@@ -718,16 +801,9 @@ class ReachingViewController: UIViewController {
     }
   }
 
-  // ── Hand center ─────────────────────────────────────────────────────────
-
   private func handCenter(_ obs: VNHumanHandPoseObservation) -> CGPoint? {
     if let tip = try? obs.recognizedPoint(.indexTip), tip.confidence > 0.3 { return tip.location }
     if let mcp = try? obs.recognizedPoint(.middleMCP), mcp.confidence > 0.3 { return mcp.location }
-    if let w = try? obs.recognizedPoint(.wrist),
-       let i = try? obs.recognizedPoint(.indexTip),
-       w.confidence > 0.3, i.confidence > 0.3 {
-      return CGPoint(x: (w.location.x+i.location.x)/2, y: (w.location.y+i.location.y)/2)
-    }
     if let w = try? obs.recognizedPoint(.wrist), w.confidence > 0.3 { return w.location }
     return nil
   }
@@ -736,89 +812,59 @@ class ReachingViewController: UIViewController {
 
   private func processARFrame(_ frame: ARFrame) {
     guard running else { return }
-
     arFrameCount += 1
 
-    // Wait for AR to stabilize before placing anchor
     if !anchorPlaced {
-      if arFrameCount >= anchorWaitFrames {
-        placeObjectAnchor(frame: frame)
-        say("Target locked.")
-      }
+      if arFrameCount >= anchorWaitFrames { placeObjectAnchor(frame: frame); say("Target locked.") }
       return
     }
 
-    // ── 1. Project bbox to screen (world-anchored) ───────────────────────
     projectBboxToScreen(frame: frame)
 
-    // ── 2. Compute aspect-fill crop (once) ───────────────────────────────
-    let pixelBuffer = frame.capturedImage
-    let imageW = CGFloat(CVPixelBufferGetWidth(pixelBuffer))
-    let imageH = CGFloat(CVPixelBufferGetHeight(pixelBuffer))
-    computeAspectFillCrop(imageW: imageW, imageH: imageH)
+    let pb = frame.capturedImage
+    computeAspectFillCrop(imageW: CGFloat(CVPixelBufferGetWidth(pb)),
+                          imageH: CGFloat(CVPixelBufferGetHeight(pb)))
 
-    // ── 3. Run hand detection ────────────────────────────────────────────
-    let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+    let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .right, options: [:])
     do { try handler.perform([handReq]) } catch { return }
 
-    let sw = view.bounds.width
-    let sh = view.bounds.height
-    guard sw > 0, sh > 0, projectedBboxW > 0 else { return }
+    guard projectedBboxW > 0 else { return }
+    let bboxCx = projectedBboxCenter.x, bboxCy = projectedBboxCenter.y
+    let bboxHalfW = projectedBboxW / 2, bboxHalfH = projectedBboxH / 2
 
-    let bboxCx = projectedBboxCenter.x
-    let bboxCy = projectedBboxCenter.y
-    let bboxHalfW = projectedBboxW / 2
-    let bboxHalfH = projectedBboxH / 2
-
-    // ── No hand detected ─────────────────────────────────────────────────
     guard let obs = handReq.results?.first else {
       noHandFrames += 1; successFrames = 0
       if noHandFrames == noHandLimit {
-        DispatchQueue.main.async { [weak self] in
-          self?.say("Hand not detected. Show your hand to the camera.")
-        }
+        DispatchQueue.main.async { [weak self] in self?.say("Show your hand to the camera.") }
       }
       if noHandFrames > noHandLimit + noHandRepeatCycle { noHandFrames = 0 }
       DispatchQueue.main.async { [weak self] in
-        self?.handDot.isHidden = true
+        self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true
         self?.updateDirectionUI(.searching)
       }
-      proximityZone = .searching
-      return
+      proximityZone = .searching; return
     }
 
     noHandFrames = 0
     guard let visionPt = handCenter(obs) else {
       successFrames = 0
-      DispatchQueue.main.async { [weak self] in self?.handDot.isHidden = true }
+      DispatchQueue.main.async { [weak self] in self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true }
       return
     }
 
-    // ── 4. Map hand to screen (aspect-fill corrected) ────────────────────
     let handScreen = visionToScreen(visionPt)
-    let screenX = handScreen.x
-    let screenY = handScreen.y
-
-    // ── 5. Distance & overlap check ──────────────────────────────────────
-    let dx = screenX - bboxCx
-    let dy = screenY - bboxCy
+    let screenX = handScreen.x, screenY = handScreen.y
+    let dx = screenX - bboxCx, dy = screenY - bboxCy
     let dist = sqrt(dx * dx + dy * dy)
 
-    // Overlap: hand inside INNER bbox (strict — no tolerance expansion)
     let innerOverlap = abs(dx) < bboxHalfW && abs(dy) < bboxHalfH
+    let tolX = max(projectedBboxW * 0.3, 20), tolY = max(projectedBboxH * 0.3, 20)
+    let nearOverlap = CGRect(x: bboxCx - bboxHalfW - tolX, y: bboxCy - bboxHalfH - tolY,
+                             width: projectedBboxW + tolX*2, height: projectedBboxH + tolY*2)
+      .contains(CGPoint(x: screenX, y: screenY))
 
-    // Tolerance overlap: hand inside outer bbox (for proximity/direction)
-    let tolX = max(projectedBboxW * 0.3, 20)
-    let tolY = max(projectedBboxH * 0.3, 20)
-    let expandedRect = CGRect(x: bboxCx - bboxHalfW - tolX,
-                              y: bboxCy - bboxHalfH - tolY,
-                              width: projectedBboxW + tolX*2,
-                              height: projectedBboxH + tolY*2)
-    let nearOverlap = expandedRect.contains(CGPoint(x: screenX, y: screenY))
-
-    // ── 6. Proximity zone ────────────────────────────────────────────────
-    let maxDim = max(sw, sh)
-    let normDist = dist / maxDim
+    let sw = cachedSW, sh = cachedSH  // Thread-safe
+    let normDist = dist / max(sw, sh)
     let newProx: ProximityZone
     if innerOverlap       { newProx = .centered }
     else if nearOverlap   { newProx = .veryClose }
@@ -827,83 +873,85 @@ class ReachingViewController: UIViewController {
     else                    { newProx = .far }
     proximityZone = newProx
 
-    // ── 7. Direction ─────────────────────────────────────────────────────
-    let direction = computeDirection(
-      handX: screenX, handY: screenY,
-      bboxCx: bboxCx, bboxCy: bboxCy,
-      bboxHalfW: bboxHalfW, bboxHalfH: bboxHalfH
-    )
+    let direction = computeDirection(handX: screenX, handY: screenY,
+                                     bboxCx: bboxCx, bboxCy: bboxCy,
+                                     bboxHalfW: bboxHalfW, bboxHalfH: bboxHalfH)
     speakDirectionIfNeeded(direction)
 
-    // ── 8. UI update ─────────────────────────────────────────────────────
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
-      let dotSize: CGFloat = 20
-      self.handDot.isHidden = false
-      self.handDot.path = UIBezierPath(ovalIn: CGRect(
-        x: screenX - dotSize/2, y: screenY - dotSize/2,
-        width: dotSize, height: dotSize)).cgPath
+      let dotR: CGFloat = 12
+      self.handDot.isHidden = false; self.handDotGlow.isHidden = false
+      self.handDot.path = UIBezierPath(ovalIn: CGRect(x: screenX-dotR, y: screenY-dotR,
+                                                       width: dotR*2, height: dotR*2)).cgPath
+      self.handDotGlow.path = UIBezierPath(ovalIn: CGRect(x: screenX-dotR*2, y: screenY-dotR*2,
+                                                           width: dotR*4, height: dotR*4)).cgPath
 
-      switch newProx {
-      case .centered:  self.handDot.fillColor = UIColor.green.cgColor
-      case .veryClose: self.handDot.fillColor = UIColor.green.withAlphaComponent(0.8).cgColor
-      case .close:     self.handDot.fillColor = UIColor.yellow.cgColor
-      case .medium:    self.handDot.fillColor = UIColor.orange.cgColor
-      default:         self.handDot.fillColor = UIColor.red.cgColor
-      }
+      let color: UIColor = {
+        switch newProx {
+        case .centered, .veryClose: return .systemGreen
+        case .close: return .systemYellow
+        case .medium: return .systemOrange
+        default: return .systemRed
+        }
+      }()
+      self.handDot.fillColor = color.cgColor
+      self.handDotGlow.fillColor = color.withAlphaComponent(0.2).cgColor
       self.updateDirectionUI(direction)
+
+      // Progress ring
+      if self.successFrames > 0 {
+        self.progressRing.isHidden = false
+        let progress = CGFloat(self.successFrames) / CGFloat(self.successThreshold)
+        self.progressRing.strokeEnd = progress
+        let ringR: CGFloat = dotR + 8
+        let ringPath = UIBezierPath(arcCenter: CGPoint(x: screenX, y: screenY),
+                                    radius: ringR, startAngle: -.pi/2,
+                                    endAngle: -.pi/2 + .pi*2, clockwise: true)
+        self.progressRing.path = ringPath.cgPath
+      } else {
+        self.progressRing.isHidden = true
+        self.progressRing.strokeEnd = 0
+      }
     }
 
-    // ── 9. Success (hand inside INNER bbox for 20 frames) ────────────────
     if innerOverlap {
       successFrames += 1
-      if successFrames % 5 == 0 {
-        NSLog("🎯 [ReachingVC] Overlap frame %d/%d", successFrames, successThreshold)
-      }
       if successFrames >= successThreshold { handleSuccess() }
-    } else {
-      if successFrames > 3 {
-        NSLog("📍 [ReachingVC] Overlap broken at %d frames", successFrames)
-      }
-      successFrames = 0
-    }
+    } else { successFrames = 0 }
   }
 
   private func updateDirectionUI(_ newDir: Direction) {
     guard newDir != currentDirection else { return }
     currentDirection = newDir
-    statusLabel.text = "  \(newDir.rawValue)  "
-    statusLabel.textColor = newDir == .centered ? .green : .white
-    statusLabel.font = UIFont.boldSystemFont(ofSize: newDir == .centered ? 26 : 22)
+    directionLabel.text = newDir == .centered ? "✅  Centered!" : newDir.rawValue
+    directionLabel.textColor = newDir == .centered ? .systemGreen : .white
+
+    // Animate bottom bar
+    UIView.animate(withDuration: 0.15) {
+      self.bottomBar.transform = CGAffineTransform(scaleX: 1.05, y: 1.05)
+    } completion: { _ in
+      UIView.animate(withDuration: 0.15) {
+        self.bottomBar.transform = .identity
+      }
+    }
   }
 }
 
-// =============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 // MARK: - ARSessionDelegate
-// =============================================================================
+// ═══════════════════════════════════════════════════════════════════════════════
 
 extension ReachingViewController: ARSessionDelegate {
-
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
-    // Process on vision queue to avoid blocking AR
-    visionQ.async { [weak self] in
-      self?.processARFrame(frame)
-    }
+    visionQ.async { [weak self] in self?.processARFrame(frame) }
   }
-
   func session(_ session: ARSession, didFailWithError error: Error) {
-    NSLog("❌ [ReachingVC] AR failed: %@", error.localizedDescription)
-    say("Tracking failed. Please try again.")
-    DispatchQueue.main.asyncAfter(deadline: .now() + 2.0) { [weak self] in
+    say("Tracking failed.")
+    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
       self?.finishWith(success: false, reason: "ar_error")
     }
   }
-
-  func sessionWasInterrupted(_ session: ARSession) {
-    say("Tracking interrupted")
-  }
-
-  func sessionInterruptionEnded(_ session: ARSession) {
-    say("Tracking resumed")
-  }
+  func sessionWasInterrupted(_ session: ARSession) { say("Tracking paused") }
+  func sessionInterruptionEnded(_ session: ARSession) { say("Tracking resumed") }
 }

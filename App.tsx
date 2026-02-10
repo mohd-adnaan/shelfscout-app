@@ -55,6 +55,7 @@ import { playSound } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
 import { NAVIGATION_CONFIG } from './src/utils/constants';
+import { fixImageOrientation } from './src/services/fixImageOrientation';
 
 const { width, height } = Dimensions.get('window');
 
@@ -105,6 +106,7 @@ function App(): React.JSX.Element {
   const isCapturingPhotoRef = useRef(false);
   const isNavigationLoopRunning = useRef(false); // Track if loop is actively running
   const navigationLoopAbortRef = useRef(false); // Signal to stop navigation loop
+  const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
 
   // ============================================================================
   // Animation
@@ -177,9 +179,19 @@ function App(): React.JSX.Element {
       const photo = await cameraRef.current.takePhoto({
         qualityPrioritization: 'speed',
         enableShutterSound: true,
+        flash: 'off',
       });
-      console.log('✅ Photo captured successfully:', photo.path);
-      return photo.path;
+
+      const fixedImage = await fixImageOrientation(photo.path);
+
+      // Store dimensions for ReachingModule bbox normalization
+      lastImageDimensions.current = {
+        width: fixedImage.width || 0,
+        height: fixedImage.height || 0
+      };
+      console.log('✅ Photo captured & orientation fixed:', fixedImage.uri,
+        `(${fixedImage.width}×${fixedImage.height})`);
+      return fixedImage.uri;
     } catch (error) {
       console.error('❌ Photo capture failed:', error);
 
@@ -471,6 +483,7 @@ function App(): React.JSX.Element {
           reaching_flag: result.reaching_flag,
           reaching_ios: result.reaching_ios,
           bbox: result.bbox,
+          depth: result.depth,
           object: result.object,
           loopDelay: result.loopDelay,
         });
@@ -538,6 +551,9 @@ function App(): React.JSX.Element {
                 const reachingResult = await ReachingModule.startReaching({
                   bbox: bbox,
                   object: result.object || 'object',
+                  depth: result.depth,
+                  imageWidth: lastImageDimensions.current.width,
+                  imageHeight: lastImageDimensions.current.height,
                 });
 
                 console.log('✅ [iOS Reaching] Native module result:', reachingResult);
@@ -1169,6 +1185,9 @@ function App(): React.JSX.Element {
               const reachingResult = await ReachingModule.startReaching({
                 bbox: bbox,
                 object: result.object || 'object',
+                depth: result.depth,
+                imageWidth: lastImageDimensions.current.width,
+                imageHeight: lastImageDimensions.current.height,
               });
 
               console.log('✅ [iOS Reaching] Result:', reachingResult);
