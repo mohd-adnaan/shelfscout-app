@@ -2,6 +2,8 @@
 export interface WorkflowRequest {
   text: string;
   imageUri: string;
+  imageWidth?: number;   
+  imageHeight?: number;
   navigation?: boolean;
   reaching_flag?: boolean;
 }

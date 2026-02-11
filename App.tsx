@@ -1117,8 +1117,10 @@ function App(): React.JSX.Element {
         {
           text: command,
           imageUri: photoPath || '',
-          navigation: false,          // Initial request
-          reaching_flag: false         // Initial request
+          imageWidth: lastImageDimensions.current.width,
+          imageHeight: lastImageDimensions.current.height,
+          navigation: false,
+          reaching_flag: false
         },
         abortController.signal
       );

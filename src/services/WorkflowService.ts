@@ -47,7 +47,7 @@ export const triggerIOSReaching = async (
       return true;
     } else {
       console.warn('⚠️ CybsGuidanceModule not available - is the native module linked?');
-      
+
       // Fallback: Announce to user
       AccessibilityService.announceForAccessibility(
         `Guiding you to ${objectName}. ARKit module initializing.`
@@ -122,7 +122,7 @@ export const startContinuousMode = (
   loopDelay?: number
 ): void => {
   console.log(`🔄 [${mode}] Continuous mode STARTED`);
-  
+
   continuousModeState.isActive = true;
   continuousModeState.mode = mode;
   continuousModeState.iterationCount = 0;
@@ -145,7 +145,7 @@ export const updateLoopDelay = (delay: number): void => {
 export const stopContinuousMode = (reason?: string, resetSession: boolean = false): void => {
   const iterations = continuousModeState.iterationCount;
   const mode = continuousModeState.mode;
-  
+
   continuousModeState = {
     isActive: false,
     mode: null,
@@ -153,12 +153,12 @@ export const stopContinuousMode = (reason?: string, resetSession: boolean = fals
     lastRequestTime: 0,
     currentLoopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
   };
-  
+
   console.log(`🛑 [${mode}] Continuous mode STOPPED after ${iterations} iterations`);
   if (reason) {
     console.log(`🛑 Reason: ${reason}`);
   }
-  
+
   if (resetSession) {
     resetSessionId();
   }
@@ -166,7 +166,7 @@ export const stopContinuousMode = (reason?: string, resetSession: boolean = fals
 
 export const shouldPreventInfiniteLoop = (): boolean => {
   const { iterationCount, lastRequestTime } = continuousModeState;
-  
+
   if (iterationCount >= NAVIGATION_CONFIG.MAX_LOOP_ITERATIONS) {
     console.warn('⚠️ Max iterations reached');
     return true;
@@ -206,16 +206,16 @@ export const sendToWorkflow = async (
     // Prepare FormData
     // ========================================================================
     const formData = new FormData();
-    
+
     formData.append('transcript', request.text || '');
-    
+
     // THREE-FLAG SYSTEM
     const navigationValue = request.navigation === true ? 'true' : 'false';
     const reachingValue = request.reaching_flag === true ? 'true' : 'false';
-    
+
     formData.append('navigation', navigationValue);
     formData.append('reaching_flag', reachingValue);
-    
+
     formData.append('user_id', 'mobile-user');
     formData.append('request_id', `mobile-${Date.now()}`);
     formData.append('session_id', SESSION_ID);
@@ -229,11 +229,19 @@ export const sendToWorkflow = async (
       }
 
       formData.append('image', {
-        uri: imageUri, 
+        uri: imageUri,
         type: 'image/jpeg',
         name: 'photo.jpg',
       } as any);
+
+      // send image dimensions
+      if (request.imageWidth && request.imageHeight) {
+        formData.append('imageWidth', String(request.imageWidth));
+        formData.append('imageHeight', String(request.imageHeight));
+        console.log(`📐 Image dimensions: ${request.imageWidth}×${request.imageHeight}`);
+      }
     }
+
 
     console.log('🚀 Sending to workflow:', WORKFLOW_URL);
     console.log('📝 Transcript:', request.text || '(continuous mode)');
@@ -271,7 +279,7 @@ export const sendToWorkflow = async (
     // Parse response with THREE-FLAG support (including reaching_ios)
     // ========================================================================
     const parsedResponse = parseWorkflowResponse(response.data);
-    
+
     console.log('📄 Response:', {
       textLength: parsedResponse.text?.length || 0,
       navigation: parsedResponse.navigation,
@@ -293,8 +301,8 @@ export const sendToWorkflow = async (
         parsedResponse.text = parsedResponse.navigation || parsedResponse.reaching_flag
           ? 'Continue'
           : parsedResponse.reaching_ios
-          ? `Guiding you to ${parsedResponse.object || 'the object'}`
-          : 'Task complete';
+            ? `Guiding you to ${parsedResponse.object || 'the object'}`
+            : 'Task complete';
       }
     }
 
@@ -306,19 +314,19 @@ export const sendToWorkflow = async (
     }
 
     console.error('❌ Workflow error:', error);
-    
+
     let userMessage = 'Failed to process request.';
 
     if (axios.isAxiosError(error)) {
       if (error.code === 'ECONNABORTED' || error.message.includes('timeout')) {
         userMessage = 'Request timed out. Please try again.';
-      } 
+      }
       else if (error.code === 'ERR_NETWORK' || error.message.includes('Network')) {
         userMessage = 'Network error. Please check your connection.';
       }
       else if (error.response) {
         const status = error.response.status;
-        userMessage = status >= 500 
+        userMessage = status >= 500
           ? 'Server error. Please try again later.'
           : `Error (${status}). Please try again.`;
       }
@@ -371,7 +379,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   // =========================================================================
   // THREE-FLAG EXTRACTION
   // =========================================================================
-  
+
   // Navigation flag
   let navigation = false;
   if (typeof innerPayload.navigation === 'boolean') {
@@ -379,7 +387,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   } else if (typeof innerPayload.navigation === 'string') {
     navigation = innerPayload.navigation.toLowerCase() === 'true';
   }
-  
+
   // Reaching flag (Android LLM-based)
   let reaching_flag = false;
   if (typeof innerPayload.reaching_flag === 'boolean') {
@@ -409,7 +417,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   // BBOX extraction (when reaching_ios is true)
   // =========================================================================
   let bbox: [number, number, number, number] | undefined;
-  
+
   if (innerPayload.bbox) {
     if (Array.isArray(innerPayload.bbox) && innerPayload.bbox.length === 4) {
       bbox = innerPayload.bbox.map((v: any) => Number(v)) as [number, number, number, number];
@@ -455,9 +463,9 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   // Session ID from response (or use current)
   const session_id = innerPayload.session_id || SESSION_ID;
 
-  console.log('📋 Parsed:', { 
-    text: text.substring(0, 50), 
-    navigation, 
+  console.log('📋 Parsed:', {
+    text: text.substring(0, 50),
+    navigation,
     reaching_flag,
     reaching_ios,
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
@@ -465,10 +473,10 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     depth,
   });
 
-  return { 
-    text, 
-    navigation, 
-    reaching_flag, 
+  return {
+    text,
+    navigation,
+    reaching_flag,
     reaching_ios,
     bbox,
     object,
@@ -482,7 +490,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
 // ★★★ NEW: Determine action mode with PRIORITY for reaching_ios ★★★
 // =============================================================================
 
-export type ActionMode = 
+export type ActionMode =
   | { type: 'reaching_ios'; bbox: [number, number, number, number]; object: string }
   | { type: 'reaching'; loopDelay: number }
   | { type: 'navigation'; loopDelay: number }

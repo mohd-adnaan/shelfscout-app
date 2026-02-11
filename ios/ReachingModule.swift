@@ -1,13 +1,5 @@
 /**
- * ReachingModule.swift — ARKit World-Anchored Reaching (v3)
- *
- * Changes v3 (Feb 9 evening):
- *   - Uses backend depth value for accurate 3D anchor placement
- *   - Apple-quality UI: blur panels, SF Symbols, gradient indicators, haptics
- *   - Image orientation fix integration
- *   - Corrected aspect-fill hand mapping
- *   - Spoken directional guidance for blind users
- *   - Strict success: inner bbox overlap for 20+ frames
+ * ReachingModule.swift — ARKit World-Anchored Reaching (v4)
  *
  * iOS 14+ | ARKit World Tracking | No LiDAR required
  */
@@ -54,11 +46,21 @@ class ReachingModule: NSObject {
     }
     let objectName = (params["object"] as? String) ?? "object"
     
-    // Parse depth from backend (in meters)
+    // Parse depth from backend (handles both meters and centimeters)
     var backendDepth: Float? = nil
     if let d = params["depth"] {
-      if let n = d as? NSNumber { backendDepth = n.floatValue }
-      else if let s = d as? String, let v = Float(s), v > 0, v < 10 { backendDepth = v }
+      var rawValue: Float? = nil
+      if let n = d as? NSNumber { rawValue = n.floatValue }
+      else if let s = d as? String, let v = Float(s) { rawValue = v }
+      
+      if var v = rawValue, v > 0 {
+        // Backend sends depth in centimeters — convert to meters
+        if v > 10 { v = v / 100.0 }
+        // Clamp to reasonable range (10cm to 5m)
+        if v >= 0.1 && v <= 5.0 {
+          backendDepth = v
+        }
+      }
     }
     NSLog("🎯 [ReachingModule] depth from backend: %@", backendDepth.map { "\($0)m" } ?? "nil")
 
@@ -235,10 +237,16 @@ class ReachingViewController: UIViewController {
   private var cachedSW: CGFloat = 393
   private var cachedSH: CGFloat = 852
 
-  // ── Aspect-fill crop ────────────────────────────────────────────────────
+  // ── Aspect-fill crop ───────────────────────────────────────────────────
 
   private var cropFracX: CGFloat = 0
   private var cropComputed = false
+  
+  // Screen-space target (set once at start, in screen points)──────────────
+  private var targetScreenCenter: CGPoint = .zero
+  private var targetScreenHalfW: CGFloat = 0
+  private var targetScreenHalfH: CGFloat = 0
+  private var targetPlaced = false
 
   // ── Init ────────────────────────────────────────────────────────────────
 
@@ -262,7 +270,6 @@ class ReachingViewController: UIViewController {
     super.viewDidLoad()
     view.backgroundColor = .black
 
-    // Cache screen bounds on main thread (thread-safe for background queues)
     cachedSW = UIScreen.main.bounds.width
     cachedSH = UIScreen.main.bounds.height
     NSLog("📐 [ReachingVC] Cached screen: %.0f×%.0f", cachedSW, cachedSH)
@@ -295,7 +302,6 @@ class ReachingViewController: UIViewController {
   // ── Normalize bbox ──────────────────────────────────────────────────────
 
   private func normalizeBbox() {
-    // Sort to ensure x1<x2, y1<y2
     let x1 = min(abs(bboxRaw[0]), abs(bboxRaw[2]))
     let y1 = min(abs(bboxRaw[1]), abs(bboxRaw[3]))
     let x2 = max(abs(bboxRaw[0]), abs(bboxRaw[2]))
@@ -314,19 +320,16 @@ class ReachingViewController: UIViewController {
     } else if maxVal <= 1.0 {
       bboxNormalized = sorted
 
-    // FALLBACK: No image dimensions provided — guess (LEGACY, should not happen)
+    // FALLBACK: No image dimensions
     } else {
-      // WARNING: This path produces incorrect results for non-square images!
       NSLog("⚠️ [ReachingVC] No image dimensions! Falling back to heuristic normalization")
       let guessW: CGFloat = max(x2 * 1.1, 1152)
       let guessH: CGFloat = max(y2 * 1.1, 2048)
       bboxNormalized = [x1 / guessW, y1 / guessH, x2 / guessW, y2 / guessH]
-      NSLog("📦 [ReachingVC] Bbox pixel → norm %@ (guessed img=%.0fx%.0f)", "\(bboxNormalized)", guessW, guessH)
     }
 
     bboxNormalized = bboxNormalized.map { min(max($0, 0), 1) }
 
-    // Validate: bbox must have non-zero area
     let bw = bboxNormalized[2] - bboxNormalized[0]
     let bh = bboxNormalized[3] - bboxNormalized[1]
     if bw < 0.01 || bh < 0.01 {
@@ -358,54 +361,103 @@ class ReachingViewController: UIViewController {
     NSLog("📷 [ReachingVC] AR session started")
   }
 
-  // ── Place Anchor (uses backend depth!) ──────────────────────────────────
-
-  private func placeObjectAnchor(frame: ARFrame) {
-    let sw = cachedSW  // Thread-safe: cached on main thread in viewDidLoad
+  private func placeScreenTarget() {
+    let sw = cachedSW
     let sh = cachedSH
 
-    let bboxCxNorm = (bboxNormalized[0] + bboxNormalized[2]) / 2
-    let bboxCyNorm = (bboxNormalized[1] + bboxNormalized[3]) / 2
-    let bboxWidthFrac = bboxNormalized[2] - bboxNormalized[0]
-    let bboxHeightFrac = bboxNormalized[3] - bboxNormalized[1]
+    // The bbox is normalized to the PORTRAIT photo dimensions.
+    // We need to map it to the screen, accounting for the aspect-fill
+    // crop that the AR camera preview applies.
+    //
+    // The AR camera preview uses aspect-fill:
+    // - AR camera is 4:3 (landscape) = 3:4 (portrait)
+    // - Screen is ~9:19.5 (portrait)
+    // - The camera image is scaled to fill the screen height,
+    //   then the sides are cropped.
+    //
+    // But we're NOT mapping from the AR camera image — we're mapping
+    // from the PHOTO, which has its own aspect ratio.
+    //
+    // Photo is 9:16 portrait (1152×2048).
+    // Screen is ~9:19.5 (393×852).
+    //
+    // If we assume the photo was taken from roughly the same position
+    // and the user hasn't moved, the photo's normalized coordinates
+    // map directly to the screen with aspect-fill scaling.
 
-    // Use backend depth if available, otherwise estimate from bbox size
-    let depth: Float
-    if let bd = backendDepth, bd > 0.1, bd < 5.0 {
-      depth = bd
-      NSLog("🎯 [ReachingVC] Using backend depth: %.2fm", depth)
+    let photoAspect = imageWidth / imageHeight  // 1152/2048 = 0.5625
+    let screenAspect = sw / sh                   // 393/852 = 0.4613
+
+    var scaleX: CGFloat = 1.0
+    var scaleY: CGFloat = 1.0
+    var offsetX: CGFloat = 0.0
+    var offsetY: CGFloat = 0.0
+
+    if photoAspect > screenAspect {
+      // Photo is wider than screen — fit height, crop sides
+      scaleY = 1.0
+      scaleX = (photoAspect / screenAspect)
+      offsetX = (scaleX - 1.0) / 2.0  // cropped from each side
     } else {
-      depth = max(0.3, min(1.5, Float(0.10 / bboxWidthFrac)))
-      NSLog("🎯 [ReachingVC] Estimated depth: %.2fm (no backend depth)", depth)
+      // Photo is taller than screen — fit width, crop top/bottom
+      scaleX = 1.0
+      scaleY = (screenAspect / photoAspect)
+      offsetY = (scaleY - 1.0) / 2.0  // cropped from top/bottom
     }
 
-    let cam = frame.camera.transform
-    let forward = -simd_normalize(simd_float3(cam.columns.2.x, cam.columns.2.y, cam.columns.2.z))
-    let right   =  simd_normalize(simd_float3(cam.columns.0.x, cam.columns.0.y, cam.columns.0.z))
-    let up      =  simd_normalize(simd_float3(cam.columns.1.x, cam.columns.1.y, cam.columns.1.z))
-    let camPos  =  simd_float3(cam.columns.3.x, cam.columns.3.y, cam.columns.3.z)
+    // Map normalized bbox to screen coordinates
+    // The photo coords need to be adjusted for the crop
+    let bx1 = (bboxNormalized[0] * scaleX - offsetX) * sw
+    let by1 = (bboxNormalized[1] * scaleY - offsetY) * sh
+    let bx2 = (bboxNormalized[2] * scaleX - offsetX) * sw
+    let by2 = (bboxNormalized[3] * scaleY - offsetY) * sh
 
-    let fovH: Float = 1.0
-    let fovV: Float = 1.4
-    let offsetX = (Float(bboxCxNorm) - 0.5) * depth * fovH
-    let offsetY = (0.5 - Float(bboxCyNorm)) * depth * fovV
+    targetScreenCenter = CGPoint(x: (bx1 + bx2) / 2, y: (by1 + by2) / 2)
+    targetScreenHalfW = max((bx2 - bx1) / 2, 15)
+    targetScreenHalfH = max((by2 - by1) / 2, 15)
+    targetPlaced = true
 
-    let worldPos = camPos + forward * depth + right * offsetX + up * offsetY
-    objectWorldPosition = worldPos
-    objectWorldRight = right
-    objectWorldUp = up
-    objectWorldHalfW = Float(bboxWidthFrac) * depth * fovH / 2
-    objectWorldHalfH = Float(bboxHeightFrac) * depth * fovV / 2
+    // Also set the projected bbox vars so the rest of the code works unchanged
+    projectedBboxCenter = targetScreenCenter
+    projectedBboxW = targetScreenHalfW * 2
+    projectedBboxH = targetScreenHalfH * 2
 
-    anchorPlaced = true
-    NSLog("🎯 [ReachingVC] Anchor placed: depth=%.2f, offset=(%.2f,%.2f)", depth, offsetX, offsetY)
+    NSLog("🎯 [ReachingVC] Screen target placed: center=(%.1f, %.1f) size=%.0f×%.0f",
+          targetScreenCenter.x, targetScreenCenter.y,
+          targetScreenHalfW * 2, targetScreenHalfH * 2)
+    NSLog("🎯 [ReachingVC] Screen normalized: center=(%.3f, %.3f)",
+          targetScreenCenter.x / sw, targetScreenCenter.y / sh)
+
+    // Draw the bbox immediately
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.bboxLayer.isHidden = false
+      self.innerBboxLayer.isHidden = false
+
+      let innerRect = CGRect(x: self.targetScreenCenter.x - self.targetScreenHalfW,
+                              y: self.targetScreenCenter.y - self.targetScreenHalfH,
+                              width: self.targetScreenHalfW * 2,
+                              height: self.targetScreenHalfH * 2)
+      let tolX = max(self.targetScreenHalfW * 0.25, 15)
+      let tolY = max(self.targetScreenHalfH * 0.25, 15)
+      let outerRect = innerRect.insetBy(dx: -tolX, dy: -tolY)
+
+      self.innerBboxLayer.path = UIBezierPath(roundedRect: innerRect, cornerRadius: 8).cgPath
+      self.bboxLayer.path = UIBezierPath(roundedRect: outerRect, cornerRadius: 12).cgPath
+
+      // Show distance from backend
+      if let depth = self.backendDepth {
+        self.distanceLabel.text = "\(Int(depth * 100)) cm"
+      }
+    }
   }
+
 
   // ── Project bbox to screen ──────────────────────────────────────────────
 
   private func projectBboxToScreen(frame: ARFrame) {
     guard let center3D = objectWorldPosition else { return }
-    let viewSize = CGSize(width: cachedSW, height: cachedSH)  // Thread-safe
+    let viewSize = CGSize(width: cachedSW, height: cachedSH)
     let camera = frame.camera
 
     let centerScreen = camera.projectPoint(center3D, orientation: .portrait, viewportSize: viewSize)
@@ -431,7 +483,6 @@ class ReachingViewController: UIViewController {
       return
     }
 
-    // Distance for display
     let dist = simd_length(center3D - camPos)
 
     projectedBboxCenter = centerScreen
@@ -450,11 +501,9 @@ class ReachingViewController: UIViewController {
       let tolY = max(self.projectedBboxH * 0.25, 15)
       let outerRect = innerRect.insetBy(dx: -tolX, dy: -tolY)
 
-      // Rounded corners for Apple feel
       self.innerBboxLayer.path = UIBezierPath(roundedRect: innerRect, cornerRadius: 8).cgPath
       self.bboxLayer.path = UIBezierPath(roundedRect: outerRect, cornerRadius: 12).cgPath
 
-      // Distance label
       let distCm = Int(dist * 100)
       self.distanceLabel.text = "\(distCm) cm"
     }
@@ -464,7 +513,7 @@ class ReachingViewController: UIViewController {
 
   private func computeAspectFillCrop(imageW: CGFloat, imageH: CGFloat) {
     guard !cropComputed else { return }
-    let sw = cachedSW, sh = cachedSH  // Thread-safe
+    let sw = cachedSW, sh = cachedSH
     guard sw > 0, sh > 0, imageW > 0, imageH > 0 else { return }
     let rotW = imageH, rotH = imageW
     let cameraAspect = rotW / rotH, screenAspect = sw / sh
@@ -478,7 +527,7 @@ class ReachingViewController: UIViewController {
   }
 
   private func visionToScreen(_ pt: CGPoint) -> CGPoint {
-    let sw = cachedSW, sh = cachedSH  // Thread-safe
+    let sw = cachedSW, sh = cachedSH
     let adjustedX = cropFracX > 0
       ? ((pt.x - cropFracX) / (1.0 - 2 * cropFracX)) * sw
       : pt.x * sw
@@ -490,11 +539,10 @@ class ReachingViewController: UIViewController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   private func setupAppleUI() {
-    // ── Bbox overlays with gradient stroke ────────────────────────────────
     bboxLayer.strokeColor = UIColor.systemCyan.cgColor
     bboxLayer.fillColor = UIColor.systemCyan.withAlphaComponent(0.06).cgColor
     bboxLayer.lineWidth = 2.5
-    bboxLayer.lineDashPattern = [8, 4]   // Dashed for outer
+    bboxLayer.lineDashPattern = [8, 4]
     bboxLayer.isHidden = true
     view.layer.addSublayer(bboxLayer)
 
@@ -504,7 +552,6 @@ class ReachingViewController: UIViewController {
     innerBboxLayer.isHidden = true
     view.layer.addSublayer(innerBboxLayer)
 
-    // ── Hand dot with glow ────────────────────────────────────────────────
     handDotGlow.fillColor = UIColor.systemGreen.withAlphaComponent(0.3).cgColor
     handDotGlow.isHidden = true
     view.layer.addSublayer(handDotGlow)
@@ -519,7 +566,6 @@ class ReachingViewController: UIViewController {
     handDot.isHidden = true
     view.layer.addSublayer(handDot)
 
-    // ── Top bar (frosted glass) ───────────────────────────────────────────
     let topBlur = UIBlurEffect(style: .systemThinMaterialDark)
     topBar = UIVisualEffectView(effect: topBlur)
     topBar.translatesAutoresizingMaskIntoConstraints = false
@@ -543,7 +589,6 @@ class ReachingViewController: UIViewController {
     distanceLabel.translatesAutoresizingMaskIntoConstraints = false
     topBar.contentView.addSubview(distanceLabel)
 
-    // ── Bottom bar (frosted glass) ────────────────────────────────────────
     let bottomBlur = UIBlurEffect(style: .systemThinMaterialDark)
     bottomBar = UIVisualEffectView(effect: bottomBlur)
     bottomBar.translatesAutoresizingMaskIntoConstraints = false
@@ -559,7 +604,6 @@ class ReachingViewController: UIViewController {
     directionLabel.translatesAutoresizingMaskIntoConstraints = false
     bottomBar.contentView.addSubview(directionLabel)
 
-    // ── Progress ring (success indicator) ─────────────────────────────────
     progressRing = CAShapeLayer()
     progressRing.strokeColor = UIColor.systemGreen.cgColor
     progressRing.fillColor = UIColor.clear.cgColor
@@ -569,7 +613,6 @@ class ReachingViewController: UIViewController {
     progressRing.isHidden = true
     view.layer.addSublayer(progressRing)
 
-    // ── Cancel button ─────────────────────────────────────────────────────
     cancelButton = UIButton(type: .system)
     cancelButton.setTitle("Cancel", for: .normal)
     cancelButton.setTitleColor(.white, for: .normal)
@@ -580,7 +623,6 @@ class ReachingViewController: UIViewController {
     cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
     view.addSubview(cancelButton)
 
-    // ── Constraints ───────────────────────────────────────────────────────
     NSLayoutConstraint.activate([
       topBar.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
       topBar.centerXAnchor.constraint(equalTo: view.centerXAnchor),
@@ -814,12 +856,15 @@ class ReachingViewController: UIViewController {
     guard running else { return }
     arFrameCount += 1
 
-    if !anchorPlaced {
-      if arFrameCount >= anchorWaitFrames { placeObjectAnchor(frame: frame); say("Target locked.") }
+    if !targetPlaced {
+      if arFrameCount >= anchorWaitFrames {
+        placeScreenTarget()
+        say("Target locked.")
+      }
       return
     }
 
-    projectBboxToScreen(frame: frame)
+    // No need to call projectBboxToScreen — target is fixed in screen space
 
     let pb = frame.capturedImage
     computeAspectFillCrop(imageW: CGFloat(CVPixelBufferGetWidth(pb)),
@@ -828,9 +873,11 @@ class ReachingViewController: UIViewController {
     let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .right, options: [:])
     do { try handler.perform([handReq]) } catch { return }
 
-    guard projectedBboxW > 0 else { return }
-    let bboxCx = projectedBboxCenter.x, bboxCy = projectedBboxCenter.y
-    let bboxHalfW = projectedBboxW / 2, bboxHalfH = projectedBboxH / 2
+    guard targetScreenHalfW > 0 else { return }
+    let bboxCx = targetScreenCenter.x
+    let bboxCy = targetScreenCenter.y
+    let bboxHalfW = targetScreenHalfW
+    let bboxHalfH = targetScreenHalfH
 
     guard let obs = handReq.results?.first else {
       noHandFrames += 1; successFrames = 0
@@ -858,12 +905,12 @@ class ReachingViewController: UIViewController {
     let dist = sqrt(dx * dx + dy * dy)
 
     let innerOverlap = abs(dx) < bboxHalfW && abs(dy) < bboxHalfH
-    let tolX = max(projectedBboxW * 0.3, 20), tolY = max(projectedBboxH * 0.3, 20)
+    let tolX = max(targetScreenHalfW * 0.3, 20), tolY = max(targetScreenHalfH * 0.3, 20)
     let nearOverlap = CGRect(x: bboxCx - bboxHalfW - tolX, y: bboxCy - bboxHalfH - tolY,
-                             width: projectedBboxW + tolX*2, height: projectedBboxH + tolY*2)
+                             width: bboxHalfW*2 + tolX*2, height: bboxHalfH*2 + tolY*2)
       .contains(CGPoint(x: screenX, y: screenY))
 
-    let sw = cachedSW, sh = cachedSH  // Thread-safe
+    let sw = cachedSW, sh = cachedSH
     let normDist = dist / max(sw, sh)
     let newProx: ProximityZone
     if innerOverlap       { newProx = .centered }
@@ -899,7 +946,6 @@ class ReachingViewController: UIViewController {
       self.handDotGlow.fillColor = color.withAlphaComponent(0.2).cgColor
       self.updateDirectionUI(direction)
 
-      // Progress ring
       if self.successFrames > 0 {
         self.progressRing.isHidden = false
         let progress = CGFloat(self.successFrames) / CGFloat(self.successThreshold)
@@ -927,7 +973,6 @@ class ReachingViewController: UIViewController {
     directionLabel.text = newDir == .centered ? "✅  Centered!" : newDir.rawValue
     directionLabel.textColor = newDir == .centered ? .systemGreen : .white
 
-    // Animate bottom bar
     UIView.animate(withDuration: 0.15) {
       self.bottomBar.transform = CGAffineTransform(scaleX: 1.05, y: 1.05)
     } completion: { _ in
