@@ -1,8 +1,6 @@
 /**
- * ReachingModule.swift — ARKit World-Anchored Reaching (v4)
- *
- * iOS 14+ | ARKit World Tracking | No LiDAR required
- */
+ ReachingModule.swift — ARKit Reaching v6
+*/
 
 import Foundation
 import AVFoundation
@@ -45,26 +43,21 @@ class ReachingModule: NSObject {
       return
     }
     let objectName = (params["object"] as? String) ?? "object"
-    
+
     // Parse depth from backend (handles both meters and centimeters)
     var backendDepth: Float? = nil
     if let d = params["depth"] {
       var rawValue: Float? = nil
       if let n = d as? NSNumber { rawValue = n.floatValue }
       else if let s = d as? String, let v = Float(s) { rawValue = v }
-      
+
       if var v = rawValue, v > 0 {
-        // Backend sends depth in centimeters — convert to meters
         if v > 10 { v = v / 100.0 }
-        // Clamp to reasonable range (10cm to 5m)
-        if v >= 0.1 && v <= 5.0 {
-          backendDepth = v
-        }
+        if v >= 0.1 && v <= 5.0 { backendDepth = v }
       }
     }
     NSLog("🎯 [ReachingModule] depth from backend: %@", backendDepth.map { "\($0)m" } ?? "nil")
 
-    // Parse actual image dimensions from fixImageOrientation
     var imgW: CGFloat = 0, imgH: CGFloat = 0
     if let w = params["imageWidth"] as? NSNumber { imgW = CGFloat(w.doubleValue) }
     if let h = params["imageHeight"] as? NSNumber { imgH = CGFloat(h.doubleValue) }
@@ -137,8 +130,6 @@ class ReachingModule: NSObject {
 
 class ReachingViewController: UIViewController {
 
-  // ── Direction ───────────────────────────────────────────────────────────
-
   enum Direction: String {
     case left = "left", topLeft = "top left", top = "up", topRight = "top right"
     case right = "right", downRight = "down right", down = "down", downLeft = "down left"
@@ -154,20 +145,29 @@ class ReachingViewController: UIViewController {
   private let bboxRaw: [CGFloat]
   private let objectName: String
   private let backendDepth: Float?
-  private let imageWidth: CGFloat   // Actual corrected image width in pixels
-  private let imageHeight: CGFloat  // Actual corrected image height in pixels
+  private let imageWidth: CGFloat
+  private let imageHeight: CGFloat
   private let onDone: ([String: Any]) -> Void
   private var bboxNormalized: [CGFloat] = [0, 0, 0, 0]
+
+  // ── 3D World Anchor (v6: LOCKED IN SPACE) ──────────────────────────────
+
+  private var objectWorldPosition: simd_float3?
+  private var objectWorldHalfW: Float = 0
+  private var objectWorldHalfH: Float = 0
+  private var anchorPlaced = false
+  /// The initial depth used to place the anchor (from backend)
+  private var anchorDepth: Float = 0.5
+  /// LIVE distance from camera to the world anchor (updated every frame)
+  private var liveDistanceToObject: Float = 0.5
+
+  // Depth gating
+  private let depthReachThreshold: Float = 0.35  // hand must be within 35cm of object
+  private var handIsCloseEnoughInDepth = false
 
   // ── ARKit ───────────────────────────────────────────────────────────────
 
   private var sceneView: ARSCNView!
-  private var objectWorldPosition: simd_float3?
-  private var objectWorldRight: simd_float3 = .zero
-  private var objectWorldUp: simd_float3 = .zero
-  private var objectWorldHalfW: Float = 0
-  private var objectWorldHalfH: Float = 0
-  private var anchorPlaced = false
   private var arFrameCount = 0
   private let anchorWaitFrames = 15
 
@@ -199,7 +199,7 @@ class ReachingViewController: UIViewController {
 
   private var hapticEngine: CHHapticEngine?
 
-  // ── UI (Apple-quality) ──────────────────────────────────────────────────
+  // ── UI ──────────────────────────────────────────────────────────────────
 
   private let bboxLayer = CAShapeLayer()
   private let innerBboxLayer = CAShapeLayer()
@@ -212,8 +212,9 @@ class ReachingViewController: UIViewController {
   private var cancelButton: UIButton!
   private var progressRing: CAShapeLayer!
   private var distanceLabel: UILabel!
+  private var depthHintLabel: UILabel!  // v6: shows "Move hand closer" when 2D aligned but depth wrong
 
-  // ── Projected bbox ──────────────────────────────────────────────────────
+  // ── Projected bbox (updated every frame from world anchor) ─────────────
 
   private var projectedBboxCenter: CGPoint = .zero
   private var projectedBboxW: CGFloat = 0
@@ -232,7 +233,7 @@ class ReachingViewController: UIViewController {
   private let noHandLimit = 50
   private let noHandRepeatCycle = 120
 
-  // ── Cached screen bounds (thread-safe) ────────────────────────────────
+  // ── Cached screen bounds ──────────────────────────────────────────────
 
   private var cachedSW: CGFloat = 393
   private var cachedSH: CGFloat = 852
@@ -241,12 +242,6 @@ class ReachingViewController: UIViewController {
 
   private var cropFracX: CGFloat = 0
   private var cropComputed = false
-  
-  // Screen-space target (set once at start, in screen points)──────────────
-  private var targetScreenCenter: CGPoint = .zero
-  private var targetScreenHalfW: CGFloat = 0
-  private var targetScreenHalfH: CGFloat = 0
-  private var targetPlaced = false
 
   // ── Init ────────────────────────────────────────────────────────────────
 
@@ -306,23 +301,15 @@ class ReachingViewController: UIViewController {
     let y1 = min(abs(bboxRaw[1]), abs(bboxRaw[3]))
     let x2 = max(abs(bboxRaw[0]), abs(bboxRaw[2]))
     let y2 = max(abs(bboxRaw[1]), abs(bboxRaw[3]))
-    let sorted: [CGFloat] = [x1, y1, x2, y2]
-
     let maxVal = max(x1, y1, x2, y2)
 
-    // PRIORITY 1: Use actual image dimensions if provided
     if imageWidth > 0 && imageHeight > 0 && maxVal > 1.0 {
       bboxNormalized = [x1 / imageWidth, y1 / imageHeight, x2 / imageWidth, y2 / imageHeight]
       NSLog("📦 [ReachingVC] Bbox [%.0f,%.0f,%.0f,%.0f] ÷ actual image %.0f×%.0f → norm %@",
             x1, y1, x2, y2, imageWidth, imageHeight, "\(bboxNormalized)")
-
-    // FALLBACK: Already normalized 0-1
     } else if maxVal <= 1.0 {
-      bboxNormalized = sorted
-
-    // FALLBACK: No image dimensions
+      bboxNormalized = [x1, y1, x2, y2]
     } else {
-      NSLog("⚠️ [ReachingVC] No image dimensions! Falling back to heuristic normalization")
       let guessW: CGFloat = max(x2 * 1.1, 1152)
       let guessH: CGFloat = max(y2 * 1.1, 2048)
       bboxNormalized = [x1 / guessW, y1 / guessH, x2 / guessW, y2 / guessH]
@@ -333,7 +320,6 @@ class ReachingViewController: UIViewController {
     let bw = bboxNormalized[2] - bboxNormalized[0]
     let bh = bboxNormalized[3] - bboxNormalized[1]
     if bw < 0.01 || bh < 0.01 {
-      NSLog("⚠️ [ReachingVC] Bbox too small (%.3f×%.3f), using center default", bw, bh)
       bboxNormalized = [0.35, 0.35, 0.65, 0.65]
     }
 
@@ -342,7 +328,9 @@ class ReachingViewController: UIViewController {
           (bboxNormalized[0]+bboxNormalized[2])/2, (bboxNormalized[1]+bboxNormalized[3])/2)
   }
 
-  // ── ARKit ───────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - ARKit Setup
+  // ═══════════════════════════════════════════════════════════════════════════
 
   private func setupARView() {
     sceneView = ARSCNView(frame: view.bounds)
@@ -356,37 +344,41 @@ class ReachingViewController: UIViewController {
   private func startAR() {
     let config = ARWorldTrackingConfiguration()
     config.planeDetection = []
+    // Enable scene depth if available (LiDAR devices)
+    if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+      config.frameSemantics.insert(.sceneDepth)
+      NSLog("📷 [ReachingVC] Scene depth ENABLED (LiDAR)")
+    } else {
+      NSLog("📷 [ReachingVC] No LiDAR — using backend depth + hand size heuristic")
+    }
     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     startBeepLoop()
     NSLog("📷 [ReachingVC] AR session started")
   }
 
-  private func placeScreenTarget() {
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - v6: Place 3D World Anchor from screen-space bbox
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Strategy: compute where the bbox SHOULD be on screen (same as v5),
+   * then use the CURRENT AR camera to shoot a ray through that screen point
+   * and place a world anchor at the backend depth along that ray.
+   *
+   * Because this uses the camera pose at frame 15 (when the phone is still
+   * roughly pointed at the scene), the 3D position is much better than
+   * doing it at frame 0.
+   *
+   * The bbox then gets REPROJECTED each frame via projectPoint, so it
+   * stays locked in world space as the camera moves.
+   */
+  private func placeWorldAnchor(frame: ARFrame) {
     let sw = cachedSW
     let sh = cachedSH
 
-    // The bbox is normalized to the PORTRAIT photo dimensions.
-    // We need to map it to the screen, accounting for the aspect-fill
-    // crop that the AR camera preview applies.
-    //
-    // The AR camera preview uses aspect-fill:
-    // - AR camera is 4:3 (landscape) = 3:4 (portrait)
-    // - Screen is ~9:19.5 (portrait)
-    // - The camera image is scaled to fill the screen height,
-    //   then the sides are cropped.
-    //
-    // But we're NOT mapping from the AR camera image — we're mapping
-    // from the PHOTO, which has its own aspect ratio.
-    //
-    // Photo is 9:16 portrait (1152×2048).
-    // Screen is ~9:19.5 (393×852).
-    //
-    // If we assume the photo was taken from roughly the same position
-    // and the user hasn't moved, the photo's normalized coordinates
-    // map directly to the screen with aspect-fill scaling.
-
-    let photoAspect = imageWidth / imageHeight  // 1152/2048 = 0.5625
-    let screenAspect = sw / sh                   // 393/852 = 0.4613
+    // Step 1: Compute screen-space bbox center (same math as v5 — KNOWN CORRECT)
+    let photoAspect = imageWidth / imageHeight
+    let screenAspect = sw / sh
 
     var scaleX: CGFloat = 1.0
     var scaleY: CGFloat = 1.0
@@ -394,84 +386,116 @@ class ReachingViewController: UIViewController {
     var offsetY: CGFloat = 0.0
 
     if photoAspect > screenAspect {
-      // Photo is wider than screen — fit height, crop sides
       scaleY = 1.0
       scaleX = (photoAspect / screenAspect)
-      offsetX = (scaleX - 1.0) / 2.0  // cropped from each side
+      offsetX = (scaleX - 1.0) / 2.0
     } else {
-      // Photo is taller than screen — fit width, crop top/bottom
       scaleX = 1.0
       scaleY = (screenAspect / photoAspect)
-      offsetY = (scaleY - 1.0) / 2.0  // cropped from top/bottom
+      offsetY = (scaleY - 1.0) / 2.0
     }
 
-    // Map normalized bbox to screen coordinates
-    // The photo coords need to be adjusted for the crop
     let bx1 = (bboxNormalized[0] * scaleX - offsetX) * sw
     let by1 = (bboxNormalized[1] * scaleY - offsetY) * sh
     let bx2 = (bboxNormalized[2] * scaleX - offsetX) * sw
     let by2 = (bboxNormalized[3] * scaleY - offsetY) * sh
 
-    targetScreenCenter = CGPoint(x: (bx1 + bx2) / 2, y: (by1 + by2) / 2)
-    targetScreenHalfW = max((bx2 - bx1) / 2, 15)
-    targetScreenHalfH = max((by2 - by1) / 2, 15)
-    targetPlaced = true
+    let screenCenter = CGPoint(x: (bx1 + bx2) / 2, y: (by1 + by2) / 2)
+    let screenHalfW = max((bx2 - bx1) / 2, 15)
+    let screenHalfH = max((by2 - by1) / 2, 15)
 
-    // Also set the projected bbox vars so the rest of the code works unchanged
-    projectedBboxCenter = targetScreenCenter
-    projectedBboxW = targetScreenHalfW * 2
-    projectedBboxH = targetScreenHalfH * 2
+    NSLog("🎯 [ReachingVC] Screen target: center=(%.1f, %.1f) size=%.0f×%.0f",
+          screenCenter.x, screenCenter.y, screenHalfW * 2, screenHalfH * 2)
 
-    NSLog("🎯 [ReachingVC] Screen target placed: center=(%.1f, %.1f) size=%.0f×%.0f",
-          targetScreenCenter.x, targetScreenCenter.y,
-          targetScreenHalfW * 2, targetScreenHalfH * 2)
-    NSLog("🎯 [ReachingVC] Screen normalized: center=(%.3f, %.3f)",
-          targetScreenCenter.x / sw, targetScreenCenter.y / sh)
+    // Step 2: Unproject screen point to 3D ray using current camera
+    let camera = frame.camera
+    let viewSize = CGSize(width: sw, height: sh)
 
-    // Draw the bbox immediately
+    // Use the camera intrinsics via projectPoint inverse:
+    // We create a point at known depth and unproject
+    let depth = backendDepth ?? 0.5
+    anchorDepth = depth
+
+    // Shoot ray: place a virtual point at screen position and unproject
+    // ARCamera doesn't have unprojectPoint on iOS 14, so we compute manually
+    let intrinsics = camera.intrinsics
+    let imageRes = camera.imageResolution  // landscape: 1920×1440
+
+    // Convert screen point to AR camera image pixel
+    // The AR camera image fills the screen with aspect-fill.
+    // Screen is portrait, AR image is landscape.
+    let arW = imageRes.width   // 1920
+    let arH = imageRes.height  // 1440
+
+    // Portrait screen → landscape AR image mapping
+    // AR image is rotated 90° CW to become portrait on screen
+    // Screen Y maps to AR image X, Screen X maps to AR image (H - Y)
+    let arPixelX = (screenCenter.y / sh) * arW   // screen Y → AR X
+    let arPixelY = (1.0 - screenCenter.x / sw) * arH  // screen X → AR Y (inverted)
+
+    let fx = CGFloat(intrinsics[0][0])
+    let fy = CGFloat(intrinsics[1][1])
+    let cx = CGFloat(intrinsics[2][0])
+    let cy = CGFloat(intrinsics[2][1])
+
+    // Ray in camera space (landscape, Y-down pixel convention)
+    let rawRayX = Float((arPixelX - cx) / fx)
+    let rawRayY = Float((arPixelY - cy) / fy)
+    let rawRayZ: Float = 1.0
+
+    // Convert to ARKit camera space (Y-up, Z-backward)
+    let rayCamera = simd_normalize(simd_float3(rawRayX, -rawRayY, -rawRayZ))
+
+    // Transform to world space using camera transform
+    let camTransform = camera.transform
+    let worldRay = simd_normalize(simd_make_float3(camTransform * simd_float4(rayCamera, 0)))
+    let camPos = simd_make_float3(camTransform.columns.3)
+
+    // Place anchor at depth along ray
+    let worldPos = camPos + worldRay * depth
+    objectWorldPosition = worldPos
+
+    // Compute world-space bbox extents for reprojection
+    let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
+    let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
+    objectWorldHalfW = depth * Float(bboxNormW) * 0.5
+    objectWorldHalfH = depth * Float(bboxNormH) * 0.8  // slightly larger for safety
+
+    anchorPlaced = true
+
+    NSLog("🎯 [ReachingVC] AR pixel: (%.1f, %.1f) in %.0f×%.0f", arPixelX, arPixelY, arW, arH)
+    NSLog("🎯 [ReachingVC] Camera ray: (%.4f, %.4f, %.4f)", rayCamera.x, rayCamera.y, rayCamera.z)
+    NSLog("🎯 [ReachingVC] World ray: (%.4f, %.4f, %.4f)", worldRay.x, worldRay.y, worldRay.z)
+    NSLog("🎯 [ReachingVC] ✅ Anchor at world: (%.3f, %.3f, %.3f) depth=%.2f",
+          worldPos.x, worldPos.y, worldPos.z, depth)
+
+    // Verify by projecting back
+    let verify = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
+    NSLog("🎯 [ReachingVC] Verify: projects to screen (%.1f, %.1f) = norm (%.3f, %.3f)",
+          verify.x, verify.y, verify.x / sw, verify.y / sh)
+
+    // Initial UI update
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
-      self.bboxLayer.isHidden = false
-      self.innerBboxLayer.isHidden = false
-
-      let innerRect = CGRect(x: self.targetScreenCenter.x - self.targetScreenHalfW,
-                              y: self.targetScreenCenter.y - self.targetScreenHalfH,
-                              width: self.targetScreenHalfW * 2,
-                              height: self.targetScreenHalfH * 2)
-      let tolX = max(self.targetScreenHalfW * 0.25, 15)
-      let tolY = max(self.targetScreenHalfH * 0.25, 15)
-      let outerRect = innerRect.insetBy(dx: -tolX, dy: -tolY)
-
-      self.innerBboxLayer.path = UIBezierPath(roundedRect: innerRect, cornerRadius: 8).cgPath
-      self.bboxLayer.path = UIBezierPath(roundedRect: outerRect, cornerRadius: 12).cgPath
-
-      // Show distance from backend
       if let depth = self.backendDepth {
         self.distanceLabel.text = "\(Int(depth * 100)) cm"
       }
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - v6: Reproject world anchor to screen each frame
+  // ═══════════════════════════════════════════════════════════════════════════
 
-  // ── Project bbox to screen ──────────────────────────────────────────────
-
-  private func projectBboxToScreen(frame: ARFrame) {
+  private func reprojectBbox(frame: ARFrame) {
     guard let center3D = objectWorldPosition else { return }
-    let viewSize = CGSize(width: cachedSW, height: cachedSH)
+    let sw = cachedSW, sh = cachedSH
     let camera = frame.camera
+    let viewSize = CGSize(width: sw, height: sh)
 
-    let centerScreen = camera.projectPoint(center3D, orientation: .portrait, viewportSize: viewSize)
-    let cornerTR = center3D + objectWorldRight * objectWorldHalfW + objectWorldUp * objectWorldHalfH
-    let cornerBL = center3D - objectWorldRight * objectWorldHalfW - objectWorldUp * objectWorldHalfH
-    let trScreen = camera.projectPoint(cornerTR, orientation: .portrait, viewportSize: viewSize)
-    let blScreen = camera.projectPoint(cornerBL, orientation: .portrait, viewportSize: viewSize)
-
-    let screenW = abs(trScreen.x - blScreen.x)
-    let screenH = abs(trScreen.y - blScreen.y)
-
-    // Check behind camera
-    let camPos = simd_float3(camera.transform.columns.3.x, camera.transform.columns.3.y, camera.transform.columns.3.z)
-    let camFwd = -simd_normalize(simd_float3(camera.transform.columns.2.x, camera.transform.columns.2.y, camera.transform.columns.2.z))
+    // Check if object is behind camera
+    let camPos = simd_make_float3(camera.transform.columns.3)
+    let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
     if simd_dot(center3D - camPos, camFwd) < 0 {
       DispatchQueue.main.async { [weak self] in
         self?.bboxLayer.isHidden = true
@@ -483,30 +507,142 @@ class ReachingViewController: UIViewController {
       return
     }
 
+    // Project center to screen
+    let centerScreen = camera.projectPoint(center3D, orientation: .portrait, viewportSize: viewSize)
+
+    // Project corners to get screen-space size
+    // Use camera right and up vectors for world-space offsets
+    let camRight = simd_normalize(simd_make_float3(camera.transform.columns.0))
+    let camUp = simd_normalize(simd_make_float3(camera.transform.columns.1))
+
+    let cornerTR = center3D + camRight * objectWorldHalfW + camUp * objectWorldHalfH
+    let cornerBL = center3D - camRight * objectWorldHalfW - camUp * objectWorldHalfH
+    let trScreen = camera.projectPoint(cornerTR, orientation: .portrait, viewportSize: viewSize)
+    let blScreen = camera.projectPoint(cornerBL, orientation: .portrait, viewportSize: viewSize)
+
+    let screenW = max(abs(trScreen.x - blScreen.x), 20)
+    let screenH = max(abs(trScreen.y - blScreen.y), 20)
+
     let dist = simd_length(center3D - camPos)
 
+    // v6.1: Update LIVE distance — this is the real AR-measured distance
+    liveDistanceToObject = dist
+
     projectedBboxCenter = centerScreen
-    projectedBboxW = max(screenW, 20)
-    projectedBboxH = max(screenH, 20)
+    projectedBboxW = screenW
+    projectedBboxH = screenH
 
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       self.bboxLayer.isHidden = false
       self.innerBboxLayer.isHidden = false
 
-      let innerRect = CGRect(x: centerScreen.x - self.projectedBboxW/2,
-                              y: centerScreen.y - self.projectedBboxH/2,
-                              width: self.projectedBboxW, height: self.projectedBboxH)
-      let tolX = max(self.projectedBboxW * 0.25, 15)
-      let tolY = max(self.projectedBboxH * 0.25, 15)
+      let innerRect = CGRect(x: centerScreen.x - screenW/2,
+                              y: centerScreen.y - screenH/2,
+                              width: screenW, height: screenH)
+      let tolX = max(screenW * 0.25, 15)
+      let tolY = max(screenH * 0.25, 15)
       let outerRect = innerRect.insetBy(dx: -tolX, dy: -tolY)
 
       self.innerBboxLayer.path = UIBezierPath(roundedRect: innerRect, cornerRadius: 8).cgPath
       self.bboxLayer.path = UIBezierPath(roundedRect: outerRect, cornerRadius: 12).cgPath
 
-      let distCm = Int(dist * 100)
-      self.distanceLabel.text = "\(distCm) cm"
+      self.distanceLabel.text = "\(Int(dist * 100)) cm"
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - v6: Depth Gating
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Check if the hand is close enough in depth to the target object.
+   *
+   * v6.1: Uses LIVE AR distance (camera→anchor) instead of initial backend depth.
+   * The anchor moves in world space as you walk toward it, so liveDistanceToObject
+   * decreases. The hand depth estimate must be close to this LIVE value.
+   *
+   * Strategy (in priority order):
+   * 1. LiDAR scene depth (most accurate) — sample depth at hand screen position
+   * 2. Hand apparent size heuristic — larger hand = closer to camera
+   * 3. Simple distance check — if camera is within reach distance of anchor, pass
+   */
+  private func checkHandDepth(
+    frame: ARFrame,
+    handScreenPt: CGPoint,
+    handObs: VNHumanHandPoseObservation
+  ) -> Bool {
+    // Use LIVE distance, not initial backend depth
+    let objectDist = liveDistanceToObject
+
+    // ── Method 1: LiDAR scene depth ──────────────────────────────────────
+    if let sceneDepth = frame.sceneDepth {
+      let depthMap = sceneDepth.depthMap
+      let depthW = CVPixelBufferGetWidth(depthMap)
+      let depthH = CVPixelBufferGetHeight(depthMap)
+
+      let normX = handScreenPt.x / cachedSW
+      let normY = handScreenPt.y / cachedSH
+
+      let depthPixelX = Int(normY * CGFloat(depthW))
+      let depthPixelY = Int((1.0 - normX) * CGFloat(depthH))
+
+      let clampedX = max(0, min(depthPixelX, depthW - 1))
+      let clampedY = max(0, min(depthPixelY, depthH - 1))
+
+      CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+      defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+
+      if let baseAddr = CVPixelBufferGetBaseAddress(depthMap) {
+        let bytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        let ptr = baseAddr.advanced(by: clampedY * bytesPerRow + clampedX * MemoryLayout<Float32>.size)
+        let handDepth = ptr.load(as: Float32.self)
+
+        if handDepth > 0 && handDepth < 10 {
+          let depthDiff = abs(handDepth - objectDist)
+          let isClose = depthDiff < depthReachThreshold
+          if arFrameCount % 30 == 0 {
+            NSLog("📏 [Depth-LiDAR] hand=%.2fm obj=%.2fm(live) diff=%.2fm close=%d",
+                  handDepth, objectDist, depthDiff, isClose ? 1 : 0)
+          }
+          return isClose
+        }
+      }
+    }
+
+    // ── Method 2: Hand apparent size heuristic ───────────────────────────
+    if let wrist = try? handObs.recognizedPoint(.wrist),
+       let middleTip = try? handObs.recognizedPoint(.middleTip),
+       wrist.confidence > 0.3 && middleTip.confidence > 0.3 {
+
+      let handSpan = sqrt(pow(wrist.location.x - middleTip.location.x, 2) +
+                          pow(wrist.location.y - middleTip.location.y, 2))
+
+      let k: CGFloat = 0.11
+      let estimatedHandDist = Float(k / max(handSpan, 0.01))
+
+      // Compare hand distance to LIVE object distance
+      let depthDiff = abs(estimatedHandDist - objectDist)
+      let isClose = depthDiff < depthReachThreshold
+
+      if arFrameCount % 30 == 0 {
+        NSLog("📏 [Depth-Heuristic] handSpan=%.3f est=%.2fm obj=%.2fm(live) diff=%.2fm close=%d",
+              handSpan, estimatedHandDist, objectDist, depthDiff, isClose ? 1 : 0)
+      }
+      return isClose
+    }
+
+    // ── Method 3: Camera proximity fallback ──────────────────────────────
+    // If hand detection can't estimate depth, but the camera itself is
+    // very close to the anchor, the user is likely at the object
+    if objectDist < 0.5 {
+      if arFrameCount % 30 == 0 {
+        NSLog("📏 [Depth-Proximity] Camera %.2fm from anchor — close enough", objectDist)
+      }
+      return true
+    }
+
+    return false
   }
 
   // ── Aspect-fill crop ────────────────────────────────────────────────────
@@ -532,6 +668,154 @@ class ReachingViewController: UIViewController {
       ? ((pt.x - cropFracX) / (1.0 - 2 * cropFracX)) * sw
       : pt.x * sw
     return CGPoint(x: adjustedX, y: (1 - pt.y) * sh)
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Process AR Frame
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private func processARFrame(_ frame: ARFrame) {
+    guard running else { return }
+    arFrameCount += 1
+
+    // Wait for AR to stabilize, then place world anchor
+    if !anchorPlaced {
+      if arFrameCount >= anchorWaitFrames {
+        placeWorldAnchor(frame: frame)
+        say("Target locked.")
+      }
+      return
+    }
+
+    // Reproject world anchor to screen (LOCKED IN SPACE)
+    reprojectBbox(frame: frame)
+
+    // Aspect-fill crop for hand detection
+    let pb = frame.capturedImage
+    computeAspectFillCrop(imageW: CGFloat(CVPixelBufferGetWidth(pb)),
+                          imageH: CGFloat(CVPixelBufferGetHeight(pb)))
+
+    // Detect hand
+    let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .right, options: [:])
+    do { try handler.perform([handReq]) } catch { return }
+
+    guard projectedBboxW > 0 else { return }
+    let bboxCx = projectedBboxCenter.x
+    let bboxCy = projectedBboxCenter.y
+    let bboxHalfW = projectedBboxW / 2
+    let bboxHalfH = projectedBboxH / 2
+
+    // No hand detected
+    guard let obs = handReq.results?.first else {
+      noHandFrames += 1; successFrames = 0; handIsCloseEnoughInDepth = false
+      if noHandFrames == noHandLimit {
+        DispatchQueue.main.async { [weak self] in self?.say("Show your hand to the camera.") }
+      }
+      if noHandFrames > noHandLimit + noHandRepeatCycle { noHandFrames = 0 }
+      DispatchQueue.main.async { [weak self] in
+        self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true
+        self?.depthHintLabel.isHidden = true
+        self?.updateDirectionUI(.searching)
+      }
+      proximityZone = .searching; return
+    }
+
+    noHandFrames = 0
+    guard let visionPt = handCenter(obs) else {
+      successFrames = 0; handIsCloseEnoughInDepth = false
+      DispatchQueue.main.async { [weak self] in
+        self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true
+      }
+      return
+    }
+
+    let handScreen = visionToScreen(visionPt)
+    let screenX = handScreen.x, screenY = handScreen.y
+    let dx = screenX - bboxCx, dy = screenY - bboxCy
+    let dist = sqrt(dx * dx + dy * dy)
+
+    // 2D overlap checks
+    let innerOverlap = abs(dx) < bboxHalfW && abs(dy) < bboxHalfH
+    let tolX = max(bboxHalfW * 0.3, 20), tolY = max(bboxHalfH * 0.3, 20)
+    let nearOverlap = CGRect(x: bboxCx - bboxHalfW - tolX, y: bboxCy - bboxHalfH - tolY,
+                             width: bboxHalfW*2 + tolX*2, height: bboxHalfH*2 + tolY*2)
+      .contains(CGPoint(x: screenX, y: screenY))
+
+    // v6: Depth check
+    let depthOk = checkHandDepth(frame: frame, handScreenPt: handScreen, handObs: obs)
+    handIsCloseEnoughInDepth = depthOk
+
+    // Proximity zones (2D-based for audio feedback)
+    let sw = cachedSW, sh = cachedSH
+    let normDist = dist / max(sw, sh)
+    let newProx: ProximityZone
+    if innerOverlap && depthOk { newProx = .centered }
+    else if innerOverlap       { newProx = .veryClose }  // 2D aligned but not deep enough
+    else if nearOverlap        { newProx = .close }
+    else if normDist < 0.15    { newProx = .close }
+    else if normDist < 0.30    { newProx = .medium }
+    else                       { newProx = .far }
+    proximityZone = newProx
+
+    let direction = computeDirection(handX: screenX, handY: screenY,
+                                     bboxCx: bboxCx, bboxCy: bboxCy,
+                                     bboxHalfW: bboxHalfW, bboxHalfH: bboxHalfH)
+    speakDirectionIfNeeded(direction)
+
+    // UI update
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      let dotR: CGFloat = 12
+      self.handDot.isHidden = false; self.handDotGlow.isHidden = false
+      self.handDot.path = UIBezierPath(ovalIn: CGRect(x: screenX-dotR, y: screenY-dotR,
+                                                       width: dotR*2, height: dotR*2)).cgPath
+      self.handDotGlow.path = UIBezierPath(ovalIn: CGRect(x: screenX-dotR*2, y: screenY-dotR*2,
+                                                           width: dotR*4, height: dotR*4)).cgPath
+
+      let color: UIColor = {
+        switch newProx {
+        case .centered:            return .systemGreen
+        case .veryClose:           return .systemYellow  // 2D aligned, need depth
+        case .close:               return .systemYellow
+        case .medium:              return .systemOrange
+        default:                   return .systemRed
+        }
+      }()
+      self.handDot.fillColor = color.cgColor
+      self.handDotGlow.fillColor = color.withAlphaComponent(0.2).cgColor
+      self.updateDirectionUI(direction)
+
+      // v6: Show depth hint when 2D aligned but depth not met
+      if innerOverlap && !depthOk {
+        self.depthHintLabel.isHidden = false
+        self.depthHintLabel.text = "Move hand closer to the object"
+      } else {
+        self.depthHintLabel.isHidden = true
+      }
+
+      // Progress ring (only counts when BOTH 2D and depth are satisfied)
+      if self.successFrames > 0 {
+        self.progressRing.isHidden = false
+        let progress = CGFloat(self.successFrames) / CGFloat(self.successThreshold)
+        self.progressRing.strokeEnd = progress
+        let ringR: CGFloat = dotR + 8
+        let ringPath = UIBezierPath(arcCenter: CGPoint(x: screenX, y: screenY),
+                                    radius: ringR, startAngle: -.pi/2,
+                                    endAngle: -.pi/2 + .pi*2, clockwise: true)
+        self.progressRing.path = ringPath.cgPath
+      } else {
+        self.progressRing.isHidden = true
+        self.progressRing.strokeEnd = 0
+      }
+    }
+
+    // v6: Success requires BOTH 2D overlap AND depth proximity
+    if innerOverlap && depthOk {
+      successFrames += 1
+      if successFrames >= successThreshold { handleSuccess() }
+    } else {
+      successFrames = 0
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -604,6 +888,16 @@ class ReachingViewController: UIViewController {
     directionLabel.translatesAutoresizingMaskIntoConstraints = false
     bottomBar.contentView.addSubview(directionLabel)
 
+    // v6: Depth hint label
+    depthHintLabel = UILabel()
+    depthHintLabel.text = "Move hand closer to the object"
+    depthHintLabel.font = UIFont.systemFont(ofSize: 15, weight: .medium)
+    depthHintLabel.textColor = .systemYellow
+    depthHintLabel.textAlignment = .center
+    depthHintLabel.isHidden = true
+    depthHintLabel.translatesAutoresizingMaskIntoConstraints = false
+    view.addSubview(depthHintLabel)
+
     progressRing = CAShapeLayer()
     progressRing.strokeColor = UIColor.systemGreen.cgColor
     progressRing.fillColor = UIColor.clear.cgColor
@@ -647,6 +941,10 @@ class ReachingViewController: UIViewController {
       directionLabel.leadingAnchor.constraint(equalTo: bottomBar.contentView.leadingAnchor, constant: 24),
       directionLabel.trailingAnchor.constraint(equalTo: bottomBar.contentView.trailingAnchor, constant: -24),
 
+      // v6: depth hint between bottom bar and cancel
+      depthHintLabel.bottomAnchor.constraint(equalTo: bottomBar.topAnchor, constant: -8),
+      depthHintLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+
       cancelButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -20),
       cancelButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
       cancelButton.widthAnchor.constraint(equalToConstant: 120),
@@ -656,7 +954,9 @@ class ReachingViewController: UIViewController {
     view.accessibilityLabel = "Reaching guidance for \(objectName). Tap Cancel to stop."
   }
 
-  // ── Audio ───────────────────────────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Audio
+  // ═══════════════════════════════════════════════════════════════════════════
 
   private func setupAudio() {
     do {
@@ -732,7 +1032,9 @@ class ReachingViewController: UIViewController {
     try? engine.makePlayer(with: CHHapticPattern(events: [event], parameters: [])).start(atTime: 0)
   }
 
-  // ── Cancel / Success / Cleanup ──────────────────────────────────────────
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Cancel / Success / Cleanup
+  // ═══════════════════════════════════════════════════════════════════════════
 
   @objc private func cancelTapped() {
     say("Cancelled"); finishWith(success: false, reason: "user_cancelled")
@@ -750,6 +1052,7 @@ class ReachingViewController: UIViewController {
       guard let self = self else { return }
       self.directionLabel.text = "✅  \(self.objectName) reached!"
       self.directionLabel.textColor = .systemGreen
+      self.depthHintLabel.isHidden = true
 
       let flash = UIView(frame: self.view.bounds)
       flash.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.25)
@@ -809,6 +1112,16 @@ class ReachingViewController: UIViewController {
     guard direction != .searching else { return }
     let now = ProcessInfo.processInfo.systemUptime
     if direction == currentDirection { directionStableFrames += 1 } else { directionStableFrames = 1 }
+
+    // v6: When 2D aligned but depth wrong, speak depth hint
+    if direction == .centered && !handIsCloseEnoughInDepth {
+      if now - lastSpeechTime > 2.5 {
+        say("Move your hand forward to reach the object")
+        lastSpeechTime = now
+      }
+      return
+    }
+
     if direction == lastSpokenDirection {
       if direction == .centered && (now - lastSpeechTime) > 3.0 { say("Centered!"); lastSpeechTime = now }
       return
@@ -848,123 +1161,6 @@ class ReachingViewController: UIViewController {
     if let mcp = try? obs.recognizedPoint(.middleMCP), mcp.confidence > 0.3 { return mcp.location }
     if let w = try? obs.recognizedPoint(.wrist), w.confidence > 0.3 { return w.location }
     return nil
-  }
-
-  // ── Process AR Frame ────────────────────────────────────────────────────
-
-  private func processARFrame(_ frame: ARFrame) {
-    guard running else { return }
-    arFrameCount += 1
-
-    if !targetPlaced {
-      if arFrameCount >= anchorWaitFrames {
-        placeScreenTarget()
-        say("Target locked.")
-      }
-      return
-    }
-
-    // No need to call projectBboxToScreen — target is fixed in screen space
-
-    let pb = frame.capturedImage
-    computeAspectFillCrop(imageW: CGFloat(CVPixelBufferGetWidth(pb)),
-                          imageH: CGFloat(CVPixelBufferGetHeight(pb)))
-
-    let handler = VNImageRequestHandler(cvPixelBuffer: pb, orientation: .right, options: [:])
-    do { try handler.perform([handReq]) } catch { return }
-
-    guard targetScreenHalfW > 0 else { return }
-    let bboxCx = targetScreenCenter.x
-    let bboxCy = targetScreenCenter.y
-    let bboxHalfW = targetScreenHalfW
-    let bboxHalfH = targetScreenHalfH
-
-    guard let obs = handReq.results?.first else {
-      noHandFrames += 1; successFrames = 0
-      if noHandFrames == noHandLimit {
-        DispatchQueue.main.async { [weak self] in self?.say("Show your hand to the camera.") }
-      }
-      if noHandFrames > noHandLimit + noHandRepeatCycle { noHandFrames = 0 }
-      DispatchQueue.main.async { [weak self] in
-        self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true
-        self?.updateDirectionUI(.searching)
-      }
-      proximityZone = .searching; return
-    }
-
-    noHandFrames = 0
-    guard let visionPt = handCenter(obs) else {
-      successFrames = 0
-      DispatchQueue.main.async { [weak self] in self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true }
-      return
-    }
-
-    let handScreen = visionToScreen(visionPt)
-    let screenX = handScreen.x, screenY = handScreen.y
-    let dx = screenX - bboxCx, dy = screenY - bboxCy
-    let dist = sqrt(dx * dx + dy * dy)
-
-    let innerOverlap = abs(dx) < bboxHalfW && abs(dy) < bboxHalfH
-    let tolX = max(targetScreenHalfW * 0.3, 20), tolY = max(targetScreenHalfH * 0.3, 20)
-    let nearOverlap = CGRect(x: bboxCx - bboxHalfW - tolX, y: bboxCy - bboxHalfH - tolY,
-                             width: bboxHalfW*2 + tolX*2, height: bboxHalfH*2 + tolY*2)
-      .contains(CGPoint(x: screenX, y: screenY))
-
-    let sw = cachedSW, sh = cachedSH
-    let normDist = dist / max(sw, sh)
-    let newProx: ProximityZone
-    if innerOverlap       { newProx = .centered }
-    else if nearOverlap   { newProx = .veryClose }
-    else if normDist < 0.15 { newProx = .close }
-    else if normDist < 0.30 { newProx = .medium }
-    else                    { newProx = .far }
-    proximityZone = newProx
-
-    let direction = computeDirection(handX: screenX, handY: screenY,
-                                     bboxCx: bboxCx, bboxCy: bboxCy,
-                                     bboxHalfW: bboxHalfW, bboxHalfH: bboxHalfH)
-    speakDirectionIfNeeded(direction)
-
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      let dotR: CGFloat = 12
-      self.handDot.isHidden = false; self.handDotGlow.isHidden = false
-      self.handDot.path = UIBezierPath(ovalIn: CGRect(x: screenX-dotR, y: screenY-dotR,
-                                                       width: dotR*2, height: dotR*2)).cgPath
-      self.handDotGlow.path = UIBezierPath(ovalIn: CGRect(x: screenX-dotR*2, y: screenY-dotR*2,
-                                                           width: dotR*4, height: dotR*4)).cgPath
-
-      let color: UIColor = {
-        switch newProx {
-        case .centered, .veryClose: return .systemGreen
-        case .close: return .systemYellow
-        case .medium: return .systemOrange
-        default: return .systemRed
-        }
-      }()
-      self.handDot.fillColor = color.cgColor
-      self.handDotGlow.fillColor = color.withAlphaComponent(0.2).cgColor
-      self.updateDirectionUI(direction)
-
-      if self.successFrames > 0 {
-        self.progressRing.isHidden = false
-        let progress = CGFloat(self.successFrames) / CGFloat(self.successThreshold)
-        self.progressRing.strokeEnd = progress
-        let ringR: CGFloat = dotR + 8
-        let ringPath = UIBezierPath(arcCenter: CGPoint(x: screenX, y: screenY),
-                                    radius: ringR, startAngle: -.pi/2,
-                                    endAngle: -.pi/2 + .pi*2, clockwise: true)
-        self.progressRing.path = ringPath.cgPath
-      } else {
-        self.progressRing.isHidden = true
-        self.progressRing.strokeEnd = 0
-      }
-    }
-
-    if innerOverlap {
-      successFrames += 1
-      if successFrames >= successThreshold { handleSuccess() }
-    } else { successFrames = 0 }
   }
 
   private func updateDirectionUI(_ newDir: Direction) {
