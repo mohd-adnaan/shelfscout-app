@@ -141,7 +141,7 @@ class ReachingViewController: UIViewController {
   }
 
   // ── Config ──────────────────────────────────────────────────────────────
-
+  private let depthForwardBias: Float = 0.20
   private let bboxRaw: [CGFloat]
   private let objectName: String
   private let backendDepth: Float?
@@ -510,13 +510,11 @@ class ReachingViewController: UIViewController {
     // Project center to screen
     let centerScreen = camera.projectPoint(center3D, orientation: .portrait, viewportSize: viewSize)
 
-    // Project corners to get screen-space size
-    // Use camera right and up vectors for world-space offsets
-    let camRight = simd_normalize(simd_make_float3(camera.transform.columns.0))
-    let camUp = simd_normalize(simd_make_float3(camera.transform.columns.1))
+    let portraitRight = -simd_normalize(simd_make_float3(camera.transform.columns.1))
+    let portraitUp = simd_normalize(simd_make_float3(camera.transform.columns.0))
 
-    let cornerTR = center3D + camRight * objectWorldHalfW + camUp * objectWorldHalfH
-    let cornerBL = center3D - camRight * objectWorldHalfW - camUp * objectWorldHalfH
+    let cornerTR = center3D + portraitRight * objectWorldHalfW + portraitUp * objectWorldHalfH
+    let cornerBL = center3D - portraitRight * objectWorldHalfW - portraitUp * objectWorldHalfH
     let trScreen = camera.projectPoint(cornerTR, orientation: .portrait, viewportSize: viewSize)
     let blScreen = camera.projectPoint(cornerBL, orientation: .portrait, viewportSize: viewSize)
 
@@ -573,7 +571,7 @@ class ReachingViewController: UIViewController {
     handObs: VNHumanHandPoseObservation
   ) -> Bool {
     // Use LIVE distance, not initial backend depth
-    let objectDist = liveDistanceToObject
+    let objectDist = liveDistanceToObject + depthForwardBias
 
     // ── Method 1: LiDAR scene depth ──────────────────────────────────────
     if let sceneDepth = frame.sceneDepth {
