@@ -1,22 +1,7 @@
 /**
  * App.tsx - CyberSight Mobile Application
  * 
- * FIXED: Complete Navigation Loop Implementation (Jan 25, 2026)
- * 
- * NAVIGATION LOOP FLOW (per team discussion):
- * 1. User says "take me to the bottle"
- * 2. Backend processes, returns { text: "...", navigation: true }
- * 3. Frontend enters navigation loop:
- *    - Speak TTS response
- *    - Wait loopDelay ms
- *    - Capture photo
- *    - Send to backend with { navigation: true, transcript: "" }
- *    - Repeat until backend returns { navigation: false }
- * 4. User can tap to interrupt at any time
- * 
- * KEY FIX: Camera cannot run simultaneously with voice recognition on iOS.
- * The camera session gets corrupted when voice recognition is active.
- * Solution: Set camera isActive={false} while listening, reactivate for capture.
+
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -56,6 +41,8 @@ import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
 import { NAVIGATION_CONFIG } from './src/utils/constants';
 import { fixImageOrientation } from './src/services/fixImageOrientation';
+import { useContinuousNavigation } from './src/services/useContinuousMode';
+
 
 const { width, height } = Dimensions.get('window');
 
@@ -66,6 +53,36 @@ const CAMERA_REACTIVATION_DELAY_MS = 800;  // Wait for camera to fully initializ
 const AUDIO_SESSION_RELEASE_DELAY_MS = 300; // Wait for audio session to release
 const TTS_COMPLETION_BUFFER_MS = 500; // Buffer after TTS before next loop iteration
 
+// =============================================================================
+// ★★★ NEW: PIPELINE PRE-FETCH CONFIGURATION ★★★
+// =============================================================================
+const PREFETCH_CONFIG = {
+  /** Enable pipeline pre-fetch (capture photo during TTS) */
+  ENABLED: true,
+
+  /** 
+   * Minimum TTS play time before attempting pre-fetch (ms)
+   * Don't try to pre-fetch if TTS is very short 
+   */
+  MIN_TTS_TIME_BEFORE_PREFETCH: 3000,
+
+  /** 
+   * TTS progress percentage at which to trigger pre-fetch (0-100)
+   * 75% means: when 3 of 4 chunks are done, capture next photo
+   */
+  PREFETCH_TRIGGER_PERCENT: 75,
+
+  /**
+   * Poll interval for checking TTS progress (ms)
+   */
+  PROGRESS_POLL_INTERVAL: 500,
+
+  /**
+   * Minimum cooldown between cycles (ms)
+   * Even with pre-fetch, give a brief pause
+   */
+  MIN_CYCLE_COOLDOWN: 300,
+};
 function App(): React.JSX.Element {
   // ============================================================================
   // State Management
@@ -107,7 +124,7 @@ function App(): React.JSX.Element {
   const isNavigationLoopRunning = useRef(false); // Track if loop is actively running
   const navigationLoopAbortRef = useRef(false); // Signal to stop navigation loop
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
-
+  const prefetchedPhotoRef = useRef<string | null>(null);
   // ============================================================================
   // Animation
   // ============================================================================
@@ -220,185 +237,9 @@ function App(): React.JSX.Element {
   /**
    * Run the navigation loop
    * 
-   * Loop: capture photo → send to backend → speak TTS → wait → repeat
-   * Until: backend returns navigation: false OR user taps to interrupt
+   * capture → send → speak(+prefetch) → cooldown → [use prefetched OR capture] → send → speak    
    */
-  const runNavigationLoop = useCallback(async () => {
-    if (!NAVIGATION_CONFIG.ENABLE_NAVIGATION_LOOP) {
-      console.log('🔄 [NavLoop] Navigation loop is disabled in config');
-      return;
-    }
-
-    if (isNavigationLoopRunning.current) {
-      console.log('🔄 [NavLoop] Loop already running');
-      return;
-    }
-
-    console.log('🔄 [NavLoop] Starting navigation loop');
-    isNavigationLoopRunning.current = true;
-    navigationLoopAbortRef.current = false;
-
-    setIsNavigation(true);
-    AccessibilityInfo.announceForAccessibility('Navigation started. Tap to stop.');
-
-    while (!navigationLoopAbortRef.current && !isEmergencyStopped.current) {
-      // Check for infinite loop prevention
-      if (shouldPreventInfiniteLoop()) {
-        console.log('🔄 [NavLoop] Stopping due to safety limits');
-        AccessibilityInfo.announceForAccessibility('Navigation stopped due to time limit.');
-        break;
-      }
-
-      try {
-        incrementNavigationLoop();
-
-        // Step 1: Wait for the configured delay
-        const delay = getCurrentLoopDelay();
-        console.log(`🔄 [NavLoop] Waiting ${delay}ms before next iteration`);
-        await new Promise(resolve => setTimeout(resolve, delay));
-
-        // Check if aborted during delay
-        if (navigationLoopAbortRef.current || isEmergencyStopped.current) {
-          console.log('🔄 [NavLoop] Aborted during delay');
-          break;
-        }
-
-        // Step 2: Capture photo
-        console.log('🔄 [NavLoop] Capturing photo...');
-        const photoPath = await reactivateCameraAndCapture();
-
-        if (!photoPath) {
-          console.warn('🔄 [NavLoop] Failed to capture photo, continuing with voice-only');
-        }
-
-        // Check if aborted after photo capture
-        if (navigationLoopAbortRef.current || isEmergencyStopped.current) {
-          console.log('🔄 [NavLoop] Aborted after photo capture');
-          break;
-        }
-
-        // Step 3: Send to backend with navigation=true and empty transcript
-        console.log('🔄 [NavLoop] Sending to backend...');
-        setIsProcessing(true);
-
-        const abortController = new AbortController();
-        abortControllerRef.current = abortController;
-
-        const result = await sendToWorkflow(
-          { text: '', imageUri: photoPath || '', navigation: true },
-          abortController.signal
-        );
-
-        setIsProcessing(false);
-
-        // Check if aborted after backend response
-        if (navigationLoopAbortRef.current || isEmergencyStopped.current) {
-          console.log('🔄 [NavLoop] Aborted after backend response');
-          break;
-        }
-
-        console.log('🔄 [NavLoop] Backend response:', {
-          text: result.text.substring(0, 50),
-          navigation: result.navigation,
-          loopDelay: result.loopDelay,
-        });
-
-        // Update loop delay if backend provided one
-        if (result.loopDelay) {
-          updateLoopDelay(result.loopDelay);
-        }
-
-        // Step 4: Check if backend wants to stop the loop
-        if (!result.navigation) {
-          console.log('🔄 [NavLoop] Backend signaled to stop (navigation: false)');
-
-          // Speak the final response
-          if (result.text) {
-            setIsSpeaking(true);
-            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            setIsSpeaking(false);
-          }
-
-          AccessibilityInfo.announceForAccessibility('Navigation complete.');
-          break;
-        }
-
-        // Step 5: Speak the TTS response
-        if (result.text && !navigationLoopAbortRef.current && !isEmergencyStopped.current) {
-          console.log('🔄 [NavLoop] Speaking response...');
-          setIsSpeaking(true);
-          await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-          setIsSpeaking(false);
-
-          // Small buffer after TTS completes
-          await new Promise(resolve => setTimeout(resolve, TTS_COMPLETION_BUFFER_MS));
-        }
-
-      } catch (error: any) {
-        console.error('🔄 [NavLoop] Error in iteration:', error);
-
-        // Don't break on cancelled requests (user interrupt)
-        if (error.message?.includes('cancel')) {
-          console.log('🔄 [NavLoop] Request was cancelled');
-          break;
-        }
-
-        // For other errors, announce and break
-        AccessibilityInfo.announceForAccessibility(`Navigation error: ${error.message}`);
-        break;
-      }
-    }
-
-    // Cleanup
-    console.log('🔄 [NavLoop] Loop ended');
-    isNavigationLoopRunning.current = false;
-    stopNavigationLoop('loop ended');
-    setIsNavigation(false);
-    setIsProcessing(false);
-    setIsSpeaking(false);
-    setIsCameraActive(true);
-
-    audioFeedback.playEarcon('ready');
-    AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
-
-  }, []);
-
-  /**
-   * Stop the navigation loop (called when user taps during navigation)
-   */
-  const stopNavigation = useCallback(async () => {
-    console.log('🛑 Stopping navigation loop');
-    navigationLoopAbortRef.current = true;
-
-    // Cancel any pending request
-    if (abortControllerRef.current) {
-      abortControllerRef.current.abort();
-      abortControllerRef.current = null;
-    }
-
-    // Stop TTS
-    await speachesSentenceChunker.stop();
-
-    // Update state
-    stopNavigationLoop('user interrupt');
-    setIsNavigation(false);
-    setIsProcessing(false);
-    setIsSpeaking(false);
-    isNavigationLoopRunning.current = false;
-
-    // Re-enable camera
-    setIsCameraActive(true);
-
-    audioFeedback.playEarcon('cancel');
-    AccessibilityInfo.announceForAccessibility('Navigation stopped. Tap to speak.');
-  }, []);
-
-
-  /**
- * Continuous loop (navigation OR reaching)
- * 
- */
-  const runContinuousLoop = useCallback(async () => {
+const runContinuousLoop = useCallback(async () => {
     if (!NAVIGATION_CONFIG.ENABLE_NAVIGATION_LOOP) {
       console.log('🔄 [ContinuousMode] Disabled in config');
       return;
@@ -409,9 +250,15 @@ function App(): React.JSX.Element {
       return;
     }
 
-    console.log('🔄 [ContinuousMode] Starting loop');
+    console.log('🔄 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    console.log('🔄 [ContinuousMode] Starting EVENT-DRIVEN loop');
+    console.log('🔄 [ContinuousMode] Pre-fetch:', PREFETCH_CONFIG.ENABLED ? 'ON' : 'OFF');
+    console.log('🔄 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
+    
     isContinuousModeRunning.current = true;
     continuousModeAbortRef.current = false;
+    prefetchedPhotoRef.current = null;
+    let cycleCount = 0;
 
     const currentMode = getCurrentMode();
     AccessibilityInfo.announceForAccessibility(`${currentMode} started. Tap to stop.`);
@@ -424,36 +271,49 @@ function App(): React.JSX.Element {
         break;
       }
 
+      cycleCount++;
+      const cycleStart = Date.now();
+      console.log(`\n🔄 ═══ CYCLE #${cycleCount} START ═══`);
+
       try {
         incrementContinuousMode();
 
-        // Wait for delay
-        const delay = getCurrentLoopDelay();
-        console.log(`🔄 [ContinuousMode] Waiting ${delay}ms before next iteration`);
-        await new Promise(resolve => setTimeout(resolve, delay));
+        // ================================================================
+        // STEP 1: CAPTURE PHOTO (or use pre-fetched)
+        // ================================================================
+        // ★ KEY CHANGE: No delay before capture! Photo is taken NOW,
+        // at user's CURRENT position (after they moved from last guidance)
+        // ================================================================
+        let photoPath = '';
 
-        if (continuousModeAbortRef.current || isEmergencyStopped.current) {
-          console.log('🔄 [ContinuousMode] Aborted during delay');
-          break;
+        if (prefetchedPhotoRef.current) {
+          // ★ Use pre-fetched photo from previous TTS cycle
+          photoPath = prefetchedPhotoRef.current;
+          prefetchedPhotoRef.current = null;
+          console.log('🔄 [Cycle] ✅ Using PRE-FETCHED photo (saved ~800ms)');
+        } else {
+          // Fresh capture (first cycle, or pre-fetch was disabled/failed)
+          console.log('🔄 [Cycle] 📸 Capturing FRESH photo at current position...');
+          photoPath = await reactivateCameraAndCapture();
         }
-
-        // Capture photo
-        console.log('🔄 [ContinuousMode] Capturing photo...');
-        const photoPath = await reactivateCameraAndCapture();
 
         if (!photoPath) {
-          console.warn('🔄 [ContinuousMode] Failed to capture photo, continuing with voice-only');
+          console.warn('🔄 [Cycle] ⚠️ No photo, continuing voice-only');
         }
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) {
-          console.log('🔄 [ContinuousMode] Aborted after photo capture');
+          console.log('🔄 [Cycle] Aborted after capture');
           break;
         }
 
-        // ======================================================================
-        // Send request with CURRENT mode flags
-        // ======================================================================
-        console.log('🔄 [ContinuousMode] Sending to backend...');
+        // ================================================================
+        // STEP 2: SEND TO BACKEND (wait for response)
+        // ================================================================
+        // ★ KEY CHANGE: We WAIT for this response. No new photos during wait.
+        // The photo we just sent IS the user's current view.
+        // ================================================================
+        console.log('🔄 [Cycle] 📤 Sending to backend...');
+        const backendStart = Date.now();
         setIsProcessing(true);
 
         const abortController = new AbortController();
@@ -470,15 +330,16 @@ function App(): React.JSX.Element {
           abortController.signal
         );
 
+        const backendMs = Date.now() - backendStart;
         setIsProcessing(false);
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) {
-          console.log('🔄 [ContinuousMode] Aborted after backend response');
+          console.log('🔄 [Cycle] Aborted after backend response');
           break;
         }
 
-        console.log('🔄 [ContinuousMode] Backend response:', {
-          text: result.text.substring(0, 50),
+        console.log(`🔄 [Cycle] ✅ Backend responded in ${backendMs}ms:`, {
+          text: result.text?.substring(0, 50),
           navigation: result.navigation,
           reaching_flag: result.reaching_flag,
           reaching_ios: result.reaching_ios,
@@ -494,7 +355,7 @@ function App(): React.JSX.Element {
         }
 
         // ======================================================================
-        // ★★★ iOS REACHING PRIORITY CHECK - Must be FIRST ★★★
+        // ★★★ iOS REACHING PRIORITY CHECK ★★★
         // ======================================================================
 
         if (Platform.OS === 'ios' && result.reaching_ios === true) {
@@ -650,31 +511,103 @@ function App(): React.JSX.Element {
           AccessibilityInfo.announceForAccessibility('Switching to object guidance.');
         }
 
-        // Speak the response
-        if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
-          console.log('🔄 [ContinuousMode] Speaking response...');
+       if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
+          console.log('🔄 [Cycle] 🔊 Speaking response...');
           setIsSpeaking(true);
-          await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+
+          if (PREFETCH_CONFIG.ENABLED) {
+            // ★ PIPELINE MODE: TTS + Pre-fetch run concurrently
+            console.log('🔄 [Cycle] 🔮 Pipeline pre-fetch ACTIVE');
+            
+            prefetchedPhotoRef.current = null; // Clear any old pre-fetch
+
+            await Promise.all([
+              // ── Task A: Play TTS (blocks until all chunks done) ──
+              speachesSentenceChunker.synthesizeSpeechChunked(result.text),
+
+              // ── Task B: Pre-fetch photo at ~75% TTS progress ──
+              (async () => {
+                try {
+                  // Wait minimum time before checking progress
+                  await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_TTS_TIME_BEFORE_PREFETCH));
+
+                  // Abort if loop was stopped during wait
+                  if (continuousModeAbortRef.current || isEmergencyStopped.current) return;
+
+                  // Poll TTS progress until we hit the trigger threshold
+                  while (speachesSentenceChunker.isCurrentlyPlaying()) {
+                    if (continuousModeAbortRef.current || isEmergencyStopped.current) return;
+
+                    const progress = speachesSentenceChunker.getProgress();
+                    
+                    if (progress.percentage >= PREFETCH_CONFIG.PREFETCH_TRIGGER_PERCENT) {
+                      console.log(`🔮 [Prefetch] TTS at ${progress.percentage}% (${progress.current}/${progress.total}) — capturing next photo!`);
+                      
+                      const prefetchPath = await reactivateCameraAndCapture();
+                      
+                      if (prefetchPath) {
+                        prefetchedPhotoRef.current = prefetchPath;
+                        console.log('🔮 [Prefetch] ✅ Photo pre-fetched and ready for next cycle');
+                      } else {
+                        console.log('🔮 [Prefetch] ⚠️ Pre-fetch capture failed, will capture fresh next cycle');
+                      }
+                      return; // Done pre-fetching
+                    }
+
+                    // Keep polling
+                    await new Promise(r => setTimeout(r, PREFETCH_CONFIG.PROGRESS_POLL_INTERVAL));
+                  }
+
+                  // TTS ended before we could pre-fetch (very short response)
+                  console.log('🔮 [Prefetch] TTS ended before pre-fetch trigger — will capture fresh');
+                } catch (prefetchError) {
+                  console.warn('🔮 [Prefetch] Error during pre-fetch (non-fatal):', prefetchError);
+                  // Pre-fetch failure is non-fatal — next cycle will just capture fresh
+                }
+              })(),
+            ]);
+
+          } else {
+            // ★ NON-PIPELINE MODE: Just play TTS, then capture fresh next cycle
+            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+          }
+
           setIsSpeaking(false);
 
-          // Small buffer after TTS
-          await new Promise(resolve => setTimeout(resolve, TTS_COMPLETION_BUFFER_MS));
+          // Brief cooldown after TTS (let audio session settle)
+          const cooldown = PREFETCH_CONFIG.ENABLED 
+            ? PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN 
+            : TTS_COMPLETION_BUFFER_MS;
+          await new Promise(resolve => setTimeout(resolve, cooldown));
         }
+
+        // ================================================================
+        // ★ NO DELAY BEFORE NEXT CAPTURE ★
+        // ================================================================
+        // Old code had: await new Promise(resolve => setTimeout(resolve, delay));
+        // This is REMOVED. The next iteration starts immediately with a fresh
+        // capture (or uses the pre-fetched photo). The natural pacing comes from:
+        //   backend response time (~6s) + TTS time (~3s) + cooldown (~0.3s)
+        // which is already ~9.3s per cycle — no artificial delay needed.
+        // ================================================================
+
+        const cycleMs = Date.now() - cycleStart;
+        console.log(`🔄 ═══ CYCLE #${cycleCount} DONE (${(cycleMs / 1000).toFixed(1)}s) ═══`);
+        console.log(`🔄 [Stats] Prefetched photo ready: ${prefetchedPhotoRef.current ? 'YES ✅' : 'NO (will capture fresh)'}`);
 
       } catch (error: any) {
         console.error('🔄 [ContinuousMode] Error in iteration:', error);
 
-        // Don't break on cancelled requests
         if (error.message?.includes('cancel')) {
           console.log('🔄 [ContinuousMode] Request was cancelled');
           break;
         }
 
-        // For other errors, announce and break
         AccessibilityInfo.announceForAccessibility(`Error: ${error.message}`);
         break;
       }
     }
+
 
     // Cleanup
     console.log('🔄 [ContinuousMode] Loop ended');
@@ -690,6 +623,54 @@ function App(): React.JSX.Element {
     AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
 
   }, [isNavigation, isReaching]);
+
+
+   /**
+   * NAVIGATION LOOP (legacy — kept for backwards compat, delegates to runContinuousLoop)
+   */
+  const runNavigationLoop = useCallback(async () => {
+    if (!NAVIGATION_CONFIG.ENABLE_NAVIGATION_LOOP) {
+      console.log('🔄 [NavLoop] Navigation loop is disabled in config');
+      return;
+    }
+
+    if (isNavigationLoopRunning.current) {
+      console.log('🔄 [NavLoop] Loop already running');
+      return;
+    }
+
+    console.log('🔄 [NavLoop] Delegating to runContinuousLoop');
+    // Delegate to the unified continuous loop
+    startContinuousMode('navigation');
+    await runContinuousLoop();
+  }, [runContinuousLoop]);
+
+  /**
+   * Stop the navigation loop
+   */
+  const stopNavigation = useCallback(async () => {
+    console.log('🛑 Stopping navigation loop');
+    navigationLoopAbortRef.current = true;
+
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+
+    await speachesSentenceChunker.stop();
+
+    stopContinuousMode('user interrupt', false);
+    setIsNavigation(false);
+    setIsProcessing(false);
+    setIsSpeaking(false);
+    isNavigationLoopRunning.current = false;
+
+    setIsCameraActive(true);
+
+    audioFeedback.playEarcon('cancel');
+    AccessibilityInfo.announceForAccessibility('Navigation stopped. Tap to speak.');
+  }, []);
+
 
   /**
    * Stop the continuous mode loop (called when user taps during continuous mode)
