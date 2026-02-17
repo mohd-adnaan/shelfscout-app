@@ -12,7 +12,8 @@
  */
 
 import { Vibration, Platform } from 'react-native';
-import { speachesTTS } from './speachesTtsClient';
+//old :import { speachesTTS } from './speachesTtsClient';
+import { speachesTTS } from './iOSTtsClient';
 import { AccessibilityService } from './AccessibilityService';
 
 class AudioFeedbackService {

@@ -1,7 +1,6 @@
 /**
  * App.tsx - CyberSight Mobile Application
  * 
-
  */
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
@@ -239,7 +238,7 @@ function App(): React.JSX.Element {
    * 
    * capture → send → speak(+prefetch) → cooldown → [use prefetched OR capture] → send → speak    
    */
-const runContinuousLoop = useCallback(async () => {
+  const runContinuousLoop = useCallback(async () => {
     if (!NAVIGATION_CONFIG.ENABLE_NAVIGATION_LOOP) {
       console.log('🔄 [ContinuousMode] Disabled in config');
       return;
@@ -254,7 +253,7 @@ const runContinuousLoop = useCallback(async () => {
     console.log('🔄 [ContinuousMode] Starting EVENT-DRIVEN loop');
     console.log('🔄 [ContinuousMode] Pre-fetch:', PREFETCH_CONFIG.ENABLED ? 'ON' : 'OFF');
     console.log('🔄 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━');
-    
+
     isContinuousModeRunning.current = true;
     continuousModeAbortRef.current = false;
     prefetchedPhotoRef.current = null;
@@ -455,6 +454,12 @@ const runContinuousLoop = useCallback(async () => {
 
             return; // ★★★ EXIT THE LOOP ★★★
           }
+          else {
+            // reaching_ios=true but no valid bbox in continuous loop
+            console.log('⚠️ [iOS Reaching Loop] No valid bbox, falling through to flag check');
+            // Let the code fall through to the flag check below
+            // which will handle both-flags-false termination
+          }
         }
 
         // ======================================================================
@@ -511,14 +516,14 @@ const runContinuousLoop = useCallback(async () => {
           AccessibilityInfo.announceForAccessibility('Switching to object guidance.');
         }
 
-       if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
+        if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
           console.log('🔄 [Cycle] 🔊 Speaking response...');
           setIsSpeaking(true);
 
           if (PREFETCH_CONFIG.ENABLED) {
             // ★ PIPELINE MODE: TTS + Pre-fetch run concurrently
             console.log('🔄 [Cycle] 🔮 Pipeline pre-fetch ACTIVE');
-            
+
             prefetchedPhotoRef.current = null; // Clear any old pre-fetch
 
             await Promise.all([
@@ -539,12 +544,12 @@ const runContinuousLoop = useCallback(async () => {
                     if (continuousModeAbortRef.current || isEmergencyStopped.current) return;
 
                     const progress = speachesSentenceChunker.getProgress();
-                    
+
                     if (progress.percentage >= PREFETCH_CONFIG.PREFETCH_TRIGGER_PERCENT) {
                       console.log(`🔮 [Prefetch] TTS at ${progress.percentage}% (${progress.current}/${progress.total}) — capturing next photo!`);
-                      
+
                       const prefetchPath = await reactivateCameraAndCapture();
-                      
+
                       if (prefetchPath) {
                         prefetchedPhotoRef.current = prefetchPath;
                         console.log('🔮 [Prefetch] ✅ Photo pre-fetched and ready for next cycle');
@@ -575,8 +580,8 @@ const runContinuousLoop = useCallback(async () => {
           setIsSpeaking(false);
 
           // Brief cooldown after TTS (let audio session settle)
-          const cooldown = PREFETCH_CONFIG.ENABLED 
-            ? PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN 
+          const cooldown = PREFETCH_CONFIG.ENABLED
+            ? PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN
             : TTS_COMPLETION_BUFFER_MS;
           await new Promise(resolve => setTimeout(resolve, cooldown));
         }
@@ -625,9 +630,9 @@ const runContinuousLoop = useCallback(async () => {
   }, [isNavigation, isReaching]);
 
 
-   /**
-   * NAVIGATION LOOP (legacy — kept for backwards compat, delegates to runContinuousLoop)
-   */
+  /**
+  * NAVIGATION LOOP (legacy — kept for backwards compat, delegates to runContinuousLoop)
+  */
   const runNavigationLoop = useCallback(async () => {
     if (!NAVIGATION_CONFIG.ENABLE_NAVIGATION_LOOP) {
       console.log('🔄 [NavLoop] Navigation loop is disabled in config');
@@ -978,10 +983,11 @@ const runContinuousLoop = useCallback(async () => {
       audioFeedback.playEarcon('listening');
       playSound('start');
 
+      await audioFeedback.announceState('listening', false);
       await new Promise(resolve => setTimeout(resolve, 100));
+
       await startSTT();
       console.log('✅ Voice recognition started');
-      await audioFeedback.announceState('listening', false);
     } catch (error) {
       console.error('❌ Start listening error:', error);
       AccessibilityInfo.announceForAccessibility(`Error: ${error}. Please try again.`);
@@ -1080,7 +1086,7 @@ const runContinuousLoop = useCallback(async () => {
 
       audioFeedback.playEarcon('thinking');
       playSound('processing');
-      audioFeedback.announceState('thinking', false);
+      await audioFeedback.announceState('thinking', false);
 
       if (!photoPath) {
         console.warn('⚠️ No photo - voice-only mode');
@@ -1133,18 +1139,29 @@ const runContinuousLoop = useCallback(async () => {
       // =========================================================================
       // ★★★ CHECK FOR iOS REACHING ON FIRST RESPONSE ★★★
       // =========================================================================
-      if (Platform.OS === 'ios' && result.reaching_ios === true && result.bbox) {
+      if (Platform.OS === 'ios' && result.reaching_ios === true) {
         let bbox: number[] | null = null;
 
-        if (Array.isArray(result.bbox)) {
-          bbox = result.bbox;
-        } else if (typeof result.bbox === 'string') {
-          try {
-            const s = (result.bbox as string).replace('[', '').replace(']', '');
-            bbox = s.split(',').map((v: string) => Number(v.trim()));
-          } catch (e) {
-            console.warn('Failed to parse bbox');
+        // Parse bbox — skip if 'none' / 'null' / missing
+        const rawBbox = result.bbox;
+        if (rawBbox && rawBbox !== 'none' && rawBbox !== 'null' && rawBbox !== '') {
+          if (Array.isArray(rawBbox)) {
+            bbox = rawBbox as number[];
+          } else if (typeof rawBbox === 'string') {
+            try {
+              const s = (rawBbox as string).replace(/[\[\]]/g, '');
+              bbox = s.split(',').map((v: string) => Number(v.trim()));
+              if (bbox.some(isNaN)) {
+                console.warn('⚠️ bbox contains NaN, discarding');
+                bbox = null;
+              }
+            } catch (e) {
+              console.warn('Failed to parse bbox:', e);
+              bbox = null;
+            }
           }
+        } else {
+          console.log('⚠️ [iOS Reaching Loop] bbox missing/none:', rawBbox);
         }
 
         if (bbox && bbox.length === 4) {
@@ -1196,6 +1213,20 @@ const runContinuousLoop = useCallback(async () => {
           audioFeedback.playEarcon('ready');
           AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
           return;  // Don't enter continuous loop
+        }
+        else {
+          // reaching_ios=true but no valid bbox — object detected but can't be precisely located
+          console.log('⚠️ [iOS Reaching] reaching_ios=true but no valid bbox:', result.bbox);
+          console.log('⚠️ [iOS Reaching] The backend detected the object but Qwen could not produce coordinates');
+          // The response text already gave directional info to the user
+          // Don't fall through to continuous loop — it will just get empty response
+          setIsCameraActive(true);
+          audioFeedback.playEarcon('ready');
+          await speachesSentenceChunker.synthesizeSpeechChunked(
+            `I can detect the ${result.object || 'object'} in the scene, but I could not get precise coordinates for ARKit reaching guidance. Try pointing your camera more directly at it and ask again.`
+          );
+          AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+          return;
         }
       }
       // =========================================================================

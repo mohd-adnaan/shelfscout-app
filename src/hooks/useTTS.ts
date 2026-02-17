@@ -8,37 +8,14 @@
  * - 4.1.3 Status Messages: Announces TTS state changes
  * - Proper error handling for blind users who depend on audio feedback
  * 
- * Uses Speaches API to match N8N workflow TTS configuration
  */
 
 import { useEffect } from 'react';
 import { Alert } from 'react-native';
-import { speachesTTS } from '../services/speachesTtsClient';
+//OLD: import { speachesTTS } from '../services/speachesTtsClient';
+import { speachesTTS } from '../services/iOSTtsClient';
 import { AccessibilityService } from '../services/AccessibilityService';
 
-/**
- * Text-to-Speech Hook
- * 
- * Provides TTS functionality using the Speaches API, matching the exact
- * configuration used in your N8N workflow. This ensures consistent voice
- * quality across web app, mobile app, and backend workflows.
- * 
- * Usage:
- * ```typescript
- * const { speak, stop, isPlaying } = useTTS();
- * 
- * // Speak some text
- * await speak("Hello, world!");
- * 
- * // Stop current speech
- * await stop();
- * 
- * // Check if playing
- * if (isPlaying()) {
- *   console.log("TTS is speaking");
- * }
- * ```
- */
 export const useTTS = () => {
   useEffect(() => {
     console.log('✅ Speaches TTS ready (N8N config)');

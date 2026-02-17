@@ -12,7 +12,8 @@
  * Critical for blind users who depend on audio feedback
  */
 
-import { speachesTTS } from './speachesTtsClient';
+// OLD: import { speachesTTS } from './speachesTtsClient';
+import { speachesTTS } from './iOSTtsClient';
 import { AccessibilityService } from './AccessibilityService';
 
 class SpeachesSentenceChunker {
