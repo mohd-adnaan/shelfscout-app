@@ -31,7 +31,7 @@ import { Platform, NativeEventEmitter, NativeModules } from 'react-native';
 
 interface UseSTTOptions {
   /** Callback when auto-submit is triggered (silence detected) */
-  onAutoSubmit?: () => void;
+  onAutoSubmit?: (transcript?: string) => void;
   /** Enable auto-submit feature */
   enableAutoSubmit?: boolean;
   /** Silence threshold in ms before auto-submit (default: 1500) */
@@ -156,7 +156,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     console.log('🎯 Calling onAutoSubmit callback...');
     
     try {
-      onAutoSubmit();
+      onAutoSubmit(transcriptRef.current);
     } finally {
       // ✅ FIX: Clear processing flag after callback completes
       // (but keep hasAutoSubmitted true until next startListening)
