@@ -1,23 +1,4 @@
 // src/services/iOSTtsClient.ts
-// ----------------------------------------------------------------------
-// iOS Native TTS Client — Drop-in replacement for speachesTtsClient
-//
-// Uses react-native-tts (AVSpeechSynthesizer) for zero-latency playback.
-//
-// v3 fixes (from real device testing):
-//   1. REMOVED 'tts-error' listener — NOT a supported event type.
-//      Supported: tts-start, tts-finish, tts-pause, tts-resume,
-//                 tts-progress, tts-cancel.  Registering tts-error
-//      causes a red-screen crash via RCTEventEmitter.
-//   2. REMOVED Tts.setDefaultRate() — the native method signature is
-//      setDefaultRate:(float)rate skipTransform:(BOOL)skipTransform
-//      and BOOL doesn't bridge on New Architecture / TurboModules.
-//      iOS default rate IS 0.5 (AVSpeechUtteranceDefaultSpeechRate)
-//      which is exactly what we want, so no call needed.
-//   3. Added init-once guard to prevent double initialization.
-//   4. Safety timeout + force-resolve in stop() for BOOL error on
-//      Tts.stop().
-// ----------------------------------------------------------------------
 
 import Tts from 'react-native-tts';
 import { NativeEventEmitter, NativeModules, Platform } from 'react-native';
@@ -43,13 +24,13 @@ try {
 // Voice preferences — warm female voices matching Kokoro "af_heart"
 // ========================================================================
 const PREFERRED_VOICES = [
-  'com.apple.voice.premium.en-US.Zoe',
-  'com.apple.voice.premium.en-US.Samantha',
   'com.apple.voice.enhanced.en-US.Samantha',
-  'com.apple.voice.enhanced.en-US.Ava',
-  'com.apple.voice.enhanced.en-AU.Karen',
-  'com.apple.voice.enhanced.en-GB.Serena',
-  'com.apple.voice.compact.en-US.Samantha',
+  //'com.apple.voice.premium.en-US.Zoe',
+  //'com.apple.voice.premium.en-US.Samantha',
+  //'com.apple.voice.enhanced.en-US.Ava',
+  //'com.apple.voice.enhanced.en-AU.Karen',
+  //'com.apple.voice.enhanced.en-GB.Serena',
+  //'com.apple.voice.compact.en-US.Samantha',
 ];
 
 const SPEECH_PITCH = 1.05;

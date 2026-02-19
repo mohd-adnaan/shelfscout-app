@@ -76,14 +76,14 @@ const PREFETCH_CONFIG = {
 function AppInner(): React.JSX.Element {
 
   // ── State ──────────────────────────────────────────────────────────────────
-  const [isProcessing, setIsProcessing]     = useState(false);
-  const [isSpeaking, setIsSpeaking]         = useState(false);
-  const [isNavigation, setIsNavigation]     = useState(false);
-  const [isReaching, setIsReaching]         = useState(false);
+  const [isProcessing, setIsProcessing] = useState(false);
+  const [isSpeaking, setIsSpeaking] = useState(false);
+  const [isNavigation, setIsNavigation] = useState(false);
+  const [isReaching, setIsReaching] = useState(false);
   const [screenReaderEnabled, setScreenReaderEnabled] = useState(false);
   const [reduceMotionEnabled, setReduceMotionEnabled] = useState(false);
   const [isCameraActive, setIsCameraActive] = useState(true);
-  const [showSettings, setShowSettings]     = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   // ── Settings ───────────────────────────────────────────────────────────────
   const { resolveReachingPipeline } = useSettings();
@@ -91,30 +91,30 @@ function AppInner(): React.JSX.Element {
   // ── Camera / Permissions ───────────────────────────────────────────────────
   const device = useCameraDevice('back');
   const { hasPermission: hasCameraPermission, requestPermission: requestCameraPermission } = useCameraPermission();
-  const { hasPermission: hasMicPermission,   requestPermission: requestMicPermission   } = useMicrophonePermission();
-  const cameraRef   = useRef<Camera>(null);
+  const { hasPermission: hasMicPermission, requestPermission: requestMicPermission } = useMicrophonePermission();
+  const cameraRef = useRef<Camera>(null);
   const containerRef = useRef<View>(null);
 
   // ── Audio / Speech ─────────────────────────────────────────────────────────
   const { speak, stop: stopTTS } = useTTS();
 
   // ── Internal Refs ──────────────────────────────────────────────────────────
-  const isEmergencyStopped       = useRef(false);
-  const isProcessingRef          = useRef(false);
-  const finalTranscriptRef       = useRef('');
-  const abortControllerRef       = useRef<AbortController | null>(null);
-  const isCapturingPhotoRef      = useRef(false);
-  const isNavigationLoopRunning  = useRef(false);
-  const navigationLoopAbortRef   = useRef(false);
-  const isContinuousModeRunning  = useRef(false);
-  const continuousModeAbortRef   = useRef(false);
-  const lastImageDimensions      = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
-  const prefetchedPhotoRef       = useRef<string | null>(null);
+  const isEmergencyStopped = useRef(false);
+  const isProcessingRef = useRef(false);
+  const finalTranscriptRef = useRef('');
+  const abortControllerRef = useRef<AbortController | null>(null);
+  const isCapturingPhotoRef = useRef(false);
+  const isNavigationLoopRunning = useRef(false);
+  const navigationLoopAbortRef = useRef(false);
+  const isContinuousModeRunning = useRef(false);
+  const continuousModeAbortRef = useRef(false);
+  const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
+  const prefetchedPhotoRef = useRef<string | null>(null);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
-  const handleVoiceCommandRef    = useRef<(command: string, photoPath: string) => Promise<void>>(async () => {});
+  const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
 
   // ── Animation ──────────────────────────────────────────────────────────────
-  const pulseAnim   = useRef(new Animated.Value(1)).current;
+  const pulseAnim = useRef(new Animated.Value(1)).current;
   const opacityAnim = useRef(new Animated.Value(0.3)).current;
 
   // ── Debug native modules on mount ──────────────────────────────────────────
@@ -187,7 +187,7 @@ function AppInner(): React.JSX.Element {
 
   useEffect(() => {
     if (!hasCameraPermission) requestCameraPermission();
-    if (!hasMicPermission)    requestMicPermission();
+    if (!hasMicPermission) requestMicPermission();
   }, [hasCameraPermission, hasMicPermission]);
 
   // ── Sync transcript ref ────────────────────────────────────────────────────
@@ -209,18 +209,18 @@ function AppInner(): React.JSX.Element {
       Animated.loop(
         Animated.sequence([
           Animated.parallel([
-            Animated.timing(pulseAnim,   { toValue: 1.3, duration: 1000, useNativeDriver: true }),
+            Animated.timing(pulseAnim, { toValue: 1.3, duration: 1000, useNativeDriver: true }),
             Animated.timing(opacityAnim, { toValue: 0.8, duration: 1000, useNativeDriver: true }),
           ]),
           Animated.parallel([
-            Animated.timing(pulseAnim,   { toValue: 1,   duration: 1000, useNativeDriver: true }),
+            Animated.timing(pulseAnim, { toValue: 1, duration: 1000, useNativeDriver: true }),
             Animated.timing(opacityAnim, { toValue: 0.3, duration: 1000, useNativeDriver: true }),
           ]),
         ])
       ).start();
     } else {
       Animated.parallel([
-        Animated.timing(pulseAnim,   { toValue: 1,   duration: 300, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 300, useNativeDriver: true }),
         Animated.timing(opacityAnim, { toValue: 0.3, duration: 300, useNativeDriver: true }),
       ]).start();
     }
@@ -242,13 +242,12 @@ function AppInner(): React.JSX.Element {
 
     try {
       const photo = await cameraRef.current.takePhoto({
-        qualityPrioritization: 'speed',
         enableShutterSound: true,
         flash: 'off',
       });
       const fixedImage = await fixImageOrientation(photo.path);
       lastImageDimensions.current = {
-        width:  fixedImage.width  || 0,
+        width: fixedImage.width || 0,
         height: fixedImage.height || 0,
       };
       console.log('✅ Photo captured & fixed:', fixedImage.uri,
@@ -259,7 +258,6 @@ function AppInner(): React.JSX.Element {
       await new Promise(resolve => setTimeout(resolve, 500));
       try {
         const retry = await cameraRef.current.takePhoto({
-          qualityPrioritization: 'speed',
           enableShutterSound: false,
         });
         return retry.path;
@@ -279,7 +277,7 @@ function AppInner(): React.JSX.Element {
     // ── Resolve user preference ───────────────────────────────────────────
     const pipeline = resolveReachingPipeline({
       reaching_ios: result.reaching_ios,
-      reaching:     result.reaching_flag,
+      reaching: result.reaching_flag,
     });
 
     if (pipeline !== 'arkit') {
@@ -328,9 +326,9 @@ function AppInner(): React.JSX.Element {
       if (ReachingModule?.startReaching) {
         const reachingResult = await ReachingModule.startReaching({
           bbox,
-          object:      result.object || 'object',
-          depth:       result.depth,
-          imageWidth:  lastImageDimensions.current.width,
+          object: result.object || 'object',
+          depth: result.depth,
+          imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
         });
 
@@ -377,9 +375,9 @@ function AppInner(): React.JSX.Element {
     console.log('🔄 [ContinuousMode] Starting EVENT-DRIVEN loop');
     console.log('🔄 [ContinuousMode] Pre-fetch:', PREFETCH_CONFIG.ENABLED ? 'ON' : 'OFF');
 
-    isContinuousModeRunning.current  = true;
-    continuousModeAbortRef.current   = false;
-    prefetchedPhotoRef.current       = null;
+    isContinuousModeRunning.current = true;
+    continuousModeAbortRef.current = false;
+    prefetchedPhotoRef.current = null;
     let cycleCount = 0;
 
     const currentMode = getCurrentMode();
@@ -418,9 +416,9 @@ function AppInner(): React.JSX.Element {
         const loopMode = getCurrentMode();
         const result = await sendToWorkflow(
           {
-            text:          '',
-            imageUri:      photoPath || '',
-            navigation:    loopMode === 'navigation',
+            text: '',
+            imageUri: photoPath || '',
+            navigation: loopMode === 'navigation',
             reaching_flag: loopMode === 'reaching',
           },
           abortCtrl.signal
@@ -431,12 +429,12 @@ function AppInner(): React.JSX.Element {
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
 
         console.log('🔄 Backend result:', {
-          text:         result.text?.substring(0, 50),
-          navigation:   result.navigation,
+          text: result.text?.substring(0, 50),
+          navigation: result.navigation,
           reaching_flag: result.reaching_flag,
           reaching_ios: result.reaching_ios,
-          bbox:         result.bbox,
-          loopDelay:    result.loopDelay,
+          bbox: result.bbox,
+          loopDelay: result.loopDelay,
         });
 
         if (result.loopDelay) updateLoopDelay(result.loopDelay);
@@ -451,8 +449,8 @@ function AppInner(): React.JSX.Element {
           }
 
           // Stop the continuous loop before handing off
-          isContinuousModeRunning.current  = true; // keep true until after handoff
-          continuousModeAbortRef.current   = true;
+          isContinuousModeRunning.current = true; // keep true until after handoff
+          continuousModeAbortRef.current = true;
           stopContinuousMode('iOS reaching takeover', false);
 
           const handled = await handleiOSReaching(result);
@@ -467,9 +465,9 @@ function AppInner(): React.JSX.Element {
         }
 
         // ── Flag check ─────────────────────────────────────────────────────
-        const navigationActive = result.navigation    === true;
-        const reachingActive   = result.reaching_flag === true;
-        const bothInactive     = !navigationActive && !reachingActive;
+        const navigationActive = result.navigation === true;
+        const reachingActive = result.reaching_flag === true;
+        const bothInactive = !navigationActive && !reachingActive;
 
         setIsNavigation(navigationActive);
         setIsReaching(reachingActive);
@@ -622,8 +620,9 @@ function AppInner(): React.JSX.Element {
       try { await cancelSTT(); } catch { }
 
       audioFeedback.playEarcon('thinking');
-      playSound('processing');
       await audioFeedback.announceState('thinking', false);
+      playSound('processing');
+      
 
       if (!photoPath) {
         console.warn('⚠️ No photo — voice-only mode');
@@ -634,11 +633,11 @@ function AppInner(): React.JSX.Element {
 
       const result = await sendToWorkflow(
         {
-          text:        command,
-          imageUri:    photoPath || '',
-          imageWidth:  lastImageDimensions.current.width,
+          text: command,
+          imageUri: photoPath || '',
+          imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
-          navigation:    false,
+          navigation: false,
           reaching_flag: false,
         },
         abortCtrl.signal
@@ -647,11 +646,11 @@ function AppInner(): React.JSX.Element {
       if (isEmergencyStopped.current) return;
 
       console.log('✅ Response:', {
-        text:         result.text.substring(0, 50) + '...',
-        navigation:   result.navigation,
+        text: result.text.substring(0, 50) + '...',
+        navigation: result.navigation,
         reaching_flag: result.reaching_flag,
         reaching_ios: result.reaching_ios,
-        loopDelay:    result.loopDelay,
+        loopDelay: result.loopDelay,
       });
 
       setIsProcessing(false);
@@ -675,8 +674,8 @@ function AppInner(): React.JSX.Element {
       }
 
       // ── Continuous mode activation ─────────────────────────────────────
-      const navigationActive = result.navigation    === true;
-      const reachingActive   = result.reaching_flag === true;
+      const navigationActive = result.navigation === true;
+      const reachingActive = result.reaching_flag === true;
 
       if (navigationActive || reachingActive) {
         const mode = navigationActive ? 'navigation' : 'reaching';
@@ -714,7 +713,7 @@ function AppInner(): React.JSX.Element {
       }
     } finally {
       setIsProcessing(false);
-      isProcessingRef.current    = false;
+      isProcessingRef.current = false;
       finalTranscriptRef.current = '';
       abortControllerRef.current = null;
     }
@@ -728,7 +727,7 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Handle Auto-Submit (silence detection)
   // ============================================================================
-  const handleAutoSubmit = useCallback(async () => {
+  const handleAutoSubmit = useCallback(async (passedTranscript: string) => {
     console.log('🎯 Auto-submit triggered by silence detection');
 
     if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) {
@@ -736,13 +735,13 @@ function AppInner(): React.JSX.Element {
       return;
     }
 
-  const finalText = (transcript ?? finalTranscriptRef.current).trim();
-  
-  if (!finalText) {
-    AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
-    audioFeedback.playEarcon('error');
-    return;
-  }
+    const finalText = (passedTranscript || finalTranscriptRef.current).trim();
+
+    if (!finalText) {
+      AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
+      audioFeedback.playEarcon('error');
+      return;
+    }
 
     console.log('⚡ Processing:', finalText);
     setIsProcessing(true);
@@ -793,15 +792,15 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   const {
     startListening: startSTT,
-    stopListening:  stopSTT,
+    stopListening: stopSTT,
     cancelListening: cancelSTT,
     isListening,
     transcript,
   } = useSTT({
-    onAutoSubmit:    handleAutoSubmit,
+    onAutoSubmit: handleAutoSubmit,
     enableAutoSubmit: true,
     silenceThreshold: 1500,
-    enableRMSVAD:    true,
+    enableRMSVAD: true,
   });
 
   // ============================================================================
@@ -840,39 +839,39 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Manual Stop
   // ============================================================================
-const stopListeningManually = async () => {
-  try {
-    if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) return;
+  const stopListeningManually = async () => {
+    try {
+      if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) return;
 
-    const finalTranscript = await stopSTT();
-    const finalText = finalTranscript.trim();
-    if (!finalText) { /* ... */ return; }
+      const finalTranscript = await stopSTT();
+      const finalText = finalTranscript.trim();
+      if (!finalText) { /* ... */ return; }
 
-    isCapturingPhotoRef.current = true;
-    audioFeedback.playEarcon('thinking');
-    AccessibilityInfo.announceForAccessibility('Processing your request');
+      isCapturingPhotoRef.current = true;
+      audioFeedback.playEarcon('thinking');
+      AccessibilityInfo.announceForAccessibility('Processing your request');
 
-    await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
-    if (isEmergencyStopped.current) { isCapturingPhotoRef.current = false; return; }
+      await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
+      if (isEmergencyStopped.current) { isCapturingPhotoRef.current = false; return; }
 
-    const photoPath = await reactivateCameraAndCapture();
-    isCapturingPhotoRef.current = false;
+      const photoPath = await reactivateCameraAndCapture();
+      isCapturingPhotoRef.current = false;
 
-    // ✅ DON'T set isProcessingRef here — handleVoiceCommand sets it itself
-    await handleVoiceCommand(finalText, photoPath);
-  } catch (error) {
-    isCapturingPhotoRef.current = false;
-    setIsProcessing(false);
-    isProcessingRef.current = false;
-  }
-};
+      // ✅ DON'T set isProcessingRef here — handleVoiceCommand sets it itself
+      await handleVoiceCommand(finalText, photoPath);
+    } catch (error) {
+      isCapturingPhotoRef.current = false;
+      setIsProcessing(false);
+      isProcessingRef.current = false;
+    }
+  };
 
   // ============================================================================
   // Emergency Stop
   // ============================================================================
   const emergencyStop = async () => {
     console.log('🚨 EMERGENCY STOP');
-    isEmergencyStopped.current    = true;
+    isEmergencyStopped.current = true;
     continuousModeAbortRef.current = true;
 
     if (abortControllerRef.current) {
@@ -889,8 +888,8 @@ const stopListeningManually = async () => {
     setIsSpeaking(false);
     setIsNavigation(false);
     setIsReaching(false);
-    isProcessingRef.current     = false;
-    finalTranscriptRef.current  = '';
+    isProcessingRef.current = false;
+    finalTranscriptRef.current = '';
     isCapturingPhotoRef.current = false;
     isContinuousModeRunning.current = false;
 
@@ -908,16 +907,16 @@ const stopListeningManually = async () => {
   // ============================================================================
   const getAccessibilityLabel = () => {
     if (isNavigation) return 'CyberSight is navigating. Tap to stop.';
-    if (isSpeaking)   return 'CyberSight is speaking. Tap to interrupt.';
+    if (isSpeaking) return 'CyberSight is speaking. Tap to interrupt.';
     if (isProcessing) return 'CyberSight is processing. Tap to interrupt.';
-    if (isListening)  return `CyberSight is listening. ${transcript ? `You said: ${transcript}. ` : ''}Tap to stop.`;
+    if (isListening) return `CyberSight is listening. ${transcript ? `You said: ${transcript}. ` : ''}Tap to stop.`;
     return 'CyberSight is ready. Tap to speak.';
   };
 
   const getAccessibilityHint = () => {
-    if (isNavigation)             return 'Tap to stop navigation';
+    if (isNavigation) return 'Tap to stop navigation';
     if (isSpeaking || isProcessing) return 'Tap to stop';
-    if (isListening)              return 'Speak naturally. Tap to stop.';
+    if (isListening) return 'Speak naturally. Tap to stop.';
     return 'Tap to start speaking';
   };
 

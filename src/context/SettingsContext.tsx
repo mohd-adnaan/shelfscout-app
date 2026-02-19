@@ -26,7 +26,7 @@ import React, {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import Tts from 'react-native-tts';
 import { Platform } from 'react-native';
-
+import { iOSTts } from '../services/iOSTtsClient';
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -88,6 +88,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
           const merged: AppSettings = { ...DEFAULT_SETTINGS, ...saved };
           setSettings(merged);
           applyTtsRate(merged.ttsRate);
+          iOSTts.setSpeechRate(merged.ttsRate);
         }
       } catch (e) {
         console.warn('[Settings] Failed to load settings:', e);
@@ -139,6 +140,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setSettings(next);
       applyTtsRate(clamped);
       await persist(next);
+      iOSTts.setSpeechRate(clamped);
     },
     [settings, persist],
   );

@@ -53,7 +53,7 @@ User Speech → Speaches API (STT) → Workflow Webhook → n8n Backend → Spea
 ```
 User Speech → Native STT → Workflow Webhook → n8n Backend → Native TTS → User
                   ↓
-          Native Camera (Double Tap)
+          Native Camera (Single Tap)
 ```
 
 ### Installation
@@ -89,9 +89,10 @@ npm run android
 **Module map file errors:**
 ```bash
 # Clean DerivedData and rebuild
-rm -rf ~/Library/Developer/Xcode/DerivedData
-cd ios
-rm -rf Pods Podfile.lock build
+cd ios                                                                        
+rm -rf Pods
+rm -rf Podfile.lock
+rm -rf ~/Library/Developer/Xcode/DerivedData/*
 bundle exec pod install
 cd ..
 ```
@@ -152,7 +153,7 @@ npm start -- --reset-cache
 
 ## License
 
-This project is developed by the Shared Reality Lab at McGill University, focused on creating accessible AI technologies for users with visual impairments.
+This project is developed by the [Shared Reality Lab](https://srl.mcgill.ca/) at McGill University, focused on creating accessible AI technologies for users with visual impairments.
 
 
-**Building accessible technology for everyone.**
+**Building accessible technology for Everyone.**
