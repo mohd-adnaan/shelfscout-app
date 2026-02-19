@@ -1,16 +1,5 @@
-/**
- * src/screens/SettingsScreen.tsx
- *
- * WCAG 2.1 Level AA Compliant Settings Screen
- *
- * Provides:
- *  1. Reaching Pipeline toggle  → ARKit (default) vs Standard pipeline
- *  2. Voice Speed slider        → Controls iOS TTS rate (0.1 – 1.0)
- *
- * Voice-first design: every control announces its state change via
- * AccessibilityInfo.announceForAccessibility so blind users always know
- * what happened.
- */
+// src/screens/SettingsScreen.tsx
+
 
 import React, { useState, useCallback, useRef } from 'react';
 import {
@@ -27,8 +16,8 @@ import {
   Dimensions,
   StatusBar,
 } from 'react-native';
-import Tts from 'react-native-tts';
 import { useSettings } from '../context/SettingsContext';
+import { iOSTts } from '../services/iOSTtsClient';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const SLIDER_TRACK_WIDTH = SCREEN_WIDTH - 80; // 40px padding each side
@@ -249,11 +238,13 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     async (v: number) => {
       setLocalRate(v);
       await updateTtsRate(v);
-      // Preview new rate
+
+      // ✅ Preview new rate through singleton (avoids BOOL crash)
       if (Platform.OS === 'ios') {
-        Tts.stop();
-        Tts.speak(`Voice speed set to ${rateLabel(v)}.`);
+        await iOSTts.stop();
+        iOSTts.synthesizeSpeech(`Voice speed set to ${rateLabel(v)}.`);
       }
+
       AccessibilityInfo.announceForAccessibility(
         `Voice speed changed to ${rateLabel(v)}, ${ratePercent(v)}.`,
       );
@@ -473,13 +464,13 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             ))}
           </View>
 
-          {/* Test button */}
+          {/* Test button — uses singleton to avoid BOOL crash */}
           <TouchableOpacity
             style={styles.testBtn}
-            onPress={() => {
+            onPress={async () => {
               if (Platform.OS === 'ios') {
-                Tts.stop();
-                Tts.speak(
+                await iOSTts.stop();
+                iOSTts.synthesizeSpeech(
                   'This is how your voice guide will sound at this speed.',
                 );
               }

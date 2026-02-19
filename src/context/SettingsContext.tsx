@@ -1,19 +1,5 @@
-/**
- * src/context/SettingsContext.tsx
- *
- * Persistent settings for CyberSight / ShelfScout.
- *
- * Settings managed:
- *  - preferAlternativeReaching: boolean
- *      false (default) → use ARKit pipeline when reaching_ios flag is true
- *      true            → use the standard "reaching" pipeline instead
- *
- *  - ttsRate: number (0.1 – 1.0)
- *      Controls react-native-tts speech rate on iOS.
- *      Default: 0.5
- *
- * Persistence: AsyncStorage under key '@cybersight_settings_v1'
- */
+// src/context/SettingsContext.tsx
+
 
 import React, {
   createContext,
@@ -24,9 +10,9 @@ import React, {
   ReactNode,
 } from 'react';
 import AsyncStorage from '@react-native-async-storage/async-storage';
-import Tts from 'react-native-tts';
 import { Platform } from 'react-native';
 import { iOSTts } from '../services/iOSTtsClient';
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
@@ -87,7 +73,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
           const saved: Partial<AppSettings> = JSON.parse(raw);
           const merged: AppSettings = { ...DEFAULT_SETTINGS, ...saved };
           setSettings(merged);
-          applyTtsRate(merged.ttsRate);
+
+          // ✅ Apply saved rate through singleton (per-utterance approach)
+          // NEVER call Tts.setDefaultRate() — BOOL crash on New Architecture
           iOSTts.setSpeechRate(merged.ttsRate);
         }
       } catch (e) {
@@ -108,17 +96,6 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const applyTtsRate = (rate: number) => {
-    if (Platform.OS === 'ios') {
-      try {
-        Tts.setDefaultRate(parseFloat(rate as any)); // true = iOS-only "skipTransform"
-        console.log(`[Settings] TTS rate set to ${rate}`);
-      } catch (e) {
-        console.warn('[Settings] Failed to apply TTS rate:', e);
-      }
-    }
-  };
-
   // ── Updaters ──────────────────────────────────────────────────────────────
 
   const updatePreferAlternativeReaching = useCallback(
@@ -138,8 +115,9 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       const clamped = Math.max(0.1, Math.min(1.0, rate));
       const next = { ...settings, ttsRate: clamped };
       setSettings(next);
-      applyTtsRate(clamped);
       await persist(next);
+
+      // ✅ Apply through singleton only — per-utterance rate control
       iOSTts.setSpeechRate(clamped);
     },
     [settings, persist],

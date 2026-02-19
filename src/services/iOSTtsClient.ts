@@ -21,30 +21,54 @@ try {
 }
 
 // ========================================================================
-// Voice preferences — warm female voices matching Kokoro "af_heart"
+// Voice preferences — ordered by quality (premium > enhanced > compact)
+//
+// Premium voices use Apple's Neural TTS engine and sound much more
+// natural than enhanced voices. They require download but most
+// accessibility users already have them installed.
+//
+// ⚠️  Your device has Zoe Premium installed but NOT Samantha Premium.
+//     Keep both listed so whichever is available gets picked.
 // ========================================================================
 const PREFERRED_VOICES = [
+  // Premium (Neural TTS) — most natural, closest to Siri quality
+  'com.apple.voice.premium.en-US.Zoe',
+  'com.apple.voice.premium.en-US.Samantha',
+  // Enhanced — good quality, often pre-installed
   'com.apple.voice.enhanced.en-US.Samantha',
-  //'com.apple.voice.premium.en-US.Zoe',
-  //'com.apple.voice.premium.en-US.Samantha',
-  //'com.apple.voice.enhanced.en-US.Ava',
-  //'com.apple.voice.enhanced.en-AU.Karen',
-  //'com.apple.voice.enhanced.en-GB.Serena',
-  //'com.apple.voice.compact.en-US.Samantha',
+  'com.apple.voice.enhanced.en-US.Ava',
+  'com.apple.voice.enhanced.en-AU.Karen',
+  'com.apple.voice.enhanced.en-GB.Serena',
+  // Compact — last resort
+  'com.apple.voice.compact.en-US.Samantha',
 ];
 
-const SPEECH_PITCH = 1.05;
-const SAFETY_TIMEOUT_MS = 30000;
+// ========================================================================
+// Defaults
+// ========================================================================
+// Pitch 1.0 = natural. Previous 1.05 made Samantha sound slightly robotic.
+const DEFAULT_SPEECH_PITCH = 1.0;
+
+// iOS AVSpeechUtteranceDefaultSpeechRate = 0.5
+// Range: 0.0 (slowest) to 1.0 (fastest)
+// 0.5 is "normal" conversational speed
+const DEFAULT_SPEECH_RATE = 0.5;
+
+const SAFETY_TIMEOUT_MS = 30_000;
 
 class IOSTtsClient {
   private _isPlaying = false;
   private _isStopped = false;
   private _initialized = false;
-  private _initializing = false; // guard against concurrent init
+  private _initializing = false;
   private _selectedVoice: string | null = null;
   private _resolveSpeak: (() => void) | null = null;
   private _safetyTimer: ReturnType<typeof setTimeout> | null = null;
   private _subscriptions: Array<{ remove: () => void }> = [];
+
+  // ── User-controllable settings ─────────────────────────────────────────
+  private _speechRate: number = DEFAULT_SPEECH_RATE;
+  private _speechPitch: number = DEFAULT_SPEECH_PITCH;
 
   constructor() {
     this._registerEventListeners();
@@ -85,11 +109,11 @@ class IOSTtsClient {
 
     try {
       // *** DO NOT call Tts.setDefaultRate() ***
-      // The native bridge method requires a BOOL param that doesn't
-      // convert on New Architecture. iOS default rate = 0.5 which
-      // is exactly what we want.
+      // The native bridge method requires a BOOL param (skipTransform)
+      // that doesn't convert on New Architecture / TurboModules.
+      // Instead we pass rate per-utterance in Tts.speak() options.
 
-      try { Tts.setDefaultPitch(SPEECH_PITCH); } catch (e: any) {
+      try { Tts.setDefaultPitch(this._speechPitch); } catch (e: any) {
         console.warn('⚠️ setDefaultPitch failed:', e.message);
       }
 
@@ -103,10 +127,11 @@ class IOSTtsClient {
       console.log(
         '✅ iOS TTS Client initialized',
         this._selectedVoice ? `(voice: ${this._selectedVoice})` : '(default voice)',
+        `| rate: ${this._speechRate} | pitch: ${this._speechPitch}`,
       );
     } catch (error: any) {
       console.warn('⚠️ iOS TTS init warning:', error.message);
-      this._initialized = true; // still mark done so we don't retry
+      this._initialized = true;
     } finally {
       this._initializing = false;
     }
@@ -122,17 +147,30 @@ class IOSTtsClient {
       const voices = await Tts.voices();
       const availableIds = new Set(voices.map((v: any) => v.id));
 
+      // Log available English voices for debugging
+      const englishVoices = voices
+        .filter((v: any) => v.language?.startsWith('en'))
+        .map((v: any) => `${v.id} (q:${v.quality})`);
+      console.log('📋 Available English voices:', englishVoices.join(', '));
+
+      // Try preferred voices in order (premium → enhanced → compact)
       for (const voiceId of PREFERRED_VOICES) {
         if (availableIds.has(voiceId)) {
-          await Tts.setDefaultVoice(voiceId);
-          this._selectedVoice = voiceId;
-          console.log('🎤 Selected iOS voice:', voiceId);
-          return;
+          try {
+            await Tts.setDefaultVoice(voiceId);
+            this._selectedVoice = voiceId;
+            const tier = voiceId.includes('.premium.') ? 'PREMIUM'
+              : voiceId.includes('.enhanced.') ? 'ENHANCED' : 'COMPACT';
+            console.log(`🎤 Selected iOS voice: ${voiceId} [${tier}]`);
+            return;
+          } catch (e: any) {
+            console.warn(`⚠️ setDefaultVoice failed for ${voiceId}:`, e.message);
+          }
         }
       }
 
-      // Fallback: any English enhanced voice
-      const englishEnhanced = voices.find(
+      // Fallback: any English voice with reasonable quality (non-network)
+      const englishFallback = voices.find(
         (v: any) =>
           v.language?.startsWith('en') &&
           v.quality != null &&
@@ -140,14 +178,18 @@ class IOSTtsClient {
           !v.networkConnectionRequired,
       );
 
-      if (englishEnhanced) {
-        await Tts.setDefaultVoice(englishEnhanced.id);
-        this._selectedVoice = englishEnhanced.id;
-        console.log('🎤 Selected fallback enhanced voice:', englishEnhanced.id);
-        return;
+      if (englishFallback) {
+        try {
+          await Tts.setDefaultVoice(englishFallback.id);
+          this._selectedVoice = englishFallback.id;
+          console.log('🎤 Selected fallback voice:', englishFallback.id);
+          return;
+        } catch (e: any) {
+          console.warn('⚠️ Fallback voice selection failed:', e.message);
+        }
       }
 
-      console.log('ℹ️ No enhanced voice found — using iOS default');
+      console.log('ℹ️ No preferred voice found — using iOS system default');
     } catch (error: any) {
       console.warn('⚠️ Voice selection failed:', error.message);
     }
@@ -194,7 +236,49 @@ class IOSTtsClient {
   }
 
   // ========================================================================
-  // Public API
+  // Public API — Speech Rate Control
+  // ========================================================================
+
+  /**
+   * Set the speech rate for ALL subsequent TTS output.
+   * Called by SettingsContext when the user moves the slider.
+   *
+   * @param rate - iOS AVSpeechUtterance rate (0.0–1.0, default 0.5)
+   *
+   * Maps to user-facing labels:
+   *   0.42 = Slow       (relaxed, good for complex directions)
+   *   0.50 = Normal     (conversational, iOS default)
+   *   0.55 = Slightly Fast
+   *   0.60 = Fast       (experienced users)
+   *   0.65 = Very Fast  (power users)
+   */
+  setSpeechRate(rate: number): void {
+    const clamped = Math.max(0.0, Math.min(1.0, rate));
+    this._speechRate = clamped;
+    console.log(`🎚️ TTS speech rate set to: ${clamped}`);
+  }
+
+  /** Get the current speech rate */
+  getSpeechRate(): number {
+    return this._speechRate;
+  }
+
+  /**
+   * Set the speech pitch for ALL subsequent TTS output.
+   * @param pitch - iOS pitch multiplier (0.5–2.0, default 1.0)
+   */
+  setSpeechPitch(pitch: number): void {
+    const clamped = Math.max(0.5, Math.min(2.0, pitch));
+    this._speechPitch = clamped;
+
+    try { Tts.setDefaultPitch(clamped); } catch (e: any) {
+      console.warn('⚠️ setDefaultPitch failed:', e.message);
+    }
+    console.log(`🎚️ TTS speech pitch set to: ${clamped}`);
+  }
+
+  // ========================================================================
+  // Public API — Speak
   // ========================================================================
 
   async synthesizeSpeech(text: string): Promise<void> {
@@ -217,14 +301,36 @@ class IOSTtsClient {
       this._isPlaying = true;
       this._startSafetyTimer();
 
-      console.log('🎤 iOS TTS speaking:', trimmed.substring(0, 50) + (trimmed.length > 50 ? '...' : ''));
+      console.log(
+        '🎤 iOS TTS speaking:',
+        trimmed.substring(0, 50) + (trimmed.length > 50 ? '...' : ''),
+        `[rate=${this._speechRate}]`,
+      );
 
-      Tts.speak(trimmed).catch((err: any) => {
+      // ── Per-utterance options ─────────────────────────────────────────
+      // This is the KEY fix: rate is passed per-speak call, bypassing
+      // the broken setDefaultRate() that crashes on New Architecture.
+      //
+      // iosVoiceId is a fallback — if setDefaultVoice() failed during
+      // init, this ensures the voice is still applied per-utterance.
+      const speakOptions: Record<string, any> = {
+        rate: this._speechRate,
+      };
+
+      if (this._selectedVoice) {
+        speakOptions.iosVoiceId = this._selectedVoice;
+      }
+
+      Tts.speak(trimmed, speakOptions).catch((err: any) => {
         console.error('❌ Tts.speak() error:', err);
         this._resolvePending();
       });
     });
   }
+
+  // ========================================================================
+  // Public API — Stop
+  // ========================================================================
 
   async stop(): Promise<void> {
     this._clearSafetyTimer();
@@ -235,11 +341,15 @@ class IOSTtsClient {
     this._isStopped = true;
     this._isPlaying = false;
 
+    // Tts.stop() takes a BOOL param (onWordBoundary) that can't bridge
+    // on New Architecture. The try/catch prevents the crash from propagating.
+    // On some devices the native side still stops; on others it may not.
+    // Either way, the new Tts.speak() call in synthesizeSpeech() will
+    // queue after the current utterance finishes (AVSpeechSynthesizer behavior).
     try {
       await Tts.stop();
     } catch (error: any) {
-      // Tts.stop() may throw BOOL conversion error — non-fatal,
-      // native side still stops speech
+      // Expected on New Architecture — BOOL conversion error
       console.warn('⚠️ Tts.stop() error (non-fatal):', error.message);
     }
 
@@ -255,6 +365,10 @@ class IOSTtsClient {
     console.log('✅ iOS TTS stopped');
   }
 
+  // ========================================================================
+  // Public API — Getters
+  // ========================================================================
+
   isCurrentlyPlaying(): boolean {
     return this._isPlaying;
   }
@@ -264,6 +378,5 @@ class IOSTtsClient {
   }
 }
 
-// Singleton
 export const iOSTts = new IOSTtsClient();
 export const speachesTTS = iOSTts;

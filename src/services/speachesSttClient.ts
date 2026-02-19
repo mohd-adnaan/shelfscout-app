@@ -226,4 +226,4 @@ class SpeachesSttClient {
   }
 }
 
-export const speachesSTT = new SpeachesSttClient();
+export { iOSTts, speachesTTS } from './iOSTtsClient';
