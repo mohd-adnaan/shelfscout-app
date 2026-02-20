@@ -10,6 +10,11 @@
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		168CFD6491C44B6C7AB12AA2 /* libPods-shelfscout.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 17E209EAA22CCC460541DB60 /* libPods-shelfscout.a */; };
 		4D9BFE671FF22FC33CC01744 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
+		5F359D602F48B656000E7BB8 /* siri-begin-improved.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5F2F48B656000E7BB8 /* siri-begin-improved.caf */; };
+		5F359D612F48B656000E7BB8 /* jbl_latency_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */; };
+		5F359D622F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5D2F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 */; };
+		5F359D632F48B656000E7BB8 /* jbl_begin_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5B2F48B656000E7BB8 /* jbl_begin_sae.caf */; };
+		5F359D642F48B656000E7BB8 /* jbl_success_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5E2F48B656000E7BB8 /* jbl_success_sae.caf */; };
 		5F3C03852F3A945F001B0A13 /* Imageorientationfixer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F3C03842F3A945B001B0A13 /* Imageorientationfixer.swift */; };
 		5F3C038A2F3A9518001B0A13 /* ImageOrientationFixer.m in Sources */ = {isa = PBXBuildFile; fileRef = 5F3C03892F3A9518001B0A13 /* ImageOrientationFixer.m */; };
 		5F5055AA2F341971000B8156 /* srlLogo.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 5F5055A92F341971000B8156 /* srlLogo.mp4 */; };
@@ -26,6 +31,11 @@
 		13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = PrivacyInfo.xcprivacy; path = shelfscout/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		17E209EAA22CCC460541DB60 /* libPods-shelfscout.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-shelfscout.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		5144E27FECB6AFF99AEE8B7F /* Pods-shelfscout.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.release.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.release.xcconfig"; sourceTree = "<group>"; };
+		5F359D5B2F48B656000E7BB8 /* jbl_begin_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_begin_sae.caf; sourceTree = "<group>"; };
+		5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_latency_sae.caf; sourceTree = "<group>"; };
+		5F359D5D2F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = jbl_stopped_ios_sae.mp3; sourceTree = "<group>"; };
+		5F359D5E2F48B656000E7BB8 /* jbl_success_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_success_sae.caf; sourceTree = "<group>"; };
+		5F359D5F2F48B656000E7BB8 /* siri-begin-improved.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "siri-begin-improved.caf"; sourceTree = "<group>"; };
 		5F3C03842F3A945B001B0A13 /* Imageorientationfixer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Imageorientationfixer.swift; sourceTree = "<group>"; };
 		5F3C03892F3A9518001B0A13 /* ImageOrientationFixer.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ImageOrientationFixer.m; sourceTree = "<group>"; };
 		5F5055A92F341971000B8156 /* srlLogo.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = srlLogo.mp4; sourceTree = "<group>"; };
@@ -53,6 +63,11 @@
 		13B07FAE1A68108700A75B9A /* shelfscout */ = {
 			isa = PBXGroup;
 			children = (
+				5F359D5B2F48B656000E7BB8 /* jbl_begin_sae.caf */,
+				5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */,
+				5F359D5D2F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 */,
+				5F359D5E2F48B656000E7BB8 /* jbl_success_sae.caf */,
+				5F359D5F2F48B656000E7BB8 /* siri-begin-improved.caf */,
 				5F3C03892F3A9518001B0A13 /* ImageOrientationFixer.m */,
 				5F3C03842F3A945B001B0A13 /* Imageorientationfixer.swift */,
 				5FC263882F395B19006AEE6F /* ReachingModule.m */,
@@ -176,6 +191,11 @@
 			buildActionMask = 2147483647;
 			files = (
 				5F5055AA2F341971000B8156 /* srlLogo.mp4 in Resources */,
+				5F359D602F48B656000E7BB8 /* siri-begin-improved.caf in Resources */,
+				5F359D612F48B656000E7BB8 /* jbl_latency_sae.caf in Resources */,
+				5F359D622F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 in Resources */,
+				5F359D632F48B656000E7BB8 /* jbl_begin_sae.caf in Resources */,
+				5F359D642F48B656000E7BB8 /* jbl_success_sae.caf in Resources */,
 				5F5055B42F34217C000B8156 /* LaunchScreen.storyboard in Resources */,
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
 				4D9BFE671FF22FC33CC01744 /* PrivacyInfo.xcprivacy in Resources */,

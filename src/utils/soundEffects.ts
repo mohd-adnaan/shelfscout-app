@@ -1,173 +1,206 @@
 // src/utils/soundEffects.ts
+// ─────────────────────────────────────────────────────────────────────────────
+// CyberSight — iOS Sound Effects
+//
+// Five physical audio files replace verbal state announcements:
+//
+//   siri-begin-improved.caf    → Listening started  (Siri-style chime)
+//   jbl_begin_sae.caf          → Thinking started   (replaces "Thinking" TTS)
+//   jbl_latency_sae.caf        → Loops while waiting for backend response
+//   jbl_success_sae.caf        → Right before speaking the result
+//   jbl_stopped_ios_sae.mp3    → Error returned from backend
+//
+// FILE PLACEMENT (see SOUND_SETUP_GUIDE.md):
+//   iOS  → ios/<ProjectName>/sounds/<filename>  (added to Xcode bundle)
+//   Droid→ android/app/src/main/res/raw/<filename>
+//
+// ─────────────────────────────────────────────────────────────────────────────
 
+import Sound from 'react-native-sound';
 import { Platform } from 'react-native';
-import { iOSTts } from '../services/iOSTtsClient';
 
-/**
- * Play audio feedback sounds for different states
- * 
- * WCAG 1.4.2: Audio feedback is supplementary, not required
- * WCAG 3.3.1: Errors handled gracefully without crashing app
- * 
- * Uses console logging for state audio cues.
- * If this fails, app continues to work - audio is optional enhancement.
- * 
- * @param type - Type of sound to play
- */
-export const playSound = async (type: 'start' | 'stop' | 'processing'): Promise<void> => {
-  try {
-    // WCAG 1.4.2: Audio feedback is supplementary
-    // If this fails, app continues to work - don't announce errors
-    
-    if (Platform.OS === 'ios') {
-      switch (type) {
-        case 'start':
-          console.log('[Audio] 🔊 Feedback: Microphone ON');
-          break;
-          
-        case 'stop':
-          console.log('[Audio] 🔊 Feedback: Microphone OFF');
-          break;
-          
-        case 'processing':
-          console.log('[Audio] 🔊 Feedback: Thinking...');
-          break;
-          
-        default:
-          console.warn('[Audio] ⚠️ Unknown sound type:', type);
-          break;
-      }
-    } else {
-      console.log(`[Audio] 🔊 Feedback: ${type}`);
+// ── Configure sound to play through the speaker, not earpiece ─────────────
+// MUST be called before any Sound() constructors
+Sound.setCategory('Playback', true); // true = mixWithOthers
+
+// ── File → bundle key map ──────────────────────────────────────────────────
+// NOTE: "jbl_stopped,IOS_sae.mp3" has been RENAMED to "jbl_stopped_ios_sae.mp3"
+// on disk. Do that rename before building.
+const SOUND_FILES: Record<string, string> = {
+  listen:   'siri-begin-improved.caf',
+  begin:    'jbl_begin_sae.caf',
+  latency:  'jbl_latency_sae.caf',
+  success:  'jbl_success_sae.caf',
+  stopped:  'jbl_stopped_ios_sae.mp3',  // ← renamed from "jbl_stopped,IOS_sae.mp3"
+};
+
+// ── Sound instances ────────────────────────────────────────────────────────
+type SoundKey = keyof typeof SOUND_FILES;
+const sounds: Partial<Record<SoundKey, Sound>> = {};
+let latencyLooping = false;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// init — call once at app startup (e.g. in App.tsx useEffect)
+// ─────────────────────────────────────────────────────────────────────────────
+export const initSounds = (): Promise<void> => {
+  return new Promise((resolve) => {
+    const keys = Object.keys(SOUND_FILES) as SoundKey[];
+    let loaded = 0;
+
+    keys.forEach((key) => {
+      const filename = SOUND_FILES[key];
+      // Sound.MAIN_BUNDLE → looks in iOS app bundle / Android raw resources
+      const s = new Sound(filename, Sound.MAIN_BUNDLE, (err) => {
+        if (err) {
+          console.warn(`⚠️ [SFX] Failed to load "${filename}":`, err.message);
+        } else {
+          console.log(`✅ [SFX] Loaded "${filename}"`);
+          sounds[key] = s;
+        }
+        loaded++;
+        if (loaded === keys.length) resolve();
+      });
+    });
+  });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Internal — play a one-shot sound, optionally with a callback on finish
+// Returns immediately so the caller is never blocked.
+// ─────────────────────────────────────────────────────────────────────────────
+const _playOnce = (key: SoundKey, onFinish?: () => void): void => {
+  const s = sounds[key];
+  if (!s) {
+    console.warn(`⚠️ [SFX] Sound "${key}" not loaded — skipping`);
+    onFinish?.();
+    return;
+  }
+  // Reset to beginning before every play so rapid calls don't skip
+  s.setCurrentTime(0);
+  s.setNumberOfLoops(0); // one-shot
+  s.play((success) => {
+    if (!success) {
+      console.warn(`⚠️ [SFX] Playback failed for "${key}"`);
     }
-    
-  } catch (error: any) {
-    // WCAG 3.3.1: Handle sound errors gracefully
-    console.warn('[Audio] ⚠️ Sound effect error:', error.message || error);
-  }
+    onFinish?.();
+  });
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
+// PUBLIC API
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Play when the app enters LISTENING state.
+ * Replaces the "Listening" verbal announcement.
+ */
+export const playListenSound = (): void => {
+  _playOnce('listen');
 };
 
 /**
- * Play success sound
- * 
- * WCAG 1.4.2: Optional audio enhancement
- * 
- * ✅ Routes through iOSTts singleton so the user's speech rate setting
- *    from SettingsContext is automatically applied.
- * 
- * @param message - Optional success message to speak
+ * Play when the app enters THINKING state (photo taken, request sent).
+ * Replaces the "Thinking" verbal announcement.
+ * Immediately starts the latency loop AFTER the begin tone finishes.
  */
-export const playSuccessSound = async (message?: string): Promise<void> => {
-  try {
-    console.log('[Audio] ✅ Success sound');
-    
-    if (message) {
-      try {
-        // ✅ Use singleton — respects user's rate setting, no BOOL crash
-        await iOSTts.synthesizeSpeech(message);
-      } catch (ttsError: any) {
-        console.warn('[Audio] TTS error:', ttsError.message);
-        // Don't crash - TTS is optional
-      }
+export const playThinkingStarted = (): void => {
+  _playOnce('begin', () => {
+    // As soon as "begin" finishes, start the latency loop
+    _startLatencyLoop();
+  });
+};
+
+/**
+ * Internal — start the latency loop. Called after "begin" sound finishes.
+ */
+const _startLatencyLoop = (): void => {
+  const s = sounds.latency;
+  if (!s) {
+    console.warn('⚠️ [SFX] Latency sound not loaded');
+    return;
+  }
+  if (latencyLooping) return; // already running
+  latencyLooping = true;
+  s.setCurrentTime(0);
+  s.setNumberOfLoops(-1); // infinite loop
+  s.play((success) => {
+    // This callback fires when play() is manually stopped or fails
+    latencyLooping = false;
+    if (!success) {
+      console.log('[SFX] Latency loop stopped');
     }
-    
-  } catch (error: any) {
-    console.warn('[Audio] Success sound error:', error.message || error);
-    // Don't crash - audio is supplementary
-  }
+  });
+  console.log('🔁 [SFX] Latency loop started');
 };
 
 /**
- * Play error sound
- * 
- * WCAG 1.4.2: Optional audio enhancement
+ * Stop the latency loop (call when backend response arrives).
+ * Returns a Promise that resolves when the loop has fully stopped.
  */
-export const playErrorSound = async (): Promise<void> => {
-  try {
-    console.log('[Audio] ❌ Error sound');
-  } catch (error: any) {
-    console.warn('[Audio] Error sound failed:', error.message || error);
-  }
+export const stopLatencyLoop = (): Promise<void> => {
+  return new Promise((resolve) => {
+    const s = sounds.latency;
+    if (!s || !latencyLooping) {
+      latencyLooping = false;
+      resolve();
+      return;
+    }
+    s.stop(() => {
+      latencyLooping = false;
+      console.log('⏹️ [SFX] Latency loop stopped');
+      resolve();
+    });
+  });
 };
 
 /**
- * Stop any currently playing sounds
- * 
- * WCAG 1.4.2: Users can control audio
- * 
- * ✅ Routes through iOSTts singleton — catches BOOL error internally.
+ * Play right before the TTS result is spoken.
+ * Returns a Promise so the caller can await it before starting TTS.
+ *
+ * Usage:
+ *   await stopLatencyLoop();
+ *   await playSuccessChime();
+ *   await iOSTts.speak(resultText);
  */
-export const stopAllSounds = async (): Promise<void> => {
-  try {
-    console.log('[Audio] 🛑 Stopping all sounds');
-    
-    // ✅ Use singleton — Tts.stop() BOOL crash handled inside
-    await iOSTts.stop();
-    
-  } catch (error: any) {
-    console.warn('[Audio] Stop sounds error:', error.message || error);
-    // Don't crash
-  }
+export const playSuccessChime = (): Promise<void> => {
+  return new Promise((resolve) => {
+    _playOnce('success', resolve);
+  });
 };
 
 /**
- * Check if TTS is available
- * 
- * @returns boolean - always true since iOSTts singleton is always available
+ * Play when the backend returns an error.
+ * Non-blocking — fire and forget.
  */
-export const isTTSAvailable = (): boolean => {
-  return true;
+export const playErrorSound = (): void => {
+  _playOnce('stopped');
 };
 
 /**
- * Initialize audio system
- * 
- * WCAG 3.3.1: Initialization errors handled gracefully
- * 
- * ✅ No direct Tts calls — iOSTts singleton handles all setup in its
- *    constructor (voice selection, pitch, ignoreSilentSwitch).
- *    Rate is applied per-utterance, so no setDefaultRate() needed.
+ * Play camera shutter sound manually.
+ * Called immediately before takePhoto() to fix iPhone 16 / iOS 18 
+ * where enableShutterSound no longer works reliably.
+ *
+ * Uses the "begin" tone as the shutter click (natural transition cue).
+ * If you have a dedicated shutter file, swap 'begin' for 'shutter'.
  */
-export const initializeAudio = async (): Promise<boolean> => {
-  try {
-    console.log('[Audio] Initializing audio system...');
-    
-    // iOSTts singleton auto-initializes in its constructor.
-    // Voice selection, pitch, and silent switch are all handled there.
-    // Speech rate is controlled by SettingsContext → iOSTts.setSpeechRate().
-    // No direct Tts.setDefaultRate() / setDefaultLanguage() calls needed.
-    
-    console.log('[Audio] ✅ Audio system initialized (via iOSTts singleton)');
-    return true;
-    
-  } catch (error: any) {
-    console.warn('[Audio] Initialization error:', error.message || error);
-    return false;
-  }
+export const playShutterSound = (): void => {
+  // The "begin" (jbl_begin_sae) serves double duty here:
+  //  • it marks the thinking state starting
+  //  • it also IS the shutter feedback sound
+  // So we call playThinkingStarted() in App.tsx rather than a separate playShutter().
+  // This function is provided as an explicit hook if you need it standalone.
+  _playOnce('begin');
 };
 
 /**
- * Clean up audio resources
- * 
- * Call this when app unmounts or user leaves screen
+ * Release all sounds — call when the main component unmounts.
  */
-export const cleanupAudio = async (): Promise<void> => {
-  try {
-    console.log('[Audio] Cleaning up audio resources...');
-    await stopAllSounds();
-    console.log('[Audio] ✅ Audio cleanup complete');
-  } catch (error: any) {
-    console.warn('[Audio] Cleanup error:', error.message || error);
-  }
-};
-
-// Export all functions
-export default {
-  playSound,
-  playSuccessSound,
-  playErrorSound,
-  stopAllSounds,
-  isTTSAvailable,
-  initializeAudio,
-  cleanupAudio,
+export const releaseSounds = (): void => {
+  (Object.keys(sounds) as SoundKey[]).forEach((key) => {
+    sounds[key]?.release();
+    delete sounds[key];
+  });
+  latencyLooping = false;
+  console.log('✅ [SFX] Sounds released');
 };

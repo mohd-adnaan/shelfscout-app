@@ -42,7 +42,15 @@ import {
   determineActionMode,
 } from './src/services/WorkflowService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
-import { playSound } from './src/utils/soundEffects';
+import {
+  initSounds,
+  releaseSounds,
+  playListenSound,
+  playThinkingStarted,
+  stopLatencyLoop,
+  playSuccessChime,
+  playErrorSound,
+} from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
 import { NAVIGATION_CONFIG } from './src/utils/constants';
@@ -170,6 +178,15 @@ function AppInner(): React.JSX.Element {
     return () => { srSub?.remove(); rmSub?.remove(); };
   }, []);
 
+  // ── Sound Check ──────────────────────────────────────────────────────────
+  useEffect(() => {
+    initSounds().then(() => {
+      console.log('✅ [App] Sound effects loaded');
+    }).catch((err) => {
+      console.error('❌ [App] Sound load failed:', err);
+    });
+  }, []);
+
   // ── Android permissions ────────────────────────────────────────────────────
   useEffect(() => {
     if (Platform.OS === 'android') {
@@ -242,7 +259,7 @@ function AppInner(): React.JSX.Element {
 
     try {
       const photo = await cameraRef.current.takePhoto({
-        enableShutterSound: true,
+        enableShutterSound: false,
         flash: 'off',
       });
       const fixedImage = await fixImageOrientation(photo.path);
@@ -620,9 +637,10 @@ function AppInner(): React.JSX.Element {
       try { await cancelSTT(); } catch { }
 
       audioFeedback.playEarcon('thinking');
-      await audioFeedback.announceState('thinking', false);
-      playSound('processing');
-      
+      //await audioFeedback.announceState('thinking', false);
+      //playSound('processing');
+      playThinkingStarted();             // ← plays jbl_begin_sae.caf, then auto-starts latency loop
+
 
       if (!photoPath) {
         console.warn('⚠️ No photo — voice-only mode');
@@ -645,6 +663,9 @@ function AppInner(): React.JSX.Element {
 
       if (isEmergencyStopped.current) return;
 
+      await stopLatencyLoop();
+      await playSuccessChime();          // ← plays jbl_success_sae.caf
+
       console.log('✅ Response:', {
         text: result.text.substring(0, 50) + '...',
         navigation: result.navigation,
@@ -656,6 +677,8 @@ function AppInner(): React.JSX.Element {
       setIsProcessing(false);
       setIsSpeaking(true);
       audioFeedback.playEarcon('speaking');
+
+
 
       if (isEmergencyStopped.current) return;
 
@@ -708,6 +731,8 @@ function AppInner(): React.JSX.Element {
       }
       if (!isEmergencyStopped.current) {
         console.error('❌ Error:', error);
+        await stopLatencyLoop();
+        playErrorSound();
         await audioFeedback.announceError(`Error: ${error.message}`, true);
         Alert.alert('Error', error.message);
       }
@@ -824,8 +849,9 @@ function AppInner(): React.JSX.Element {
       finalTranscriptRef.current = '';
 
       audioFeedback.playEarcon('listening');
-      playSound('start');
-      await audioFeedback.announceState('listening', false);
+      //playSound('start');
+      playListenSound();
+      //await audioFeedback.announceState('listening', false);
       await new Promise(resolve => setTimeout(resolve, 100));
 
       await startSTT();
