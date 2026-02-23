@@ -104,10 +104,8 @@ export const playListenSound = (): void => {
  * Immediately starts the latency loop AFTER the begin tone finishes.
  */
 export const playThinkingStarted = (): void => {
-  _playOnce('begin', () => {
     // As soon as "begin" finishes, start the latency loop
     _startLatencyLoop();
-  });
 };
 
 /**

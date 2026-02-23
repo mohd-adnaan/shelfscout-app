@@ -664,7 +664,7 @@ function AppInner(): React.JSX.Element {
       if (isEmergencyStopped.current) return;
 
       await stopLatencyLoop();
-      await playSuccessChime();          // ← plays jbl_success_sae.caf
+      //await playSuccessChime();          // ← plays jbl_success_sae.caf
 
       console.log('✅ Response:', {
         text: result.text.substring(0, 50) + '...',
@@ -721,6 +721,7 @@ function AppInner(): React.JSX.Element {
       AccessibilityInfo.announceForAccessibility('Response complete. Tap to speak.');
 
     } catch (error: any) {
+      // ── Cancelled / aborted requests are silent ──────
       if (
         error.name === 'AbortError' ||
         error.message?.includes('aborted') ||
@@ -729,12 +730,35 @@ function AppInner(): React.JSX.Element {
         console.log('✅ Request cancelled');
         return;
       }
+
       if (!isEmergencyStopped.current) {
-        console.error('❌ Error:', error);
+        // ── Error handling (debugging) ───────────
+        console.error('❌ handleVoiceCommand error:', error);
+        console.error('❌ Error detail:', error?.message, error?.code);
+
+        // ── Stop audio feedback────────────────────────────────────
+        // 1. Stop the new CAF latency loop (jbl_latency_sae.caf)
         await stopLatencyLoop();
-        playErrorSound();
-        await audioFeedback.announceError(`Error: ${error.message}`, true);
-        Alert.alert('Error', error.message);
+        // 2. Stop the audioFeedback 'thinking' earcon (old system still active)
+        audioFeedback.playEarcon('cancel');  
+
+        // ── Audio feedback: error sound → fixed TTS message ───────────────
+        playErrorSound();   // plays jbl_stopped_ios_sae.mp3 immediately
+
+        // Wait for error chime is heard before voice
+        await new Promise(resolve => setTimeout(resolve, 600));
+
+        // Fixed message — user doesn't need the raw error string
+        await speachesSentenceChunker.synthesizeSpeechChunked(
+          'Error processing your request.'
+        );
+
+        // ── Auto-reset to ready — no Alert, no tap ───────────────
+        setIsCameraActive(true);
+        audioFeedback.playEarcon('ready');
+        AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+        // No Alert.alert — blind users can't dismiss it without finding
+        // the OK button. Auto-reset is the correct pattern here.
       }
     } finally {
       setIsProcessing(false);
