@@ -14,9 +14,11 @@ export interface WorkflowResponse {
   // Continuous mode flags (THREE-FLAG SYSTEM)
   navigation: boolean;
   reaching_flag: boolean;
+  reaching_completed?: boolean;
   
   // iOS ARKit Reaching (HIGHEST PRIORITY)
   reaching_ios: boolean;
+  
   bbox?: [number, number, number, number];  // [xmin, ymin, xmax, ymax] from Qwen detection
   object?: string;                           // Name of detected object
   depth?: string;

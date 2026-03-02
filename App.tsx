@@ -1,7 +1,4 @@
-/**
- * App.tsx - CyberSight Mobile Application
- *
- */
+// App.tsx - CyberSight Mobile Application
 
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import {
@@ -430,6 +427,8 @@ function AppInner(): React.JSX.Element {
         const abortCtrl = new AbortController();
         abortControllerRef.current = abortCtrl;
 
+        playThinkingStarted(); // ← start thinking SFX for this cycle
+
         const loopMode = getCurrentMode();
         const result = await sendToWorkflow(
           {
@@ -441,7 +440,9 @@ function AppInner(): React.JSX.Element {
           abortCtrl.signal
         );
 
+        await stopLatencyLoop(); // ← stop thinking SFX when result arrives
         setIsProcessing(false);
+
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
 
@@ -458,27 +459,50 @@ function AppInner(): React.JSX.Element {
 
         // ── iOS ARKit reaching check (respects user preference) ───────────
         if (Platform.OS === 'ios' && result.reaching_ios === true) {
-          // Speak the navigation text first
-          if (result.text) {
-            setIsSpeaking(true);
-            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            setIsSpeaking(false);
-          }
+          // Check pipeline FIRST — determines whether to kill the loop or continue it
+          const loopPipeline = resolveReachingPipeline({
+            reaching_ios: result.reaching_ios,
+            reaching: result.reaching_flag,
+          });
 
-          // Stop the continuous loop before handing off
-          isContinuousModeRunning.current = true; // keep true until after handoff
-          continuousModeAbortRef.current = true;
-          stopContinuousMode('iOS reaching takeover', false);
+          if (loopPipeline === 'arkit') {
+            // ── ARKit path: speak, abort loop, hand off ──────────────────
+            if (result.text) {
+              setIsSpeaking(true);
+              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+              setIsSpeaking(false);
+            }
+            isContinuousModeRunning.current = true; // keep until handoff complete
+            continuousModeAbortRef.current = true;
+            stopContinuousMode('iOS reaching takeover', false);
+            const handled = await handleiOSReaching(result);
+            if (handled) {
+              setIsNavigation(false);
+              setIsReaching(false);
+              setIsProcessing(false);
+              isContinuousModeRunning.current = false;
+              return; // ★ ARKit handled — clean exit
+            }
+            // ARKit path but module unavailable — loop is already aborted, exit
+            break;
 
-          const handled = await handleiOSReaching(result);
-          if (handled) {
-            setIsNavigation(false);
-            setIsReaching(false);
-            setIsProcessing(false);
-            isContinuousModeRunning.current = false;
-            return; // ★ EXIT LOOP
+          } else {
+            // ── Standard pipeline: use reaching_completed to gate the loop ─
+            if (result.reaching_completed === true) {
+              // Backend says object reached — speak final message and reset
+              if (result.text) {
+                setIsSpeaking(true);
+                await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+                setIsSpeaking(false);
+              }
+              console.log('✅ [Reaching] reaching_completed=true — resetting session');
+              resetSessionId();
+              stopContinuousMode('reaching complete', true);
+              break; // ★ Standard complete — clean exit
+            }
+            // reaching_completed=false → do NOT abort, fall through and loop again
+            console.log('🔄 [Reaching] Standard mode — reaching_completed=false, continuing...');
           }
-          // If not handled (standard pipeline), fall through
         }
 
         // ── Flag check ─────────────────────────────────────────────────────
@@ -574,7 +598,7 @@ function AppInner(): React.JSX.Element {
     setIsCameraActive(true);
     audioFeedback.playEarcon('ready');
     AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
-  }, [handleiOSReaching]);
+  }, [handleiOSReaching, resolveReachingPipeline]);
 
   // ============================================================================
   // Stop helpers
