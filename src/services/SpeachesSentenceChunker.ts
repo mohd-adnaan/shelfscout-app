@@ -1,19 +1,6 @@
-/**
- * src/services/SpeachesSentenceChunker.ts
- * 
- * WCAG 2.1 Level AA Compliant Sentence-by-Sentence TTS with Smart Chunking
- * 
- * Compliance Features:
- * - 1.4.2 Audio Control: Users can stop audio at any time
- * - 3.3.1 Error Identification: Clear error messages for TTS failures
- * - 4.1.3 Status Messages: Announces when speech is interrupted
- * 
- * Provides fast perceived response by playing text in chunks
- * Critical for blind users who depend on audio feedback
- */
+// src/services/SpeachesSentenceChunker.ts
 
-// OLD: import { speachesTTS } from './speachesTtsClient';
-import { speachesTTS } from './iOSTtsClient';
+import { speachesTTS } from './speachesTtsClient';
 import { AccessibilityService } from './AccessibilityService';
 
 class SpeachesSentenceChunker {
@@ -23,220 +10,248 @@ class SpeachesSentenceChunker {
   private totalChunks: number = 0;
 
   /**
-   * Split text into smart chunks and speak sequentially
-   * 
-   * WCAG 1.4.2: Audio can be stopped at any time via stop()
-   * WCAG 3.3.1: Provides clear error handling
-   * WCAG 4.1.3: Announces when playback fails
-   * 
-   * Starts playing first chunk immediately for fast feedback.
-   * Critical for blind users who rely on timely audio responses.
-   * 
-   * @param text - Text to speak in chunks
-   * @throws Error with user-friendly message if chunking/playback fails
+   * SESSION ID — the key to the race condition fix.
+   *
+   * Incremented on every new synthesizeSpeechChunked() call.
+   * Each loop iteration captures its own `mySession` snapshot.
+   * If `this.sessionId !== mySession`, the loop knows it has been
+   * superseded by a newer call and bails out immediately.
+   */
+  private sessionId: number = 0;
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Public API
+  // ──────────────────────────────────────────────────────────────────────────
+
+  /**
+   * Split text into smart chunks and speak them sequentially.
+   *
+   * CRITICAL ORDERING (prevents race condition):
+   *   1. Increment sessionId  ← invalidates any running loop immediately
+   *   2. await this.stop()    ← stops underlying audio & sets isStopped=true
+   *   3. Capture mySession    ← snapshot for this call's loop
+   *   4. Reset isStopped=false ← safe now, old loops have already exited
+   *   5. Enter chunk loop     ← guarded by BOTH isStopped AND sessionId check
    */
   async synthesizeSpeechChunked(text: string): Promise<void> {
     const trimmed = (text || '').trim();
-    
-    // WCAG 3.3.1: Validate input
+
     if (!trimmed) {
       console.warn('⚠️ No text provided for chunked TTS');
       return;
     }
 
+    // ── STEP 1: Invalidate any running loop IMMEDIATELY ──────────────────────
+    this.sessionId++;
+    const mySession = this.sessionId;
+    console.log(`🆕 TTS session ${mySession} starting`);
+
+    // ── STEP 2: Stop previous audio BEFORE touching isStopped ────────────────
+    // stop() sets this.isStopped = true.
+    // Any loop still running from a previous session will see isStopped=true
+    // and bail out on its next guard check — BEFORE we reset it below.
+    await this.stop();
+
+    // ── STEP 3: Guard — if another call snuck in while we were stopping ───────
+    if (this.sessionId !== mySession) {
+      console.log(`⏩ Session ${mySession} superseded before starting — aborting`);
+      return;
+    }
+
+    // ── STEP 4: Safe to reset now. Old loops have exited. ─────────────────────
     this.isStopped = false;
     this.isPlaying = true;
     this.currentChunkIndex = 0;
 
     try {
-      // Split into smart chunks (sentences, but not too long)
       const chunks = this.splitIntoChunks(trimmed);
       this.totalChunks = chunks.length;
-      
-      console.log(`📝 Split into ${chunks.length} chunks for playback`);
+      console.log(`📝 Session ${mySession}: split into ${chunks.length} chunk(s)`);
 
-      // WCAG 4.1.3: Announce that we're starting to speak
-      // (This is handled by calling code, not duplicated here)
-
-      // Play each chunk
+      // ── STEP 5: Chunk loop guarded by BOTH isStopped AND sessionId ───────────
       for (let i = 0; i < chunks.length; i++) {
-        // WCAG 1.4.2: Check if user stopped playback
+
+        // Guard A: explicit stop() was called
         if (this.isStopped) {
-          console.log('⚠️ Playback stopped by user during chunk', i + 1);
-          
-          // WCAG 4.1.3: Announce interruption
+          console.log(`🛑 Session ${mySession}: isStopped=true at chunk ${i + 1} — breaking`);
           AccessibilityService.announce('Speech interrupted');
-          
+          break;
+        }
+
+        // Guard B: a newer call started — this session is stale
+        if (this.sessionId !== mySession) {
+          console.log(`⏩ Session ${mySession} superseded at chunk ${i + 1} — breaking`);
           break;
         }
 
         this.currentChunkIndex = i;
         const chunk = chunks[i];
-        
-        const preview = chunk.length > 40 
-          ? chunk.substring(0, 40) + '...' 
-          : chunk;
-        
-        console.log(`🎙️ Playing chunk ${i + 1}/${chunks.length}: "${preview}"`);
+        const preview = chunk.length > 40 ? chunk.substring(0, 40) + '...' : chunk;
+        console.log(`🎙️ Session ${mySession} — chunk ${i + 1}/${chunks.length}: "${preview}"`);
 
         try {
-          // Use existing blocking TTS client for each chunk
           await speachesTTS.synthesizeSpeech(chunk);
-          
-          console.log(`✅ Chunk ${i + 1}/${chunks.length} played successfully`);
-          
-        } catch (error: any) {
-          // WCAG 3.3.1: Handle chunk-specific errors
-          console.error(`❌ Error playing chunk ${i + 1}:`, error);
-          
-          // Don't stop entire playback for one failed chunk
-          // Continue with next chunk instead
-          console.log(`ℹ️ Continuing with next chunk after error`);
-          
-          // If first chunk fails, announce the error
+          console.log(`✅ Session ${mySession} — chunk ${i + 1}/${chunks.length} done`);
+        } catch (chunkError: any) {
+          console.error(`❌ Session ${mySession} — chunk ${i + 1} error:`, chunkError);
           if (i === 0) {
-            const message = 'Audio playback issue. Trying to continue.';
-            AccessibilityService.announceWarning(message);
+            AccessibilityService.announceWarning('Audio playback issue. Trying to continue.');
           }
-          
-          // Continue loop to try next chunk
+          // Don't abort entire session for one chunk error — continue to next
         }
 
-        // WCAG 1.4.2: Check again after chunk finishes
-        if (this.isStopped) {
-          console.log('⚠️ Playback stopped by user after chunk', i + 1);
-          AccessibilityService.announce('Speech interrupted');
+        // Post-chunk guards (stop() may have been called during playback)
+        if (this.isStopped || this.sessionId !== mySession) {
+          console.log(`🛑 Session ${mySession}: invalidated after chunk ${i + 1} — breaking`);
+          if (this.isStopped) AccessibilityService.announce('Speech interrupted');
           break;
         }
 
-        // Small delay between chunks for natural flow
-        if (i < chunks.length - 1 && !this.isStopped) {
+        // Small natural gap between chunks
+        if (i < chunks.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 100));
         }
       }
 
-      if (!this.isStopped) {
-        console.log('✅ All chunks played successfully');
+      if (this.sessionId === mySession && !this.isStopped) {
+        console.log(`✅ Session ${mySession}: all chunks complete`);
       }
-      
+
     } catch (error: any) {
-      // WCAG 3.3.1: Handle top-level errors
-      console.error('❌ Chunked playback error:', error);
-      
-      // Format user-friendly error message
+      console.error(`❌ Session ${mySession}: top-level error:`, error);
+
       let userMessage = 'Speech playback failed.';
-      
       if (error.message?.includes('network')) {
         userMessage = 'Network error during speech playback. Please try again.';
       } else if (error.message?.includes('audio')) {
         userMessage = 'Audio playback error. Please check your device audio settings.';
-      } else if (error.message) {
-        userMessage = `Speech error: ${error.message}`;
       }
-      
-      // WCAG 4.1.3: Announce error
-      AccessibilityService.announceError(userMessage, false);
-      
-      // Re-throw with user-friendly message
-      throw new Error(userMessage);
-      
+
+      if (this.sessionId === mySession) {
+        AccessibilityService.announceError(userMessage, false);
+      }
     } finally {
+      // Only update shared isPlaying if this session is still the active one
+      if (this.sessionId === mySession) {
+        this.isPlaying = false;
+      }
+    }
+  }
+
+  /**
+   * Stop all playback immediately.
+   *
+   * Sets isStopped=true FIRST so that any running chunk loop sees it
+   * on its next iteration.
+   */
+  async stop(): Promise<void> {
+    try {
+      console.log('🛑 SpeachesSentenceChunker: stop() called');
+
+      // Flag first — loop checks this between every chunk
+      this.isStopped = true;
       this.isPlaying = false;
-      this.currentChunkIndex = 0;
-      this.totalChunks = 0;
-    }
-  }
 
-  /**
-   * Split text into smart chunks for playback
-   * 
-   * - Prioritizes sentence boundaries
-   * - Limits chunk size for faster initial response
-   * - Handles edge cases gracefully
-   * 
-   * @param text - Text to split
-   * @returns Array of text chunks
-   * @private
-   */
-  private splitIntoChunks(text: string): string[] {
-    const MAX_CHUNK_LENGTH = 200; // Characters per chunk for fast response
-    const chunks: string[] = [];
+      // Stop underlying audio
+      await speachesTTS.stop();
 
-    try {
-      // First try to split by sentences
-      const sentences = this.splitIntoSentences(text);
-
-      let currentChunk = '';
-
-      for (const sentence of sentences) {
-        // If adding this sentence would make chunk too long, flush current chunk
-        if (currentChunk.length > 0 && 
-            currentChunk.length + sentence.length > MAX_CHUNK_LENGTH) {
-          chunks.push(currentChunk.trim());
-          currentChunk = sentence;
-        } else {
-          currentChunk += (currentChunk.length > 0 ? ' ' : '') + sentence;
-        }
-      }
-
-      // Add remaining chunk
-      if (currentChunk.trim().length > 0) {
-        chunks.push(currentChunk.trim());
-      }
-
-      // If we still have no chunks (no sentence boundaries), split by length
-      if (chunks.length === 0) {
-        return this.splitByLength(text, MAX_CHUNK_LENGTH);
-      }
-
-      return chunks;
-      
+      console.log('✅ SpeachesSentenceChunker: stopped');
     } catch (error: any) {
-      // WCAG 3.3.1: Fallback to simple splitting if smart splitting fails
-      console.warn('⚠️ Smart chunking failed, using simple split:', error);
-      return this.splitByLength(text, MAX_CHUNK_LENGTH);
+      console.warn('⚠️ Error stopping chunked TTS (non-fatal):', error);
+      // Force state regardless
+      this.isStopped = true;
+      this.isPlaying = false;
     }
   }
 
   /**
-   * Split text into sentences using multiple delimiters
-   * 
-   * FIXED: Uses ASCII quotes only, no Unicode characters
-   * 
-   * @param text - Text to split into sentences
-   * @returns Array of sentences
-   * @private
+   * Reset for a brand-new interaction cycle.
+   * NOTE: Do NOT reset sessionId — it must keep incrementing globally.
    */
-  private splitIntoSentences(text: string): string[] {
+  reset(): void {
+    console.log('🔄 SpeachesSentenceChunker: reset');
+    this.isStopped = false;
+    this.isPlaying = false;
+    this.currentChunkIndex = 0;
+    this.totalChunks = 0;
+  }
+
+  isCurrentlyPlaying(): boolean {
+    return this.isPlaying;
+  }
+
+  getProgress(): { current: number; total: number; percentage: number } {
+    const percentage = this.totalChunks > 0
+      ? Math.round((this.currentChunkIndex / this.totalChunks) * 100)
+      : 0;
+    return {
+      current: this.currentChunkIndex + 1,
+      total: this.totalChunks,
+      percentage,
+    };
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────
+  // Text splitting helpers
+  // ──────────────────────────────────────────────────────────────────────────
+
+  private splitIntoChunks(text: string): string[] {
+    const MAX_CHUNK_LENGTH = 200;
+
     try {
-      // Match sentences ending with . ! ? followed by space or end of string
-      // Handles regular quotes and parentheses with ASCII characters only
-      const sentenceRegex = /[^.!?]+[.!?]+(?:\s|$|(?=['"()]))|[^.!?]+$/g;
-      const matches = text.match(sentenceRegex) || [];
-      
-      if (matches.length === 0) {
+      if (text.length <= MAX_CHUNK_LENGTH) {
         return [text];
       }
 
-      return matches
-        .map(s => s.trim())
-        .filter(s => s.length > 0);
-        
+      const sentences = this.splitIntoSentences(text);
+
+      if (sentences.length <= 1) {
+        return this.splitByLength(text, MAX_CHUNK_LENGTH);
+      }
+
+      const chunks: string[] = [];
+      let currentChunk = '';
+
+      for (const sentence of sentences) {
+        if (currentChunk.length + sentence.length + 1 <= MAX_CHUNK_LENGTH) {
+          currentChunk = currentChunk ? `${currentChunk} ${sentence}` : sentence;
+        } else {
+          if (currentChunk) {
+            chunks.push(currentChunk.trim());
+          }
+          if (sentence.length > MAX_CHUNK_LENGTH) {
+            const subChunks = this.splitByLength(sentence, MAX_CHUNK_LENGTH);
+            chunks.push(...subChunks.slice(0, -1));
+            currentChunk = subChunks[subChunks.length - 1] || '';
+          } else {
+            currentChunk = sentence;
+          }
+        }
+      }
+
+      if (currentChunk.trim()) {
+        chunks.push(currentChunk.trim());
+      }
+
+      return chunks.filter(c => c.length > 0);
+
     } catch (error: any) {
-      // WCAG 3.3.1: Fallback if regex fails
-      console.warn('⚠️ Sentence splitting failed, using full text:', error);
+      console.warn('⚠️ Chunk splitting failed, using full text:', error);
       return [text];
     }
   }
 
-  /**
-   * Split text by length when no sentence boundaries available
-   * 
-   * @param text - Text to split
-   * @param maxLength - Maximum chunk length
-   * @returns Array of text chunks
-   * @private
-   */
+  private splitIntoSentences(text: string): string[] {
+    try {
+      const sentenceRegex = /[^.!?]+[.!?]+(?:\s|$|(?=['"()]))|[^.!?]+$/g;
+      const matches = text.match(sentenceRegex) || [];
+      if (matches.length === 0) return [text];
+      return matches.map(s => s.trim()).filter(s => s.length > 0);
+    } catch {
+      return [text];
+    }
+  }
+
   private splitByLength(text: string, maxLength: number): string[] {
     const chunks: string[] = [];
     let currentIndex = 0;
@@ -244,98 +259,17 @@ class SpeachesSentenceChunker {
     try {
       while (currentIndex < text.length) {
         let chunkEnd = Math.min(currentIndex + maxLength, text.length);
-
-        // Try to break at word boundary if not at end
         if (chunkEnd < text.length) {
           const lastSpace = text.lastIndexOf(' ', chunkEnd);
-          if (lastSpace > currentIndex) {
-            chunkEnd = lastSpace;
-          }
+          if (lastSpace > currentIndex) chunkEnd = lastSpace;
         }
-
         chunks.push(text.substring(currentIndex, chunkEnd).trim());
-        currentIndex = chunkEnd + 1; // +1 to skip the space
+        currentIndex = chunkEnd + 1;
       }
-
       return chunks.filter(c => c.length > 0);
-      
-    } catch (error: any) {
-      // WCAG 3.3.1: Last resort - return full text as single chunk
-      console.warn('⚠️ Length splitting failed, using full text:', error);
+    } catch {
       return [text];
     }
-  }
-
-  /**
-   * Stop playback
-   * 
-   * WCAG 1.4.2: Allows users to stop audio at any time
-   * WCAG 4.1.3: Announces that speech was stopped
-   */
-  async stop(): Promise<void> {
-    try {
-      console.log('🛑 Stopping chunked TTS playback');
-      
-      this.isStopped = true;
-      this.isPlaying = false;
-      
-      // Stop the underlying TTS client
-      await speachesTTS.stop();
-      
-      console.log('✅ Chunked TTS stopped');
-      
-      // WCAG 4.1.3: Announce interruption
-      // (This is handled by calling code to avoid duplicate announcements)
-      
-    } catch (error: any) {
-      // WCAG 3.3.1: Handle stop errors gracefully
-      console.warn('⚠️ Error stopping chunked TTS:', error);
-      
-      // Force stopped state anyway
-      this.isStopped = true;
-      this.isPlaying = false;
-      
-      // Don't throw - stopping is best-effort
-    }
-  }
-
-  /**
-   * Reset for new request
-   * 
-   * Call this before starting a new synthesis request
-   */
-  reset(): void {
-    console.log('🔄 Resetting sentence chunker');
-    this.isStopped = false;
-    this.isPlaying = false;
-    this.currentChunkIndex = 0;
-    this.totalChunks = 0;
-  }
-
-  /**
-   * Check if currently playing
-   * 
-   * @returns true if audio is playing, false otherwise
-   */
-  isCurrentlyPlaying(): boolean {
-    return this.isPlaying;
-  }
-
-  /**
-   * Get current playback progress
-   * 
-   * @returns Object with current chunk index and total chunks
-   */
-  getProgress(): { current: number; total: number; percentage: number } {
-    const percentage = this.totalChunks > 0 
-      ? Math.round((this.currentChunkIndex / this.totalChunks) * 100)
-      : 0;
-    
-    return {
-      current: this.currentChunkIndex + 1, // 1-indexed for display
-      total: this.totalChunks,
-      percentage,
-    };
   }
 }
 

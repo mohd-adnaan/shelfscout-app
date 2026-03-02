@@ -1,5 +1,4 @@
-// ReachingModule.swift 
-
+//ReachingModule.swift — ARKit Reaching v7 (Depth Overhaul)
 
 import Foundation
 import AVFoundation
@@ -141,6 +140,10 @@ class ReachingViewController: UIViewController {
   private let raycastDepthThreshold: Float = 0.18   // 18 cm — raycast vs anchor
   private let lidarDepthThreshold:   Float = 0.12   // 12 cm — LiDAR is very accurate
   private let heuristicDepthThreshold: Float = 0.22 // 22 cm — hand span heuristic
+  // Camera-to-anchor proximity gate for success.
+  // Average adult reach is ~65cm. User must be within this distance AND 2D-centered.
+  // This is device-agnostic: the phone itself moves, no hand-depth sensing needed.
+  private let reachProximityThreshold: Float = 0.70  // 70cm — must walk to object
 
   // ── Config ───────────────────────────────────────────────────────────────
   private let bboxRaw: [CGFloat]
@@ -168,6 +171,10 @@ class ReachingViewController: UIViewController {
   private var arFrameCount = 0
   private let anchorWaitFrames = 15
   private var meshReconstructionEnabled = false
+  private var lastFrameProcessedAt: TimeInterval = 0   // timestamp throttle (fixes ARFrame retention)
+  private let frameProcessInterval: TimeInterval = 0.05 // max 20fps vision processing
+  private var anchorRefinementFrames = 0           // counts from 1 after anchor placed
+  private let anchorRefinementLimit = 90           // try raycast refinement for ~3s post-placement
 
   // ── Vision ───────────────────────────────────────────────────────────────
   private let handReq = VNDetectHumanHandPoseRequest()
@@ -221,7 +228,7 @@ class ReachingViewController: UIViewController {
   private var successFrames = 0
   private var hasCompleted = false
 
-  private let successThreshold = 20
+  private let successThreshold = 35   // ~1.2s sustained 2D overlap at 30fps
   private let noHandLimit = 50
   private let noHandRepeatCycle = 120
 
@@ -424,7 +431,8 @@ class ReachingViewController: UIViewController {
     objectWorldCornerBL = worldPos - placementRight * objectWorldHalfW - placementUp * objectWorldHalfH
 
     anchorPlaced = true
-    NSLog("🎯 [ReachingVC] ✅ Anchor LOCKED at (%.3f, %.3f, %.3f) depth=%.2fm",
+    anchorRefinementFrames = 1   // immediately begin ARKit raycast refinement
+    NSLog("🎯 [ReachingVC] ✅ Anchor SEEDED at (%.3f, %.3f, %.3f) depth=%.2fm (Qwen — refining with ARKit...)",
           worldPos.x, worldPos.y, worldPos.z, depth)
 
     DispatchQueue.main.async { [weak self] in
@@ -434,7 +442,122 @@ class ReachingViewController: UIViewController {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MARK: - Reproject fixed world-space corners each frame
+  // MARK: - Refine Anchor Depth with ARKit Raycast (THE CORE FIX)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // THE PROBLEM: Qwen AI estimates object depth from a single image (monocular).
+  // This is inherently imprecise (±10-30cm). The bbox X,Y are accurate because
+  // they come from pixel detection, but placing the 3D anchor at the WRONG depth
+  // causes the box to float in mid-air when the user moves or approaches — even
+  // though it looks correct head-on.
+  //
+  // THE FIX: Objects like bottles, cups, food sit ON SURFACES (desks, shelves).
+  // ARKit detects these surfaces via plane estimation (works on ALL devices, even
+  // iPhone SE with no LiDAR). Shooting a ray at the bbox center will HIT the
+  // desk/shelf surface, giving us the true depth — exactly what Measure app does.
+  //
+  // We keep Qwen's estimate as the seed (so bbox is visible immediately), then
+  // replace it with the ARKit measurement within the first ~3 seconds.
+
+  private func tryRefineAnchorDepth(frame: ARFrame) {
+    guard let currentPos = objectWorldPosition else { return }
+
+    let sw = cachedSW, sh = cachedSH
+    let camera = frame.camera
+    let intrinsics = camera.intrinsics
+    let imgRes = camera.imageResolution
+
+    // ── Compute bbox center screen point ─────────────────────────────────
+    let photoAspect = imageWidth / imageHeight
+    let screenAspect = sw / sh
+    var scaleX: CGFloat = 1, scaleY: CGFloat = 1
+    var offsetX: CGFloat = 0, offsetY: CGFloat = 0
+    if photoAspect > screenAspect {
+      scaleX  = photoAspect / screenAspect; offsetX = (scaleX - 1) / 2
+    } else {
+      scaleY  = screenAspect / photoAspect; offsetY = (scaleY - 1) / 2
+    }
+    let bx1 = (bboxNormalized[0] * scaleX - offsetX) * sw
+    let by1 = (bboxNormalized[1] * scaleY - offsetY) * sh
+    let bx2 = (bboxNormalized[2] * scaleX - offsetX) * sw
+    let by2 = (bboxNormalized[3] * scaleY - offsetY) * sh
+    let screenCenter = CGPoint(x: (bx1+bx2)/2, y: (by1+by2)/2)
+
+    // ── Build world-space ray direction from camera intrinsics ────────────
+    let arPxX = (screenCenter.y / sh) * imgRes.width
+    let arPxY = (1.0 - screenCenter.x / sw) * imgRes.height
+    let fx = Float(intrinsics[0][0]), fy = Float(intrinsics[1][1])
+    let cx = Float(intrinsics[2][0]), cy = Float(intrinsics[2][1])
+    let rX = (Float(arPxX) - cx) / fx
+    let rY = (Float(arPxY) - cy) / fy
+    let rayCam   = simd_normalize(simd_float3(rX, -rY, -1.0))
+    let camT     = camera.transform
+    let worldDir = simd_normalize(simd_make_float3(camT * simd_float4(rayCam, 0)))
+    let camPos   = simd_make_float3(camT.columns.3)
+
+    // ── Fire raycast — existingPlaneGeometry first, then estimatedPlane ───
+    // Note: we're raycasting at the OBJECT LOCATION (not through the hand).
+    // The object rests on a physical surface that ARKit has detected.
+    var hitPos: simd_float3? = nil
+    for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
+      let query = ARRaycastQuery(origin: camPos, direction: worldDir,
+                                 allowing: target, alignment: .any)
+      if let hit = sceneView.session.raycast(query).first {
+        hitPos = simd_make_float3(hit.worldTransform.columns.3)
+        break
+      }
+    }
+
+    guard let hp = hitPos else {
+      if anchorRefinementFrames % 30 == 0 {
+        NSLog("🎯 [Refine] No plane hit yet (frame %d) — planes still forming", anchorRefinementFrames)
+      }
+      return
+    }
+
+    let newDepth = simd_length(hp - camPos)
+
+    // Sanity check: must be a plausible object distance
+    guard newDepth > 0.08 && newDepth < 3.0 else {
+      NSLog("🎯 [Refine] Rejected hit at %.2fm (out of range)", newDepth)
+      return
+    }
+
+    let currentDepth = simd_length(currentPos - camPos)
+
+    // If already within 3cm of current estimate, it's converged — stop
+    if abs(newDepth - currentDepth) < 0.03 {
+      NSLog("🎯 [Refine] ✅ Converged at %.2fm (diff=%.1fcm) — stopping", newDepth, abs(newDepth-currentDepth)*100)
+      anchorRefinementFrames = anchorRefinementLimit
+      return
+    }
+
+    // ── Update anchor to ARKit-measured depth ─────────────────────────────
+    // Recompute position along the ORIGINAL camera ray (direction at placement time)
+    // so X,Y stay locked to the detection result, only Z (depth) changes.
+    let newWorldPos   = camPos + worldDir * newDepth
+    objectWorldPosition = newWorldPos
+
+    // Recompute fixed world-space corners at new depth
+    let placementRight = -simd_normalize(simd_make_float3(camT.columns.1))
+    let placementUp    =  simd_normalize(simd_make_float3(camT.columns.0))
+    objectWorldCornerTR = newWorldPos + placementRight * objectWorldHalfW + placementUp * objectWorldHalfH
+    objectWorldCornerBL = newWorldPos - placementRight * objectWorldHalfW - placementUp * objectWorldHalfH
+    anchorDepth        = newDepth
+    liveDistanceToObject = newDepth
+
+    NSLog("🎯 [Refine] ✅ DEPTH CORRECTED: Qwen=%.2fm → ARKit=%.2fm (Δ=%.1fcm)",
+          currentDepth, newDepth, abs(newDepth - currentDepth) * 100)
+
+    DispatchQueue.main.async { [weak self] in
+      self?.distanceLabel.text = "\(Int(newDepth * 100)) cm"
+    }
+
+    // Stop refining — one clean ARKit hit is enough
+    anchorRefinementFrames = anchorRefinementLimit
+  }
+
+
   // ═══════════════════════════════════════════════════════════════════════════
 
   private func reprojectBbox(frame: ARFrame) {
@@ -445,7 +568,18 @@ class ReachingViewController: UIViewController {
 
     let camPos = simd_make_float3(camera.transform.columns.3)
     let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
+    let camToAnchorDist = simd_length(center3D - camPos)
     if simd_dot(center3D - camPos, camFwd) < 0 {
+      // Anchor is behind the camera. Two cases:
+      // (a) User is close (< 55cm): they've physically passed through the object → success.
+      // (b) User is far: they turned around → tell them to turn back.
+      if camToAnchorDist < 0.55 {
+        // Case (a): user overshot by a few cm — they've reached the object.
+        NSLog("🎯 [ReachingVC] Anchor behind camera at %.2fm — auto-success (user at object)", camToAnchorDist)
+        DispatchQueue.main.async { [weak self] in self?.handleSuccess() }
+        return
+      }
+      // Case (b): genuinely turned the wrong way
       DispatchQueue.main.async { [weak self] in
         self?.bboxLayer.isHidden = true; self?.innerBboxLayer.isHidden = true
         self?.directionLabel.text = "Turn back"
@@ -485,6 +619,26 @@ class ReachingViewController: UIViewController {
   // MARK: - v7 DEPTH CHECK — ARKit Raycast (Measure-app approach)
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /**
+   Determines whether the hand is at the same depth as the target object.
+
+   Method 1 — ARKit raycasting (primary, all devices):
+     Compute a 3D ray from the camera through the hand's screen position,
+     then call ARSession.raycast() against the scene geometry ARKit has built
+     from motion parallax and/or LiDAR. This is exactly how the Measure app
+     works. Returns a real-world intersection point whose distance we compare
+     to the anchor distance. Accurate to ~3-8 cm.
+
+   Method 2 — LiDAR depth map (secondary, Pro devices only):
+     Sample the raw depth map at the hand's screen position. Accurate to ~2 cm
+     but requires correct coordinate mapping (portrait screen ↔ landscape depth map).
+
+   Method 3 — Hand span heuristic (last resort):
+     Estimate depth from the apparent size of the hand in the image.
+     k constant calibrated from typical 18-20 cm hand spans at known distances.
+
+   REMOVED: camera-proximity fallback that caused false positives.
+  */
   private func checkHandDepth(
     frame: ARFrame,
     handScreenPt: CGPoint,
@@ -642,6 +796,11 @@ class ReachingViewController: UIViewController {
       return
     }
 
+    if anchorRefinementFrames > 0 && anchorRefinementFrames < anchorRefinementLimit {
+      anchorRefinementFrames += 1
+      tryRefineAnchorDepth(frame: frame)
+    }
+
     reprojectBbox(frame: frame)
 
     let pb = frame.capturedImage
@@ -652,6 +811,7 @@ class ReachingViewController: UIViewController {
     do { try handler.perform([handReq]) } catch { return }
 
     guard projectedBboxW > 0 else { return }
+
     let bboxCx    = projectedBboxCenter.x
     let bboxCy    = projectedBboxCenter.y
     let bboxHalfW = projectedBboxW / 2
@@ -659,24 +819,14 @@ class ReachingViewController: UIViewController {
 
     guard let obs = handReq.results?.first else {
       noHandFrames += 1; successFrames = 0; handIsCloseEnoughInDepth = false
-      if noHandFrames == noHandLimit {
-        DispatchQueue.main.async { [weak self] in self?.say("Show your hand to the camera.") }
-      }
-      if noHandFrames > noHandLimit + noHandRepeatCycle { noHandFrames = 0 }
-      DispatchQueue.main.async { [weak self] in
-        self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true
-        self?.depthHintLabel.isHidden = true
-        self?.updateDirectionUI(.searching)
-      }
-      proximityZone = .searching; return
+      proximityZone = .searching
+      return
     }
 
     noHandFrames = 0
+
     guard let visionPt = handCenter(obs) else {
       successFrames = 0; handIsCloseEnoughInDepth = false
-      DispatchQueue.main.async { [weak self] in
-        self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true
-      }
       return
     }
 
@@ -686,15 +836,23 @@ class ReachingViewController: UIViewController {
     let dist2D = sqrt(dx*dx + dy*dy)
 
     let innerOverlap = abs(dx) < bboxHalfW && abs(dy) < bboxHalfH
-    let tolX = max(bboxHalfW * 0.3, 20), tolY = max(bboxHalfH * 0.3, 20)
-    let nearOverlap = CGRect(x: bboxCx - bboxHalfW - tolX, y: bboxCy - bboxHalfH - tolY,
-                             width: bboxHalfW*2 + tolX*2, height: bboxHalfH*2 + tolY*2)
-      .contains(CGPoint(x: screenX, y: screenY))
+    let tolX = max(bboxHalfW * 0.3, 20)
+    let tolY = max(bboxHalfH * 0.3, 20)
 
-    let (depthOk, depthMethodStr) = checkHandDepth(frame: frame, handScreenPt: handScreen, handObs: obs)
+    let nearOverlap = CGRect(
+      x: bboxCx - bboxHalfW - tolX,
+      y: bboxCy - bboxHalfH - tolY,
+      width: bboxHalfW*2 + tolX*2,
+      height: bboxHalfH*2 + tolY*2
+    ).contains(CGPoint(x: screenX, y: screenY))
+
+    let (depthOk, depthMethodStr) =
+      checkHandDepth(frame: frame, handScreenPt: handScreen, handObs: obs)
+
     handIsCloseEnoughInDepth = depthOk
 
     let normDist = dist2D / max(cachedSW, cachedSH)
+
     let newProx: ProximityZone
     if innerOverlap && depthOk { newProx = .centered }
     else if innerOverlap       { newProx = .veryClose }
@@ -702,57 +860,41 @@ class ReachingViewController: UIViewController {
     else if normDist < 0.15    { newProx = .close }
     else if normDist < 0.30    { newProx = .medium }
     else                       { newProx = .far }
+
     proximityZone = newProx
 
-    let direction = computeDirection(handX: screenX, handY: screenY,
-                                     bboxCx: bboxCx, bboxCy: bboxCy,
-                                     bboxHalfW: bboxHalfW, bboxHalfH: bboxHalfH)
+    let direction = computeDirection(
+      handX: screenX, handY: screenY,
+      bboxCx: bboxCx, bboxCy: bboxCy,
+      bboxHalfW: bboxHalfW, bboxHalfH: bboxHalfH
+    )
+
     speakDirectionIfNeeded(direction)
+
+    // ✅ FIX: declare BEFORE closure
+    let cameraIsClose = liveDistanceToObject < reachProximityThreshold
 
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
-      let dotR: CGFloat = 12
-      self.handDot.isHidden = false; self.handDotGlow.isHidden = false
-      self.handDot.path = UIBezierPath(ovalIn: CGRect(x: screenX-dotR, y: screenY-dotR,
-                                                       width: dotR*2, height: dotR*2)).cgPath
-      self.handDotGlow.path = UIBezierPath(ovalIn: CGRect(x: screenX-dotR*2, y: screenY-dotR*2,
-                                                           width: dotR*4, height: dotR*4)).cgPath
-      let color: UIColor
-      switch newProx {
-      case .centered:  color = .systemGreen
-      case .veryClose: color = .systemYellow
-      case .close:     color = .systemYellow
-      case .medium:    color = .systemOrange
-      default:         color = .systemRed
-      }
-      self.handDot.fillColor  = color.cgColor
-      self.handDotGlow.fillColor = color.withAlphaComponent(0.2).cgColor
+
       self.updateDirectionUI(direction)
 
-      // Depth hint: when 2D aligned but depth not satisfied
-      self.depthHintLabel.isHidden = !(innerOverlap && !depthOk)
-      if innerOverlap && !depthOk {
-        self.depthHintLabel.text = "Reach further — extend your arm"
+      // Depth hint logic now safely captures cameraIsClose
+      self.depthHintLabel.isHidden = !(innerOverlap && !cameraIsClose)
+      if innerOverlap && !cameraIsClose {
+        let remaining = Int((self.liveDistanceToObject - self.reachProximityThreshold) * 100)
+        self.depthHintLabel.text = "Walk closer — \(remaining)cm more"
       }
 
-      // Debug label (small, top-right corner)
       self.depthMethodLabel.text = depthMethodStr
-
-      if self.successFrames > 0 {
-        self.progressRing.isHidden = false
-        self.progressRing.strokeEnd = CGFloat(self.successFrames) / CGFloat(self.successThreshold)
-        let ringR: CGFloat = dotR + 8
-        self.progressRing.path = UIBezierPath(
-          arcCenter: CGPoint(x: screenX, y: screenY), radius: ringR,
-          startAngle: -.pi/2, endAngle: .pi*1.5, clockwise: true).cgPath
-      } else {
-        self.progressRing.isHidden = true; self.progressRing.strokeEnd = 0
-      }
     }
 
-    if innerOverlap && depthOk {
+    // SUCCESS GATE
+    if innerOverlap && cameraIsClose {
       successFrames += 1
-      if successFrames >= successThreshold { handleSuccess() }
+      if successFrames >= successThreshold {
+        handleSuccess()
+      }
     } else {
       successFrames = 0
     }
@@ -1052,9 +1194,10 @@ class ReachingViewController: UIViewController {
     let now = ProcessInfo.processInfo.systemUptime
     if direction == currentDirection { directionStableFrames += 1 } else { directionStableFrames = 1 }
 
-    if direction == .centered && !handIsCloseEnoughInDepth {
+    if direction == .centered && liveDistanceToObject >= reachProximityThreshold {
       if now - lastSpeechTime > 2.5 {
-        say("Extend your arm to reach the object")
+        let remaining = Int((liveDistanceToObject - reachProximityThreshold) * 100)
+        say("Walk closer — \(remaining) centimeters more")
         lastSpeechTime = now
       }
       return
@@ -1121,6 +1264,10 @@ class ReachingViewController: UIViewController {
 
 extension ReachingViewController: ARSessionDelegate {
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
+    guard running else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - lastFrameProcessedAt >= frameProcessInterval else { return }
+    lastFrameProcessedAt = now
     visionQ.async { [weak self] in self?.processARFrame(frame) }
   }
   func session(_ session: ARSession, didFailWithError error: Error) {
