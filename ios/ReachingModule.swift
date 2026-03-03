@@ -1,21 +1,11 @@
-//ReachingModule.swift — ARKit Reaching v10 (Depth-Gated Success)
+//ReachingModule.swift — ARKit Reaching v11 (Hardened Success Gate)
 //
-// CHANGELOG v7.0 → v8:
-//   FIX 1: finishWith() never fired after handleSuccess() — added hasDismissed flag
-//   FIX 2: Hand dot never rendered — added position update in processARFrame
-//   FIX 3: No "show your hand" / "move closer" speech cues — added noHandFrames speech
-//   FIX 4: Depth — raycast measures wall BEHIND hand, not hand; heuristic thresholds
-//          lowered; refinement window extended; camera proximity is primary success signal
-//   FIX 5: ARFrame retention leak — pause session immediately on success/cancel
+// CHANGELOG v9 → v10:
 //
-// CHANGELOG v8 → v9:
-//   FIX 6: Anchor refinement — was locking on FIRST noisy raycast hit (0.85m when shelf
-//          is at 1.0m). Now accumulates hits in sliding window, applies median when IQR
-//          converges below 5cm. Result: anchor lands on actual shelf surface, not mid-air.
-//   FIX 7: Heuristic k constant — was 0.09, estimated hand at 13cm when actually at 40cm.
-//          Corrected to 0.25 from iPhone FOV math (75° wide, 19cm hand length).
-//   FIX 8: Distance label discrepancy — top bar showed total distance, hint showed remaining.
-//          Now both show remaining distance ("Xcm to go" + "Move Xcm closer").
+//  FIX 13: Bound refinement to reject hits beyond 2x backend, Identified messaging locations for object-grabbing interaction refinement
+//  FIX 14a:  UI labels "Grab it now" when remaining <= 5cm:Devised sed command to replace calculation lines conditionally
+//  FIX 14b: Speech cue:Prepared version update and header modification
+//
 
 import Foundation
 import AVFoundation
@@ -520,6 +510,13 @@ class ReachingViewController: UIViewController {
       return
     }
 
+    // FIX 13: Reject raycasts beyond 2x backend estimate.
+    // Ray passes through shelf and hits BACK WALL (backend=0.6m->raycast=1.96m).
+    if let bd = backendDepth, hitDepth > bd * 2.0 {
+      NSLog("🎯 [Refine] Rejected hit at %.2fm (>2x backend %.2fm)", hitDepth, bd)
+      return
+    }
+
     // ── FIX 6: Accumulate hits, use median ────────────────────────────────
     // Don't lock on first noisy hit. ARKit plane estimates improve over time.
     // Keep last 20 hits (sliding window), apply median when we have enough.
@@ -957,8 +954,13 @@ class ReachingViewController: UIViewController {
       if innerOverlap && !cameraIsClose {
         // FIX 8: Show REMAINING distance consistently (was: top showed total, bottom showed remaining)
         let remaining = max(0, Int((self.liveDistanceToObject - self.reachProximityThreshold) * 100))
-        self.depthHintLabel.text = "Move \(remaining)cm closer"
-        self.distanceLabel.text = "\(remaining)cm to go"
+        if remaining <= 5 {
+          self.depthHintLabel.text = "Grab it now!"
+          self.distanceLabel.text = "Within reach"
+        } else {
+          self.depthHintLabel.text = "Move \(remaining)cm closer"
+          self.distanceLabel.text = "\(remaining)cm to go"
+        }
       }
 
       self.depthMethodLabel.text = depthMethodStr
@@ -983,15 +985,15 @@ class ReachingViewController: UIViewController {
     // Previously: innerOverlap && cameraIsClose was enough → false "reached"
     // Now: must also have depth confirmation OR be extremely close (30cm fallback)
     if depthOk {
-      depthConfirmedFrames += 1
-    } else if !innerOverlap || !cameraIsClose {
-      depthConfirmedFrames = max(0, depthConfirmedFrames - 1) // decay when not overlapping
+      depthConfirmedFrames = min(depthConfirmedFrames + 1, 15) // FIX 12: cap
+    } else {
+      depthConfirmedFrames = max(0, depthConfirmedFrames - 2) // FIX 12: ALWAYS decay
     }
 
     let depthGateOk: Bool
     if depthOk {
       depthGateOk = true  // real-time depth says hand is at object
-    } else if depthConfirmedFrames >= 5 {
+    } else if depthConfirmedFrames >= 8 {
       depthGateOk = true  // accumulated enough recent depth evidence
     } else if liveDistanceToObject < 0.30 {
       depthGateOk = true  // camera physically within 30cm — must be there
@@ -1338,7 +1340,11 @@ class ReachingViewController: UIViewController {
     if direction == .centered && liveDistanceToObject >= reachProximityThreshold {
       if now - lastSpeechTime > 2.5 {
         let remaining = max(0, Int((liveDistanceToObject - reachProximityThreshold) * 100))
-        say("Move \(remaining) centimeters closer")
+        if remaining <= 5 {
+          say("You can grab it now")
+        } else {
+          say("Move \(remaining) centimeters closer")
+        }
         lastSpeechTime = now
       }
       return
