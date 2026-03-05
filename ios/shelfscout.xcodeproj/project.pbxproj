@@ -19,6 +19,11 @@
 		5F3C038A2F3A9518001B0A13 /* ImageOrientationFixer.m in Sources */ = {isa = PBXBuildFile; fileRef = 5F3C03892F3A9518001B0A13 /* ImageOrientationFixer.m */; };
 		5F5055AA2F341971000B8156 /* srlLogo.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 5F5055A92F341971000B8156 /* srlLogo.mp4 */; };
 		5F5055B42F34217C000B8156 /* LaunchScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = 5F5055B32F34217C000B8156 /* LaunchScreen.storyboard */; };
+		5FC043E82F59264600DA3B66 /* Reachingviewcontroller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC043E72F59264300DA3B66 /* Reachingviewcontroller.swift */; };
+		5FC043EA2F59269800DA3B66 /* Reachingviewcontroller+processing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC043E92F59269500DA3B66 /* Reachingviewcontroller+processing.swift */; };
+		5FC043EC2F5926D100DA3B66 /* Reachingviewcontroller+ar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC043EB2F5926D000DA3B66 /* Reachingviewcontroller+ar.swift */; };
+		5FC043EE2F59273C00DA3B66 /* Reachingviewcontroller+depth.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC043ED2F59273A00DA3B66 /* Reachingviewcontroller+depth.swift */; };
+		5FC043F02F59277700DA3B66 /* Reachingviewcontroller+audio.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC043EF2F59277500DA3B66 /* Reachingviewcontroller+audio.swift */; };
 		5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263892F395B19006AEE6F /* ReachingModule.swift */; };
 		5FC2638C2F395B19006AEE6F /* ReachingModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263882F395B19006AEE6F /* ReachingModule.m */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
@@ -40,6 +45,11 @@
 		5F3C03892F3A9518001B0A13 /* ImageOrientationFixer.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ImageOrientationFixer.m; sourceTree = "<group>"; };
 		5F5055A92F341971000B8156 /* srlLogo.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = srlLogo.mp4; sourceTree = "<group>"; };
 		5F5055B32F34217C000B8156 /* LaunchScreen.storyboard */ = {isa = PBXFileReference; lastKnownFileType = file.storyboard; path = LaunchScreen.storyboard; sourceTree = "<group>"; };
+		5FC043E72F59264300DA3B66 /* Reachingviewcontroller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Reachingviewcontroller.swift; sourceTree = "<group>"; };
+		5FC043E92F59269500DA3B66 /* Reachingviewcontroller+processing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+processing.swift"; sourceTree = "<group>"; };
+		5FC043EB2F5926D000DA3B66 /* Reachingviewcontroller+ar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+ar.swift"; sourceTree = "<group>"; };
+		5FC043ED2F59273A00DA3B66 /* Reachingviewcontroller+depth.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+depth.swift"; sourceTree = "<group>"; };
+		5FC043EF2F59277500DA3B66 /* Reachingviewcontroller+audio.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+audio.swift"; sourceTree = "<group>"; };
 		5FC263882F395B19006AEE6F /* ReachingModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ReachingModule.m; sourceTree = "<group>"; };
 		5FC263892F395B19006AEE6F /* ReachingModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReachingModule.swift; sourceTree = "<group>"; };
 		5FC2638A2F395B19006AEE6F /* shelfscout-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "shelfscout-Bridging-Header.h"; sourceTree = "<group>"; };
@@ -71,6 +81,11 @@
 				5F3C03892F3A9518001B0A13 /* ImageOrientationFixer.m */,
 				5F3C03842F3A945B001B0A13 /* Imageorientationfixer.swift */,
 				5FC263882F395B19006AEE6F /* ReachingModule.m */,
+				5FC043ED2F59273A00DA3B66 /* Reachingviewcontroller+depth.swift */,
+				5FC043EF2F59277500DA3B66 /* Reachingviewcontroller+audio.swift */,
+				5FC043EB2F5926D000DA3B66 /* Reachingviewcontroller+ar.swift */,
+				5FC043E92F59269500DA3B66 /* Reachingviewcontroller+processing.swift */,
+				5FC043E72F59264300DA3B66 /* Reachingviewcontroller.swift */,
 				5FC263892F395B19006AEE6F /* ReachingModule.swift */,
 				5FC2638A2F395B19006AEE6F /* shelfscout-Bridging-Header.h */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
@@ -229,9 +244,13 @@
 			inputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks-${CONFIGURATION}-input-files.xcfilelist",
 			);
+			inputPaths = (
+			);
 			name = "[CP] Embed Pods Frameworks";
 			outputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
@@ -246,9 +265,13 @@
 			inputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-input-files.xcfilelist",
 			);
+			inputPaths = (
+			);
 			name = "[CP] Copy Pods Resources";
 			outputFileListPaths = (
 				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			outputPaths = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
@@ -284,8 +307,13 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5FC043EA2F59269800DA3B66 /* Reachingviewcontroller+processing.swift in Sources */,
 				5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */,
+				5FC043EC2F5926D100DA3B66 /* Reachingviewcontroller+ar.swift in Sources */,
+				5FC043E82F59264600DA3B66 /* Reachingviewcontroller.swift in Sources */,
 				5F3C038A2F3A9518001B0A13 /* ImageOrientationFixer.m in Sources */,
+				5FC043EE2F59273C00DA3B66 /* Reachingviewcontroller+depth.swift in Sources */,
+				5FC043F02F59277700DA3B66 /* Reachingviewcontroller+audio.swift in Sources */,
 				5FC2638C2F395B19006AEE6F /* ReachingModule.m in Sources */,
 				761780ED2CA45674006654EE /* AppDelegate.swift in Sources */,
 				5F3C03852F3A945F001B0A13 /* Imageorientationfixer.swift in Sources */,
