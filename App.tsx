@@ -589,6 +589,7 @@ function AppInner(): React.JSX.Element {
 
     // ── Cleanup ────────────────────────────────────────────────────────────
     console.log('🔄 [ContinuousMode] Loop ended');
+    await stopLatencyLoop(); 
     isContinuousModeRunning.current = false;
     stopContinuousMode('loop ended', false);
     setIsNavigation(false);
@@ -612,6 +613,7 @@ function AppInner(): React.JSX.Element {
       abortControllerRef.current = null;
     }
 
+    await stopLatencyLoop();
     await speachesSentenceChunker.stop();
     stopContinuousMode('user interrupt', false);
     setIsNavigation(false);
@@ -812,7 +814,7 @@ function AppInner(): React.JSX.Element {
 
     if (!finalText) {
       AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
-      audioFeedback.playEarcon('error');
+      playErrorSound();
       return;
     }
 

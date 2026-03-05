@@ -333,7 +333,7 @@ export const sendToWorkflow = async (
     }
 
     AccessibilityService.announceError(userMessage, false);
-    Alert.alert('Request Failed', userMessage, [{ text: 'OK' }]);
+    // Alert.alert('Request Failed', userMessage, [{ text: 'OK' }]);
 
     throw new Error(userMessage);
   }
