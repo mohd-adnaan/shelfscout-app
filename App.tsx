@@ -317,11 +317,18 @@ function AppInner(): React.JSX.Element {
     }
 
     if (!bbox || bbox.length !== 4) {
-      // reaching_ios=true but no valid bbox
+      // reaching_ios=true but no valid bbox — guard with isSpeaking so
+      // a tap during TTS routes to emergencyStop, NOT startListening (dead-loop fix)
       console.log('⚠️ [ARKit] reaching_ios=true but no valid bbox:', rawBbox);
+      setIsSpeaking(true);
       await speachesSentenceChunker.synthesizeSpeechChunked(
         `I can detect the ${result.object || 'object'} in the scene, but I could not get precise coordinates for guidance. Try pointing your camera more directly at it and ask again.`
       );
+      setIsSpeaking(false);                // ← release speaking guard
+      // Clean transition to ready (matches the ARKit-success path below)
+      setIsCameraActive(true);
+      audioFeedback.playEarcon('ready');
+      AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
       return true; // Handled (but without ARKit)
     }
 
@@ -589,7 +596,7 @@ function AppInner(): React.JSX.Element {
 
     // ── Cleanup ────────────────────────────────────────────────────────────
     console.log('🔄 [ContinuousMode] Loop ended');
-    await stopLatencyLoop(); 
+    await stopLatencyLoop();
     isContinuousModeRunning.current = false;
     stopContinuousMode('loop ended', false);
     setIsNavigation(false);
@@ -766,7 +773,7 @@ function AppInner(): React.JSX.Element {
         // 1. Stop the new CAF latency loop (jbl_latency_sae.caf)
         await stopLatencyLoop();
         // 2. Stop the audioFeedback 'thinking' earcon (old system still active)
-        audioFeedback.playEarcon('cancel');  
+        audioFeedback.playEarcon('cancel');
 
         // ── Audio feedback: error sound → fixed TTS message ───────────────
         playErrorSound();   // plays jbl_stopped_ios_sae.mp3 immediately

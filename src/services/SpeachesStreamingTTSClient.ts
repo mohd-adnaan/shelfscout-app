@@ -37,9 +37,6 @@ class SpeachesStreamingTTSClient {
   private processingPromise: Promise<void> | null = null;
 
   constructor() {
-    // ========================================================================
-    // CRITICAL FIX #1: Set audio category in constructor
-    // ========================================================================
     try {
       Sound.setCategory('Playback', false); // Don't mix with others
       console.log('✅ Audio category set to Playback in TTS constructor');
@@ -314,14 +311,11 @@ class SpeachesStreamingTTSClient {
       }
     }
 
-    // CRITICAL: Reset audio category to allow Voice Recognition
-    try {
-      Sound.setCategory('Ambient');
-      console.log('✅ Audio category reset to Ambient');
-    } catch (error: any) {
-      console.warn('⚠️ Failed to reset audio category:', error);
-    }
-
+    // FIX: Do NOT reset to 'Ambient' here.
+    // 'Ambient' routes audio to ringer volume — physical buttons stop working
+    // and all subsequent sound effects play at near-silent levels.
+    // Voice recognition (STT) manages its own audio session category when it
+    // starts; we don't need to pre-emptively switch away from Playback.
     console.log('✅ TTS stopped successfully');
   }
 

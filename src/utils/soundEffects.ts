@@ -21,7 +21,9 @@ import { Platform } from 'react-native';
 
 // ── Configure sound to play through the speaker, not earpiece ─────────────
 // MUST be called before any Sound() constructors
-Sound.setCategory('Playback', true); // true = mixWithOthers
+// FIX: mixWithOthers = false → full volume, physical buttons control it.
+// With mixWithOthers = true, iOS treats our audio as secondary and ducks it.
+Sound.setCategory('Playback', false);
 
 // ── File → bundle key map ──────────────────────────────────────────────────
 // NOTE: "jbl_stopped,IOS_sae.mp3" has been RENAMED to "jbl_stopped_ios_sae.mp3"
@@ -55,6 +57,7 @@ export const initSounds = (): Promise<void> => {
           console.warn(`⚠️ [SFX] Failed to load "${filename}":`, err.message);
         } else {
           console.log(`✅ [SFX] Loaded "${filename}"`);
+          s.setVolume(1.0); // FIX: ensure max volume on media channel
           sounds[key] = s;
         }
         loaded++;
@@ -75,6 +78,12 @@ const _playOnce = (key: SoundKey, onFinish?: () => void): void => {
     onFinish?.();
     return;
   }
+  // FIX: Re-assert Playback category before every play.
+  // Other modules (e.g. streaming TTS stop, voice recognition) may have
+  // switched the category to Ambient/PlayAndRecord — this guarantees our
+  // earcons always play at full media volume controlled by physical buttons.
+  Sound.setCategory('Playback', false);
+  s.setVolume(1.0);
   // Reset to beginning before every play so rapid calls don't skip
   s.setCurrentTime(0);
   s.setNumberOfLoops(0); // one-shot
@@ -119,6 +128,9 @@ const _startLatencyLoop = (): void => {
   }
   if (latencyLooping) return; // already running
   latencyLooping = true;
+  // FIX: Re-assert Playback category + full volume before looping audio
+  Sound.setCategory('Playback', false);
+  s.setVolume(1.0);
   s.setCurrentTime(0);
   s.setNumberOfLoops(-1); // infinite loop
   s.play((success) => {
@@ -183,11 +195,6 @@ export const playErrorSound = (): void => {
  * If you have a dedicated shutter file, swap 'begin' for 'shutter'.
  */
 export const playShutterSound = (): void => {
-  // The "begin" (jbl_begin_sae) serves double duty here:
-  //  • it marks the thinking state starting
-  //  • it also IS the shutter feedback sound
-  // So we call playThinkingStarted() in App.tsx rather than a separate playShutter().
-  // This function is provided as an explicit hook if you need it standalone.
   _playOnce('begin');
 };
 
