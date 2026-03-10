@@ -117,6 +117,8 @@ function AppInner(): React.JSX.Element {
   const prefetchedPhotoRef = useRef<string | null>(null);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
+  // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
+  const screenReaderEnabledRef = useRef(false);
 
   // ── Animation ──────────────────────────────────────────────────────────────
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -159,18 +161,19 @@ function AppInner(): React.JSX.Element {
           AccessibilityInfo.isReduceMotionEnabled(),
         ]);
         setScreenReaderEnabled(sr);
+        screenReaderEnabledRef.current = sr;
         setReduceMotionEnabled(rm);
-        if (sr) {
-          setTimeout(() => {
-            AccessibilityInfo.announceForAccessibility(
-              'CyberSight activated. Tap anywhere to start speaking.'
-            );
-          }, 1000);
-        }
+        // NOTE: Do NOT announce here — VoiceOver will read the button's
+        // accessibilityLabel automatically when focus lands on it.
+        // A programmatic announcement creates double-speech:
+        // "CyberSight is ready tap to speak button tap to start speaking"
       } catch (e) { console.error('❌ Accessibility check:', e); }
     })();
 
-    const srSub = AccessibilityInfo.addEventListener('screenReaderChanged', setScreenReaderEnabled);
+    const srSub = AccessibilityInfo.addEventListener('screenReaderChanged', (enabled: boolean) => {
+      setScreenReaderEnabled(enabled);
+      screenReaderEnabledRef.current = enabled;
+    });
     const rmSub = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotionEnabled);
     return () => { srSub?.remove(); rmSub?.remove(); };
   }, []);
@@ -327,7 +330,7 @@ function AppInner(): React.JSX.Element {
       setIsSpeaking(false);                // ← release speaking guard
       // Clean transition to ready (matches the ARKit-success path below)
       setIsCameraActive(true);
-      audioFeedback.playEarcon('ready');
+      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
       AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
       return true; // Handled (but without ARKit)
     }
@@ -374,7 +377,7 @@ function AppInner(): React.JSX.Element {
     resetSessionId();
     setIsReaching(false);
     setIsCameraActive(true);
-    audioFeedback.playEarcon('ready');
+    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
     AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
     return true;
   }, [resolveReachingPipeline]);
@@ -434,7 +437,9 @@ function AppInner(): React.JSX.Element {
         const abortCtrl = new AbortController();
         abortControllerRef.current = abortCtrl;
 
-        playThinkingStarted(); // ← start thinking SFX for this cycle
+        if (!screenReaderEnabledRef.current) {
+          playThinkingStarted(); // ← start thinking SFX for this cycle
+        }
 
         const loopMode = getCurrentMode();
         const result = await sendToWorkflow(
@@ -604,7 +609,7 @@ function AppInner(): React.JSX.Element {
     setIsProcessing(false);
     setIsSpeaking(false);
     setIsCameraActive(true);
-    audioFeedback.playEarcon('ready');
+    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
     AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
   }, [handleiOSReaching, resolveReachingPipeline]);
 
@@ -630,7 +635,7 @@ function AppInner(): React.JSX.Element {
     isContinuousModeRunning.current = false;
     setIsCameraActive(true);
 
-    audioFeedback.playEarcon('cancel');
+    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
     AccessibilityInfo.announceForAccessibility('Stopped. Tap to speak.');
   }, []);
 
@@ -644,7 +649,7 @@ function AppInner(): React.JSX.Element {
     setIsSpeaking(false);
     isNavigationLoopRunning.current = false;
     setIsCameraActive(true);
-    audioFeedback.playEarcon('cancel');
+    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
     AccessibilityInfo.announceForAccessibility('Navigation stopped. Tap to speak.');
   }, []);
 
@@ -669,10 +674,11 @@ function AppInner(): React.JSX.Element {
 
       try { await cancelSTT(); } catch { }
 
-      audioFeedback.playEarcon('thinking');
-      //await audioFeedback.announceState('thinking', false);
-      //playSound('processing');
-      playThinkingStarted();             // ← plays jbl_begin_sae.caf, then auto-starts latency loop
+      // Skip earcons/SFX when VoiceOver is on — audio session conflicts
+      if (!screenReaderEnabledRef.current) {
+        audioFeedback.playEarcon('thinking');
+        playThinkingStarted();
+      }
 
 
       if (!photoPath) {
@@ -709,7 +715,10 @@ function AppInner(): React.JSX.Element {
 
       setIsProcessing(false);
       setIsSpeaking(true);
-      audioFeedback.playEarcon('speaking');
+      // Skip earcon when VoiceOver is on — it would overlap with TTS response
+      if (!screenReaderEnabledRef.current) {
+        audioFeedback.playEarcon('speaking');
+      }
 
 
 
@@ -750,8 +759,8 @@ function AppInner(): React.JSX.Element {
 
       // ── Normal (no continuous mode) ────────────────────────────────────
       setIsCameraActive(true);
-      audioFeedback.playEarcon('ready');
-      AccessibilityInfo.announceForAccessibility('Response complete. Tap to speak.');
+      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
 
     } catch (error: any) {
       // ── Cancelled / aborted requests are silent ──────
@@ -765,33 +774,24 @@ function AppInner(): React.JSX.Element {
       }
 
       if (!isEmergencyStopped.current) {
-        // ── Error handling (debugging) ───────────
         console.error('❌ handleVoiceCommand error:', error);
         console.error('❌ Error detail:', error?.message, error?.code);
 
-        // ── Stop audio feedback────────────────────────────────────
-        // 1. Stop the new CAF latency loop (jbl_latency_sae.caf)
         await stopLatencyLoop();
-        // 2. Stop the audioFeedback 'thinking' earcon (old system still active)
-        audioFeedback.playEarcon('cancel');
+        if (!screenReaderEnabledRef.current) {
+          audioFeedback.playEarcon('cancel');
+          playErrorSound();
+        }
 
-        // ── Audio feedback: error sound → fixed TTS message ───────────────
-        playErrorSound();   // plays jbl_stopped_ios_sae.mp3 immediately
-
-        // Wait for error chime is heard before voice
         await new Promise(resolve => setTimeout(resolve, 600));
 
-        // Fixed message — user doesn't need the raw error string
         await speachesSentenceChunker.synthesizeSpeechChunked(
           'Error processing your request.'
         );
 
-        // ── Auto-reset to ready — no Alert, no tap ───────────────
         setIsCameraActive(true);
-        audioFeedback.playEarcon('ready');
+        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
         AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
-        // No Alert.alert — blind users can't dismiss it without finding
-        // the OK button. Auto-reset is the correct pattern here.
       }
     } finally {
       setIsProcessing(false);
@@ -821,15 +821,39 @@ function AppInner(): React.JSX.Element {
 
     if (!finalText) {
       AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
-      playErrorSound();
+      if (!screenReaderEnabledRef.current) { playErrorSound(); }
       return;
+    }
+
+    // ── VOICEOVER SAFETY NET ──────────────────────────────────────────────
+    // Even with the STT delay, VoiceOver might still bleed into the mic.
+    // Reject transcripts that are clearly VoiceOver UI text, not user speech.
+    // Uses ref (not state) because handleAutoSubmit has stable [] deps.
+    if (screenReaderEnabledRef.current) {
+      const voPatterns = [
+        'speak naturally', 'tap to stop', 'tap to speak', 'tap to interrupt',
+        'cybersight is ready', 'cybersight is listening', 'cybersight is speaking',
+        'cybersight is processing', 'processing your request', 'double tap to',
+        'ready tap to speak', 'ready button', 'listening button',
+        'thinking button', 'speaking button', 'navigating button',
+        'button tap', 'ready tap', 'ready to speak',
+        'please speak your command', 'please speak your',
+      ];
+      const lower = finalText.toLowerCase();
+      if (voPatterns.some(p => lower.includes(p))) {
+        console.log('♿ VoiceOver noise rejected:', finalText);
+        // CRITICAL: Do NOT announce anything here. Any announceForAccessibility
+        // call gets read by VoiceOver, the mic picks it up, and it becomes
+        // the transcript for the NEXT listening session ("please speak your command").
+        return;
+      }
     }
 
     console.log('⚡ Processing:', finalText);
     setIsProcessing(true);
     isCapturingPhotoRef.current = true;
-    audioFeedback.playEarcon('thinking');
-    AccessibilityInfo.announceForAccessibility('Processing your request');
+    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('thinking'); }
+    AccessibilityInfo.announceForAccessibility('Thinking');
 
     try {
       try { await cancelSTT(); } catch { }
@@ -885,10 +909,22 @@ function AppInner(): React.JSX.Element {
     enableRMSVAD: true,
   });
 
+  // ── Re-entry guard for startListening ─────────────────────────────────────
+  const isStartingRef = useRef(false);
+
   // ============================================================================
   // Start Listening
   // ============================================================================
   const startListening = async () => {
+    // ── Re-entry guard: prevent multiple concurrent calls ────────────────
+    // VoiceOver double-tap can fire handleScreenTap multiple times if the
+    // user taps rapidly. Without this guard, each tap queues a startSTT().
+    if (isStartingRef.current) {
+      console.log('⚠️ startListening already in progress — ignoring');
+      return;
+    }
+    isStartingRef.current = true;
+
     try {
       if (Platform.OS === 'android') {
         const granted = await PermissionsAndroid.request(
@@ -905,17 +941,36 @@ function AppInner(): React.JSX.Element {
       await stopTTS();
       finalTranscriptRef.current = '';
 
-      audioFeedback.playEarcon('listening');
-      //playSound('start');
-      playListenSound();
-      //await audioFeedback.announceState('listening', false);
+      // ── Audio feedback: Skip earcon/SFX when VoiceOver is on ──────────
+      // VoiceOver owns the iOS audio session. Playing earcon sounds causes
+      // audio session conflicts ("Failed to set properties, error: '!pri'")
+      // producing glitchy/screamy artifacts. VoiceOver announcements replace
+      // earcon feedback for blind users.
+      if (!screenReaderEnabled) {
+        audioFeedback.playEarcon('listening');
+        playListenSound();
+      }
+
+      // Small delay to let audio session settle
       await new Promise(resolve => setTimeout(resolve, 100));
 
-      await startSTT();
+      // ── Start STT immediately with grace period for VoiceOver ─────────
+      // Instead of a long delay (which causes race conditions, stale labels,
+      // and "Speech recognition already started!" errors), we start STT
+      // right away but tell it to DISCARD any results arriving in the first
+      // 2 seconds. VoiceOver reads the button label (~1.5s of speech) and
+      // the mic picks it up — the grace period filters that noise out.
+      const gracePeriodMs = screenReaderEnabled ? 3500 : 0;
+
+      await startSTT(gracePeriodMs);
       console.log('✅ Voice recognition started');
     } catch (error) {
       console.error('❌ Start listening error:', error);
-      AccessibilityInfo.announceForAccessibility(`Error: ${error}. Please try again.`);
+      if (screenReaderEnabled) {
+        AccessibilityInfo.announceForAccessibility('Error starting voice. Tap to try again.');
+      }
+    } finally {
+      isStartingRef.current = false;
     }
   };
 
@@ -930,9 +985,16 @@ function AppInner(): React.JSX.Element {
       const finalText = finalTranscript.trim();
       if (!finalText) { /* ... */ return; }
 
+      // ── VoiceOver safety net ────────────────────────────────────────────
+      if (isVoiceOverNoise(finalText)) {
+        console.log('♿ VoiceOver noise rejected (manual stop):', finalText);
+        // Silent discard — no announcement (would feed back into mic)
+        return;
+      }
+
       isCapturingPhotoRef.current = true;
-      audioFeedback.playEarcon('thinking');
-      AccessibilityInfo.announceForAccessibility('Processing your request');
+      if (!screenReaderEnabled) { audioFeedback.playEarcon('thinking'); }
+      AccessibilityInfo.announceForAccessibility('Thinking');
 
       await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
       if (isEmergencyStopped.current) { isCapturingPhotoRef.current = false; return; }
@@ -955,6 +1017,7 @@ function AppInner(): React.JSX.Element {
   const emergencyStop = async () => {
     console.log('🚨 EMERGENCY STOP');
     isEmergencyStopped.current = true;
+    isStartingRef.current = false; // ← release re-entry guard
     continuousModeAbortRef.current = true;
 
     if (abortControllerRef.current) {
@@ -980,7 +1043,10 @@ function AppInner(): React.JSX.Element {
     setIsCameraActive(true);
     isEmergencyStopped.current = false;
 
-    audioFeedback.playEarcon('ready');
+    // Skip earcon when VoiceOver is on — audio session conflict
+    if (!screenReaderEnabled) {
+      audioFeedback.playEarcon('ready');
+    }
     AccessibilityInfo.announceForAccessibility('Stopped. Tap to speak.');
     console.log('✅ Emergency stop complete');
   };
@@ -988,19 +1054,47 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Accessibility helpers
   // ============================================================================
+
+  // ── VoiceOver Noise Filter ──────────────────────────────────────────────
+  // When VoiceOver is on, it reads UI elements aloud. The mic can pick
+  // this up and the speech recognizer treats it as user speech. This filter
+  // rejects transcripts that match known VoiceOver UI text patterns.
+  const isVoiceOverNoise = useCallback((text: string): boolean => {
+    if (!screenReaderEnabled) return false;
+    const patterns = [
+      // Old labels (might still echo from previous announcement)
+      'speak naturally', 'tap to stop', 'tap to speak', 'tap to interrupt',
+      'cybersight is ready', 'cybersight is listening', 'cybersight is speaking',
+      'cybersight is processing', 'processing your request', 'double tap to',
+      // New simplified labels (VoiceOver reads these from the button)
+      'ready tap to speak', 'ready button', 'listening button',
+      'thinking button', 'speaking button', 'navigating button',
+      'speaking tap', 'thinking tap', 'navigating tap',
+      // Generic VoiceOver UI fragments
+      'button tap', 'ready tap', 'ready to speak',
+      // Our own rejection announcements (if they leaked)
+      'please speak your command', 'please speak your',
+    ];
+    const lower = text.toLowerCase();
+    return patterns.some(p => lower.includes(p));
+  }, [screenReaderEnabled]);
+
   const getAccessibilityLabel = () => {
-    if (isNavigation) return 'CyberSight is navigating. Tap to stop.';
-    if (isSpeaking) return 'CyberSight is speaking. Tap to interrupt.';
-    if (isProcessing) return 'CyberSight is processing. Tap to interrupt.';
-    if (isListening) return `CyberSight is listening. ${transcript ? `You said: ${transcript}. ` : ''}Tap to stop.`;
-    return 'CyberSight is ready. Tap to speak.';
+    // VoiceOver reads: {label}. {role}.
+    // With accessibilityRole="button", VoiceOver appends "Button" automatically.
+    // So "Ready. Tap to speak" → VoiceOver says "Ready. Tap to speak. Button."
+    // Keep labels SHORT — no "CyberSight is" prefix (wastes time).
+    if (isNavigation) return 'Navigating. Tap to stop';
+    if (isSpeaking) return 'Speaking. Tap to stop';
+    if (isProcessing) return 'Thinking';
+    if (isListening) return 'Listening';
+    return 'Ready. Tap to speak';
   };
 
   const getAccessibilityHint = () => {
-    if (isNavigation) return 'Tap to stop navigation';
-    if (isSpeaking || isProcessing) return 'Tap to stop';
-    if (isListening) return 'Speak naturally. Tap to stop.';
-    return 'Tap to start speaking';
+    // Hints are read AFTER label + role, with a pause.
+    // Only use for info NOT in the label.
+    return '';
   };
 
   // ============================================================================
@@ -1023,7 +1117,7 @@ function AppInner(): React.JSX.Element {
     }
 
     if (isListening) {
-      AccessibilityInfo.announceForAccessibility('Processing now.');
+      AccessibilityInfo.announceForAccessibility('Thinking.');
       await stopListeningManually();
       return;
     }
@@ -1063,7 +1157,6 @@ function AppInner(): React.JSX.Element {
       accessibilityLabel={getAccessibilityLabel()}
       accessibilityHint={getAccessibilityHint()}
       accessibilityRole="button"
-      accessibilityLiveRegion="polite"
       accessibilityState={{ busy: isProcessing || isNavigation, disabled: false }}
     >
       <View

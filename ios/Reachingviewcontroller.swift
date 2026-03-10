@@ -238,9 +238,39 @@ class ReachingViewController: UIViewController {
     guard !hasCompleted else { return }
     let pt = gesture.location(in: view)
     if cancelButton.frame.contains(pt) { return }
-    if topBar.frame.contains(pt)       { return }
-    if bottomBar.frame.contains(pt)    { return }
+    // NOTE: Removed topBar/bottomBar exclusions — tapping anywhere should cancel.
+    // With VoiceOver, these exclusions prevented exit since VoiceOver focuses
+    // on topBar elements and double-tap triggers within their frame.
     cancelTapped()
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - VoiceOver Accessibility Overrides
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Two-finger scrub (VoiceOver "back" gesture) → cancel reaching
+  override func accessibilityPerformEscape() -> Bool {
+    guard !hasCompleted else { return true }
+    NSLog("♿ [ReachingVC] VoiceOver escape gesture — cancelling")
+    cancelTapped()
+    return true
+  }
+
+  /// Two-finger double-tap (VoiceOver "magic tap") → cancel reaching
+  override func accessibilityPerformMagicTap() -> Bool {
+    guard !hasCompleted else { return true }
+    NSLog("♿ [ReachingVC] VoiceOver magic tap — cancelling")
+    cancelTapped()
+    return true
+  }
+
+  /// VoiceOver double-tap on any focused element → cancel reaching
+  /// This propagates up the responder chain from any child element.
+  override func accessibilityActivate() -> Bool {
+    guard !hasCompleted else { return true }
+    NSLog("♿ [ReachingVC] VoiceOver activate (double-tap) — cancelling")
+    cancelTapped()
+    return true
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -457,7 +487,52 @@ class ReachingViewController: UIViewController {
       cancelButton.heightAnchor.constraint(equalToConstant: 44),
     ])
 
-    view.accessibilityLabel = "Reaching guidance for \(objectName). Tap anywhere to stop."
+    view.accessibilityLabel = "Reaching guidance for \(objectName). Double tap to stop."
+
+    // ── VoiceOver Configuration ──────────────────────────────────────────────
+    // Make the objectNameLabel (which gets initial VoiceOver focus) actionable.
+    // UILabel doesn't respond to VoiceOver double-tap by default — we need
+    // userInteractionEnabled + a tap gesture so VoiceOver's synthetic tap fires.
+    objectNameLabel.isAccessibilityElement = true
+    objectNameLabel.accessibilityLabel = "Guiding to \(objectName). Double tap to stop."
+    objectNameLabel.accessibilityTraits = .button
+    objectNameLabel.isUserInteractionEnabled = true
+    let nameTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
+    objectNameLabel.addGestureRecognizer(nameTap)
+
+    // Same for topBar and bottomBar — VoiceOver may focus on them
+    topBar.isUserInteractionEnabled = true
+    let topTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
+    topBar.addGestureRecognizer(topTap)
+    topBar.isAccessibilityElement = false // children are the elements
+
+    bottomBar.isUserInteractionEnabled = true
+    let botTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
+    bottomBar.addGestureRecognizer(botTap)
+    bottomBar.isAccessibilityElement = false
+
+    // Make direction label readable but not actionable
+    directionLabel.isAccessibilityElement = true
+    directionLabel.accessibilityLabel = "Direction guidance"
+    directionLabel.accessibilityTraits = .updatesFrequently
+    directionLabel.isUserInteractionEnabled = true
+    let dirTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
+    directionLabel.addGestureRecognizer(dirTap)
+
+    // Cancel button — proper accessibility
+    cancelButton.isAccessibilityElement = true
+    cancelButton.accessibilityLabel = "Cancel reaching"
+    cancelButton.accessibilityHint = "Double tap to stop reaching guidance"
+
+    // Add custom accessibility action on the view so ANY focused element
+    // can trigger cancel via the actions rotor
+    view.accessibilityCustomActions = [
+      UIAccessibilityCustomAction(
+        name: "Stop reaching",
+        target: self,
+        selector: #selector(cancelTapped)
+      )
+    ]
   }
 
   func updateDirectionUI(_ newDir: Direction) {
@@ -472,43 +547,3 @@ class ReachingViewController: UIViewController {
     }
   }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

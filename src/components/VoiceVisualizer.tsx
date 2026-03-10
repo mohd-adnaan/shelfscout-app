@@ -112,13 +112,20 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     return 'Tap to speak';
   };
 
-  // Announce state changes
+  // ── State change tracking ──────────────────────────────────────────────
+  // VoiceVisualizer does NOT announce state changes via announceForAccessibility.
+  // Reason: App.tsx already handles all announcements at correct timing:
+  //   - Listening: nothing (earcon only, VoiceOver label updates)
+  //   - Thinking: handleAutoSubmit announces "Thinking"
+  //   - Speaking: no announcement needed (TTS response IS the audio)
+  //   - Ready: handleVoiceCommand announces "Ready. Tap to speak."
+  //
+  // Previous approach caused:
+  //   - "Tap to interrupt" overlapping with "Thinking" 
+  //   - "Speaking. Tap to interrupt" fighting with TTS response audio
+  //   - Duplicate announcements (both VoiceVisualizer AND App.tsx)
   useEffect(() => {
-    const currentState = getStatusText();
-    if (currentState !== previousState.current && previousState.current !== '') {
-      AccessibilityInfo.announceForAccessibility(`${currentState}. ${getInstructionText()}`);
-    }
-    previousState.current = currentState;
+    previousState.current = getStatusText();
   }, [isListening, isProcessing, isSpeaking, isNavigation, isReaching]);
 
   // Slow rotation for processing/navigation/reaching
@@ -232,7 +239,7 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   };
 
   return (
-    <View style={styles.container} accessible accessibilityLabel={`${getStatusText()}. ${getInstructionText()}`} accessibilityRole="text" accessibilityLiveRegion="polite">
+    <View style={styles.container} accessible accessibilityLabel={`${getStatusText()}. ${getInstructionText()}`} accessibilityRole="text">
       
       <View style={styles.visualizer} accessible={false} importantForAccessibility="no-hide-descendants">
         

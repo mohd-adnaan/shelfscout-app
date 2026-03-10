@@ -41,7 +41,7 @@ interface UseSTTOptions {
 }
 
 interface UseSTTReturn {
-  startListening: () => Promise<void>;
+  startListening: (gracePeriodMs?: number) => Promise<void>;
   stopListening: () => Promise<string>;
   cancelListening: () => Promise<void>;
   isListening: boolean;
@@ -86,6 +86,14 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
   
   // ✅ FIX: Track if we're currently processing an auto-submit
   const isAutoSubmittingRef = useRef(false);
+
+  // ✅ VOICEOVER FIX: Grace period — discard results arriving within this window
+  // When VoiceOver is on, it reads UI labels aloud right as STT starts.
+  // The mic picks up VoiceOver's speech. Instead of delaying STT start (which
+  // causes race conditions), we start STT immediately but discard any results
+  // that arrive within the grace window.
+  const sttStartTimeRef = useRef<number>(0);
+  const gracePeriodMsRef = useRef<number>(0);
 
   // ============================================================================
   // Cleanup Functions
@@ -252,6 +260,13 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     const finalResult = results[0] || '';
     
     if (finalResult) {
+      // ✅ VOICEOVER FIX: Discard results during grace period
+      const elapsed = Date.now() - sttStartTimeRef.current;
+      if (elapsed < gracePeriodMsRef.current) {
+        console.log(`♿ [Grace] Discarding result (${elapsed}ms < ${gracePeriodMsRef.current}ms):`, finalResult);
+        return;
+      }
+
       transcriptRef.current = finalResult;
       setTranscript(finalResult);
       lastSpeechTimeRef.current = Date.now();
@@ -270,6 +285,13 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     const partialResult = results[0] || '';
     
     if (partialResult) {
+      // ✅ VOICEOVER FIX: Discard results during grace period
+      const elapsed = Date.now() - sttStartTimeRef.current;
+      if (elapsed < gracePeriodMsRef.current) {
+        console.log(`♿ [Grace] Discarding partial (${elapsed}ms < ${gracePeriodMsRef.current}ms):`, partialResult);
+        return;
+      }
+
       transcriptRef.current = partialResult;
       setTranscript(partialResult);
       lastSpeechTimeRef.current = Date.now();
@@ -280,16 +302,21 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
 
   const onSpeechEnd = useCallback((e: SpeechEndEvent) => {
     console.log('🎤 Speech ended (iOS)');
+
+    // ✅ VOICEOVER FIX: If no real transcript made it past the grace period,
+    // don't trigger auto-submit (it was just VoiceOver noise).
+    const hasRealTranscript = transcriptRef.current.trim().length > 0;
+
     console.log("'📊 iOS onSpeechEnd state:'", {
       hasAutoSubmitted: hasAutoSubmittedRef.current,
       isManualStop: isManualStopRef.current,
-      hasTranscript: !!transcriptRef.current.trim(),
+      hasTranscript: hasRealTranscript,
     });
     
     // ✅ FIX: Only trigger if not already auto-submitted and not manual stop
     if (!isManualStopRef.current && 
         !hasAutoSubmittedRef.current && 
-        transcriptRef.current.trim() && 
+        hasRealTranscript && 
         enableAutoSubmit && 
         onAutoSubmit) {
       triggerAutoSubmit('iOS_onSpeechEnd');
@@ -323,7 +350,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
   // Public Methods
   // ============================================================================
 
-  const startListening = useCallback(async () => {
+  const startListening = useCallback(async (gracePeriodMs: number = 0) => {
     try {
       setError(null);
       setTranscript('');
@@ -333,6 +360,9 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       // ✅ FIX: Reset auto-submit flag for new listening session
       hasAutoSubmittedRef.current = false;
       isAutoSubmittingRef.current = false;
+
+      // ✅ VOICEOVER FIX: Set grace period for discarding early results
+      gracePeriodMsRef.current = gracePeriodMs;
       
       console.log('🎤 Starting iOS voice with RMS VAD...');
       console.log("'⚙️ Auto-submit config:'", {
@@ -340,12 +370,37 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
         threshold: `${silenceThreshold}ms`,
         rmsVAD: enableRMSVAD,
         hasCallback: !!onAutoSubmit,
+        gracePeriodMs,
       });
+
+      // ✅ FIX: Force-destroy any existing Voice session BEFORE starting.
+      // After emergency stop, Voice.cancel() doesn't always fully reset the
+      // native iOS speech recognizer. Voice.destroy() does a hard reset.
+      // This prevents "Speech recognition already started!" errors.
+      try {
+        await Voice.cancel();
+      } catch { /* ignore — may not be active */ }
+      try {
+        await Voice.destroy();
+      } catch { /* ignore */ }
+
+      // Re-register listeners after destroy
+      Voice.onSpeechStart = onSpeechStart;
+      Voice.onSpeechEnd = onSpeechEnd;
+      Voice.onSpeechResults = onSpeechResults;
+      Voice.onSpeechPartialResults = onSpeechPartialResults;
+      Voice.onSpeechError = onSpeechError;
+
+      // ✅ VOICEOVER FIX: Record start time BEFORE Voice.start()
+      sttStartTimeRef.current = Date.now();
 
       await Voice.start('en-US');
       setIsListening(true);
       
       console.log('✅ iOS voice started - waiting for speech...');
+      if (gracePeriodMs > 0) {
+        console.log(`♿ Grace period active: ${gracePeriodMs}ms (discarding VoiceOver noise)`);
+      }
       
       // Start RMS monitoring for VAD
       if (enableRMSVAD) {
@@ -356,7 +411,8 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       setError(err.message || 'Failed to start voice recognition');
       setIsListening(false);
     }
-  }, [enableAutoSubmit, silenceThreshold, enableRMSVAD, onAutoSubmit, startRMSMonitoring]);
+  }, [enableAutoSubmit, silenceThreshold, enableRMSVAD, onAutoSubmit, startRMSMonitoring,
+      onSpeechStart, onSpeechEnd, onSpeechResults, onSpeechPartialResults, onSpeechError]);
 
   const stopListening = useCallback(async (): Promise<string> => {
     try {
@@ -391,7 +447,10 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       clearSilenceTimer();
       stopRMSMonitoring();
       
-      await Voice.cancel();
+      // ✅ FIX: Force-destroy to ensure clean state for next start
+      try { await Voice.cancel(); } catch { }
+      try { await Voice.destroy(); } catch { }
+      
       setIsListening(false);
       setTranscript('');
       transcriptRef.current = '';
