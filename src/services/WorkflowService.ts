@@ -10,6 +10,7 @@ import { Platform, Alert, NativeModules } from 'react-native';
 import { WORKFLOW_URL, CONFIG, NAVIGATION_CONFIG } from '../utils/constants';
 import { WorkflowRequest, WorkflowResponse, ContinuousModeState } from '../utils/types';
 import { AccessibilityService } from './AccessibilityService';
+import { debugLogger } from './DebugLogger';
 
 // =============================================================================
 // iOS ARKit Native Module Bridge
@@ -249,6 +250,12 @@ export const sendToWorkflow = async (
     console.log('🎯 Reaching:', reachingValue);
     console.log('🆔 Session:', SESSION_ID);
 
+    const requestStartTime = Date.now();
+    debugLogger.logAPI(
+      `→ POST ${WORKFLOW_URL.replace('https://cybersight.cim.mcgill.ca', '')}`,
+      `transcript="${(request.text || '').substring(0, 60)}" nav=${navigationValue} reach=${reachingValue} img=${!!request.imageUri}`,
+    );
+
     if (signal?.aborted) {
       throw new Error('Request cancelled');
     }
@@ -275,6 +282,11 @@ export const sendToWorkflow = async (
 
     console.log('✅ Workflow response received');
 
+    const elapsed = Date.now() - requestStartTime;
+    debugLogger.logAPI(
+      `← ${response.status} OK (${elapsed}ms)`,
+    );
+
     // ========================================================================
     // Parse response with THREE-FLAG support (including reaching_ios)
     // ========================================================================
@@ -288,6 +300,11 @@ export const sendToWorkflow = async (
       bbox: !!parsedResponse.bbox,
       object: parsedResponse.object,
     });
+
+    debugLogger.logAPI(
+      `← Parsed: nav=${parsedResponse.navigation} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox}`,
+      `text="${(parsedResponse.text || '').substring(0, 80)}"`,
+    );
 
     // ========================================================================
     // Validate response
@@ -315,6 +332,7 @@ export const sendToWorkflow = async (
 
     console.error('❌ Workflow error:', error);
 
+    const elapsed = Date.now() - requestStartTime;
     let userMessage = 'Failed to process request.';
 
     if (axios.isAxiosError(error)) {
@@ -331,6 +349,11 @@ export const sendToWorkflow = async (
           : `Error (${status}). Please try again.`;
       }
     }
+
+    debugLogger.logAPIError(
+      `✗ ${userMessage} (${elapsed}ms)`,
+      error?.message || String(error),
+    );
 
     AccessibilityService.announceError(userMessage, false);
     // Alert.alert('Request Failed', userMessage, [{ text: 'OK' }]);

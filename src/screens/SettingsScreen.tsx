@@ -210,7 +210,7 @@ interface SettingsScreenProps {
 }
 
 export default function SettingsScreen({ onClose }: SettingsScreenProps) {
-  const { settings, updatePreferAlternativeReaching, updateTtsRate } =
+  const { settings, updatePreferAlternativeReaching, updateTtsRate, updateDeveloperMode } =
     useSettings();
 
   const [localRate, setLocalRate] = useState(settings.ttsRate);
@@ -482,6 +482,38 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
           >
             <Text style={styles.testBtnText}>▶  Preview Voice</Text>
           </TouchableOpacity>
+        </Section>
+
+        {/* ══════════════════════════════════════════
+            SECTION 3 — Developer Options
+        ══════════════════════════════════════════ */}
+        <Section title="Developer Options">
+          <Text style={styles.settingDescription}>
+            Enable the debug overlay to inspect API calls, backend responses,
+            errors, and timing in real-time. Use with{' '}
+            <Text style={styles.emphasisText}>VoiceOver OFF</Text> during
+            testing.
+          </Text>
+
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabelBlock}>
+              <Text style={styles.settingLabel}>Developer Mode</Text>
+              <Text style={styles.settingSubLabel}>
+                {settings.developerMode
+                  ? 'Debug overlay active — 🐛 button visible'
+                  : 'Debug overlay hidden'}
+              </Text>
+            </View>
+            <Switch
+              value={settings.developerMode}
+              onValueChange={async (value: boolean) => {
+                await updateDeveloperMode(value);
+              }}
+              trackColor={{ false: C.border, true: C.primary }}
+              thumbColor={settings.developerMode ? C.primary : C.sliderThumb}
+              ios_backgroundColor={C.border}
+            />
+          </View>
         </Section>
 
         {/* Footer padding */}

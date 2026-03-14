@@ -108,6 +108,18 @@ export const playListenSound = (): void => {
 };
 
 /**
+ * Reset the iOS audio session from Playback → PlayAndRecord so that
+ * Voice / SFSpeechRecognizer can acquire the microphone.
+ *
+ * MUST be called after playListenSound() and before Voice.start().
+ * Without this, the earcon's Sound.setCategory('Playback', false) leaves
+ * the session in exclusive-playback mode, which blocks recording.
+ */
+export const prepareForRecording = (): void => {
+  Sound.setCategory('PlayAndRecord', false);
+};
+
+/**
  * Play when the app enters THINKING state (photo taken, request sent).
  * Replaces the "Thinking" verbal announcement.
  * Immediately starts the latency loop AFTER the begin tone finishes.

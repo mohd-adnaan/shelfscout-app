@@ -47,6 +47,7 @@ import {
   stopLatencyLoop,
   playSuccessChime,
   playErrorSound,
+  prepareForRecording,
 } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
@@ -54,6 +55,8 @@ import { NAVIGATION_CONFIG } from './src/utils/constants';
 import { fixImageOrientation } from './src/services/fixImageOrientation';
 import { SettingsProvider, useSettings } from './src/context/SettingsContext';
 import SettingsScreen from './src/screens/SettingsScreen';
+import { debugLogger } from './src/services/DebugLogger';
+import { DebugOverlay } from './src/components/DebugOverlay';
 
 const { width, height } = Dimensions.get('window');
 
@@ -91,7 +94,7 @@ function AppInner(): React.JSX.Element {
   const [showSettings, setShowSettings] = useState(false);
 
   // ── Settings ───────────────────────────────────────────────────────────────
-  const { resolveReachingPipeline } = useSettings();
+  const { settings, resolveReachingPipeline } = useSettings();
 
   // ── Camera / Permissions ───────────────────────────────────────────────────
   const device = useCameraDevice('back');
@@ -134,6 +137,7 @@ function AppInner(): React.JSX.Element {
 
   // ── Session / config log ───────────────────────────────────────────────────
   useEffect(() => {
+    debugLogger.init(); // Install console interceptors for debug overlay
     console.log('🚀 CyberSight App Started');
     console.log('🆔 Session ID:', getSessionId());
     console.log('🔄 Navigation loop enabled:', NAVIGATION_CONFIG.ENABLE_NAVIGATION_LOOP);
@@ -949,10 +953,17 @@ function AppInner(): React.JSX.Element {
       if (!screenReaderEnabled) {
         audioFeedback.playEarcon('listening');
         playListenSound();
+
+        // ✅ FIX: The earcon sets Sound.setCategory('Playback', false) which
+        // locks the audio session in exclusive-playback mode. Voice.start()
+        // needs PlayAndRecord. Reset the category BEFORE starting STT so the
+        // mic can be acquired. PlayAndRecord allows the earcon to keep playing
+        // while recording begins simultaneously.
+        prepareForRecording();
       }
 
-      // Small delay to let audio session settle
-      await new Promise(resolve => setTimeout(resolve, 100));
+      // Delay to let audio session reconfigure after category switch
+      await new Promise(resolve => setTimeout(resolve, 350));
 
       // ── Start STT immediately with grace period for VoiceOver ─────────
       // Instead of a long delay (which causes race conditions, stale labels,
@@ -1146,72 +1157,78 @@ function AppInner(): React.JSX.Element {
       <View style={styles.container}>
         <StatusBar barStyle="light-content" backgroundColor="#0A0A0F" />
         <SettingsScreen onClose={() => setShowSettings(false)} />
+        {settings.developerMode && <DebugOverlay />}
       </View>
     );
   }
 
   return (
-    <TouchableWithoutFeedback
-      onPress={handleScreenTap}
-      accessible={true}
-      accessibilityLabel={getAccessibilityLabel()}
-      accessibilityHint={getAccessibilityHint()}
-      accessibilityRole="button"
-      accessibilityState={{ busy: isProcessing || isNavigation, disabled: false }}
-    >
-      <View
-        ref={containerRef}
-        style={styles.container}
-        accessible={false}
-        importantForAccessibility="no-hide-descendants"
+    <View style={styles.container}>
+      <TouchableWithoutFeedback
+        onPress={handleScreenTap}
+        accessible={true}
+        accessibilityLabel={getAccessibilityLabel()}
+        accessibilityHint={getAccessibilityHint()}
+        accessibilityRole="button"
+        accessibilityState={{ busy: isProcessing || isNavigation, disabled: false }}
       >
-        <StatusBar barStyle="light-content" backgroundColor="#000" />
-
-        {/* Camera */}
-        <Camera
-          ref={cameraRef}
-          style={StyleSheet.absoluteFill}
-          device={device}
-          isActive={isCameraActive}
-          photo={true}
-          accessible={false}
-          accessibilityElementsHidden={true}
-        />
-
         <View
-          style={styles.darkOverlay}
+          ref={containerRef}
+          style={StyleSheet.absoluteFill}
           accessible={false}
           importantForAccessibility="no-hide-descendants"
-        />
-
-        {/* Voice Visualizer */}
-        <VoiceVisualizer
-          isListening={isListening}
-          isProcessing={isProcessing}
-          isSpeaking={isSpeaking}
-          isNavigation={isNavigation}
-          isReaching={isReaching}
-          transcript={transcript}
-          pulseAnim={pulseAnim}
-          opacityAnim={opacityAnim}
-        />
-
-        {/* ── Settings Gear Button (top-right) ── */}
-        <TouchableOpacity
-          style={styles.settingsGearButton}
-          onPress={() => setShowSettings(true)}
-          accessible={true}
-          accessibilityRole="button"
-          accessibilityLabel="Open settings"
-          accessibilityHint="Double tap to open settings for voice speed and reaching pipeline"
-          // Prevent the gear tap from also firing handleScreenTap
-          onStartShouldSetResponder={() => true}
         >
-          <Text style={styles.settingsGear} accessible={false}>⚙</Text>
-        </TouchableOpacity>
+          <StatusBar barStyle="light-content" backgroundColor="#000" />
 
-      </View>
-    </TouchableWithoutFeedback>
+          {/* Camera */}
+          <Camera
+            ref={cameraRef}
+            style={StyleSheet.absoluteFill}
+            device={device}
+            isActive={isCameraActive}
+            photo={true}
+            accessible={false}
+            accessibilityElementsHidden={true}
+          />
+
+          <View
+            style={styles.darkOverlay}
+            accessible={false}
+            importantForAccessibility="no-hide-descendants"
+          />
+
+          {/* Voice Visualizer */}
+          <VoiceVisualizer
+            isListening={isListening}
+            isProcessing={isProcessing}
+            isSpeaking={isSpeaking}
+            isNavigation={isNavigation}
+            isReaching={isReaching}
+            transcript={transcript}
+            pulseAnim={pulseAnim}
+            opacityAnim={opacityAnim}
+          />
+
+          {/* ── Settings Gear Button (top-right) ── */}
+          <TouchableOpacity
+            style={styles.settingsGearButton}
+            onPress={() => setShowSettings(true)}
+            accessible={true}
+            accessibilityRole="button"
+            accessibilityLabel="Open settings"
+            accessibilityHint="Double tap to open settings for voice speed and reaching pipeline"
+            // Prevent the gear tap from also firing handleScreenTap
+            onStartShouldSetResponder={() => true}
+          >
+            <Text style={styles.settingsGear} accessible={false}>⚙</Text>
+          </TouchableOpacity>
+
+        </View>
+      </TouchableWithoutFeedback>
+
+      {/* ── Debug Overlay (outside TouchableWithoutFeedback so touches work) ── */}
+      {settings.developerMode && <DebugOverlay />}
+    </View>
   );
 }
 

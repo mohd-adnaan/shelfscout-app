@@ -22,6 +22,8 @@ export interface AppSettings {
   preferAlternativeReaching: boolean;
   /** iOS TTS speech rate (0.1 = slowest, 1.0 = fastest). Default 0.5 */
   ttsRate: number;
+  /** When true, shows the debug overlay bug button. Default false. */
+  developerMode: boolean;
 }
 
 interface SettingsContextValue {
@@ -29,6 +31,7 @@ interface SettingsContextValue {
   isLoaded: boolean;
   updatePreferAlternativeReaching: (value: boolean) => Promise<void>;
   updateTtsRate: (rate: number) => Promise<void>;
+  updateDeveloperMode: (value: boolean) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
    * Returns 'arkit' | 'standard' | 'none'.
@@ -46,6 +49,7 @@ interface SettingsContextValue {
 const DEFAULT_SETTINGS: AppSettings = {
   preferAlternativeReaching: false,
   ttsRate: 0.5,
+  developerMode: false,
 };
 
 const STORAGE_KEY = '@cybersight_settings_v1';
@@ -123,6 +127,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateDeveloperMode = useCallback(
+    async (value: boolean) => {
+      const next = { ...settings, developerMode: value };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Developer mode → ${value ? 'ON' : 'OFF'}`);
+    },
+    [settings, persist],
+  );
+
   // ── Pipeline resolver ─────────────────────────────────────────────────────
 
   const resolveReachingPipeline = useCallback(
@@ -153,6 +167,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     isLoaded,
     updatePreferAlternativeReaching,
     updateTtsRate,
+    updateDeveloperMode,
     resolveReachingPipeline,
   };
 
