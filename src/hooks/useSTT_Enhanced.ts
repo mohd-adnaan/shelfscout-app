@@ -3,15 +3,14 @@
  * 
  * Enhanced Speech-to-Text hook with automatic silence detection
  * 
- * FIXED: Prevents duplicate auto-submits (Jan 24, 2026)
- * - Added hasAutoSubmittedRef to track if we've already auto-submitted
- * - Both RMS_VAD and iOS_onSpeechEnd can detect end-of-utterance
- * - Only the FIRST detection triggers auto-submit
- * - Reset flag when starting new listening session
+ * FIXED: OpenAI-backed end-of-utterance validation (Mar 14, 2026)
+ * - Uses OpenAI turn detection before auto-submit
+ * - Keeps local silence fallback if OpenAI is unavailable
+ * - Prevents duplicate auto-submits with request/submit guards
  * 
  * Features:
  * - iOS native voice recognition
- * - RMS-based Voice Activity Detection (VAD)
+ * - OpenAI-based end-of-utterance validation
  * - Automatic end-of-utterance detection
  * - Auto-submit callback when silence detected
  */
@@ -23,7 +22,7 @@ import Voice, {
   SpeechEndEvent,
   SpeechStartEvent,
 } from '@react-native-voice/voice';
-import { Platform, NativeEventEmitter, NativeModules } from 'react-native';
+import { openAIVADService } from '../services/OpenAIVADService';
 
 // ============================================================================
 // Types
@@ -36,8 +35,10 @@ interface UseSTTOptions {
   enableAutoSubmit?: boolean;
   /** Silence threshold in ms before auto-submit (default: 1500) */
   silenceThreshold?: number;
-  /** Enable RMS-based VAD (default: true) */
-  enableRMSVAD?: boolean;
+  /** Enable OpenAI VAD validation (default: true) */
+  enableOpenAIVAD?: boolean;
+  /** Minimum confidence required from OpenAI VAD (default: 0.55) */
+  openAIVADMinConfidence?: number;
 }
 
 interface UseSTTReturn {
@@ -54,8 +55,8 @@ interface UseSTTReturn {
 // ============================================================================
 
 const DEFAULT_SILENCE_THRESHOLD = 1500; // 1.5 seconds
-const RMS_SILENCE_THRESHOLD = 0.02; // RMS level below this = silence
-const RMS_CHECK_INTERVAL = 100; // Check RMS every 100ms
+const OPENAI_VAD_RECHECK_INTERVAL_MS = 350;
+const OPENAI_VAD_REQUEST_TIMEOUT_MS = 2500;
 
 // ============================================================================
 // Hook Implementation
@@ -66,7 +67,8 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     onAutoSubmit,
     enableAutoSubmit = true,
     silenceThreshold = DEFAULT_SILENCE_THRESHOLD,
-    enableRMSVAD = true,
+    enableOpenAIVAD = true,
+    openAIVADMinConfidence = 0.55,
   } = options;
 
   // State
@@ -76,10 +78,10 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
 
   // Refs for internal state management
   const transcriptRef = useRef('');
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const rmsMonitorRef = useRef<NodeJS.Timeout | null>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSpeechTimeRef = useRef<number>(Date.now());
   const isManualStopRef = useRef(false);
+  const openAIVadRequestSeqRef = useRef(0);
   
   // ✅ FIX: Track if we've already auto-submitted for this utterance
   const hasAutoSubmittedRef = useRef(false);
@@ -103,14 +105,6 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     if (silenceTimerRef.current) {
       clearTimeout(silenceTimerRef.current);
       silenceTimerRef.current = null;
-    }
-  }, []);
-
-  const stopRMSMonitoring = useCallback(() => {
-    if (rmsMonitorRef.current) {
-      clearInterval(rmsMonitorRef.current);
-      rmsMonitorRef.current = null;
-      console.log('✅ VAD monitoring stopped');
     }
   }, []);
 
@@ -158,8 +152,6 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     
     // Stop monitoring
     clearSilenceTimer();
-    stopRMSMonitoring();
-    
     // Call the callback
     console.log('🎯 Calling onAutoSubmit callback...');
     
@@ -170,7 +162,80 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       // (but keep hasAutoSubmitted true until next startListening)
       isAutoSubmittingRef.current = false;
     }
-  }, [onAutoSubmit, enableAutoSubmit, clearSilenceTimer, stopRMSMonitoring]);
+  }, [onAutoSubmit, enableAutoSubmit, clearSilenceTimer]);
+
+  // ============================================================================
+  // OpenAI VAD validation
+  // ============================================================================
+
+  const validateWithOpenAIVAD = useCallback(async (source: string) => {
+    if (!enableAutoSubmit || hasAutoSubmittedRef.current || isManualStopRef.current) {
+      return;
+    }
+
+    const currentTranscript = transcriptRef.current.trim();
+    if (!currentTranscript) {
+      return;
+    }
+
+    const silenceDurationMs = Date.now() - lastSpeechTimeRef.current;
+
+    if (silenceDurationMs < silenceThreshold) {
+      return;
+    }
+
+    if (!enableOpenAIVAD || !openAIVADService.isConfigured()) {
+      console.log(`⚠️ [${source}] OpenAI VAD unavailable, using local fallback`);
+      triggerAutoSubmit(`${source}_LocalFallback`);
+      return;
+    }
+
+    const requestSeq = ++openAIVadRequestSeqRef.current;
+
+    try {
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        setTimeout(() => reject(new Error('OpenAI VAD timeout')), OPENAI_VAD_REQUEST_TIMEOUT_MS);
+      });
+
+      const result = await Promise.race([
+        openAIVADService.detectEndOfUtterance({
+          transcript: currentTranscript,
+          silenceDurationMs,
+          silenceThresholdMs: silenceThreshold,
+        }),
+        timeoutPromise,
+      ]);
+
+      // Ignore stale responses from older requests.
+      if (requestSeq !== openAIVadRequestSeqRef.current || hasAutoSubmittedRef.current) {
+        return;
+      }
+
+      if (result.shouldAutoSubmit && result.confidence >= openAIVADMinConfidence) {
+        console.log('✅ OpenAI VAD confirmed end-of-utterance:', result);
+        triggerAutoSubmit('OpenAI_VAD');
+        return;
+      }
+
+      console.log('⏳ OpenAI VAD says continue listening, scheduling recheck:', result);
+      clearSilenceTimer();
+      silenceTimerRef.current = setTimeout(() => {
+        validateWithOpenAIVAD('OpenAI_VAD_Recheck').catch((err) => {
+          console.warn('⚠️ OpenAI VAD recheck failed:', err?.message || err);
+        });
+      }, OPENAI_VAD_RECHECK_INTERVAL_MS);
+    } catch (err: any) {
+      console.warn(`⚠️ [${source}] OpenAI VAD failed, using local fallback:`, err?.message || err);
+      triggerAutoSubmit(`${source}_LocalFallback`);
+    }
+  }, [
+    clearSilenceTimer,
+    enableAutoSubmit,
+    enableOpenAIVAD,
+    openAIVADMinConfidence,
+    silenceThreshold,
+    triggerAutoSubmit,
+  ]);
 
   // ============================================================================
   // Silence Detection (EOU Timer)
@@ -185,74 +250,24 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       return;
     }
     
-    console.log(`⏱️ EOU timer started: ${silenceThreshold - 1}ms remaining`);
+    console.log(`⏱️ EOU timer started: ${silenceThreshold}ms remaining`);
     
     silenceTimerRef.current = setTimeout(() => {
-      console.log('🎯 End-of-Utterance detected!');
-      triggerAutoSubmit('Silence_Timer');
+      validateWithOpenAIVAD('Silence_Timer').catch((err) => {
+        console.warn('⚠️ OpenAI VAD timer check failed:', err?.message || err);
+      });
     }, silenceThreshold);
-  }, [silenceThreshold, clearSilenceTimer, triggerAutoSubmit]);
-
-  // ============================================================================
-  // RMS Voice Activity Detection
-  // ============================================================================
-
-  const startRMSMonitoring = useCallback(() => {
-    if (!enableRMSVAD) return;
-    
-    stopRMSMonitoring();
-    
-    let isSpeaking = false;
-    let silenceStartTime: number | null = null;
-    
-    console.log('✅ VAD monitoring started');
-    console.log('Start Monitoring');
-    
-    rmsMonitorRef.current = setInterval(() => {
-      // ✅ FIX: Stop monitoring if already auto-submitted
-      if (hasAutoSubmittedRef.current) {
-        stopRMSMonitoring();
-        return;
-      }
-      
-      // Simulate RMS detection based on speech activity
-      // In real implementation, this would read from audio buffer
-      const timeSinceLastSpeech = Date.now() - lastSpeechTimeRef.current;
-      const isCurrentlySpeaking = timeSinceLastSpeech < 300; // 300ms window
-      
-      if (isCurrentlySpeaking && !isSpeaking) {
-        // Speech started
-        isSpeaking = true;
-        silenceStartTime = null;
-        console.log('🗣️ Speech detected!');
-        console.log('🗣️ RMS VAD: Speech detected');
-        clearSilenceTimer();
-      } else if (!isCurrentlySpeaking && isSpeaking) {
-        // Speech ended, silence started
-        isSpeaking = false;
-        silenceStartTime = Date.now();
-        console.log('🤫 Silence detected - starting EOU timer');
-        console.log('🤫 RMS VAD: Silence detected');
-        startSilenceTimer();
-      } else if (!isCurrentlySpeaking && silenceStartTime) {
-        // Check if silence has exceeded threshold
-        const silenceDuration = Date.now() - silenceStartTime;
-        
-        if (silenceDuration >= silenceThreshold && transcriptRef.current.trim()) {
-          triggerAutoSubmit('RMS_VAD');
-        }
-      }
-    }, RMS_CHECK_INTERVAL);
-  }, [enableRMSVAD, silenceThreshold, stopRMSMonitoring, clearSilenceTimer, startSilenceTimer, triggerAutoSubmit]);
+  }, [silenceThreshold, clearSilenceTimer, validateWithOpenAIVAD]);
 
   // ============================================================================
   // Voice Event Handlers
   // ============================================================================
 
-  const onSpeechStart = useCallback((e: SpeechStartEvent) => {
+  const onSpeechStart = useCallback((_e: SpeechStartEvent) => {
     console.log('🎤 Speech started (iOS)');
     lastSpeechTimeRef.current = Date.now();
     clearSilenceTimer();
+    openAIVadRequestSeqRef.current += 1;
   }, [clearSilenceTimer]);
 
   const onSpeechResults = useCallback((e: SpeechResultsEvent) => {
@@ -275,10 +290,10 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       
       // Cancel any pending silence timer since we got new speech
       if (!hasAutoSubmittedRef.current) {
-        clearSilenceTimer();
+        startSilenceTimer();
       }
     }
-  }, [clearSilenceTimer]);
+  }, [startSilenceTimer]);
 
   const onSpeechPartialResults = useCallback((e: SpeechResultsEvent) => {
     const results = e.value || [];
@@ -297,10 +312,14 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       lastSpeechTimeRef.current = Date.now();
       
       console.log("'📝 Partial:'", `'${partialResult}'`);
-    }
-  }, []);
 
-  const onSpeechEnd = useCallback((e: SpeechEndEvent) => {
+      if (!hasAutoSubmittedRef.current) {
+        startSilenceTimer();
+      }
+    }
+  }, [startSilenceTimer]);
+
+  const onSpeechEnd = useCallback((_e: SpeechEndEvent) => {
     console.log('🎤 Speech ended (iOS)');
 
     // ✅ VOICEOVER FIX: If no real transcript made it past the grace period,
@@ -319,14 +338,19 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
         hasRealTranscript && 
         enableAutoSubmit && 
         onAutoSubmit) {
-      triggerAutoSubmit('iOS_onSpeechEnd');
+      validateWithOpenAIVAD('iOS_onSpeechEnd').catch((err) => {
+        console.warn('⚠️ OpenAI VAD speech-end check failed:', err?.message || err);
+      });
     }
-  }, [enableAutoSubmit, onAutoSubmit, triggerAutoSubmit]);
+  }, [enableAutoSubmit, onAutoSubmit, validateWithOpenAIVAD]);
 
   const onSpeechError = useCallback((e: SpeechErrorEvent) => {
     console.error('❌ Speech error:', e.error);
     setError(e.error?.message || 'Speech recognition error');
-  }, []);
+    clearSilenceTimer();
+    openAIVadRequestSeqRef.current += 1;
+    setIsListening(false);
+  }, [clearSilenceTimer]);
 
   // ============================================================================
   // Setup Voice Listeners
@@ -342,9 +366,8 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     return () => {
       Voice.destroy().then(Voice.removeAllListeners);
       clearSilenceTimer();
-      stopRMSMonitoring();
     };
-  }, [onSpeechStart, onSpeechEnd, onSpeechResults, onSpeechPartialResults, onSpeechError]);
+  }, [onSpeechStart, onSpeechEnd, onSpeechResults, onSpeechPartialResults, onSpeechError, clearSilenceTimer]);
 
   // ============================================================================
   // Public Methods
@@ -364,14 +387,16 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       // ✅ VOICEOVER FIX: Set grace period for discarding early results
       gracePeriodMsRef.current = gracePeriodMs;
       
-      console.log('🎤 Starting iOS voice with RMS VAD...');
+      console.log('🎤 Starting iOS voice with OpenAI VAD...');
       console.log("'⚙️ Auto-submit config:'", {
         enabled: enableAutoSubmit,
         threshold: `${silenceThreshold}ms`,
-        rmsVAD: enableRMSVAD,
+        openAIVAD: enableOpenAIVAD,
         hasCallback: !!onAutoSubmit,
         gracePeriodMs,
       });
+
+      openAIVadRequestSeqRef.current += 1;
 
       // ✅ FIX: Force-destroy any existing Voice session BEFORE starting.
       // After emergency stop, Voice.cancel() doesn't always fully reset the
@@ -401,26 +426,33 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       if (gracePeriodMs > 0) {
         console.log(`♿ Grace period active: ${gracePeriodMs}ms (discarding VoiceOver noise)`);
       }
-      
-      // Start RMS monitoring for VAD
-      if (enableRMSVAD) {
-        startRMSMonitoring();
-      }
+
+      startSilenceTimer();
     } catch (err: any) {
       console.error('❌ Failed to start voice:', err);
       setError(err.message || 'Failed to start voice recognition');
       setIsListening(false);
     }
-  }, [enableAutoSubmit, silenceThreshold, enableRMSVAD, onAutoSubmit, startRMSMonitoring,
-      onSpeechStart, onSpeechEnd, onSpeechResults, onSpeechPartialResults, onSpeechError]);
+  }, [
+    enableAutoSubmit,
+    silenceThreshold,
+    enableOpenAIVAD,
+    onAutoSubmit,
+    onSpeechStart,
+    onSpeechEnd,
+    onSpeechResults,
+    onSpeechPartialResults,
+    onSpeechError,
+    startSilenceTimer,
+  ]);
 
   const stopListening = useCallback(async (): Promise<string> => {
     try {
       console.log('🛑 Stopping STT...');
       isManualStopRef.current = true;
+      openAIVadRequestSeqRef.current += 1;
       
       clearSilenceTimer();
-      stopRMSMonitoring();
       
       await Voice.stop();
       setIsListening(false);
@@ -434,7 +466,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       setIsListening(false);
       return transcriptRef.current;
     }
-  }, [clearSilenceTimer, stopRMSMonitoring]);
+  }, [clearSilenceTimer]);
 
   const cancelListening = useCallback(async () => {
     try {
@@ -443,9 +475,9 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       
       // ✅ FIX: Set auto-submitted flag to prevent any pending auto-submits
       hasAutoSubmittedRef.current = true;
+      openAIVadRequestSeqRef.current += 1;
       
       clearSilenceTimer();
-      stopRMSMonitoring();
       
       // ✅ FIX: Force-destroy to ensure clean state for next start
       try { await Voice.cancel(); } catch { }
@@ -458,7 +490,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       console.error('❌ Failed to cancel voice:', err);
       setIsListening(false);
     }
-  }, [clearSilenceTimer, stopRMSMonitoring]);
+  }, [clearSilenceTimer]);
 
   return {
     startListening,

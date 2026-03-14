@@ -60,6 +60,9 @@ yarn-error.log
 # testing
 /coverage
 
+# OpenAI local secrets
+src/config/openai.secrets.ts
+
 # Yarn
 .yarn/*
 !.yarn/patches
