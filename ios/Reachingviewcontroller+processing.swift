@@ -95,9 +95,12 @@ extension ReachingViewController {
       self.handDotGlow.fillColor = dotColor.withAlphaComponent(0.3).cgColor
     }
 
-    // ── Overlap checks ────────────────────────────────────────────────────
-    let innerOverlap = abs(dx) < bboxHalfW && abs(dy) < bboxHalfH
-    let tolX = max(bboxHalfW * 0.3, 20), tolY = max(bboxHalfH * 0.3, 20)
+    // ── Overlap checks (v9: widened — anchor is approximate) ─────────────
+    // Inner overlap uses 1.3x bbox to account for anchor placement error.
+    // The bbox projection from a stale photo will never be pixel-perfect.
+    let innerTolW = bboxHalfW * 1.3, innerTolH = bboxHalfH * 1.3
+    let innerOverlap = abs(dx) < innerTolW && abs(dy) < innerTolH
+    let tolX = max(bboxHalfW * 0.5, 30), tolY = max(bboxHalfH * 0.5, 30)
     let nearOverlap = CGRect(
       x: bboxCx - bboxHalfW - tolX, y: bboxCy - bboxHalfH - tolY,
       width: bboxHalfW*2 + tolX*2, height: bboxHalfH*2 + tolY*2
@@ -134,16 +137,23 @@ extension ReachingViewController {
       guard let self = self else { return }
       self.updateDirectionUI(direction)
 
-      self.depthHintLabel.isHidden = !(innerOverlap && !cameraIsClose)
-      if innerOverlap && !cameraIsClose {
+      // Show manual-exit hint whenever hand is aligned (inner overlap)
+      if innerOverlap && cameraIsClose {
+        self.depthHintLabel.isHidden = false
+        self.depthHintLabel.text = "Tap anywhere when you have it"
+        self.distanceLabel.text = "Within reach"
+      } else if innerOverlap && !cameraIsClose {
+        self.depthHintLabel.isHidden = false
         let remaining = max(0, Int((self.liveDistanceToObject - self.reachProximityThreshold) * 100))
         if remaining <= 5 {
-          self.depthHintLabel.text = "Grab it now!"
+          self.depthHintLabel.text = "Tap anywhere when you have it"
           self.distanceLabel.text = "Within reach"
         } else {
           self.depthHintLabel.text = "Move \(remaining)cm closer"
           self.distanceLabel.text = "\(remaining)cm to go"
         }
+      } else {
+        self.depthHintLabel.isHidden = true
       }
 
       self.depthMethodLabel.text = depthMethodStr
@@ -162,19 +172,15 @@ extension ReachingViewController {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // MARK: Success Gate — Two-Tier + 3-State Depth (v8.2)
+    // MARK: Depth Tracking (informational only — v9 manual exit)
     // ═══════════════════════════════════════════════════════════════════════
     //
-    // TIER 1 (dist < 0.30m): innerOverlap only. Physics guarantee.
-    // TIER 2 (dist 0.30–0.70m): innerOverlap + depthGateOk.
-    // TIER 3 (dist >= 0.70m): Walk closer.
-    //
-    // 3-STATE DEPTH (fixes "stuck with bottle in hand"):
-    //   .close → increment progress + confirmed counter
-    //   .far   → RESET progress (hand confirmed away from object)
-    //   .noData → FREEZE progress (don't increment, don't reset)
-    //   This prevents "No depth method succeeded" frames from flushing
-    //   legitimate progress accumulated from real depth confirmations.
+    // Auto-success is DISABLED. The anchor placement + depth estimation
+    // is not reliable enough (< 80% accuracy) to confirm object acquisition.
+    // User must tap "Done" to exit. Depth tracking still drives:
+    //   - Proximity beeps (faster = closer)
+    //   - "Move closer" hints
+    //   - Progress ring (visual feedback only, does NOT auto-dismiss)
 
     if depthOk {
       depthConfirmedFrames = min(depthConfirmedFrames + 1, 15)
@@ -183,43 +189,13 @@ extension ReachingViewController {
     }
     // .noData: don't touch depthConfirmedFrames — preserve recent evidence
 
-    let depthGateOk: Bool
-    if depthOk {
-      depthGateOk = true
-    } else if depthConfirmedFrames >= 8 {
-      depthGateOk = true
-    } else {
-      depthGateOk = false
+    // Track alignment progress for visual ring feedback (informational only)
+    if innerOverlap && (liveDistanceToObject < 0.30 || cameraIsClose) {
+      successFrames = min(successFrames + 1, successThreshold)
+    } else if !innerOverlap {
+      successFrames = max(0, successFrames - 2)
     }
-
-    // Two-tier decision
-    let tier1 = liveDistanceToObject < 0.30  // physics guarantee (was 0.40)
-    let tier2 = cameraIsClose && depthGateOk // depth-confirmed zone
-
-    let gateOpen = innerOverlap && (tier1 || tier2)
-
-    if gateOpen {
-      successFrames += 1
-      if arFrameCount % 10 == 0 {
-        NSLog("✅ [Gate] progress=%d/%d tier=%@ depth=%@ confirmed=%d dist=%.2fm",
-              successFrames, successThreshold,
-              tier1 ? "T1-physics" : "T2-depth",
-              depthOk ? "YES" : "no", depthConfirmedFrames, liveDistanceToObject)
-      }
-      if successFrames >= successThreshold {
-        handleSuccess()
-      }
-    } else if depthFar || !innerOverlap {
-      // Only RESET when depth actively says NO or hand left the bbox.
-      // "No data" frames preserve progress — don't punish sensor gaps.
-      if successFrames > 0 && arFrameCount % 30 == 0 {
-        NSLog("❌ [Gate] RESET — overlap=%@ dist=%.2f depthFar=%@ (confirmed=%d)",
-              innerOverlap ? "Y" : "N", liveDistanceToObject,
-              depthFar ? "Y" : "N", depthConfirmedFrames)
-      }
-      successFrames = 0
-    }
-    // else: noData + innerOverlap → freeze (don't increment, don't reset)
+    // NOTE: No handleSuccess() call — user exits via "Done" button
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -230,7 +206,8 @@ extension ReachingViewController {
                         bboxCx: CGFloat, bboxCy: CGFloat,
                         bboxHalfW: CGFloat, bboxHalfH: CGFloat) -> Direction {
     let dx = handX - bboxCx, dy = handY - bboxCy
-    if abs(dx) < bboxHalfW && abs(dy) < bboxHalfH { return .centered }
+    // v9: Use 1.3x tolerance matching the widened innerOverlap zone
+    if abs(dx) < bboxHalfW * 1.3 && abs(dy) < bboxHalfH * 1.3 { return .centered }
     let angleRad = atan2(-(bboxCy - handY), bboxCx - handX)
     var angleDeg = angleRad * 180.0 / .pi
     if angleDeg < 0 { angleDeg += 360 }

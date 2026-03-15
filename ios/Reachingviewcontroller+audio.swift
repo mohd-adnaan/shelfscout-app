@@ -136,9 +136,9 @@ extension ReachingViewController {
       if now - lastSpeechTime > 2.5 {
         let remaining = max(0, Int((liveDistanceToObject - reachProximityThreshold) * 100))
         if remaining <= 5 {
-          say("You can grab it now")
+          say("Aligned. Reach forward and tap anywhere when ready.")
         } else {
-          say("Move \(remaining) centimeters closer")
+          say("Aligned. Move \(remaining) centimeters closer.")
         }
         lastSpeechTime = now
       }
@@ -147,12 +147,12 @@ extension ReachingViewController {
 
     if direction == lastSpokenDirection {
       if direction == .centered && (now - lastSpeechTime) > 3.0 {
-        say("Centered! Hold steady."); lastSpeechTime = now
+        say("Aligned. Tap anywhere when you have it."); lastSpeechTime = now
       }
       return
     }
     if directionStableFrames >= directionStableThreshold && (now - lastSpeechTime) >= speechCooldown {
-      say(direction == .centered ? "Centered!" : direction.rawValue)
+      say(direction == .centered ? "Aligned" : direction.rawValue)
       lastSpokenDirection = direction; lastSpeechTime = now
       if direction != .centered && direction != .searching { triggerHaptic(0.4) }
     }

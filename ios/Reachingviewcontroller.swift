@@ -24,7 +24,7 @@ class ReachingViewController: UIViewController {
   enum Direction: String {
     case left = "left", topLeft = "top left", top = "up", topRight = "top right"
     case right = "right", downRight = "down right", down = "down", downLeft = "down left"
-    case centered = "Centered!", searching = "Show your hand"
+    case centered = "Aligned", searching = "Show your hand"
   }
 
   enum ProximityZone: String {
@@ -212,7 +212,7 @@ class ReachingViewController: UIViewController {
       guard let self = self, !self.hasCompleted else { return }
       self.startAR()
       self.running = true
-      self.say("Guiding to \(self.objectName). Show your hand to the camera.")
+      self.say("Guiding to \(self.objectName). Show your hand. Tap anywhere when you have it.")
     }
   }
 
@@ -248,27 +248,27 @@ class ReachingViewController: UIViewController {
   // MARK: - VoiceOver Accessibility Overrides
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /// Two-finger scrub (VoiceOver "back" gesture) → cancel reaching
+  /// Two-finger scrub (VoiceOver "back" gesture) → done reaching
   override func accessibilityPerformEscape() -> Bool {
     guard !hasCompleted else { return true }
-    NSLog("♿ [ReachingVC] VoiceOver escape gesture — cancelling")
+    NSLog("♿ [ReachingVC] VoiceOver escape gesture — done")
     cancelTapped()
     return true
   }
 
-  /// Two-finger double-tap (VoiceOver "magic tap") → cancel reaching
+  /// Two-finger double-tap (VoiceOver "magic tap") → done reaching
   override func accessibilityPerformMagicTap() -> Bool {
     guard !hasCompleted else { return true }
-    NSLog("♿ [ReachingVC] VoiceOver magic tap — cancelling")
+    NSLog("♿ [ReachingVC] VoiceOver magic tap — done")
     cancelTapped()
     return true
   }
 
-  /// VoiceOver double-tap on any focused element → cancel reaching
+  /// VoiceOver double-tap on any focused element → done reaching
   /// This propagates up the responder chain from any child element.
   override func accessibilityActivate() -> Bool {
     guard !hasCompleted else { return true }
-    NSLog("♿ [ReachingVC] VoiceOver activate (double-tap) — cancelling")
+    NSLog("♿ [ReachingVC] VoiceOver activate (double-tap) — done")
     cancelTapped()
     return true
   }
@@ -284,19 +284,37 @@ class ReachingViewController: UIViewController {
     let y2 = max(abs(bboxRaw[1]), abs(bboxRaw[3]))
     let maxVal = max(x1, y1, x2, y2)
 
-    if imageWidth > 0 && imageHeight > 0 && maxVal > 1.0 {
-      bboxNormalized = [x1/imageWidth, y1/imageHeight, x2/imageWidth, y2/imageHeight]
-    } else if maxVal <= 1.0 {
+    NSLog("📦 [ReachingVC] Raw bbox: [%.1f, %.1f, %.1f, %.1f] imgDims=%.0f×%.0f maxVal=%.1f",
+          x1, y1, x2, y2, imageWidth, imageHeight, maxVal)
+
+    if maxVal <= 1.0 {
+      // Already normalized [0..1]
       bboxNormalized = [x1, y1, x2, y2]
+      NSLog("📦 [ReachingVC] Bbox already normalized [0..1]")
+    } else if imageWidth > 0 && imageHeight > 0 {
+      // Have real dimensions — normalize directly
+      bboxNormalized = [x1/imageWidth, y1/imageHeight, x2/imageWidth, y2/imageHeight]
+      NSLog("📦 [ReachingVC] Normalized with real dims: %.0f×%.0f", imageWidth, imageHeight)
+    } else if maxVal <= 1000 {
+      // Qwen normalized-to-1000 format (backend Scale bbox should have converted,
+      // but if imageWidth/imageHeight were 0, the scaled values may still be 0-1000)
+      bboxNormalized = [x1/1000, y1/1000, x2/1000, y2/1000]
+      NSLog("⚠️ [ReachingVC] imgDims=0×0 but maxVal<=1000 — assuming Qwen 1000-scale")
     } else {
-      let gW: CGFloat = max(x2 * 1.1, 1152), gH: CGFloat = max(y2 * 1.1, 2048)
+      // Last resort: estimate from bbox values themselves
+      let gW: CGFloat = max(x2 * 1.1, 1536), gH: CGFloat = max(y2 * 1.1, 2048)
       bboxNormalized = [x1/gW, y1/gH, x2/gW, y2/gH]
+      NSLog("⚠️ [ReachingVC] imgDims=0×0, guessing %.0f×%.0f from bbox extents", gW, gH)
     }
+
     bboxNormalized = bboxNormalized.map { min(max($0, 0), 1) }
     let bw = bboxNormalized[2] - bboxNormalized[0]
     let bh = bboxNormalized[3] - bboxNormalized[1]
-    if bw < 0.01 || bh < 0.01 { bboxNormalized = [0.35, 0.35, 0.65, 0.65] }
-    NSLog("📦 [ReachingVC] Normalized bbox: [%.3f, %.3f, %.3f, %.3f]",
+    if bw < 0.01 || bh < 0.01 {
+      bboxNormalized = [0.35, 0.35, 0.65, 0.65]
+      NSLog("⚠️ [ReachingVC] Bbox degenerate (%.3f×%.3f) — using center fallback", bw, bh)
+    }
+    NSLog("📦 [ReachingVC] Final normalized bbox: [%.3f, %.3f, %.3f, %.3f]",
           bboxNormalized[0], bboxNormalized[1], bboxNormalized[2], bboxNormalized[3])
   }
 
@@ -306,7 +324,9 @@ class ReachingViewController: UIViewController {
 
   @objc func cancelTapped() {
     guard !hasCompleted else { return }
-    say("Cancelled"); finishWith(success: false, reason: "user_cancelled")
+    // Manual exit = user confirms they have the object (or wants to stop)
+    // Always treat as success since auto-detection is unreliable
+    say("Done"); finishWith(success: true, reason: "user_confirmed")
   }
 
   func handleSuccess() {
@@ -349,12 +369,15 @@ class ReachingViewController: UIViewController {
     hasDismissed = true; running = false
     sceneView.session.pause()
     cleanup()
+    let msg = reason == "user_confirmed"
+      ? "Reaching complete."
+      : (success ? "\(objectName) reached!" : "Reaching ended.")
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       self.dismiss(animated: true) {
         self.onDone(["success": success, "object": self.objectName,
                      "reason": reason,
-                     "message": success ? "\(self.objectName) reached!" : "Cancelled"])
+                     "message": msg])
       }
     }
   }
@@ -425,7 +448,7 @@ class ReachingViewController: UIViewController {
     bottomBar.contentView.addSubview(directionLabel)
 
     depthHintLabel = UILabel()
-    depthHintLabel.text = "Reach further — extend your arm"
+    depthHintLabel.text = "Tap anywhere when you have the object"
     depthHintLabel.font = .systemFont(ofSize: 15, weight: .medium)
     depthHintLabel.textColor = .systemYellow; depthHintLabel.textAlignment = .center
     depthHintLabel.isHidden = true
@@ -448,11 +471,13 @@ class ReachingViewController: UIViewController {
     view.layer.addSublayer(progressRing)
 
     cancelButton = UIButton(type: .system)
-    cancelButton.setTitle("Cancel", for: .normal)
+    cancelButton.setTitle("Done", for: .normal)
     cancelButton.setTitleColor(.white, for: .normal)
     cancelButton.titleLabel?.font = .systemFont(ofSize: 17, weight: .medium)
-    cancelButton.backgroundColor = UIColor.white.withAlphaComponent(0.15)
+    cancelButton.backgroundColor = UIColor.systemGreen.withAlphaComponent(0.25)
     cancelButton.layer.cornerRadius = 22
+    cancelButton.layer.borderWidth = 1.5
+    cancelButton.layer.borderColor = UIColor.systemGreen.withAlphaComponent(0.6).cgColor
     cancelButton.translatesAutoresizingMaskIntoConstraints = false
     cancelButton.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
     view.addSubview(cancelButton)
@@ -487,14 +512,14 @@ class ReachingViewController: UIViewController {
       cancelButton.heightAnchor.constraint(equalToConstant: 44),
     ])
 
-    view.accessibilityLabel = "Reaching guidance for \(objectName). Double tap to stop."
+    view.accessibilityLabel = "Reaching guidance for \(objectName). Double tap anywhere to confirm."
 
     // ── VoiceOver Configuration ──────────────────────────────────────────────
     // Make the objectNameLabel (which gets initial VoiceOver focus) actionable.
     // UILabel doesn't respond to VoiceOver double-tap by default — we need
     // userInteractionEnabled + a tap gesture so VoiceOver's synthetic tap fires.
     objectNameLabel.isAccessibilityElement = true
-    objectNameLabel.accessibilityLabel = "Guiding to \(objectName). Double tap to stop."
+    objectNameLabel.accessibilityLabel = "Guiding to \(objectName). Double tap anywhere to confirm."
     objectNameLabel.accessibilityTraits = .button
     objectNameLabel.isUserInteractionEnabled = true
     let nameTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
@@ -519,16 +544,16 @@ class ReachingViewController: UIViewController {
     let dirTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
     directionLabel.addGestureRecognizer(dirTap)
 
-    // Cancel button — proper accessibility
+    // Cancel button — proper accessibility (also reachable via full-screen tap)
     cancelButton.isAccessibilityElement = true
-    cancelButton.accessibilityLabel = "Cancel reaching"
-    cancelButton.accessibilityHint = "Double tap to stop reaching guidance"
+    cancelButton.accessibilityLabel = "Confirm. I have the object."
+    cancelButton.accessibilityHint = "Double tap to exit reaching guidance"
 
     // Add custom accessibility action on the view so ANY focused element
-    // can trigger cancel via the actions rotor
+    // can trigger exit via the actions rotor
     view.accessibilityCustomActions = [
       UIAccessibilityCustomAction(
-        name: "Stop reaching",
+        name: "I have it",
         target: self,
         selector: #selector(cancelTapped)
       )
@@ -538,7 +563,7 @@ class ReachingViewController: UIViewController {
   func updateDirectionUI(_ newDir: Direction) {
     guard newDir != currentDirection else { return }
     currentDirection = newDir
-    directionLabel.text = newDir == .centered ? "✅  Centered!" : newDir.rawValue
+    directionLabel.text = newDir == .centered ? "✅  Aligned" : newDir.rawValue
     directionLabel.textColor = newDir == .centered ? .systemGreen : .white
     UIView.animate(withDuration: 0.15) {
       self.bottomBar.transform = CGAffineTransform(scaleX: 1.05, y: 1.05)

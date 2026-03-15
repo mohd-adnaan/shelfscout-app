@@ -342,7 +342,7 @@ function AppInner(): React.JSX.Element {
     console.log('🎯 [ARKit] Launching native reaching for:', result.object, 'bbox:', bbox);
 
     AccessibilityInfo.announceForAccessibility(
-      `Guiding you to ${result.object || 'object'}. Follow the audio beeps.`
+      `Guiding you to ${result.object || 'object'}. Follow the audio beeps. Tap anywhere when you have it.`
     );
 
     setIsCameraActive(false);
@@ -362,11 +362,13 @@ function AppInner(): React.JSX.Element {
 
         console.log('✅ [ARKit] Native result:', reachingResult);
 
-        AccessibilityInfo.announceForAccessibility(
-          reachingResult?.success
-            ? `${result.object || 'Object'} reached successfully!`
-            : 'Reaching guidance ended.'
-        );
+        // Manual exit: reason will be "user_confirmed" or "ar_error"
+        const msg = reachingResult?.reason === 'user_confirmed'
+          ? 'Reaching complete.'
+          : reachingResult?.success
+            ? `${result.object || 'Object'} reached!`
+            : 'Reaching guidance ended.';
+        AccessibilityInfo.announceForAccessibility(msg);
       } else {
         console.warn('⚠️ ReachingModule not available — native module not linked');
         AccessibilityInfo.announceForAccessibility(
@@ -450,6 +452,8 @@ function AppInner(): React.JSX.Element {
           {
             text: '',
             imageUri: photoPath || '',
+            imageWidth: lastImageDimensions.current.width,
+            imageHeight: lastImageDimensions.current.height,
             navigation: loopMode === 'navigation',
             reaching_flag: loopMode === 'reaching',
           },
