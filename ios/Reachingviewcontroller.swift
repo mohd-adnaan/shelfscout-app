@@ -54,10 +54,21 @@ class ReachingViewController: UIViewController {
   let bboxRaw: [CGFloat]
   let objectName: String
   let backendDepth: Float?
-  let imageWidth:   CGFloat
-  let imageHeight:  CGFloat
+  var imageWidth:   CGFloat          // var — updated by progressive re-detection
+  var imageHeight:  CGFloat          // var — updated by progressive re-detection
   let onDone: ([String: Any]) -> Void
   var bboxNormalized: [CGFloat] = [0, 0, 0, 0]
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Progressive Re-detection
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  let detectionUrl: String?
+  var bboxUpdateCount = 0
+  var redetectTimer: Timer?
+  let redetectInterval: TimeInterval = 8.0   // seconds between re-detections (Qwen takes ~10-20s)
+  var isRedetecting = false
+  var lastARFrame: ARFrame?                   // latest frame for capture
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - 3D World Anchor
@@ -176,12 +187,14 @@ class ReachingViewController: UIViewController {
 
   init(bboxRaw: [CGFloat], objectName: String, backendDepth: Float?,
        imageWidth: CGFloat, imageHeight: CGFloat,
+       detectionUrl: String? = nil,
        onDone: @escaping ([String: Any]) -> Void) {
     self.bboxRaw      = bboxRaw
     self.objectName   = objectName
     self.backendDepth = backendDepth
     self.imageWidth   = imageWidth
     self.imageHeight  = imageHeight
+    self.detectionUrl = detectionUrl
     self.onDone       = onDone
     super.init(nibName: nil, bundle: nil)
     handReq.maximumHandCount = 1
@@ -384,6 +397,7 @@ class ReachingViewController: UIViewController {
 
   func cleanup() {
     running = false; beepTimer?.cancel(); beepTimer = nil
+    redetectTimer?.invalidate(); redetectTimer = nil
     playerNode?.stop(); audioEngine?.stop(); audioEngine = nil
     hapticEngine?.stop(); hapticEngine = nil
     synth.stopSpeaking(at: .immediate)
@@ -448,7 +462,7 @@ class ReachingViewController: UIViewController {
     bottomBar.contentView.addSubview(directionLabel)
 
     depthHintLabel = UILabel()
-    depthHintLabel.text = "Tap anywhere when you have the object"
+    depthHintLabel.text = "Move hand forward — tap anywhere when done"
     depthHintLabel.font = .systemFont(ofSize: 15, weight: .medium)
     depthHintLabel.textColor = .systemYellow; depthHintLabel.textAlignment = .center
     depthHintLabel.isHidden = true

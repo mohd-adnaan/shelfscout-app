@@ -51,7 +51,7 @@ import {
 } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
-import { NAVIGATION_CONFIG } from './src/utils/constants';
+import { NAVIGATION_CONFIG, DETECTION_URL } from './src/utils/constants';
 import { fixImageOrientation } from './src/services/fixImageOrientation';
 import { SettingsProvider, useSettings } from './src/context/SettingsContext';
 import SettingsScreen from './src/screens/SettingsScreen';
@@ -358,6 +358,7 @@ function AppInner(): React.JSX.Element {
           depth: result.depth,
           imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
+          detectionUrl: DETECTION_URL,
         });
 
         console.log('✅ [ARKit] Native result:', reachingResult);

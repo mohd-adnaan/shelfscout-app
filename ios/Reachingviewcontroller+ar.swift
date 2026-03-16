@@ -42,6 +42,7 @@ extension ReachingViewController {
 
     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     startBeepLoop()
+    startRedetectionLoop()
     NSLog("📷 [ReachingVC] AR session started")
   }
 
@@ -69,8 +70,15 @@ extension ReachingViewController {
     let screenCenter = CGPoint(x: (bx1+bx2)/2, y: (by1+by2)/2)
 
     let camera = frame.camera
-    let depth  = backendDepth ?? 0.5
-    anchorDepth = depth
+    // On re-detection, anchorDepth is updated by updateBboxFromBackend.
+    // On first placement, use backendDepth. anchorDepth default is 0.5.
+    let depth: Float
+    if bboxUpdateCount > 0, anchorDepth > 0.05 {
+      depth = anchorDepth  // use re-detected depth
+    } else {
+      depth = backendDepth ?? 0.5
+      anchorDepth = depth
+    }
 
     let intrinsics = camera.intrinsics
     let imgRes = camera.imageResolution
@@ -107,7 +115,7 @@ extension ReachingViewController {
 
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
-      if let d = self.backendDepth { self.distanceLabel.text = "\(Int(d*100)) cm" }
+      self.distanceLabel.text = "\(Int(depth * 100)) cm"
     }
   }
 
@@ -245,11 +253,8 @@ extension ReachingViewController {
     let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
     let camToAnchorDist = simd_length(center3D - camPos)
     if simd_dot(center3D - camPos, camFwd) < 0 {
-      if camToAnchorDist < 0.25 {
-        NSLog("🎯 [ReachingVC] Anchor behind camera at %.2fm — auto-success", camToAnchorDist)
-        DispatchQueue.main.async { [weak self] in self?.handleSuccess() }
-        return
-      }
+      // v10: NO auto-success. Manual exit only.
+      // Just tell user object is behind them.
       DispatchQueue.main.async { [weak self] in
         self?.bboxLayer.isHidden = true; self?.innerBboxLayer.isHidden = true
         self?.directionLabel.text = "Turn back"
@@ -293,6 +298,267 @@ extension ReachingViewController {
       self.distanceLabel.text  = "\(Int(dist*100)) cm"
     }
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Progressive Re-detection Loop
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Every N seconds: capture ARKit camera frame → JPEG → POST to detection
+  // endpoint → parse fresh bbox → re-normalize → re-place anchor from
+  // CURRENT camera pose + FRESH bbox. This eliminates the stale-photo
+  // anchor drift that made v9 unusable.
+
+  func startRedetectionLoop() {
+    guard let url = detectionUrl, !url.isEmpty else {
+      NSLog("🔄 [Redetect] No detectionUrl — progressive re-detection DISABLED")
+      return
+    }
+    NSLog("🔄 [Redetect] Starting loop (every %.0fs) → %@", redetectInterval, url)
+
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.redetectTimer = Timer.scheduledTimer(withTimeInterval: self.redetectInterval,
+                                                repeats: true) { [weak self] _ in
+        self?.captureAndRedetect()
+      }
+    }
+  }
+
+  func captureAndRedetect() {
+    guard running, !hasCompleted, !isRedetecting else { return }
+    guard let urlStr = detectionUrl, let url = URL(string: urlStr) else { return }
+    guard let frame = lastARFrame else {
+      NSLog("🔄 [Redetect] No AR frame available yet")
+      return
+    }
+
+    isRedetecting = true
+
+    // Capture current AR camera image as JPEG
+    let pixelBuffer = frame.capturedImage
+    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+    let context = CIContext()
+    guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+      NSLog("🔄 [Redetect] Failed to create CGImage from frame")
+      isRedetecting = false
+      return
+    }
+
+    // AR camera is landscape — rotate to portrait for backend
+    let fullImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: .right)
+
+    // Resize to ~750px max to reduce payload (1440×1920 → ~562×750)
+    let maxDim: CGFloat = 750
+    let scale = min(maxDim / fullImage.size.width, maxDim / fullImage.size.height, 1.0)
+    let newSize = CGSize(width: fullImage.size.width * scale, height: fullImage.size.height * scale)
+    UIGraphicsBeginImageContextWithOptions(newSize, true, 1.0)
+    fullImage.draw(in: CGRect(origin: .zero, size: newSize))
+    let resizedImage = UIGraphicsGetImageFromCurrentImageContext() ?? fullImage
+    UIGraphicsEndImageContext()
+
+    guard let jpegData = resizedImage.jpegData(compressionQuality: 0.5) else {
+      NSLog("🔄 [Redetect] Failed to encode JPEG")
+      isRedetecting = false
+      return
+    }
+
+    let base64Str = "data:image/jpeg;base64," + jpegData.base64EncodedString()
+    let imgW = resizedImage.size.width
+    let imgH = resizedImage.size.height
+
+    NSLog("🔄 [Redetect] Captured %.0f×%.0f (%.0fKB) — sending to backend...",
+          imgW, imgH, Double(jpegData.count) / 1024.0)
+
+    // Build request
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.timeoutInterval = 60  // Qwen inference can take 20-40s on CPU
+
+    let body: [String: Any] = [
+      "image": base64Str,
+      "object": objectName,
+      "score_threshold": 0.1
+    ]
+    guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+      NSLog("🔄 [Redetect] Failed to serialize request body")
+      isRedetecting = false
+      return
+    }
+    request.httpBody = bodyData
+
+    // Fire async
+    let capturedFrame = frame  // capture for re-anchor
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      defer { self?.isRedetecting = false }
+      guard let self = self, self.running, !self.hasCompleted else { return }
+
+      if let error = error {
+        NSLog("🔄 [Redetect] Request failed: %@", error.localizedDescription)
+        return
+      }
+
+      // Check HTTP status
+      let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+      guard let data = data else {
+        NSLog("🔄 [Redetect] No data in response (HTTP %d)", httpStatus)
+        return
+      }
+
+      // Log raw response on failure for debugging
+      guard let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        let rawStr = String(data: data.prefix(500), encoding: .utf8) ?? "(binary)"
+        NSLog("🔄 [Redetect] Failed to parse JSON (HTTP %d): %@", httpStatus, rawStr)
+        return
+      }
+
+      // 404 = object not found
+      if httpStatus == 404 {
+        let err = json["error"] as? String ?? "not found"
+        NSLog("🔄 [Redetect] Object not found (404): %@", err)
+        return
+      }
+
+      // Extract bbox — handle multiple formats from vision pipeline
+      var newBbox: [CGFloat]? = nil
+
+      if let bboxArr = json["bbox"] as? [Any] {
+        // Array of numbers (Int or Double or NSNumber)
+        let mapped = bboxArr.compactMap { v -> CGFloat? in
+          if let n = v as? NSNumber { return CGFloat(n.doubleValue) }
+          if let i = v as? Int { return CGFloat(i) }
+          if let d = v as? Double { return CGFloat(d) }
+          return nil
+        }
+        if mapped.count == 4 { newBbox = mapped }
+      } else if let bboxStr = json["bbox"] as? String {
+        // String format "[x1, y1, x2, y2]"
+        let cleaned = bboxStr.trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
+        let parts = cleaned.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+        if parts.count == 4 { newBbox = parts.map { CGFloat($0) } }
+      }
+
+      guard let bbox = newBbox, bbox.count == 4 else {
+        NSLog("🔄 [Redetect] No valid bbox — keys: %@", json.keys.joined(separator: ", "))
+        return
+      }
+
+      // Extract depth if available
+      var newDepth: Float? = nil
+      if let d = json["depth"] as? NSNumber {
+        newDepth = d.floatValue
+      }
+
+      let conf = (json["confidence"] as? NSNumber)?.floatValue ?? 0
+
+      NSLog("🔄 [Redetect] ✅ Got fresh bbox [%.0f,%.0f,%.0f,%.0f] conf=%.2f depth=%@ img=%.0f×%.0f",
+            bbox[0], bbox[1], bbox[2], bbox[3], conf, 
+            newDepth.map{String(format:"%.2f",$0)} ?? "nil", imgW, imgH)
+
+      // Apply update on main thread
+      DispatchQueue.main.async { [weak self] in
+        self?.updateBboxFromBackend(newBbox: bbox, newImgW: imgW, newImgH: imgH,
+                                    newDepth: newDepth, fromFrame: capturedFrame)
+      }
+    }.resume()
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Update Bbox from Backend Re-detection
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Re-normalizes the bbox, resets anchor state, and re-places the 3D anchor
+  // from the CURRENT camera pose. This is the key fix: the anchor is always
+  // placed from a recent frame, not from the stale initial photo.
+
+  func updateBboxFromBackend(newBbox: [CGFloat], newImgW: CGFloat, newImgH: CGFloat,
+                             newDepth: Float?, fromFrame: ARFrame? = nil) {
+    bboxUpdateCount += 1
+
+    // ── Normalize the fresh bbox ──────────────────────────────────────────
+    let x1 = min(newBbox[0], newBbox[2])
+    let y1 = min(newBbox[1], newBbox[3])
+    let x2 = max(newBbox[0], newBbox[2])
+    let y2 = max(newBbox[1], newBbox[3])
+
+    var newNorm: [CGFloat]
+    if newImgW > 0 && newImgH > 0 {
+      newNorm = [x1/newImgW, y1/newImgH, x2/newImgW, y2/newImgH]
+    } else {
+      let maxVal = max(x1, y1, x2, y2)
+      if maxVal <= 1.0 {
+        newNorm = [x1, y1, x2, y2]
+      } else if maxVal <= 1000 {
+        newNorm = [x1/1000, y1/1000, x2/1000, y2/1000]
+      } else {
+        NSLog("🔄 [Redetect] ⚠️ Can't normalize bbox, skipping update #%d", bboxUpdateCount)
+        return
+      }
+    }
+    newNorm = newNorm.map { min(max($0, 0), 1) }
+
+    let newW = newNorm[2] - newNorm[0]
+    let newH = newNorm[3] - newNorm[1]
+    let newCx = (newNorm[0] + newNorm[2]) / 2
+    let newCy = (newNorm[1] + newNorm[3]) / 2
+
+    // ── Reject degenerate detections ──────────────────────────────────────
+    if newW < 0.01 || newH < 0.01 {
+      NSLog("🔄 [Redetect] ⚠️ Degenerate bbox (%.3f×%.3f), skipping update #%d", newW, newH, bboxUpdateCount)
+      return
+    }
+
+    // ── KEY: Use re-detected CENTER but keep the LARGER of old/new SIZE ──
+    // The re-detected image is resized (563×750) so pixel bboxes are smaller.
+    // Also the user is walking, so the object may appear at different scales.
+    // Keeping the larger size ensures the on-screen target stays usable.
+    let oldW = bboxNormalized[2] - bboxNormalized[0]
+    let oldH = bboxNormalized[3] - bboxNormalized[1]
+    let useW = max(oldW, newW, 0.03)   // minimum 3% of image
+    let useH = max(oldH, newH, 0.04)   // minimum 4% of image
+
+    // Build new bbox: fresh center + preserved size
+    let finalX1 = max(newCx - useW / 2, 0)
+    let finalY1 = max(newCy - useH / 2, 0)
+    let finalX2 = min(newCx + useW / 2, 1)
+    let finalY2 = min(newCy + useH / 2, 1)
+
+    NSLog("🔄 [Redetect] Update #%d — center=(%.3f,%.3f) newSize=%.3f×%.3f → useSize=%.3f×%.3f",
+          bboxUpdateCount, newCx, newCy, newW, newH, useW, useH)
+    NSLog("🔄 [Redetect] Old norm: [%.3f,%.3f,%.3f,%.3f] → New norm: [%.3f,%.3f,%.3f,%.3f]",
+          bboxNormalized[0], bboxNormalized[1], bboxNormalized[2], bboxNormalized[3],
+          finalX1, finalY1, finalX2, finalY2)
+
+    bboxNormalized = [finalX1, finalY1, finalX2, finalY2]
+
+    // Update image dimensions for aspect-fill mapping in placeWorldAnchor
+    if newImgW > 0 && newImgH > 0 {
+      imageWidth = newImgW
+      imageHeight = newImgH
+    }
+
+    // Update depth if provided and reasonable
+    if let d = newDepth, d > 0.05, d < 10.0 {
+      anchorDepth = d
+      NSLog("🔄 [Redetect] Updated anchorDepth → %.2fm", d)
+    }
+
+    // Reset anchor state so placeWorldAnchor fires with fresh position
+    anchorPlaced = false
+    anchorRefinementFrames = 0
+    refinementHits.removeAll()
+    lastRefinementAppliedDepth = 0
+    objectWorldPosition = nil
+
+    // Re-anchor immediately from the captured frame
+    if let frame = fromFrame ?? lastARFrame {
+      placeWorldAnchor(frame: frame)
+      NSLog("🔄 [Redetect] ✅ Anchor RE-PLACED from fresh frame + fresh center")
+    } else {
+      NSLog("🔄 [Redetect] ⏳ Anchor reset — will re-place on next AR frame")
+    }
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -302,6 +568,7 @@ extension ReachingViewController {
 extension ReachingViewController: ARSessionDelegate {
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
     guard running, !hasCompleted else { return }
+    lastARFrame = frame  // store for re-detection capture
     let now = ProcessInfo.processInfo.systemUptime
     guard now - lastFrameProcessedAt >= frameProcessInterval else { return }
     lastFrameProcessedAt = now

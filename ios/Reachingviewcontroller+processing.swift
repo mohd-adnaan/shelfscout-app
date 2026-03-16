@@ -140,13 +140,13 @@ extension ReachingViewController {
       // Show manual-exit hint whenever hand is aligned (inner overlap)
       if innerOverlap && cameraIsClose {
         self.depthHintLabel.isHidden = false
-        self.depthHintLabel.text = "Tap anywhere when you have it"
+        self.depthHintLabel.text = "Move hand forward — tap anywhere when done"
         self.distanceLabel.text = "Within reach"
       } else if innerOverlap && !cameraIsClose {
         self.depthHintLabel.isHidden = false
         let remaining = max(0, Int((self.liveDistanceToObject - self.reachProximityThreshold) * 100))
         if remaining <= 5 {
-          self.depthHintLabel.text = "Tap anywhere when you have it"
+          self.depthHintLabel.text = "Move hand forward — tap anywhere when done"
           self.distanceLabel.text = "Within reach"
         } else {
           self.depthHintLabel.text = "Move \(remaining)cm closer"

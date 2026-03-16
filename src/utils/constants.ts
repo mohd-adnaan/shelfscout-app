@@ -112,6 +112,11 @@ export const COLORS = {
 // Mansi's workflow
 export const WORKFLOW_URL = 'https://cybersight.cim.mcgill.ca/api/webhook/29ee1345-f789-4738-997f-ffdae65bba74';
 
+// Vision pipeline detection endpoint for progressive re-detection during reaching.
+// This is the external URL for the Docker vision-pipeline service (internal: cybersight-vision-pipeline-1:5000/detect).
+// Update this if the Traefik route differs.
+export const DETECTION_URL = 'https://cybersight.cim.mcgill.ca/vision/detect';
+
 // Adnaan's workflow 
 //export const WORKFLOW_URL = 'https://cybersight.cim.mcgill.ca/api/webhook/2a6dcae3-c11b-4989-86ce-8a4224f18a7f';
 
@@ -186,6 +191,7 @@ export default {
   CONFIG,
   COLORS,
   WORKFLOW_URL,
+  DETECTION_URL,
   SPEACHES_CONFIG,
   SILENCE_DETECTION_CONFIG,
   NAVIGATION_CONFIG,
