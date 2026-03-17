@@ -341,19 +341,19 @@ class IOSTtsClient {
     this._isStopped = true;
     this._isPlaying = false;
 
-    // Tts.stop() takes a BOOL param (onWordBoundary) that can't bridge
-    // on New Architecture. The try/catch prevents the crash from propagating.
-    // On some devices the native side still stops; on others it may not.
-    // Either way, the new Tts.speak() call in synthesizeSpeech() will
-    // queue after the current utterance finishes (AVSpeechSynthesizer behavior).
+    // Stop native AVSpeechSynthesizer immediately.
+    // The BOOL→double patch in react-native-tts+4.1.1.patch ensures
+    // this actually reaches the native stopSpeakingAtBoundary: call
+    // on New Architecture. Without that patch, Tts.stop() silently
+    // fails and speech continues in the background.
     try {
       await Tts.stop();
     } catch (error: any) {
-      // Expected on New Architecture — BOOL conversion error
-      console.warn('⚠️ Tts.stop() error (non-fatal):', error.message);
+      console.warn('⚠️ Tts.stop() error:', error.message,
+        '— ensure patches/react-native-tts+4.1.1.patch is applied (npx patch-package)');
     }
 
-    // Give native cancel event 50ms to fire, then force-resolve
+    // Give native tts-cancel event 50ms to fire, then force-resolve
     await new Promise<void>((r) => setTimeout(r, 50));
 
     if (this._resolveSpeak) {

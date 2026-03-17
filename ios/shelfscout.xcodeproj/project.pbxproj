@@ -8,7 +8,6 @@
 
 /* Begin PBXBuildFile section */
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
-		168CFD6491C44B6C7AB12AA2 /* libPods-shelfscout.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 17E209EAA22CCC460541DB60 /* libPods-shelfscout.a */; };
 		4D9BFE671FF22FC33CC01744 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
 		5F359D602F48B656000E7BB8 /* siri-begin-improved.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5F2F48B656000E7BB8 /* siri-begin-improved.caf */; };
 		5F359D612F48B656000E7BB8 /* jbl_latency_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */; };
@@ -27,6 +26,7 @@
 		5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263892F395B19006AEE6F /* ReachingModule.swift */; };
 		5FC2638C2F395B19006AEE6F /* ReachingModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263882F395B19006AEE6F /* ReachingModule.m */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
+		82A91F85908A392152984A4C /* libPods-shelfscout.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 73374CA1766F685C3E9D3D64 /* libPods-shelfscout.a */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -34,8 +34,6 @@
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = shelfscout/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = shelfscout/Info.plist; sourceTree = "<group>"; };
 		13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = PrivacyInfo.xcprivacy; path = shelfscout/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
-		17E209EAA22CCC460541DB60 /* libPods-shelfscout.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-shelfscout.a"; sourceTree = BUILT_PRODUCTS_DIR; };
-		5144E27FECB6AFF99AEE8B7F /* Pods-shelfscout.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.release.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.release.xcconfig"; sourceTree = "<group>"; };
 		5F359D5B2F48B656000E7BB8 /* jbl_begin_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_begin_sae.caf; sourceTree = "<group>"; };
 		5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_latency_sae.caf; sourceTree = "<group>"; };
 		5F359D5D2F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = jbl_stopped_ios_sae.mp3; sourceTree = "<group>"; };
@@ -53,9 +51,11 @@
 		5FC263882F395B19006AEE6F /* ReachingModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ReachingModule.m; sourceTree = "<group>"; };
 		5FC263892F395B19006AEE6F /* ReachingModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReachingModule.swift; sourceTree = "<group>"; };
 		5FC2638A2F395B19006AEE6F /* shelfscout-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "shelfscout-Bridging-Header.h"; sourceTree = "<group>"; };
+		73374CA1766F685C3E9D3D64 /* libPods-shelfscout.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-shelfscout.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = shelfscout/AppDelegate.swift; sourceTree = "<group>"; };
-		DCCA6945BA638C8CB86E94A9 /* Pods-shelfscout.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.debug.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.debug.xcconfig"; sourceTree = "<group>"; };
+		850A50DCF0311F804946B211 /* Pods-shelfscout.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.release.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.release.xcconfig"; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
+		F0AA5FE0F429EFB7B2078CDB /* Pods-shelfscout.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.debug.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.debug.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -63,7 +63,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				168CFD6491C44B6C7AB12AA2 /* libPods-shelfscout.a in Frameworks */,
+				82A91F85908A392152984A4C /* libPods-shelfscout.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -102,7 +102,7 @@
 			isa = PBXGroup;
 			children = (
 				ED297162215061F000B7C4FE /* JavaScriptCore.framework */,
-				17E209EAA22CCC460541DB60 /* libPods-shelfscout.a */,
+				73374CA1766F685C3E9D3D64 /* libPods-shelfscout.a */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -139,8 +139,8 @@
 		BBD78D7AC51CEA395F1C20DB /* Pods */ = {
 			isa = PBXGroup;
 			children = (
-				DCCA6945BA638C8CB86E94A9 /* Pods-shelfscout.debug.xcconfig */,
-				5144E27FECB6AFF99AEE8B7F /* Pods-shelfscout.release.xcconfig */,
+				F0AA5FE0F429EFB7B2078CDB /* Pods-shelfscout.debug.xcconfig */,
+				850A50DCF0311F804946B211 /* Pods-shelfscout.release.xcconfig */,
 			);
 			path = Pods;
 			sourceTree = "<group>";
@@ -152,13 +152,13 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 13B07F931A680F5B00A75B9A /* Build configuration list for PBXNativeTarget "shelfscout" */;
 			buildPhases = (
-				FCCDE60BA5FF41C42BA6B3C6 /* [CP] Check Pods Manifest.lock */,
+				FCB4C99A3FECF319BB4FC357 /* [CP] Check Pods Manifest.lock */,
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
 				00DD1BFF1BD5951E006B06BC /* Bundle React Native code and images */,
-				541ED4D026FBD7B8104A17DA /* [CP] Embed Pods Frameworks */,
-				FBCAA54A2BAECED2E297DCD9 /* [CP] Copy Pods Resources */,
+				E3C38F3051A6FBC6231F7AD4 /* [CP] Embed Pods Frameworks */,
+				890033B2F556037C2674E9B1 /* [CP] Copy Pods Resources */,
 			);
 			buildRules = (
 			);
@@ -236,24 +236,7 @@
 			shellPath = /bin/sh;
 			shellScript = "set -e\n\nWITH_ENVIRONMENT=\"$REACT_NATIVE_PATH/scripts/xcode/with-environment.sh\"\nREACT_NATIVE_XCODE=\"$REACT_NATIVE_PATH/scripts/react-native-xcode.sh\"\n\n/bin/sh -c \"\\\"$WITH_ENVIRONMENT\\\" \\\"$REACT_NATIVE_XCODE\\\"\"\n";
 		};
-		541ED4D026FBD7B8104A17DA /* [CP] Embed Pods Frameworks */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks-${CONFIGURATION}-input-files.xcfilelist",
-			);
-			name = "[CP] Embed Pods Frameworks";
-			outputFileListPaths = (
-				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks-${CONFIGURATION}-output-files.xcfilelist",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks.sh\"\n";
-			showEnvVarsInLog = 0;
-		};
-		FBCAA54A2BAECED2E297DCD9 /* [CP] Copy Pods Resources */ = {
+		890033B2F556037C2674E9B1 /* [CP] Copy Pods Resources */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -270,7 +253,24 @@
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
-		FCCDE60BA5FF41C42BA6B3C6 /* [CP] Check Pods Manifest.lock */ = {
+		E3C38F3051A6FBC6231F7AD4 /* [CP] Embed Pods Frameworks */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Embed Pods Frameworks";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks.sh\"\n";
+			showEnvVarsInLog = 0;
+		};
+		FCB4C99A3FECF319BB4FC357 /* [CP] Check Pods Manifest.lock */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -317,7 +317,7 @@
 /* Begin XCBuildConfiguration section */
 		13B07F941A680F5B00A75B9A /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = DCCA6945BA638C8CB86E94A9 /* Pods-shelfscout.debug.xcconfig */;
+			baseConfigurationReference = F0AA5FE0F429EFB7B2078CDB /* Pods-shelfscout.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
@@ -355,7 +355,7 @@
 		};
 		13B07F951A680F5B00A75B9A /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 5144E27FECB6AFF99AEE8B7F /* Pods-shelfscout.release.xcconfig */;
+			baseConfigurationReference = 850A50DCF0311F804946B211 /* Pods-shelfscout.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;

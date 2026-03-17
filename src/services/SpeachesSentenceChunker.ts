@@ -1,6 +1,6 @@
 // src/services/SpeachesSentenceChunker.ts
 
-import { speachesTTS } from './speachesTtsClient';
+import { speachesTTS } from './iOSTtsClient';
 import { AccessibilityService } from './AccessibilityService';
 
 class SpeachesSentenceChunker {
