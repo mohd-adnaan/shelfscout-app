@@ -1,14 +1,14 @@
 /**
  * src/components/DebugOverlay.tsx
  *
- * Floating debug panel for ShelfScout mobile app.
+ * Floating debug panel for ShelfScout / CyberSight mobile app.
  *
  * ── Behaviour ──
- * - Renders a small 🐛 button at the bottom-right corner.
- * - Tapping the button toggles a scrollable log panel.
- * - Log entries are color coded by level.
- * - Auto-scrolls to newest entry.
- * - "Clear" button wipes the log.
+ * - 🐛 button at bottom-right toggles a scrollable log panel.
+ * - Color-coded entries by level; filter tabs.
+ * - "Export" button → pick JSON or CSV → writes file → opens iOS share sheet.
+ * - "Session" button → inserts a labeled session marker.
+ * - "Clear" button wipes all entries.
  * - No accessibility announcements — for sighted developer testing only.
  */
 
@@ -21,7 +21,10 @@ import {
   StyleSheet,
   Dimensions,
   Platform,
+  Share,
+  Alert,
 } from 'react-native';
+import RNFS from 'react-native-fs';
 import { debugLogger, LogEntry, LogLevel } from '../services/DebugLogger';
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -30,19 +33,22 @@ import { debugLogger, LogEntry, LogLevel } from '../services/DebugLogger';
 
 const C = {
   panelBg: 'rgba(10, 10, 15, 0.94)',
-  entryBg: 'rgba(28, 28, 40, 0.6)',
   border: '#2A2A3D',
-  text: '#E0E0E0',
   timestamp: '#52526A',
   log: '#CCCCCC',
   warn: '#FF9F0A',
   error: '#FF453A',
   api: '#64D2FF',
   'api-error': '#FF6B6B',
+  session: '#34C759',
   btnBg: 'rgba(79, 110, 247, 0.85)',
   btnBgActive: '#FF453A',
   clearBg: 'rgba(255, 69, 58, 0.15)',
   clearBorder: '#FF453A',
+  exportBg: 'rgba(52, 199, 89, 0.15)',
+  exportBorder: '#34C759',
+  sessionBtnBg: 'rgba(79, 110, 247, 0.15)',
+  sessionBtnBorder: '#4F6EF7',
 };
 
 const LEVEL_COLORS: Record<LogLevel, string> = {
@@ -51,6 +57,7 @@ const LEVEL_COLORS: Record<LogLevel, string> = {
   error: C.error,
   api: C.api,
   'api-error': C['api-error'],
+  session: C.session,
 };
 
 const LEVEL_LABELS: Record<LogLevel, string> = {
@@ -59,6 +66,7 @@ const LEVEL_LABELS: Record<LogLevel, string> = {
   error: 'ERR',
   api: 'API',
   'api-error': 'API✗',
+  session: '▸▸▸',
 };
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -74,11 +82,16 @@ function formatTime(ts: number): string {
   return `${h}:${m}:${s}.${ms}`;
 }
 
+function fileTimestamp(): string {
+  const d = new Date();
+  return `${d.getFullYear()}${(d.getMonth() + 1).toString().padStart(2, '0')}${d.getDate().toString().padStart(2, '0')}_${d.getHours().toString().padStart(2, '0')}${d.getMinutes().toString().padStart(2, '0')}${d.getSeconds().toString().padStart(2, '0')}`;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Component
 // ─────────────────────────────────────────────────────────────────────────────
 
-const { width: SCREEN_W, height: SCREEN_H } = Dimensions.get('window');
+const { height: SCREEN_H } = Dimensions.get('window');
 const PANEL_HEIGHT = SCREEN_H * 0.55;
 
 export function DebugOverlay(): React.JSX.Element {
@@ -86,6 +99,8 @@ export function DebugOverlay(): React.JSX.Element {
   const [entries, setEntries] = useState<LogEntry[]>(debugLogger.getAll());
   const scrollRef = useRef<ScrollView>(null);
   const [filter, setFilter] = useState<LogLevel | 'all'>('all');
+  const [showFormatPicker, setShowFormatPicker] = useState(false);
+  const [exporting, setExporting] = useState(false);
 
   // Subscribe to live log updates
   useEffect(() => {
@@ -98,7 +113,6 @@ export function DebugOverlay(): React.JSX.Element {
   // Auto-scroll when new entries arrive (only when expanded)
   useEffect(() => {
     if (expanded && scrollRef.current) {
-      // Small delay so the ScrollView has time to lay out new content
       const t = setTimeout(() => {
         scrollRef.current?.scrollToEnd({ animated: true });
       }, 80);
@@ -108,16 +122,67 @@ export function DebugOverlay(): React.JSX.Element {
 
   const togglePanel = useCallback(() => {
     setExpanded(prev => !prev);
+    setShowFormatPicker(false);
   }, []);
 
   const handleClear = useCallback(() => {
     debugLogger.clear();
   }, []);
 
+  // ── Session marker ──────────────────────────────────────────────────────
+
+  const handleNewSession = useCallback(() => {
+    debugLogger.markNewSession();
+  }, []);
+
+  // ── Export ──────────────────────────────────────────────────────────────
+
+  const handleExport = useCallback(async (format: 'json' | 'csv') => {
+    setShowFormatPicker(false);
+    setExporting(true);
+    try {
+      const ts = fileTimestamp();
+      const ext = format;
+      const filename = `cybersight_logs_${ts}.${ext}`;
+      const filePath = `${RNFS.DocumentDirectoryPath}/${filename}`;
+
+      const content = format === 'json'
+        ? debugLogger.exportAsJSON(filter)
+        : debugLogger.exportAsCSV(filter);
+
+      await RNFS.writeFile(filePath, content, 'utf8');
+
+      const fileUrl = `file://${filePath}`;
+
+      if (Platform.OS === 'ios') {
+        // iOS Share sheet supports file URLs → AirDrop, Mail, Files, etc.
+        await Share.share({ url: fileUrl });
+      } else {
+        // Android fallback: share content as text (file sharing needs extra deps)
+        await Share.share({
+          message: content,
+          title: filename,
+        });
+      }
+
+      // Clean up the temp file after sharing
+      try { await RNFS.unlink(filePath); } catch { /* ignore */ }
+
+    } catch (err: any) {
+      if (err?.message?.includes('User did not share')) {
+        // User cancelled share sheet — not an error
+      } else {
+        Alert.alert('Export failed', err?.message || 'Unknown error');
+      }
+    } finally {
+      setExporting(false);
+    }
+  }, [filter]);
+
+  // ── Derived ─────────────────────────────────────────────────────────────
+
   const filteredEntries =
     filter === 'all' ? entries : entries.filter(e => e.level === filter);
-
-  // ── Filter tabs ─────────────────────────────────────────────────────────
 
   const filters: Array<{ key: LogLevel | 'all'; label: string }> = [
     { key: 'all', label: 'All' },
@@ -126,6 +191,10 @@ export function DebugOverlay(): React.JSX.Element {
     { key: 'warn', label: 'Wrn' },
     { key: 'log', label: 'Log' },
   ];
+
+  const sessionNum = debugLogger.getSession();
+
+  // ── Render ──────────────────────────────────────────────────────────────
 
   return (
     <View
@@ -142,8 +211,31 @@ export function DebugOverlay(): React.JSX.Element {
           <View style={styles.panelHeader}>
             <Text style={styles.panelTitle}>Debug Logs</Text>
             <Text style={styles.entryCount}>
-              {filteredEntries.length} entries
+              S{sessionNum} · {filteredEntries.length}
             </Text>
+
+            {/* Session marker button */}
+            <TouchableOpacity
+              style={styles.sessionBtn}
+              onPress={handleNewSession}
+              activeOpacity={0.7}
+            >
+              <Text style={styles.sessionBtnText}>+Session</Text>
+            </TouchableOpacity>
+
+            {/* Export button */}
+            <TouchableOpacity
+              style={styles.exportBtn}
+              onPress={() => setShowFormatPicker(prev => !prev)}
+              activeOpacity={0.7}
+              disabled={exporting}
+            >
+              <Text style={styles.exportBtnText}>
+                {exporting ? '…' : 'Export'}
+              </Text>
+            </TouchableOpacity>
+
+            {/* Clear button */}
             <TouchableOpacity
               style={styles.clearBtn}
               onPress={handleClear}
@@ -152,6 +244,29 @@ export function DebugOverlay(): React.JSX.Element {
               <Text style={styles.clearBtnText}>Clear</Text>
             </TouchableOpacity>
           </View>
+
+          {/* ── Format picker (appears when Export is tapped) ──────────── */}
+          {showFormatPicker && (
+            <View style={styles.formatPickerRow}>
+              <Text style={styles.formatLabel}>Format:</Text>
+              <TouchableOpacity
+                style={styles.formatOption}
+                onPress={() => handleExport('json')}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.formatOptionText}>JSON</Text>
+                <Text style={styles.formatOptionSub}>Research</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.formatOption}
+                onPress={() => handleExport('csv')}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.formatOptionText}>CSV</Text>
+                <Text style={styles.formatOptionSub}>Spreadsheet</Text>
+              </TouchableOpacity>
+            </View>
+          )}
 
           {/* Filter tabs */}
           <View style={styles.filterRow}>
@@ -187,35 +302,48 @@ export function DebugOverlay(): React.JSX.Element {
             {filteredEntries.length === 0 ? (
               <Text style={styles.emptyText}>No logs yet.</Text>
             ) : (
-              filteredEntries.map(entry => (
-                <View key={entry.id} style={styles.entryRow}>
-                  <Text style={styles.entryTimestamp}>
-                    {formatTime(entry.timestamp)}
-                  </Text>
-                  <Text
-                    style={[
-                      styles.entryBadge,
-                      { color: LEVEL_COLORS[entry.level] },
-                    ]}
-                  >
-                    {LEVEL_LABELS[entry.level]}
-                  </Text>
-                  <Text
-                    style={[
-                      styles.entryMessage,
-                      { color: LEVEL_COLORS[entry.level] },
-                    ]}
-                    numberOfLines={3}
-                  >
-                    {entry.message}
-                  </Text>
-                  {entry.detail && (
-                    <Text style={styles.entryDetail} numberOfLines={2}>
-                      {entry.detail}
+              filteredEntries.map(entry => {
+                // Session markers get a full-width highlight
+                if (entry.level === 'session') {
+                  return (
+                    <View key={entry.id} style={styles.sessionMarkerRow}>
+                      <Text style={styles.sessionMarkerText}>
+                        {entry.message}
+                      </Text>
+                    </View>
+                  );
+                }
+
+                return (
+                  <View key={entry.id} style={styles.entryRow}>
+                    <Text style={styles.entryTimestamp}>
+                      {formatTime(entry.timestamp)}
                     </Text>
-                  )}
-                </View>
-              ))
+                    <Text
+                      style={[
+                        styles.entryBadge,
+                        { color: LEVEL_COLORS[entry.level] },
+                      ]}
+                    >
+                      {LEVEL_LABELS[entry.level]}
+                    </Text>
+                    <Text
+                      style={[
+                        styles.entryMessage,
+                        { color: LEVEL_COLORS[entry.level] },
+                      ]}
+                      numberOfLines={3}
+                    >
+                      {entry.message}
+                    </Text>
+                    {entry.detail && (
+                      <Text style={styles.entryDetail} numberOfLines={2}>
+                        {entry.detail}
+                      </Text>
+                    )}
+                  </View>
+                );
+              })
             )}
           </ScrollView>
         </View>
@@ -228,7 +356,6 @@ export function DebugOverlay(): React.JSX.Element {
         activeOpacity={0.7}
       >
         <Text style={styles.bugBtnText}>🐛</Text>
-        {/* Red dot if there are errors */}
         {entries.some(e => e.level === 'error' || e.level === 'api-error') &&
           !expanded && <View style={styles.errorDot} />}
       </TouchableOpacity>
@@ -245,7 +372,6 @@ const styles = StyleSheet.create({
     ...StyleSheet.absoluteFillObject,
     zIndex: 9999,
     elevation: 9999,
-    // NOTE: pointerEvents is a View PROP, not a style — set on the <View> directly
   },
 
   // ── Bug button ──
@@ -301,35 +427,106 @@ const styles = StyleSheet.create({
   panelHeader: {
     flexDirection: 'row',
     alignItems: 'center',
-    paddingHorizontal: 14,
-    paddingVertical: 10,
+    paddingHorizontal: 10,
+    paddingVertical: 8,
     borderBottomWidth: 1,
     borderBottomColor: C.border,
   },
   panelTitle: {
     color: '#FFFFFF',
-    fontSize: 14,
+    fontSize: 13,
     fontWeight: '700',
     letterSpacing: 0.3,
-    flex: 1,
+    marginRight: 6,
   },
   entryCount: {
     color: C.timestamp,
-    fontSize: 11,
-    marginRight: 10,
+    fontSize: 10,
+    flex: 1,
   },
+
+  // ── Session button ──
+  sessionBtn: {
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 5,
+    backgroundColor: C.sessionBtnBg,
+    borderWidth: 1,
+    borderColor: C.sessionBtnBorder,
+    marginRight: 5,
+  },
+  sessionBtnText: {
+    color: '#4F6EF7',
+    fontSize: 9,
+    fontWeight: '700',
+  },
+
+  // ── Export button ──
+  exportBtn: {
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 5,
+    backgroundColor: C.exportBg,
+    borderWidth: 1,
+    borderColor: C.exportBorder,
+    marginRight: 5,
+  },
+  exportBtnText: {
+    color: C.exportBorder,
+    fontSize: 9,
+    fontWeight: '700',
+  },
+
+  // ── Clear button ──
   clearBtn: {
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    borderRadius: 6,
+    paddingHorizontal: 7,
+    paddingVertical: 3,
+    borderRadius: 5,
     backgroundColor: C.clearBg,
     borderWidth: 1,
     borderColor: C.clearBorder,
   },
   clearBtnText: {
     color: C.error,
-    fontSize: 11,
+    fontSize: 9,
+    fontWeight: '700',
+  },
+
+  // ── Format picker ──
+  formatPickerRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingHorizontal: 10,
+    paddingVertical: 6,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+    backgroundColor: 'rgba(52, 199, 89, 0.06)',
+  },
+  formatLabel: {
+    color: C.timestamp,
+    fontSize: 10,
     fontWeight: '600',
+    marginRight: 8,
+  },
+  formatOption: {
+    paddingHorizontal: 14,
+    paddingVertical: 5,
+    borderRadius: 6,
+    backgroundColor: 'rgba(255,255,255,0.06)',
+    borderWidth: 1,
+    borderColor: C.border,
+    marginRight: 8,
+    alignItems: 'center',
+  },
+  formatOptionText: {
+    color: '#FFFFFF',
+    fontSize: 11,
+    fontWeight: '700',
+  },
+  formatOptionSub: {
+    color: C.timestamp,
+    fontSize: 8,
+    marginTop: 1,
   },
 
   // ── Filter row ──
@@ -366,6 +563,24 @@ const styles = StyleSheet.create({
   scrollContent: {
     paddingHorizontal: 10,
     paddingVertical: 6,
+  },
+
+  // ── Session marker ──
+  sessionMarkerRow: {
+    paddingVertical: 6,
+    paddingHorizontal: 8,
+    marginVertical: 4,
+    borderRadius: 6,
+    backgroundColor: 'rgba(52, 199, 89, 0.1)',
+    borderLeftWidth: 3,
+    borderLeftColor: C.session,
+  },
+  sessionMarkerText: {
+    color: C.session,
+    fontSize: 10,
+    fontWeight: '800',
+    fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
+    letterSpacing: 0.5,
   },
 
   // ── Entry row ──
@@ -406,7 +621,7 @@ const styles = StyleSheet.create({
     fontFamily: Platform.OS === 'ios' ? 'Menlo' : 'monospace',
     lineHeight: 14,
     marginTop: 2,
-    paddingLeft: 108, // align under message
+    paddingLeft: 108,
   },
 
   // ── Empty state ──
