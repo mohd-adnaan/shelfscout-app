@@ -1,17 +1,15 @@
 {
   "images" : [
     {
-      "filename" : "srl-logo@1x.png",
+      "filename" : "srl-logo-rbg.png",
       "idiom" : "universal",
       "scale" : "1x"
     },
     {
-      "filename" : "srl-logo@2x.png",
       "idiom" : "universal",
       "scale" : "2x"
     },
     {
-      "filename" : "srl-logo@3x.png",
       "idiom" : "universal",
       "scale" : "3x"
     }
