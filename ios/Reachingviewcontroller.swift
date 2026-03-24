@@ -44,7 +44,7 @@ class ReachingViewController: UIViewController {
 
   let raycastDepthThreshold: Float = 0.18
   let lidarDepthThreshold:   Float = 0.12
-  let heuristicDepthThreshold: Float = 0.12 
+  let heuristicDepthThreshold: Float = 0.12
   let reachProximityThreshold: Float = 0.70
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -69,6 +69,11 @@ class ReachingViewController: UIViewController {
   let redetectInterval: TimeInterval = 8.0   // seconds between re-detections (Qwen takes ~10-20s)
   var isRedetecting = false
   var lastARFrame: ARFrame?                   // latest frame for capture
+
+  // Spatial Consistency Gate — prevent re-detection from jumping to wrong object
+  var initialBboxCenter: (cx: CGFloat, cy: CGFloat) = (0.5, 0.5)
+  var initialBboxSize: (w: CGFloat, h: CGFloat) = (0.05, 0.06)
+  var consecutiveRejects = 0
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - 3D World Anchor
@@ -212,6 +217,20 @@ class ReachingViewController: UIViewController {
     cachedSH = UIScreen.main.bounds.height
     NSLog("📐 [ReachingVC] Screen: %.0f×%.0f", cachedSW, cachedSH)
     normalizeBbox()
+
+    // Store the initial bbox center as the reference for spatial consistency gate.
+    // All subsequent re-detections are compared against this to prevent drift.
+    initialBboxCenter = (
+      cx: (bboxNormalized[0] + bboxNormalized[2]) / 2,
+      cy: (bboxNormalized[1] + bboxNormalized[3]) / 2
+    )
+    initialBboxSize = (
+      w: bboxNormalized[2] - bboxNormalized[0],
+      h: bboxNormalized[3] - bboxNormalized[1]
+    )
+    NSLog("📦 [ReachingVC] Initial center=(%.3f,%.3f) size=%.3f×%.3f — spatial gate reference locked",
+          initialBboxCenter.cx, initialBboxCenter.cy, initialBboxSize.w, initialBboxSize.h)
+
     setupARView()
     setupAppleUI()
     setupAudio()
@@ -398,6 +417,7 @@ class ReachingViewController: UIViewController {
   func cleanup() {
     running = false; beepTimer?.cancel(); beepTimer = nil
     redetectTimer?.invalidate(); redetectTimer = nil
+    lastARFrame = nil  // release to avoid ARFrame retention warning
     playerNode?.stop(); audioEngine?.stop(); audioEngine = nil
     hapticEngine?.stop(); hapticEngine = nil
     synth.stopSpeaking(at: .immediate)

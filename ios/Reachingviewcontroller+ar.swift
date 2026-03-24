@@ -332,6 +332,19 @@ extension ReachingViewController {
       return
     }
 
+    // ── Layer 1: Don't re-detect when object is behind camera ──────────
+    // When user turns away, Qwen sees different scenery and detects
+    // the wrong object with high confidence. Skip entirely.
+    if let pos = objectWorldPosition {
+      let cam = frame.camera
+      let camPos = simd_make_float3(cam.transform.columns.3)
+      let camFwd = -simd_normalize(simd_make_float3(cam.transform.columns.2))
+      if simd_dot(pos - camPos, camFwd) < 0 {
+        NSLog("🔄 [Redetect] ⏭ Skipping — object behind camera (user facing away)")
+        return
+      }
+    }
+
     isRedetecting = true
 
     // Capture current AR camera image as JPEG
@@ -387,8 +400,9 @@ extension ReachingViewController {
     }
     request.httpBody = bodyData
 
-    // Fire async
-    let capturedFrame = frame  // capture for re-anchor
+    // Fire async — NOTE: We don't capture the frame here to avoid ARFrame retention.
+    // updateBboxFromBackend will use lastARFrame (the MOST RECENT frame), which is
+    // better anyway since the response arrives 10-30s later when the user has moved.
     URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
       defer { self?.isRedetecting = false }
       guard let self = self, self.running, !self.hasCompleted else { return }
@@ -453,13 +467,13 @@ extension ReachingViewController {
       let conf = (json["confidence"] as? NSNumber)?.floatValue ?? 0
 
       NSLog("🔄 [Redetect] ✅ Got fresh bbox [%.0f,%.0f,%.0f,%.0f] conf=%.2f depth=%@ img=%.0f×%.0f",
-            bbox[0], bbox[1], bbox[2], bbox[3], conf, 
+            bbox[0], bbox[1], bbox[2], bbox[3], conf,
             newDepth.map{String(format:"%.2f",$0)} ?? "nil", imgW, imgH)
 
-      // Apply update on main thread
+      // Apply update on main thread (fromFrame: nil → uses lastARFrame)
       DispatchQueue.main.async { [weak self] in
         self?.updateBboxFromBackend(newBbox: bbox, newImgW: imgW, newImgH: imgH,
-                                    newDepth: newDepth, fromFrame: capturedFrame)
+                                    newDepth: newDepth)
       }
     }.resume()
   }
@@ -509,23 +523,59 @@ extension ReachingViewController {
       return
     }
 
-    // ── KEY: Use re-detected CENTER but keep the LARGER of old/new SIZE ──
-    // The re-detected image is resized (563×750) so pixel bboxes are smaller.
-    // Also the user is walking, so the object may appear at different scales.
-    // Keeping the larger size ensures the on-screen target stays usable.
+    // ── Layer 2: Spatial Consistency Gate ─────────────────────────────────
+    // Compare re-detected center against the INITIAL N8N bbox center.
+    // If the new detection is too far away, Qwen likely found a different
+    // similar-looking object (e.g. user turned and another bottle appeared).
+    // Reject and keep the existing anchor position.
+    let dCx = newCx - initialBboxCenter.cx
+    let dCy = newCy - initialBboxCenter.cy
+    let displacement = sqrt(dCx * dCx + dCy * dCy)
+
+    // NOTE: This threshold is in normalized screen-space [0..1].
+    // 0.25 ≈ quarter of the screen — generous enough for walking approach,
+    // tight enough to reject cross-screen jumps to wrong objects.
+    let maxDisplacement: CGFloat = 0.25
+
+    if displacement > maxDisplacement {
+      consecutiveRejects += 1
+      NSLog("🔄 [Redetect] ❌ REJECTED #%d — displacement=%.3f (max=%.3f) center=(%.3f,%.3f) vs initial=(%.3f,%.3f) [%d consecutive]",
+            bboxUpdateCount, displacement, maxDisplacement,
+            newCx, newCy, initialBboxCenter.cx, initialBboxCenter.cy,
+            consecutiveRejects)
+
+      // After 5 consecutive rejects, the object may have genuinely moved
+      // (e.g. someone moved the bottle). Update the reference to allow recovery.
+      if consecutiveRejects >= 5 {
+        initialBboxCenter = (cx: newCx, cy: newCy)
+        consecutiveRejects = 0
+        NSLog("🔄 [Redetect] 🔁 Reference center UPDATED after 5 rejects → (%.3f,%.3f)", newCx, newCy)
+        // Fall through to apply this update
+      } else {
+        return  // Keep existing anchor position
+      }
+    } else {
+      consecutiveRejects = 0
+    }
+
+    // ── Use re-detected CENTER but keep controlled SIZE ──────────────────
+    // Take the larger of old vs new, but cap at 3× the initial size to
+    // prevent runaway inflation from one bad detection.
     let oldW = bboxNormalized[2] - bboxNormalized[0]
     let oldH = bboxNormalized[3] - bboxNormalized[1]
-    let useW = max(oldW, newW, 0.03)   // minimum 3% of image
-    let useH = max(oldH, newH, 0.04)   // minimum 4% of image
+    let maxW = initialBboxSize.w * 3.0  // cap at 3× original
+    let maxH = initialBboxSize.h * 3.0
+    let useW = min(max(oldW, newW, 0.03), maxW)
+    let useH = min(max(oldH, newH, 0.04), maxH)
 
-    // Build new bbox: fresh center + preserved size
+    // Build new bbox: fresh center + controlled size
     let finalX1 = max(newCx - useW / 2, 0)
     let finalY1 = max(newCy - useH / 2, 0)
     let finalX2 = min(newCx + useW / 2, 1)
     let finalY2 = min(newCy + useH / 2, 1)
 
-    NSLog("🔄 [Redetect] Update #%d — center=(%.3f,%.3f) newSize=%.3f×%.3f → useSize=%.3f×%.3f",
-          bboxUpdateCount, newCx, newCy, newW, newH, useW, useH)
+    NSLog("🔄 [Redetect] ✅ ACCEPTED #%d — disp=%.3f center=(%.3f,%.3f) size=%.3f×%.3f → %.3f×%.3f",
+          bboxUpdateCount, displacement, newCx, newCy, newW, newH, useW, useH)
     NSLog("🔄 [Redetect] Old norm: [%.3f,%.3f,%.3f,%.3f] → New norm: [%.3f,%.3f,%.3f,%.3f]",
           bboxNormalized[0], bboxNormalized[1], bboxNormalized[2], bboxNormalized[3],
           finalX1, finalY1, finalX2, finalY2)
@@ -551,7 +601,7 @@ extension ReachingViewController {
     lastRefinementAppliedDepth = 0
     objectWorldPosition = nil
 
-    // Re-anchor immediately from the captured frame
+    // Re-anchor from the most recent AR frame (not the stale capture frame)
     if let frame = fromFrame ?? lastARFrame {
       placeWorldAnchor(frame: frame)
       NSLog("🔄 [Redetect] ✅ Anchor RE-PLACED from fresh frame + fresh center")

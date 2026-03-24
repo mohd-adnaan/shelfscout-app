@@ -478,6 +478,30 @@ function AppInner(): React.JSX.Element {
 
         if (result.loopDelay) updateLoopDelay(result.loopDelay);
 
+        // ── "Null" response detection ──────────────────────────────────────
+        // The n8n synthesizer returns the literal string "Null" when Redis
+        // fields are empty (e.g. guidance pipeline hasn't populated yet).
+        // Detect it, log it, and clear text so downstream TTS blocks skip.
+        const rawText = result.text;
+        const isNullResponse =
+          typeof rawText === 'string' &&
+          rawText.trim().toLowerCase() === 'null';
+
+        if (isNullResponse) {
+          result.text = ''; // clear so every `if (result.text)` guard skips TTS
+        }
+
+        // ── Structured debug log (EVERY cycle) ────────────────────────────
+        const cycleElapsed = Date.now() - cycleStart;
+        debugLogger.logAPI(
+          `🔄 Cycle #${cycleCount} | ${isNullResponse ? '⏭️ NULL' : '🔊 SPEAK'} | ${cycleElapsed}ms`,
+          `mode=${loopMode} nav=${result.navigation} reach=${result.reaching_flag} ios=${result.reaching_ios} text="${(rawText || '').substring(0, 80)}"`,
+        );
+
+        if (isNullResponse) {
+          console.log(`🔄 ⏭️ Cycle #${cycleCount} — "Null" response, skipping TTS, fast-polling…`);
+        }
+
         // ── iOS ARKit reaching check (respects user preference) ───────────
         if (Platform.OS === 'ios' && result.reaching_ios === true) {
           // Check pipeline FIRST — determines whether to kill the loop or continue it
@@ -595,10 +619,18 @@ function AppInner(): React.JSX.Element {
               ? PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN
               : TTS_COMPLETION_BUFFER_MS)
           );
+        } else if (isNullResponse) {
+          // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
+          // This gives ~2 polls/sec so we catch the real response quickly.
+          console.log(`🔄 ⏭️ Null fast-poll — waiting 500ms before next cycle`);
+          await new Promise(resolve => setTimeout(resolve, 500));
         }
 
         const cycleMs = Date.now() - cycleStart;
-        console.log(`🔄 ═══ CYCLE #${cycleCount} DONE (${(cycleMs / 1000).toFixed(1)}s) ═══`);
+        debugLogger.logAPI(
+          `🔄 Cycle #${cycleCount} DONE | ${isNullResponse ? 'NULL→SKIP' : 'SPOKE'} | ${(cycleMs / 1000).toFixed(1)}s`,
+        );
+        console.log(`🔄 ═══ CYCLE #${cycleCount} DONE (${(cycleMs / 1000).toFixed(1)}s) ${isNullResponse ? '[NULL-SKIP]' : ''} ═══`);
 
       } catch (error: any) {
         console.error('🔄 [ContinuousMode] Error:', error);
