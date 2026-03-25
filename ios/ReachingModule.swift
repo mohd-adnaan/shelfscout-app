@@ -38,6 +38,11 @@ class ReachingModule: NSObject {
     }
     let objectName = (params["object"] as? String) ?? "object"
 
+    // Parse reaching mode: handFree (default) or withHand
+    let modeStr = (params["mode"] as? String) ?? "handFree"
+    let mode: ReachingViewController.ReachingMode = modeStr == "withHand" ? .withHand : .handFree
+    NSLog("🎯 [ReachingModule] mode: %@", mode.rawValue)
+
     var backendDepth: Float? = nil
     if let d = params["depth"] {
       var rawValue: Float? = nil
@@ -60,7 +65,7 @@ class ReachingModule: NSObject {
     let launch = { [weak self] in
       self?.presentReachingVC(bbox: bbox, objectName: objectName,
                               depth: backendDepth, imageW: imgW, imageH: imgH,
-                              detectionUrl: detectionUrl,
+                              detectionUrl: detectionUrl, mode: mode,
                               resolver: resolver, rejecter: rejecter)
     }
     if status == .authorized { launch() }
@@ -138,6 +143,7 @@ class ReachingModule: NSObject {
     bbox: [CGFloat], objectName: String, depth: Float?,
     imageW: CGFloat, imageH: CGFloat,
     detectionUrl: String?,
+    mode: ReachingViewController.ReachingMode,
     resolver: @escaping RCTPromiseResolveBlock,
     rejecter: @escaping RCTPromiseRejectBlock
   ) {
@@ -151,7 +157,7 @@ class ReachingModule: NSObject {
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             self.presentReachingVC(bbox: bbox, objectName: objectName, depth: depth,
                                    imageW: imageW, imageH: imageH,
-                                   detectionUrl: detectionUrl,
+                                   detectionUrl: detectionUrl, mode: mode,
                                    resolver: resolver, rejecter: rejecter)
           }
         }
@@ -161,6 +167,7 @@ class ReachingModule: NSObject {
         bboxRaw: bbox, objectName: objectName, backendDepth: depth,
         imageWidth: imageW, imageHeight: imageH,
         detectionUrl: detectionUrl,
+        mode: mode,
         onDone: { result in
           ReachingModule.activeVC = nil
           resolver(result)

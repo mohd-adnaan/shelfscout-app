@@ -359,6 +359,7 @@ function AppInner(): React.JSX.Element {
           imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
           detectionUrl: DETECTION_URL,
+          mode: settings.reachingMode,
         });
 
         console.log('✅ [ARKit] Native result:', reachingResult);

@@ -57,15 +57,35 @@ extension ReachingViewController {
 
   func tickBeep() {
     guard running, proximityZone != .searching else { return }
+
+    // Hand-free parking sensor mode: continuous tone at very close range
+    if mode == .handFree && (proximityZone == .centered || proximityZone == .veryClose) {
+      tickParkingSensor()
+      return
+    }
+
     let now = ProcessInfo.processInfo.systemUptime
     let iv: TimeInterval = {
-      switch proximityZone {
-      case .searching: return 99
-      case .far:       return 0.7
-      case .medium:    return 0.4
-      case .close:     return 0.2
-      case .veryClose: return 0.08
-      case .centered:  return 0.04
+      if mode == .handFree {
+        // Hand-free beep intervals: distance-mapped (wider zones)
+        switch proximityZone {
+        case .searching: return 99
+        case .far:       return 0.8
+        case .medium:    return 0.4
+        case .close:     return 0.15
+        case .veryClose: return 0.06   // will be caught by parking sensor above
+        case .centered:  return 0.03   // will be caught by parking sensor above
+        }
+      } else {
+        // With-hand: existing behavior
+        switch proximityZone {
+        case .searching: return 99
+        case .far:       return 0.7
+        case .medium:    return 0.4
+        case .close:     return 0.2
+        case .veryClose: return 0.08
+        case .centered:  return 0.04
+        }
       }
     }()
     if now - lastBeep >= iv {
@@ -75,11 +95,54 @@ extension ReachingViewController {
         case .right, .topRight, .downRight: p.pan =  0.8
         default:                            p.pan =  0.0
         }
+
         p.scheduleBuffer(b, at: nil, options: .interrupts)
         if !p.isPlaying { p.play() }
       }
       lastBeep = now
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Parking Sensor Continuous Tone (Hand-Free Mode)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // When camera is within ~30cm: switch to a continuous tone that rises
+  // in frequency as distance drops. Universal parking sensor UX.
+  //   30cm → 800Hz (low hum)
+  //   15cm → 1000Hz (medium)
+  //   <5cm → 1200Hz (high — you're there)
+
+  func tickParkingSensor() {
+    guard let player = playerNode, let fmt = audioFmt else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    // Generate a short continuous segment (200ms) and keep re-scheduling.
+    // This gives us the ability to update frequency every 200ms based on live distance.
+    guard now - lastBeep >= 0.18 else { return }
+
+    let sr: Double = 44100
+    let dur: Double = 0.22  // slightly longer than interval to avoid gaps
+    let fc = AVAudioFrameCount(sr * dur)
+    guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: fc) else { return }
+    buf.frameLength = fc; let d = buf.floatChannelData![0]
+
+    // Map distance to frequency: 800Hz at 30cm → 1200Hz at 0cm
+    let dist = max(Double(liveDistanceToObject), 0.0)
+    let freq = min(1200, max(800, 800 + (0.30 - dist) * 1333))
+    // Volume ramps up as you get closer
+    let vol = min(0.7, max(0.3, 0.3 + (0.30 - dist) * 1.33))
+
+    for i in 0..<Int(fc) {
+      let t = Double(i) / sr
+      // Smooth envelope: 5ms attack, 5ms release
+      let env = min(t / 0.005, 1) * min((dur - t) / 0.005, 1)
+      d[i] = Float(sin(2 * .pi * freq * t) * vol * env)
+    }
+
+    player.pan = 0  // centered — object is ahead
+    player.scheduleBuffer(buf, at: nil, options: .interrupts)
+    if !player.isPlaying { player.play() }
+    lastBeep = now
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

@@ -24,6 +24,8 @@ export interface AppSettings {
   ttsRate: number;
   /** When true, shows the debug overlay bug button. Default false. */
   developerMode: boolean;
+  /** ARKit reaching mode: 'handFree' (default) or 'withHand' */
+  reachingMode: 'handFree' | 'withHand';
 }
 
 interface SettingsContextValue {
@@ -32,6 +34,7 @@ interface SettingsContextValue {
   updatePreferAlternativeReaching: (value: boolean) => Promise<void>;
   updateTtsRate: (rate: number) => Promise<void>;
   updateDeveloperMode: (value: boolean) => Promise<void>;
+  updateReachingMode: (mode: 'handFree' | 'withHand') => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
    * Returns 'arkit' | 'standard' | 'none'.
@@ -50,6 +53,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   preferAlternativeReaching: false,
   ttsRate: 0.5,
   developerMode: false,
+  reachingMode: 'handFree',
 };
 
 const STORAGE_KEY = '@cybersight_settings_v1';
@@ -137,6 +141,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateReachingMode = useCallback(
+    async (mode: 'handFree' | 'withHand') => {
+      const next = { ...settings, reachingMode: mode };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Reaching mode → ${mode === 'handFree' ? 'Hands-free' : 'With hand tracking'}`);
+    },
+    [settings, persist],
+  );
+
   // ── Pipeline resolver ─────────────────────────────────────────────────────
 
   const resolveReachingPipeline = useCallback(
@@ -168,6 +182,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updatePreferAlternativeReaching,
     updateTtsRate,
     updateDeveloperMode,
+    updateReachingMode,
     resolveReachingPipeline,
   };
 

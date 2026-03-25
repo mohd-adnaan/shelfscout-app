@@ -25,6 +25,8 @@ export interface ReachingConfig {
   imageWidth: number;
   /** Height of the image that was sent to Qwen */
   imageHeight: number;
+  /** Reaching mode: 'handFree' (default) or 'withHand' */
+  mode?: 'handFree' | 'withHand';
 }
 
 export type ReachingState = 'idle' | 'tracking' | 'locked' | 'reached' | 'lost';

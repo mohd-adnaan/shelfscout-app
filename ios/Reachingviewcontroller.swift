@@ -24,7 +24,7 @@ class ReachingViewController: UIViewController {
   enum Direction: String {
     case left = "left", topLeft = "top left", top = "up", topRight = "top right"
     case right = "right", downRight = "down right", down = "down", downLeft = "down left"
-    case centered = "Aligned", searching = "Show your hand"
+    case centered = "Aligned", searching = "Searching"
   }
 
   enum ProximityZone: String {
@@ -36,6 +36,12 @@ class ReachingViewController: UIViewController {
     case close      // depth method confirms hand is at object
     case far        // depth method confirms hand is NOT at object
     case noData     // no method could measure — inconclusive
+  }
+
+  /// Reaching mode: hand-free uses camera center as reference; withHand uses Vision hand tracking
+  enum ReachingMode: String {
+    case handFree = "handFree"
+    case withHand = "withHand"
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -58,6 +64,7 @@ class ReachingViewController: UIViewController {
   var imageHeight:  CGFloat          // var — updated by progressive re-detection
   let onDone: ([String: Any]) -> Void
   var bboxNormalized: [CGFloat] = [0, 0, 0, 0]
+  let mode: ReachingMode
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Progressive Re-detection
@@ -193,6 +200,7 @@ class ReachingViewController: UIViewController {
   init(bboxRaw: [CGFloat], objectName: String, backendDepth: Float?,
        imageWidth: CGFloat, imageHeight: CGFloat,
        detectionUrl: String? = nil,
+       mode: ReachingMode = .handFree,
        onDone: @escaping ([String: Any]) -> Void) {
     self.bboxRaw      = bboxRaw
     self.objectName   = objectName
@@ -200,9 +208,12 @@ class ReachingViewController: UIViewController {
     self.imageWidth   = imageWidth
     self.imageHeight  = imageHeight
     self.detectionUrl = detectionUrl
+    self.mode         = mode
     self.onDone       = onDone
     super.init(nibName: nil, bundle: nil)
-    handReq.maximumHandCount = 1
+    if mode == .withHand {
+      handReq.maximumHandCount = 1
+    }
   }
   required init?(coder: NSCoder) { fatalError() }
 
@@ -244,7 +255,11 @@ class ReachingViewController: UIViewController {
       guard let self = self, !self.hasCompleted else { return }
       self.startAR()
       self.running = true
-      self.say("Guiding to \(self.objectName). Show your hand. Tap anywhere when you have it.")
+      if self.mode == .handFree {
+        self.say("Guiding to \(self.objectName). Point phone toward it. Tap anywhere when you have it.")
+      } else {
+        self.say("Guiding to \(self.objectName). Show your hand. Tap anywhere when you have it.")
+      }
     }
   }
 
@@ -391,7 +406,8 @@ class ReachingViewController: UIViewController {
       self.cleanup()
       self.dismiss(animated: true) {
         self.onDone(["success": true, "object": self.objectName,
-                     "reason": "reached", "message": "\(self.objectName) reached!"])
+                     "reason": "reached", "mode": self.mode.rawValue,
+                     "message": "\(self.objectName) reached!"])
       }
     }
   }
@@ -409,6 +425,7 @@ class ReachingViewController: UIViewController {
       self.dismiss(animated: true) {
         self.onDone(["success": success, "object": self.objectName,
                      "reason": reason,
+                     "mode": self.mode.rawValue,
                      "message": msg])
       }
     }
@@ -475,14 +492,16 @@ class ReachingViewController: UIViewController {
     view.addSubview(bottomBar)
 
     directionLabel = UILabel()
-    directionLabel.text = "Show your hand…"
+    directionLabel.text = mode == .handFree ? "Point camera…" : "Show your hand…"
     directionLabel.font = .systemFont(ofSize: 24, weight: .bold)
     directionLabel.textColor = .white; directionLabel.textAlignment = .center
     directionLabel.translatesAutoresizingMaskIntoConstraints = false
     bottomBar.contentView.addSubview(directionLabel)
 
     depthHintLabel = UILabel()
-    depthHintLabel.text = "Move hand forward — tap anywhere when done"
+    depthHintLabel.text = mode == .handFree
+      ? "Move closer — tap anywhere when done"
+      : "Move hand forward — tap anywhere when done"
     depthHintLabel.font = .systemFont(ofSize: 15, weight: .medium)
     depthHintLabel.textColor = .systemYellow; depthHintLabel.textAlignment = .center
     depthHintLabel.isHidden = true
@@ -546,14 +565,18 @@ class ReachingViewController: UIViewController {
       cancelButton.heightAnchor.constraint(equalToConstant: 44),
     ])
 
-    view.accessibilityLabel = "Reaching guidance for \(objectName). Double tap anywhere to confirm."
+    view.accessibilityLabel = mode == .handFree
+      ? "Reaching guidance for \(objectName). Point camera toward object. Tap anywhere to confirm."
+      : "Reaching guidance for \(objectName). Double tap anywhere to confirm."
 
     // ── VoiceOver Configuration ──────────────────────────────────────────────
     // Make the objectNameLabel (which gets initial VoiceOver focus) actionable.
     // UILabel doesn't respond to VoiceOver double-tap by default — we need
     // userInteractionEnabled + a tap gesture so VoiceOver's synthetic tap fires.
     objectNameLabel.isAccessibilityElement = true
-    objectNameLabel.accessibilityLabel = "Guiding to \(objectName). Double tap anywhere to confirm."
+    objectNameLabel.accessibilityLabel = mode == .handFree
+      ? "Guiding to \(objectName). Point camera toward it. Double tap to confirm."
+      : "Guiding to \(objectName). Double tap anywhere to confirm."
     objectNameLabel.accessibilityTraits = .button
     objectNameLabel.isUserInteractionEnabled = true
     let nameTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))

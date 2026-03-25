@@ -210,7 +210,7 @@ interface SettingsScreenProps {
 }
 
 export default function SettingsScreen({ onClose }: SettingsScreenProps) {
-  const { settings, updatePreferAlternativeReaching, updateTtsRate, updateDeveloperMode } =
+  const { settings, updatePreferAlternativeReaching, updateTtsRate, updateDeveloperMode, updateReachingMode } =
     useSettings();
 
   const [localRate, setLocalRate] = useState(settings.ttsRate);
@@ -399,6 +399,74 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             </View>
           </View>
         </Section>
+
+        {/* ══════════════════════════════════════════
+            SECTION 1.5 — Reaching Mode (Hand-free vs With Hand)
+        ══════════════════════════════════════════ */}
+        {Platform.OS === 'ios' && !settings.preferAlternativeReaching && (
+          <Section title="Reaching Mode">
+            <Text style={styles.settingDescription}>
+              Choose how object guidance works.{' '}
+              <Text style={styles.emphasisText}>Hands-free</Text> guides you
+              using the camera direction — ideal when hands are occupied.{' '}
+              <Text style={styles.emphasisText}>With hand</Text> tracks your
+              hand to guide it toward the object.
+            </Text>
+
+            {/* Mode comparison */}
+            <View style={styles.comparisonRow}>
+              <TouchableOpacity
+                style={[
+                  styles.pipelineOption,
+                  settings.reachingMode === 'handFree' && styles.pipelineOptionActive,
+                ]}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel={`Hands-free mode${settings.reachingMode === 'handFree' ? ', currently selected' : ''}`}
+                accessibilityHint="Double tap to select hands-free reaching"
+                onPress={async () => {
+                  await updateReachingMode('handFree');
+                  AccessibilityInfo.announceForAccessibility('Hands-free reaching mode enabled. Camera guides you to the object.');
+                }}
+              >
+                <Text style={styles.pipelineOptionIcon}>📱</Text>
+                <Text style={styles.pipelineOptionName}>Hands-free</Text>
+                <Text style={styles.pipelineOptionDesc}>
+                  Camera direction{'\n'}guides you
+                </Text>
+                {settings.reachingMode === 'handFree' && (
+                  <View style={styles.activeDot} />
+                )}
+              </TouchableOpacity>
+
+              <View style={styles.pipelineDivider} />
+
+              <TouchableOpacity
+                style={[
+                  styles.pipelineOption,
+                  settings.reachingMode === 'withHand' && styles.pipelineOptionActiveAlt,
+                ]}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel={`With hand mode${settings.reachingMode === 'withHand' ? ', currently selected' : ''}`}
+                accessibilityHint="Double tap to select hand tracking reaching"
+                onPress={async () => {
+                  await updateReachingMode('withHand');
+                  AccessibilityInfo.announceForAccessibility('Hand tracking reaching mode enabled. Show your hand to guide it to the object.');
+                }}
+              >
+                <Text style={styles.pipelineOptionIcon}>✋</Text>
+                <Text style={styles.pipelineOptionName}>With hand</Text>
+                <Text style={styles.pipelineOptionDesc}>
+                  Hand tracking{'\n'}guides your reach
+                </Text>
+                {settings.reachingMode === 'withHand' && (
+                  <View style={[styles.activeDot, { backgroundColor: C.warning }]} />
+                )}
+              </TouchableOpacity>
+            </View>
+          </Section>
+        )}
 
         {/* ══════════════════════════════════════════
             SECTION 2 — Voice Speed
