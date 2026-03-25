@@ -216,6 +216,12 @@ extension ReachingViewController {
       NSLog("🎯 [Refine] ✅ CONVERGED at %.2fm (Δ=%.1fcm from last) — stopping",
             median, abs(median - lastRefinementAppliedDepth) * 100)
       anchorRefinementFrames = anchorRefinementLimit
+      // Hand-free: lock anchor permanently after first convergence.
+      // Re-detection can still run but cannot move the anchor.
+      if mode == .handFree && !anchorLockedForHandFree {
+        anchorLockedForHandFree = true
+        NSLog("🔒 [Refine] Hand-free anchor LOCKED at %.2fm — re-detection will not move it", median)
+      }
       return
     }
 
@@ -489,6 +495,15 @@ extension ReachingViewController {
   func updateBboxFromBackend(newBbox: [CGFloat], newImgW: CGFloat, newImgH: CGFloat,
                              newDepth: Float?, fromFrame: ARFrame? = nil) {
     bboxUpdateCount += 1
+
+    // Hand-free: anchor is locked after first convergence. Log the detection
+    // for debugging but do NOT move the anchor — the user is walking and
+    // each new frame's bbox is at a completely different screen position.
+    if mode == .handFree && anchorLockedForHandFree {
+      NSLog("🔒 [Redetect] #%d SKIPPED — anchor locked in hand-free mode (bbox=[%.0f,%.0f,%.0f,%.0f])",
+            bboxUpdateCount, newBbox[0], newBbox[1], newBbox[2], newBbox[3])
+      return
+    }
 
     // ── Normalize the fresh bbox ──────────────────────────────────────────
     let x1 = min(newBbox[0], newBbox[2])

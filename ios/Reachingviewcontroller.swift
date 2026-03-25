@@ -95,6 +95,9 @@ class ReachingViewController: UIViewController {
   var anchorDepth: Float = 0.5
   var liveDistanceToObject: Float = 0.5
   var handIsCloseEnoughInDepth = false
+  /// Hand-free: lock anchor after first ARKit refinement converges.
+  /// Re-detection still runs (for logging) but CANNOT move the anchor.
+  var anchorLockedForHandFree = false
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - ARKit
@@ -135,9 +138,19 @@ class ReachingViewController: UIViewController {
   let synth = AVSpeechSynthesizer()
   var lastSpokenDirection: Direction = .searching
   var lastSpeechTime: TimeInterval = 0
-  let speechCooldown: TimeInterval = 1.2
+  var speechCooldown: TimeInterval = 1.2
   var directionStableFrames = 0
-  let directionStableThreshold = 4
+  var directionStableThreshold = 4
+  /// TTS rate passed from React Native (matches user's app-wide setting)
+  var ttsRate: Float = 0.5
+  /// Cached premium voice (Zoe if available, else best English US)
+  lazy var premiumVoice: AVSpeechSynthesisVoice? = {
+    // Try premium Zoe first (matches the rest of the app)
+    if let zoe = AVSpeechSynthesisVoice(identifier: "com.apple.voice.premium.en-US.Zoe") { return zoe }
+    // Fallback: enhanced Samantha
+    if let sam = AVSpeechSynthesisVoice(identifier: "com.apple.voice.enhanced.en-US.Samantha") { return sam }
+    return AVSpeechSynthesisVoice(language: "en-US")
+  }()
 
   var hapticEngine: CHHapticEngine?
 
@@ -201,6 +214,7 @@ class ReachingViewController: UIViewController {
        imageWidth: CGFloat, imageHeight: CGFloat,
        detectionUrl: String? = nil,
        mode: ReachingMode = .handFree,
+       ttsRate: Float = 0.5,
        onDone: @escaping ([String: Any]) -> Void) {
     self.bboxRaw      = bboxRaw
     self.objectName   = objectName
@@ -209,10 +223,15 @@ class ReachingViewController: UIViewController {
     self.imageHeight  = imageHeight
     self.detectionUrl = detectionUrl
     self.mode         = mode
+    self.ttsRate      = ttsRate
     self.onDone       = onDone
     super.init(nibName: nil, bundle: nil)
     if mode == .withHand {
       handReq.maximumHandCount = 1
+    } else {
+      // Hand-free: wider stability thresholds — user is walking, directions flicker
+      speechCooldown = 2.0
+      directionStableThreshold = 8
     }
   }
   required init?(coder: NSCoder) { fatalError() }

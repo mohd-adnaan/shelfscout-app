@@ -1,3 +1,4 @@
+//hehe
 //
 //  Reachingviewcontroller+processing.swift
 //  shelfscout
@@ -29,34 +30,81 @@ extension ReachingViewController {
       tryRefineAnchorDepth(frame: frame)
     }
 
-    reprojectBbox(frame: frame)
-
     // Route to mode-specific processing
     if mode == .handFree {
+      // Hand-free: direction computed in 3D world space, reprojectBbox called
+      // inside for visual overlay only (not for direction computation)
       processARFrameHandFree(frame)
     } else {
+      reprojectBbox(frame: frame)
       processARFrameWithHand(frame)
     }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MARK: - Hand-Free Processing (camera center as reference)
+  // MARK: - Hand-Free Processing (3D world-space directions)
   // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Unlike with-hand mode, we do NOT compare screen center vs projected bbox.
+  // That approach is unstable because projected bbox depends on anchor corners
+  // which jump on every re-detection.
+  //
+  // Instead: compute direction from CAMERA to ANCHOR CENTER in 3D world space.
+  // dot(objectDir, cameraRight) → left/right
+  // dot(objectDir, cameraUp)    → up/down
+  // This is stable because it only depends on the anchor center (not corners)
+  // and the camera's own tracked orientation (which ARKit does at cm accuracy).
 
   func processARFrameHandFree(_ frame: ARFrame) {
-    guard projectedBboxW > 0 else { return }
+    guard let anchorPos = objectWorldPosition else { return }
 
-    let bboxCx    = projectedBboxCenter.x
-    let bboxCy    = projectedBboxCenter.y
-    let bboxHalfW = projectedBboxW / 2
-    let bboxHalfH = projectedBboxH / 2
+    let camera = frame.camera
+    let camPos = simd_make_float3(camera.transform.columns.3)
+    let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
+    let camRight = simd_normalize(simd_make_float3(camera.transform.columns.0))
+    let camUp = simd_normalize(simd_make_float3(camera.transform.columns.1))
 
-    // Reference point = screen center (where camera points)
-    let refX = cachedSW / 2
-    let refY = cachedSH / 2
+    let toObj = anchorPos - camPos
+    let dist = simd_length(toObj)
+    liveDistanceToObject = dist
 
-    // ── Proximity zone (camera distance only — no hand) ──────────────────
-    let dist = liveDistanceToObject
+    // Check if object is behind camera
+    if simd_dot(toObj, camFwd) < 0 {
+      let now = ProcessInfo.processInfo.systemUptime
+      if now - lastSpeechTime > 3.0 {
+        say("Object is behind you. Turn around.")
+        lastSpeechTime = now
+      }
+      DispatchQueue.main.async { [weak self] in
+        self?.directionLabel.text = "Turn around"
+        self?.bboxLayer.isHidden = true; self?.innerBboxLayer.isHidden = true
+      }
+      return
+    }
+
+    let toObjNorm = simd_normalize(toObj)
+
+    // Project onto camera axes
+    let rightDot = simd_dot(toObjNorm, camRight)   // + = right, - = left
+    let upDot    = simd_dot(toObjNorm, camUp)       // + = up, - = down
+
+    // ── Direction (simple 4-direction + aligned) ─────────────────────────
+    // Dead zone: ~15° off center (dot < 0.25 ≈ 14.5°)
+    let horizThreshold: Float = 0.20
+    let vertThreshold: Float = 0.15
+
+    let direction: Direction
+    if abs(rightDot) < horizThreshold && abs(upDot) < vertThreshold {
+      direction = .centered
+    } else if abs(rightDot) > abs(upDot) {
+      // Horizontal correction is primary
+      direction = rightDot > 0 ? .right : .left
+    } else {
+      // Vertical correction is primary
+      direction = upDot > 0 ? .top : .down
+    }
+
+    // ── Proximity zone (camera distance only) ────────────────────────────
     let newProx: ProximityZone
     if dist < 0.15       { newProx = .centered }
     else if dist < 0.30  { newProx = .veryClose }
@@ -65,37 +113,31 @@ extension ReachingViewController {
     else                  { newProx = .far }
     proximityZone = newProx
 
-    // ── Direction (camera center vs projected bbox center) ───────────────
-    let direction = computeDirection(handX: refX, handY: refY,
-                                     bboxCx: bboxCx, bboxCy: bboxCy,
-                                     bboxHalfW: bboxHalfW, bboxHalfH: bboxHalfH)
     speakDirectionHandFree(direction)
+
+    // ── Reproject bbox for visual overlay (but NOT used for direction) ───
+    reprojectBbox(frame: frame)
 
     // ── UI update ────────────────────────────────────────────────────────
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       self.updateDirectionUI(direction)
 
-      // Show proximity hints based on camera distance
-      if direction == .centered && dist < 0.50 {
+      let cm = Int(dist * 100)
+      if direction == .centered && dist < 0.30 {
         self.depthHintLabel.isHidden = false
-        if dist < 0.15 {
-          self.depthHintLabel.text = "Within reach — tap to confirm"
-          self.distanceLabel.text = "Within reach"
-        } else {
-          let remaining = max(0, Int(dist * 100) - 15)
-          self.depthHintLabel.text = "Move \(remaining)cm closer"
-          self.distanceLabel.text = "\(remaining)cm to go"
-        }
+        self.depthHintLabel.text = "Within reach — tap to confirm"
+        self.distanceLabel.text = "Within reach"
       } else if direction == .centered {
         self.depthHintLabel.isHidden = false
-        let remaining = Int(dist * 100)
-        self.depthHintLabel.text = "Aligned — \(remaining)cm ahead"
+        self.depthHintLabel.text = "\(cm)cm ahead"
+        self.distanceLabel.text = "\(cm) cm"
       } else {
         self.depthHintLabel.isHidden = true
+        self.distanceLabel.text = "\(cm) cm"
       }
 
-      self.depthMethodLabel.text = "cam→obj \(Int(dist*100))cm"
+      self.depthMethodLabel.text = "cam→obj \(cm)cm"
     }
   }
 
@@ -308,58 +350,47 @@ extension ReachingViewController {
   // MARK: - Hand-Free Speech Feedback
   // ═══════════════════════════════════════════════════════════════════════════
   //
-  // In hand-free mode, speech semantics differ:
-  // - "left"/"right" means "turn the phone left/right"
-  // - "Aligned" means "camera is pointing at the object"
-  // - Distance announcements use camera-to-object distance
-  // - No "show your hand" prompts ever
+  // Simple, calm, infrequent speech. Only 4 directions + aligned.
+  // Higher stability threshold (8 frames) and longer cooldown (2.0s)
+  // prevent the rapid-fire direction spam that makes this unusable.
 
   func speakDirectionHandFree(_ direction: Direction) {
     guard direction != .searching else { return }
     let now = ProcessInfo.processInfo.systemUptime
-    if direction == currentDirection { directionStableFrames += 1 } else { directionStableFrames = 1 }
+    if direction == currentDirection { directionStableFrames += 1 } else { directionStableFrames = 0 }
 
     let dist = liveDistanceToObject
+    let cm = Int(dist * 100)
 
-    // Case 1: Aligned — announce distance-based guidance
+    // Case 1: Aligned (camera pointing at object)
     if direction == .centered {
-      if dist < 0.15 {
-        // Within reach — strong confirmation
-        if direction != lastSpokenDirection {
-          say("Right there. Reach forward and tap when done.")
-          lastSpokenDirection = direction; lastSpeechTime = now
-        } else if now - lastSpeechTime > 4.0 {
-          say("Object right ahead. Tap when you have it.")
-          lastSpeechTime = now
+      if direction != lastSpokenDirection {
+        // First time aligning — announce with distance
+        if dist < 0.30 {
+          say("Right here. Tap when you have it.")
+        } else {
+          say("Straight ahead. \(cm) centimeters.")
         }
-      } else if dist < 0.50 {
-        // Very close — encourage final approach
-        if direction != lastSpokenDirection {
-          let cm = Int(dist * 100)
-          say("Aligned. \(cm) centimeters ahead.")
-          lastSpokenDirection = direction; lastSpeechTime = now
-        } else if now - lastSpeechTime > 3.0 {
-          let cm = Int(dist * 100)
-          say("\(cm) centimeters. Keep moving forward.")
-          lastSpeechTime = now
+        lastSpokenDirection = direction; lastSpeechTime = now
+      } else if now - lastSpeechTime > 4.0 {
+        // Periodic distance update while aligned
+        if dist < 0.30 {
+          say("Within reach. Tap to confirm.")
+        } else {
+          say("\(cm) centimeters ahead.")
         }
-      } else {
-        // Aligned but far — announce distance
-        if direction != lastSpokenDirection || now - lastSpeechTime > 3.5 {
-          let cm = Int(dist * 100)
-          say("Aligned. \(cm) centimeters ahead. Walk forward.")
-          lastSpokenDirection = direction; lastSpeechTime = now
-        }
+        lastSpeechTime = now
       }
       return
     }
 
-    // Case 2: Not aligned — speak direction
+    // Case 2: Not aligned — speak simple direction
+    // Only speak after direction is stable for N frames AND cooldown elapsed
     if direction == lastSpokenDirection { return }
     if directionStableFrames >= directionStableThreshold && (now - lastSpeechTime) >= speechCooldown {
       say(direction.rawValue)
       lastSpokenDirection = direction; lastSpeechTime = now
-      if direction != .centered && direction != .searching { triggerHaptic(0.4) }
+      triggerHaptic(0.4)
     }
   }
 }

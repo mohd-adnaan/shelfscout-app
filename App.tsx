@@ -360,6 +360,7 @@ function AppInner(): React.JSX.Element {
           imageHeight: lastImageDimensions.current.height,
           detectionUrl: DETECTION_URL,
           mode: settings.reachingMode,
+          ttsRate: settings.ttsRate,
         });
 
         console.log('✅ [ARKit] Native result:', reachingResult);

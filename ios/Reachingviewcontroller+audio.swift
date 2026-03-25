@@ -185,8 +185,12 @@ extension ReachingViewController {
   func say(_ text: String) {
     synth.stopSpeaking(at: .immediate)
     let u = AVSpeechUtterance(string: text)
-    u.rate = AVSpeechUtteranceDefaultSpeechRate * 1.1
-    u.voice = AVSpeechSynthesisVoice(language: "en-US")
+    // Use the user's app-wide TTS rate (matches Speaches/Zoe experience)
+    // AVSpeech rate range: 0.0-1.0, default ~0.5. User's ttsRate is 0.1-1.0.
+    u.rate = ttsRate * AVSpeechUtteranceDefaultSpeechRate
+    u.voice = premiumVoice
+    u.pitchMultiplier = 1.0
+    u.preUtteranceDelay = 0.0
     synth.speak(u); NSLog("🗣 [ReachingVC] %@", text)
   }
 

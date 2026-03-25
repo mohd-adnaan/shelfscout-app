@@ -43,6 +43,9 @@ class ReachingModule: NSObject {
     let mode: ReachingViewController.ReachingMode = modeStr == "withHand" ? .withHand : .handFree
     NSLog("🎯 [ReachingModule] mode: %@", mode.rawValue)
 
+    // Parse TTS rate from user's app settings (0.1-1.0, default 0.5)
+    let ttsRate: Float = (params["ttsRate"] as? NSNumber)?.floatValue ?? 0.5
+
     var backendDepth: Float? = nil
     if let d = params["depth"] {
       var rawValue: Float? = nil
@@ -66,6 +69,7 @@ class ReachingModule: NSObject {
       self?.presentReachingVC(bbox: bbox, objectName: objectName,
                               depth: backendDepth, imageW: imgW, imageH: imgH,
                               detectionUrl: detectionUrl, mode: mode,
+                              ttsRate: ttsRate,
                               resolver: resolver, rejecter: rejecter)
     }
     if status == .authorized { launch() }
@@ -144,6 +148,7 @@ class ReachingModule: NSObject {
     imageW: CGFloat, imageH: CGFloat,
     detectionUrl: String?,
     mode: ReachingViewController.ReachingMode,
+    ttsRate: Float,
     resolver: @escaping RCTPromiseResolveBlock,
     rejecter: @escaping RCTPromiseRejectBlock
   ) {
@@ -158,6 +163,7 @@ class ReachingModule: NSObject {
             self.presentReachingVC(bbox: bbox, objectName: objectName, depth: depth,
                                    imageW: imageW, imageH: imageH,
                                    detectionUrl: detectionUrl, mode: mode,
+                                   ttsRate: ttsRate,
                                    resolver: resolver, rejecter: rejecter)
           }
         }
@@ -168,6 +174,7 @@ class ReachingModule: NSObject {
         imageWidth: imageW, imageHeight: imageH,
         detectionUrl: detectionUrl,
         mode: mode,
+        ttsRate: ttsRate,
         onDone: { result in
           ReachingModule.activeVC = nil
           resolver(result)
