@@ -1,3 +1,4 @@
+
 //
 //  Reachingviewcontroller.swift
 //  shelfscout
@@ -193,6 +194,33 @@ class ReachingViewController: UIViewController {
   var hasCompleted = false
   var hasDismissed = false
 
+  // ── Hand-free state ────────────────────────────────────────────────────
+  /// Initial distance when anchor locks — used to compute step progress
+  var initialLockedDistance: Float = 0
+  /// Last announced step count — used to confirm "going the right way"
+  var lastAnnouncedSteps: Int = -1
+  /// How many times we've confirmed direction progress (cap at 2)
+  var progressConfirmations: Int = 0
+  /// Whether the object is currently off-screen (behind or far off-axis)
+  /// Drives beep behavior: slow + panned when true
+  var objectOffScreen: Bool = false
+  /// Last known horizontal direction of object (for beep panning when off-screen)
+  var lastKnownHorizontalSign: Float = 0  // +1 = right, -1 = left
+  /// Continuous right-dot value for grab guidance ("slightly left/right")
+  var lastRightDot: Float = 0
+  /// Whether camera is currently aligned with object (for state-change sounds)
+  var isCenteredState: Bool = false
+  /// Human-readable label of last known direction ("to your right", "to your left")
+  /// Used for "Out of view, was to your right" memory
+  var lastKnownDirectionLabel: String = ""
+  /// Distance unit: "steps" or "cm"
+  var distanceUnit: String = "steps"
+
+  // ── Nicolas-style state-change audio players ───────────────────────────
+  var centeredPlayer: AVAudioPlayer?
+  var uncenteredPlayer: AVAudioPlayer?
+  var targetLostPlayer: AVAudioPlayer?
+
   let successThreshold = 35
   let noHandLimit = 50
   let noHandRepeatCycle = 120
@@ -215,6 +243,7 @@ class ReachingViewController: UIViewController {
        detectionUrl: String? = nil,
        mode: ReachingMode = .handFree,
        ttsRate: Float = 0.5,
+       distanceUnit: String = "steps",
        onDone: @escaping ([String: Any]) -> Void) {
     self.bboxRaw      = bboxRaw
     self.objectName   = objectName
@@ -224,6 +253,7 @@ class ReachingViewController: UIViewController {
     self.detectionUrl = detectionUrl
     self.mode         = mode
     self.ttsRate      = ttsRate
+    self.distanceUnit = distanceUnit
     self.onDone       = onDone
     super.init(nibName: nil, bundle: nil)
     if mode == .withHand {

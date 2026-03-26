@@ -9,12 +9,16 @@
 /* Begin PBXBuildFile section */
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		4D9BFE671FF22FC33CC01744 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */; };
-		563C6282E961F7DB5F929587 /* libPods-shelfscout.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 54C8FEE83B0652D6209C0A4C /* libPods-shelfscout.a */; };
 		5F359D602F48B656000E7BB8 /* siri-begin-improved.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5F2F48B656000E7BB8 /* siri-begin-improved.caf */; };
 		5F359D612F48B656000E7BB8 /* jbl_latency_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */; };
 		5F359D622F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5D2F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 */; };
 		5F359D632F48B656000E7BB8 /* jbl_begin_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5B2F48B656000E7BB8 /* jbl_begin_sae.caf */; };
 		5F359D642F48B656000E7BB8 /* jbl_success_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5E2F48B656000E7BB8 /* jbl_success_sae.caf */; };
+		5F385F1C2F74C593007323E0 /* bip.wav in Resources */ = {isa = PBXBuildFile; fileRef = 5F385F172F74C592007323E0 /* bip.wav */; };
+		5F385F1D2F74C593007323E0 /* targetLost.wav in Resources */ = {isa = PBXBuildFile; fileRef = 5F385F192F74C592007323E0 /* targetLost.wav */; };
+		5F385F1E2F74C593007323E0 /* targetLost_sound.wav in Resources */ = {isa = PBXBuildFile; fileRef = 5F385F1A2F74C592007323E0 /* targetLost_sound.wav */; };
+		5F385F1F2F74C593007323E0 /* centered_sound.wav in Resources */ = {isa = PBXBuildFile; fileRef = 5F385F182F74C592007323E0 /* centered_sound.wav */; };
+		5F385F202F74C593007323E0 /* uncentered_sound.wav in Resources */ = {isa = PBXBuildFile; fileRef = 5F385F1B2F74C592007323E0 /* uncentered_sound.wav */; };
 		5F3C03852F3A945F001B0A13 /* Imageorientationfixer.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F3C03842F3A945B001B0A13 /* Imageorientationfixer.swift */; };
 		5F3C038A2F3A9518001B0A13 /* ImageOrientationFixer.m in Sources */ = {isa = PBXBuildFile; fileRef = 5F3C03892F3A9518001B0A13 /* ImageOrientationFixer.m */; };
 		5F5055AA2F341971000B8156 /* srlLogo.mp4 in Resources */ = {isa = PBXBuildFile; fileRef = 5F5055A92F341971000B8156 /* srlLogo.mp4 */; };
@@ -27,19 +31,26 @@
 		5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263892F395B19006AEE6F /* ReachingModule.swift */; };
 		5FC2638C2F395B19006AEE6F /* ReachingModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263882F395B19006AEE6F /* ReachingModule.m */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
+		836858127A3035D3CA3DBED3 /* libPods-shelfscout.a in Frameworks */ = {isa = PBXBuildFile; fileRef = 2440B4C2310891181D51B59A /* libPods-shelfscout.a */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		0457F99365215F4796057E62 /* Pods-shelfscout.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.release.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.release.xcconfig"; sourceTree = "<group>"; };
 		13B07F961A680F5B00A75B9A /* shelfscout.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = shelfscout.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = shelfscout/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = shelfscout/Info.plist; sourceTree = "<group>"; };
 		13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = PrivacyInfo.xcprivacy; path = shelfscout/PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
-		54C8FEE83B0652D6209C0A4C /* libPods-shelfscout.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-shelfscout.a"; sourceTree = BUILT_PRODUCTS_DIR; };
+		2440B4C2310891181D51B59A /* libPods-shelfscout.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-shelfscout.a"; sourceTree = BUILT_PRODUCTS_DIR; };
 		5F359D5B2F48B656000E7BB8 /* jbl_begin_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_begin_sae.caf; sourceTree = "<group>"; };
 		5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_latency_sae.caf; sourceTree = "<group>"; };
 		5F359D5D2F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = jbl_stopped_ios_sae.mp3; sourceTree = "<group>"; };
 		5F359D5E2F48B656000E7BB8 /* jbl_success_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_success_sae.caf; sourceTree = "<group>"; };
 		5F359D5F2F48B656000E7BB8 /* siri-begin-improved.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = "siri-begin-improved.caf"; sourceTree = "<group>"; };
+		5F385F172F74C592007323E0 /* bip.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = bip.wav; sourceTree = "<group>"; };
+		5F385F182F74C592007323E0 /* centered_sound.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = centered_sound.wav; sourceTree = "<group>"; };
+		5F385F192F74C592007323E0 /* targetLost.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = targetLost.wav; sourceTree = "<group>"; };
+		5F385F1A2F74C592007323E0 /* targetLost_sound.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = targetLost_sound.wav; sourceTree = "<group>"; };
+		5F385F1B2F74C592007323E0 /* uncentered_sound.wav */ = {isa = PBXFileReference; lastKnownFileType = audio.wav; path = uncentered_sound.wav; sourceTree = "<group>"; };
 		5F3C03842F3A945B001B0A13 /* Imageorientationfixer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Imageorientationfixer.swift; sourceTree = "<group>"; };
 		5F3C03892F3A9518001B0A13 /* ImageOrientationFixer.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ImageOrientationFixer.m; sourceTree = "<group>"; };
 		5F5055A92F341971000B8156 /* srlLogo.mp4 */ = {isa = PBXFileReference; lastKnownFileType = file; path = srlLogo.mp4; sourceTree = "<group>"; };
@@ -53,9 +64,8 @@
 		5FC263892F395B19006AEE6F /* ReachingModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReachingModule.swift; sourceTree = "<group>"; };
 		5FC2638A2F395B19006AEE6F /* shelfscout-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "shelfscout-Bridging-Header.h"; sourceTree = "<group>"; };
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = shelfscout/AppDelegate.swift; sourceTree = "<group>"; };
-		BE65CC6A8661C2958BFFC697 /* Pods-shelfscout.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.release.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.release.xcconfig"; sourceTree = "<group>"; };
+		A14DB8605A5658FC07A438C6 /* Pods-shelfscout.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.debug.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.debug.xcconfig"; sourceTree = "<group>"; };
 		ED297162215061F000B7C4FE /* JavaScriptCore.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = JavaScriptCore.framework; path = System/Library/Frameworks/JavaScriptCore.framework; sourceTree = SDKROOT; };
-		F8B82B66D353E36CC777A573 /* Pods-shelfscout.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.debug.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.debug.xcconfig"; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -63,7 +73,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
-				563C6282E961F7DB5F929587 /* libPods-shelfscout.a in Frameworks */,
+				836858127A3035D3CA3DBED3 /* libPods-shelfscout.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -94,6 +104,11 @@
 				13B07FB61A68108700A75B9A /* Info.plist */,
 				13B07FB81A68108700A75B9A /* PrivacyInfo.xcprivacy */,
 				5F5055A92F341971000B8156 /* srlLogo.mp4 */,
+				5F385F172F74C592007323E0 /* bip.wav */,
+				5F385F182F74C592007323E0 /* centered_sound.wav */,
+				5F385F192F74C592007323E0 /* targetLost.wav */,
+				5F385F1A2F74C592007323E0 /* targetLost_sound.wav */,
+				5F385F1B2F74C592007323E0 /* uncentered_sound.wav */,
 			);
 			name = shelfscout;
 			sourceTree = "<group>";
@@ -102,7 +117,7 @@
 			isa = PBXGroup;
 			children = (
 				ED297162215061F000B7C4FE /* JavaScriptCore.framework */,
-				54C8FEE83B0652D6209C0A4C /* libPods-shelfscout.a */,
+				2440B4C2310891181D51B59A /* libPods-shelfscout.a */,
 			);
 			name = Frameworks;
 			sourceTree = "<group>";
@@ -139,8 +154,8 @@
 		BBD78D7AC51CEA395F1C20DB /* Pods */ = {
 			isa = PBXGroup;
 			children = (
-				F8B82B66D353E36CC777A573 /* Pods-shelfscout.debug.xcconfig */,
-				BE65CC6A8661C2958BFFC697 /* Pods-shelfscout.release.xcconfig */,
+				A14DB8605A5658FC07A438C6 /* Pods-shelfscout.debug.xcconfig */,
+				0457F99365215F4796057E62 /* Pods-shelfscout.release.xcconfig */,
 			);
 			path = Pods;
 			sourceTree = "<group>";
@@ -152,13 +167,13 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 13B07F931A680F5B00A75B9A /* Build configuration list for PBXNativeTarget "shelfscout" */;
 			buildPhases = (
-				B9163FF30F8AF1D26042EECC /* [CP] Check Pods Manifest.lock */,
+				8F6D5FE982A00BB3C2B81F82 /* [CP] Check Pods Manifest.lock */,
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
 				00DD1BFF1BD5951E006B06BC /* Bundle React Native code and images */,
-				93EB5E982488E84582B94937 /* [CP] Embed Pods Frameworks */,
-				530CEFA9DCD3345DE5A7BBAB /* [CP] Copy Pods Resources */,
+				7A348D71F3FE082D4D9A4E20 /* [CP] Embed Pods Frameworks */,
+				E538296514E9C8519A129845 /* [CP] Copy Pods Resources */,
 			);
 			buildRules = (
 			);
@@ -210,6 +225,11 @@
 				5F359D612F48B656000E7BB8 /* jbl_latency_sae.caf in Resources */,
 				5F359D622F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 in Resources */,
 				5F359D632F48B656000E7BB8 /* jbl_begin_sae.caf in Resources */,
+				5F385F1C2F74C593007323E0 /* bip.wav in Resources */,
+				5F385F1D2F74C593007323E0 /* targetLost.wav in Resources */,
+				5F385F1E2F74C593007323E0 /* targetLost_sound.wav in Resources */,
+				5F385F1F2F74C593007323E0 /* centered_sound.wav in Resources */,
+				5F385F202F74C593007323E0 /* uncentered_sound.wav in Resources */,
 				5F359D642F48B656000E7BB8 /* jbl_success_sae.caf in Resources */,
 				5F5055B42F34217C000B8156 /* LaunchScreen.storyboard in Resources */,
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
@@ -236,24 +256,7 @@
 			shellPath = /bin/sh;
 			shellScript = "set -e\n\nWITH_ENVIRONMENT=\"$REACT_NATIVE_PATH/scripts/xcode/with-environment.sh\"\nREACT_NATIVE_XCODE=\"$REACT_NATIVE_PATH/scripts/react-native-xcode.sh\"\n\n/bin/sh -c \"\\\"$WITH_ENVIRONMENT\\\" \\\"$REACT_NATIVE_XCODE\\\"\"\n";
 		};
-		530CEFA9DCD3345DE5A7BBAB /* [CP] Copy Pods Resources */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-input-files.xcfilelist",
-			);
-			name = "[CP] Copy Pods Resources";
-			outputFileListPaths = (
-				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-output-files.xcfilelist",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources.sh\"\n";
-			showEnvVarsInLog = 0;
-		};
-		93EB5E982488E84582B94937 /* [CP] Embed Pods Frameworks */ = {
+		7A348D71F3FE082D4D9A4E20 /* [CP] Embed Pods Frameworks */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -270,7 +273,7 @@
 			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-frameworks.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
-		B9163FF30F8AF1D26042EECC /* [CP] Check Pods Manifest.lock */ = {
+		8F6D5FE982A00BB3C2B81F82 /* [CP] Check Pods Manifest.lock */ = {
 			isa = PBXShellScriptBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -290,6 +293,23 @@
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
 			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
+			showEnvVarsInLog = 0;
+		};
+		E538296514E9C8519A129845 /* [CP] Copy Pods Resources */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-input-files.xcfilelist",
+			);
+			name = "[CP] Copy Pods Resources";
+			outputFileListPaths = (
+				"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources-${CONFIGURATION}-output-files.xcfilelist",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/sh;
+			shellScript = "\"${PODS_ROOT}/Target Support Files/Pods-shelfscout/Pods-shelfscout-resources.sh\"\n";
 			showEnvVarsInLog = 0;
 		};
 /* End PBXShellScriptBuildPhase section */
@@ -317,7 +337,7 @@
 /* Begin XCBuildConfiguration section */
 		13B07F941A680F5B00A75B9A /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = F8B82B66D353E36CC777A573 /* Pods-shelfscout.debug.xcconfig */;
+			baseConfigurationReference = A14DB8605A5658FC07A438C6 /* Pods-shelfscout.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
@@ -355,7 +375,7 @@
 		};
 		13B07F951A680F5B00A75B9A /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = BE65CC6A8661C2958BFFC697 /* Pods-shelfscout.release.xcconfig */;
+			baseConfigurationReference = 0457F99365215F4796057E62 /* Pods-shelfscout.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;

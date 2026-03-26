@@ -95,6 +95,9 @@ function AppInner(): React.JSX.Element {
 
   // ── Settings ───────────────────────────────────────────────────────────────
   const { settings, resolveReachingPipeline } = useSettings();
+  // Ref always holds the latest settings — avoids stale closure in useCallback
+  const settingsRef = useRef(settings);
+  useEffect(() => { settingsRef.current = settings; }, [settings]);
 
   // ── Camera / Permissions ───────────────────────────────────────────────────
   const device = useCameraDevice('back');
@@ -359,8 +362,9 @@ function AppInner(): React.JSX.Element {
           imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
           detectionUrl: DETECTION_URL,
-          mode: settings.reachingMode,
-          ttsRate: settings.ttsRate,
+          mode: settingsRef.current.reachingMode,
+          ttsRate: settingsRef.current.ttsRate,
+          distanceUnit: settingsRef.current.distanceUnit,
         });
 
         console.log('✅ [ARKit] Native result:', reachingResult);

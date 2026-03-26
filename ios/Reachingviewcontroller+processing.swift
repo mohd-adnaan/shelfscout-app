@@ -1,4 +1,3 @@
-//hehe
 //
 //  Reachingviewcontroller+processing.swift
 //  shelfscout
@@ -29,6 +28,12 @@ extension ReachingViewController {
       anchorRefinementFrames += 1
       tryRefineAnchorDepth(frame: frame)
     }
+    // Hand-free: refinement NEVER stops — keep raycasting for the entire session.
+    // As user walks closer, ARKit plane estimates improve dramatically.
+    if mode == .handFree && anchorRefinementFrames >= anchorRefinementLimit {
+      // Reset to keep refining
+      anchorRefinementFrames = 1
+    }
 
     // Route to mode-specific processing
     if mode == .handFree {
@@ -45,15 +50,19 @@ extension ReachingViewController {
   // MARK: - Hand-Free Processing (3D world-space directions)
   // ═══════════════════════════════════════════════════════════════════════════
   //
-  // Unlike with-hand mode, we do NOT compare screen center vs projected bbox.
-  // That approach is unstable because projected bbox depends on anchor corners
-  // which jump on every re-detection.
+  // Direction = dot product of (camera → anchor) against camera's own axes.
+  // Only 3 directions: left / right / straight ahead.
+  // "Up"/"down" suppressed — user is walking, phone tilt is noise.
+  // Exception: "Tilt phone down" at extreme vertical angle.
   //
-  // Instead: compute direction from CAMERA to ANCHOR CENTER in 3D world space.
-  // dot(objectDir, cameraRight) → left/right
-  // dot(objectDir, cameraUp)    → up/down
-  // This is stable because it only depends on the anchor center (not corners)
-  // and the camera's own tracked orientation (which ARKit does at cm accuracy).
+  // State-change sounds (Nicolas approach):
+  //   centered_sound.wav → plays ONCE when entering alignment
+  //   uncentered_sound.wav → plays ONCE when leaving alignment
+  //   bip.wav → proximity beeps (faster = closer)
+  //
+  // Speech uses contextual phrasing:
+  //   "Object is to your right" not bare "right"
+  //   "Out of view, was to your right" when lost
 
   func processARFrameHandFree(_ frame: ARFrame) {
     guard let anchorPos = objectWorldPosition else { return }
@@ -67,77 +76,127 @@ extension ReachingViewController {
     let toObj = anchorPos - camPos
     let dist = simd_length(toObj)
     liveDistanceToObject = dist
+    let toObjNorm = simd_normalize(toObj)
 
-    // Check if object is behind camera
-    if simd_dot(toObj, camFwd) < 0 {
+    let rightDot = simd_dot(toObjNorm, camRight)   // + = right, - = left
+    let upDot    = simd_dot(toObjNorm, camUp)       // + = up, - = down
+    let fwdDot   = simd_dot(toObjNorm, camFwd)      // + = in front, - = behind
+    lastRightDot = rightDot
+
+    // Track last known horizontal for beep panning and "out of view" memory
+    if abs(rightDot) > 0.05 {
+      lastKnownHorizontalSign = rightDot > 0 ? 1.0 : -1.0
+      lastKnownDirectionLabel = rightDot > 0 ? "to your right" : "to your left"
+    }
+
+    // ── Object behind camera ─────────────────────────────────────────────
+    if fwdDot < 0 {
+      objectOffScreen = true
+      proximityZone = .far
+
+      // Use horizontal dot to tell user which way to turn
+      let turnDir = rightDot >= 0 ? "right" : "left"
       let now = ProcessInfo.processInfo.systemUptime
-      if now - lastSpeechTime > 3.0 {
-        say("Object is behind you. Turn around.")
-        lastSpeechTime = now
+
+      // State-change: was centered → now lost
+      if isCenteredState {
+        isCenteredState = false
+        playUncenteredSound()
       }
+
+      if now - lastSpeechTime > 3.0 {
+        if lastKnownDirectionLabel.isEmpty {
+          say("Object is behind you. Turn \(turnDir).")
+        } else {
+          say("Out of view, was \(lastKnownDirectionLabel). Turn \(turnDir).")
+        }
+        lastSpeechTime = now
+        lastSpokenDirection = .searching
+      }
+
       DispatchQueue.main.async { [weak self] in
-        self?.directionLabel.text = "Turn around"
-        self?.bboxLayer.isHidden = true; self?.innerBboxLayer.isHidden = true
+        guard let self = self else { return }
+        self.directionLabel.text = "Turn \(turnDir)"
+        self.directionLabel.textColor = .systemOrange
+        self.depthHintLabel.isHidden = true
+        self.bboxLayer.isHidden = true; self.innerBboxLayer.isHidden = true
+        self.distanceLabel.text = "\(Int(dist * 100)) cm"
+        self.depthMethodLabel.text = "behind → \(turnDir)"
       }
       return
     }
 
-    let toObjNorm = simd_normalize(toObj)
-
-    // Project onto camera axes
-    let rightDot = simd_dot(toObjNorm, camRight)   // + = right, - = left
-    let upDot    = simd_dot(toObjNorm, camUp)       // + = up, - = down
-
-    // ── Direction (simple 4-direction + aligned) ─────────────────────────
-    // Dead zone: ~15° off center (dot < 0.25 ≈ 14.5°)
+    // ── Object in front of camera ────────────────────────────────────────
+    // Only 3 directions: left / right / straight
+    // Suppress "up"/"down" — phone tilt is noise when walking
+    // Exception: extreme downward angle means phone pointed at ceiling
     let horizThreshold: Float = 0.20
-    let vertThreshold: Float = 0.15
 
     let direction: Direction
-    if abs(rightDot) < horizThreshold && abs(upDot) < vertThreshold {
+    if abs(rightDot) < horizThreshold && upDot < 0.40 {
       direction = .centered
-    } else if abs(rightDot) > abs(upDot) {
-      // Horizontal correction is primary
+      objectOffScreen = false
+    } else if upDot > 0.50 {
+      // Phone pointed way too low — object is above camera view
+      direction = .top  // will be spoken as "Tilt phone down" (object above = phone too low)
+      objectOffScreen = true
+    } else if abs(rightDot) >= horizThreshold {
       direction = rightDot > 0 ? .right : .left
+      objectOffScreen = abs(rightDot) > 0.55
     } else {
-      // Vertical correction is primary
-      direction = upDot > 0 ? .top : .down
+      // Mild vertical offset — treat as aligned (user is walking, phone bobs)
+      direction = .centered
+      objectOffScreen = false
     }
 
-    // ── Proximity zone (camera distance only) ────────────────────────────
+    // ── State-change sounds (Nicolas approach) ───────────────────────────
+    if direction == .centered && !isCenteredState {
+      isCenteredState = true
+      playCenteredSound()
+    } else if direction != .centered && isCenteredState {
+      isCenteredState = false
+      playUncenteredSound()
+    }
+
+    // ── Proximity zone ───────────────────────────────────────────────────
     let newProx: ProximityZone
-    if dist < 0.15       { newProx = .centered }
-    else if dist < 0.30  { newProx = .veryClose }
-    else if dist < 0.70  { newProx = .close }
-    else if dist < 1.50  { newProx = .medium }
-    else                  { newProx = .far }
+    if objectOffScreen {
+      newProx = .far
+    } else if dist < 0.15 {
+      newProx = .centered
+    } else if dist < 0.30 {
+      newProx = .veryClose
+    } else if dist < 0.70 {
+      newProx = .close
+    } else if dist < 1.50 {
+      newProx = .medium
+    } else {
+      newProx = .far
+    }
     proximityZone = newProx
 
     speakDirectionHandFree(direction)
 
-    // ── Reproject bbox for visual overlay (but NOT used for direction) ───
+    // Reproject bbox for visual overlay only
     reprojectBbox(frame: frame)
 
     // ── UI update ────────────────────────────────────────────────────────
+    let cm = Int(dist * 100)
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       self.updateDirectionUI(direction)
+      self.distanceLabel.text = "\(cm) cm"
+      self.depthMethodLabel.text = "cam→obj \(cm)cm"
 
-      let cm = Int(dist * 100)
       if direction == .centered && dist < 0.30 {
         self.depthHintLabel.isHidden = false
-        self.depthHintLabel.text = "Within reach — tap to confirm"
-        self.distanceLabel.text = "Within reach"
+        self.depthHintLabel.text = "\(self.objectName) here — reach forward"
       } else if direction == .centered {
         self.depthHintLabel.isHidden = false
-        self.depthHintLabel.text = "\(cm)cm ahead"
-        self.distanceLabel.text = "\(cm) cm"
+        self.depthHintLabel.text = self.distanceDescription(dist)
       } else {
         self.depthHintLabel.isHidden = true
-        self.distanceLabel.text = "\(cm) cm"
       }
-
-      self.depthMethodLabel.text = "cam→obj \(cm)cm"
     }
   }
 
@@ -350,9 +409,26 @@ extension ReachingViewController {
   // MARK: - Hand-Free Speech Feedback
   // ═══════════════════════════════════════════════════════════════════════════
   //
-  // Simple, calm, infrequent speech. Only 4 directions + aligned.
-  // Higher stability threshold (8 frames) and longer cooldown (2.0s)
-  // prevent the rapid-fire direction spam that makes this unusable.
+  // Distance spoken as STEPS (75cm each), not centimeters.
+  // Progressive confidence: first time aligned → "About N steps ahead"
+  //   As user approaches: "N steps, going the right way" (first 2 times only)
+  //   Close: "One step away" → "Arm's reach" → "{object} here. Reach forward."
+  //
+  // Screen still shows cm for debugging.
+
+  /// Convert distance to human-friendly description based on distanceUnit setting
+  func distanceDescription(_ dist: Float) -> String {
+    if distanceUnit == "cm" {
+      let cm = Int(dist * 100)
+      if cm < 30 { return "arm's reach" }
+      return "\(cm) centimeters"
+    } else {
+      let steps = Int(round(dist / 0.75))  // 75cm per step
+      if steps <= 0 { return "arm's reach" }
+      if steps == 1 { return "one step away" }
+      return "about \(steps) steps"
+    }
+  }
 
   func speakDirectionHandFree(_ direction: Direction) {
     guard direction != .searching else { return }
@@ -360,36 +436,77 @@ extension ReachingViewController {
     if direction == currentDirection { directionStableFrames += 1 } else { directionStableFrames = 0 }
 
     let dist = liveDistanceToObject
-    let cm = Int(dist * 100)
+    let steps = Int(round(dist / 0.75))
 
-    // Case 1: Aligned (camera pointing at object)
-    if direction == .centered {
-      if direction != lastSpokenDirection {
-        // First time aligning — announce with distance
-        if dist < 0.30 {
-          say("Right here. Tap when you have it.")
-        } else {
-          say("Straight ahead. \(cm) centimeters.")
+    // ── Case 1: Arms reach (<30cm) — grab guidance with 3D hint ─────────
+    if direction == .centered && dist < 0.30 {
+      if direction != lastSpokenDirection || now - lastSpeechTime > 5.0 {
+        var hint = ""
+        if abs(lastRightDot) > 0.10 {
+          hint = lastRightDot > 0 ? ", slightly right" : ", slightly left"
         }
+        say("\(objectName) here. Reach forward\(hint).")
+        lastSpokenDirection = direction; lastSpeechTime = now
+      }
+      return
+    }
+
+    // ── Case 2: Very close (<75cm) — "arm's reach" ─────────────────────
+    if direction == .centered && dist < 0.75 {
+      if direction != lastSpokenDirection {
+        say("Arm's reach. Keep going.")
         lastSpokenDirection = direction; lastSpeechTime = now
       } else if now - lastSpeechTime > 4.0 {
-        // Periodic distance update while aligned
-        if dist < 0.30 {
-          say("Within reach. Tap to confirm.")
-        } else {
-          say("\(cm) centimeters ahead.")
-        }
+        say("Almost there.")
         lastSpeechTime = now
       }
       return
     }
 
-    // Case 2: Not aligned — speak simple direction
-    // Only speak after direction is stable for N frames AND cooldown elapsed
+    // ── Case 3: Aligned, walking toward ─────────────────────────────────
+    if direction == .centered {
+      if direction != lastSpokenDirection {
+        say("Straight ahead. \(distanceDescription(dist)).")
+        lastSpokenDirection = direction; lastSpeechTime = now
+        lastAnnouncedSteps = steps
+      } else if now - lastSpeechTime > 4.0 {
+        if steps < lastAnnouncedSteps && progressConfirmations < 2 {
+          say("\(distanceDescription(dist)). Going the right way.")
+          progressConfirmations += 1
+        } else if steps > lastAnnouncedSteps + 1 && progressConfirmations > 0 {
+          say("Getting further. \(distanceDescription(dist)).")
+          progressConfirmations = 0
+        } else {
+          say("\(distanceDescription(dist)).")
+        }
+        lastAnnouncedSteps = steps
+        lastSpeechTime = now
+      }
+      return
+    }
+
+    // ── Case 4: "Tilt phone down" for extreme vertical ──────────────────
+    if direction == .top {
+      if direction != lastSpokenDirection && (now - lastSpeechTime) >= speechCooldown {
+        say("Tilt phone down.")
+        lastSpokenDirection = direction; lastSpeechTime = now
+      }
+      return
+    }
+
+    // ── Case 5: Not aligned — contextual direction ──────────────────────
     if direction == lastSpokenDirection { return }
     if directionStableFrames >= directionStableThreshold && (now - lastSpeechTime) >= speechCooldown {
-      say(direction.rawValue)
+      let dirLabel = direction == .right ? "to your right" : "to your left"
+
+      // If user was aligned and drifted off
+      if lastSpokenDirection == .centered && progressConfirmations > 0 {
+        say("Off track. Object is \(dirLabel).")
+      } else {
+        say("Object is \(dirLabel).")
+      }
       lastSpokenDirection = direction; lastSpeechTime = now
+      progressConfirmations = 0
       triggerHaptic(0.4)
     }
   }

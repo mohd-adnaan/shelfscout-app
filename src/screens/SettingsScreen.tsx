@@ -210,7 +210,7 @@ interface SettingsScreenProps {
 }
 
 export default function SettingsScreen({ onClose }: SettingsScreenProps) {
-  const { settings, updatePreferAlternativeReaching, updateTtsRate, updateDeveloperMode, updateReachingMode } =
+  const { settings, updatePreferAlternativeReaching, updateTtsRate, updateDeveloperMode, updateReachingMode, updateDistanceUnit } =
     useSettings();
 
   const [localRate, setLocalRate] = useState(settings.ttsRate);
@@ -461,6 +461,69 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                   Hand tracking{'\n'}guides your reach
                 </Text>
                 {settings.reachingMode === 'withHand' && (
+                  <View style={[styles.activeDot, { backgroundColor: C.warning }]} />
+                )}
+              </TouchableOpacity>
+            </View>
+          </Section>
+        )}
+
+        {/* ══════════════════════════════════════════
+            SECTION 1.6 — Distance Unit
+        ══════════════════════════════════════════ */}
+        {Platform.OS === 'ios' && !settings.preferAlternativeReaching && (
+          <Section title="Distance Feedback">
+            <Text style={styles.settingDescription}>
+              Choose how distance is announced during reaching guidance.
+            </Text>
+
+            <View style={styles.comparisonRow}>
+              <TouchableOpacity
+                style={[
+                  styles.pipelineOption,
+                  settings.distanceUnit === 'steps' && styles.pipelineOptionActive,
+                ]}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel={`Steps${settings.distanceUnit === 'steps' ? ', currently selected' : ''}`}
+                accessibilityHint="Double tap to use step-based distance"
+                onPress={async () => {
+                  await updateDistanceUnit('steps');
+                  AccessibilityInfo.announceForAccessibility('Distance announced in steps.');
+                }}
+              >
+                <Text style={styles.pipelineOptionIcon}>👣</Text>
+                <Text style={styles.pipelineOptionName}>Steps</Text>
+                <Text style={styles.pipelineOptionDesc}>
+                  "About 3 steps"
+                </Text>
+                {settings.distanceUnit === 'steps' && (
+                  <View style={styles.activeDot} />
+                )}
+              </TouchableOpacity>
+
+              <View style={styles.pipelineDivider} />
+
+              <TouchableOpacity
+                style={[
+                  styles.pipelineOption,
+                  settings.distanceUnit === 'cm' && styles.pipelineOptionActiveAlt,
+                ]}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel={`Centimeters${settings.distanceUnit === 'cm' ? ', currently selected' : ''}`}
+                accessibilityHint="Double tap to use centimeter-based distance"
+                onPress={async () => {
+                  await updateDistanceUnit('cm');
+                  AccessibilityInfo.announceForAccessibility('Distance announced in centimeters.');
+                }}
+              >
+                <Text style={styles.pipelineOptionIcon}>📏</Text>
+                <Text style={styles.pipelineOptionName}>Centimeters</Text>
+                <Text style={styles.pipelineOptionDesc}>
+                  "150 centimeters"
+                </Text>
+                {settings.distanceUnit === 'cm' && (
                   <View style={[styles.activeDot, { backgroundColor: C.warning }]} />
                 )}
               </TouchableOpacity>

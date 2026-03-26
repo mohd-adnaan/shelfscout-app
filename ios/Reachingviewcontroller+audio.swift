@@ -22,19 +22,69 @@ extension ReachingViewController {
       try s.setActive(true)
       let engine = AVAudioEngine(); let player = AVAudioPlayerNode()
       engine.attach(player)
-      let sr: Double = 44100; let dur: Double = 0.06; let freq: Double = 1000
-      let fc = AVAudioFrameCount(sr * dur)
-      guard let fmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1) else { return }
-      audioFmt = fmt; engine.connect(player, to: engine.mainMixerNode, format: fmt)
-      guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: fc) else { return }
-      buf.frameLength = fc; let d = buf.floatChannelData![0]
-      for i in 0..<Int(fc) {
-        let t = Double(i)/sr
-        let env = min(t/0.005, 1) * min((dur-t)/0.005, 1)
-        d[i] = Float(sin(2 * .pi * freq * t) * 0.5 * env)
+
+      // ── Load beep buffer ─────────────────────────────────────────────
+      // Try Nicolas's bip.wav first; fall back to synthesized beep
+      var loadedBuf: AVAudioPCMBuffer?
+      var loadedFmt: AVAudioFormat?
+      if let bipURL = Bundle.main.url(forResource: "bip", withExtension: "wav") {
+        do {
+          let bipFile = try AVAudioFile(forReading: bipURL)
+          loadedFmt = bipFile.processingFormat
+          let frameCount = UInt32(bipFile.length)
+          if let buf = AVAudioPCMBuffer(pcmFormat: bipFile.processingFormat, frameCapacity: frameCount) {
+            try bipFile.read(into: buf)
+            loadedBuf = buf
+            NSLog("🔊 [Audio] Loaded bip.wav (%d frames, %.0fHz)", frameCount, bipFile.processingFormat.sampleRate)
+          }
+        } catch {
+          NSLog("⚠️ [Audio] Failed to load bip.wav: %@", error.localizedDescription)
+        }
       }
+
+      // Fallback: synthesized 60ms 1000Hz beep
+      if loadedBuf == nil {
+        let sr: Double = 44100; let dur: Double = 0.06; let freq: Double = 1000
+        let fc = AVAudioFrameCount(sr * dur)
+        loadedFmt = AVAudioFormat(standardFormatWithSampleRate: sr, channels: 1)
+        if let fmt = loadedFmt, let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: fc) {
+          buf.frameLength = fc; let d = buf.floatChannelData![0]
+          for i in 0..<Int(fc) {
+            let t = Double(i)/sr
+            let env = min(t/0.005, 1) * min((dur-t)/0.005, 1)
+            d[i] = Float(sin(2 * .pi * freq * t) * 0.5 * env)
+          }
+          loadedBuf = buf
+          NSLog("🔊 [Audio] Using synthesized beep (bip.wav not in bundle)")
+        }
+      }
+
+      guard let fmt = loadedFmt, let buf = loadedBuf else { return }
+      audioFmt = fmt
+      engine.connect(player, to: engine.mainMixerNode, format: fmt)
       beepBuf = buf; playerNode = player; audioEngine = engine
       try engine.start()
+
+      // ── Load state-change sounds (Nicolas approach) ──────────────────
+      if let url = Bundle.main.url(forResource: "centered_sound", withExtension: "wav") {
+        centeredPlayer = try? AVAudioPlayer(contentsOf: url)
+        centeredPlayer?.prepareToPlay()
+        centeredPlayer?.volume = 0.6
+        NSLog("🔊 [Audio] Loaded centered_sound.wav")
+      }
+      if let url = Bundle.main.url(forResource: "uncentered_sound", withExtension: "wav") {
+        uncenteredPlayer = try? AVAudioPlayer(contentsOf: url)
+        uncenteredPlayer?.prepareToPlay()
+        uncenteredPlayer?.volume = 0.5
+        NSLog("🔊 [Audio] Loaded uncentered_sound.wav")
+      }
+      if let url = Bundle.main.url(forResource: "targetLost", withExtension: "wav") {
+        targetLostPlayer = try? AVAudioPlayer(contentsOf: url)
+        targetLostPlayer?.prepareToPlay()
+        targetLostPlayer?.volume = 0.4
+        NSLog("🔊 [Audio] Loaded targetLost.wav")
+      }
+
     } catch { NSLog("⚠️ Audio: %@", error.localizedDescription) }
   }
 
@@ -42,6 +92,33 @@ extension ReachingViewController {
     guard CHHapticEngine.capabilitiesForHardware().supportsHaptics else { return }
     hapticEngine = try? CHHapticEngine()
     try? hapticEngine?.start()
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - State-Change Sounds (Nicolas Approach)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // These play ONCE at the transition moment — not continuously.
+  // centered_sound.wav → entering alignment (positive confirmation)
+  // uncentered_sound.wav → leaving alignment (gentle alert)
+  // targetLost.wav → object completely lost from view
+
+  func playCenteredSound() {
+    centeredPlayer?.currentTime = 0
+    centeredPlayer?.play()
+    NSLog("🔔 [Audio] centered_sound")
+  }
+
+  func playUncenteredSound() {
+    uncenteredPlayer?.currentTime = 0
+    uncenteredPlayer?.play()
+    NSLog("🔔 [Audio] uncentered_sound")
+  }
+
+  func playTargetLostSound() {
+    targetLostPlayer?.currentTime = 0
+    targetLostPlayer?.play()
+    NSLog("🔔 [Audio] targetLost")
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -58,44 +135,57 @@ extension ReachingViewController {
   func tickBeep() {
     guard running, proximityZone != .searching else { return }
 
-    // Hand-free parking sensor mode: continuous tone at very close range
-    if mode == .handFree && (proximityZone == .centered || proximityZone == .veryClose) {
+    // Hand-free parking sensor: gentle continuous tone at very close + aligned
+    if mode == .handFree && !objectOffScreen
+       && (proximityZone == .centered || proximityZone == .veryClose) {
       tickParkingSensor()
       return
     }
 
     let now = ProcessInfo.processInfo.systemUptime
-    let iv: TimeInterval = {
-      if mode == .handFree {
-        // Hand-free beep intervals: distance-mapped (wider zones)
-        switch proximityZone {
-        case .searching: return 99
-        case .far:       return 0.8
-        case .medium:    return 0.4
-        case .close:     return 0.15
-        case .veryClose: return 0.06   // will be caught by parking sensor above
-        case .centered:  return 0.03   // will be caught by parking sensor above
-        }
+    let iv: TimeInterval
+    let vol: Float
+    let pan: Float
+
+    if mode == .handFree {
+      if objectOffScreen {
+        // ── Object off-screen: slow sparse beeps, hard-panned toward object ──
+        iv = 1.2
+        vol = 0.15  // quiet — just a directional hint
+        pan = Float(lastKnownHorizontalSign) * 0.9  // hard left or right
       } else {
-        // With-hand: existing behavior
+        // ── Object on-screen: normal progressive beeps ──
         switch proximityZone {
-        case .searching: return 99
-        case .far:       return 0.7
-        case .medium:    return 0.4
-        case .close:     return 0.2
-        case .veryClose: return 0.08
-        case .centered:  return 0.04
+        case .searching: iv = 99; vol = 0; pan = 0
+        case .far:       iv = 0.7; vol = 0.25; pan = 0
+        case .medium:    iv = 0.35; vol = 0.35; pan = 0
+        case .close:     iv = 0.15; vol = 0.45; pan = 0
+        case .veryClose: iv = 0.06; vol = 0.5; pan = 0  // caught by parking sensor above
+        case .centered:  iv = 0.03; vol = 0.5; pan = 0  // caught by parking sensor above
         }
       }
-    }()
+    } else {
+      // With-hand: existing behavior — unchanged
+      vol = 0.5
+      switch proximityZone {
+      case .searching: iv = 99
+      case .far:       iv = 0.7
+      case .medium:    iv = 0.4
+      case .close:     iv = 0.2
+      case .veryClose: iv = 0.08
+      case .centered:  iv = 0.04
+      }
+      switch currentDirection {
+      case .left, .topLeft, .downLeft:    pan = -0.8
+      case .right, .topRight, .downRight: pan =  0.8
+      default:                            pan =  0.0
+      }
+    }
+
     if now - lastBeep >= iv {
       if let p = playerNode, let b = beepBuf {
-        switch currentDirection {
-        case .left, .topLeft, .downLeft:    p.pan = -0.8
-        case .right, .topRight, .downRight: p.pan =  0.8
-        default:                            p.pan =  0.0
-        }
-
+        p.pan = pan
+        p.volume = vol
         p.scheduleBuffer(b, at: nil, options: .interrupts)
         if !p.isPlaying { p.play() }
       }
@@ -104,42 +194,40 @@ extension ReachingViewController {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MARK: - Parking Sensor Continuous Tone (Hand-Free Mode)
+  // MARK: - Parking Sensor Tone (Hand-Free, Close + Aligned)
   // ═══════════════════════════════════════════════════════════════════════════
   //
-  // When camera is within ~30cm: switch to a continuous tone that rises
-  // in frequency as distance drops. Universal parking sensor UX.
-  //   30cm → 800Hz (low hum)
-  //   15cm → 1000Hz (medium)
-  //   <5cm → 1200Hz (high — you're there)
+  // Gentle continuous tone — NOT alarm-like. Warm frequency range.
+  //   30cm → 440Hz (A4 — warm, musical)
+  //   15cm → 523Hz (C5 — brighter)
+  //   <5cm → 587Hz (D5 — gentle high)
+  // Volume stays moderate. This is "you're close" not "danger".
 
   func tickParkingSensor() {
     guard let player = playerNode, let fmt = audioFmt else { return }
     let now = ProcessInfo.processInfo.systemUptime
-    // Generate a short continuous segment (200ms) and keep re-scheduling.
-    // This gives us the ability to update frequency every 200ms based on live distance.
     guard now - lastBeep >= 0.18 else { return }
 
     let sr: Double = 44100
-    let dur: Double = 0.22  // slightly longer than interval to avoid gaps
+    let dur: Double = 0.22
     let fc = AVAudioFrameCount(sr * dur)
     guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: fc) else { return }
     buf.frameLength = fc; let d = buf.floatChannelData![0]
 
-    // Map distance to frequency: 800Hz at 30cm → 1200Hz at 0cm
+    // Gentle frequency ramp: 440Hz → 587Hz over 30cm → 0cm
     let dist = max(Double(liveDistanceToObject), 0.0)
-    let freq = min(1200, max(800, 800 + (0.30 - dist) * 1333))
-    // Volume ramps up as you get closer
-    let vol = min(0.7, max(0.3, 0.3 + (0.30 - dist) * 1.33))
+    let freq = min(587, max(440, 440 + (0.30 - dist) * 490))
+    // Moderate volume — never above 0.4
+    let vol = min(0.4, max(0.2, 0.2 + (0.30 - dist) * 0.67))
 
     for i in 0..<Int(fc) {
       let t = Double(i) / sr
-      // Smooth envelope: 5ms attack, 5ms release
       let env = min(t / 0.005, 1) * min((dur - t) / 0.005, 1)
       d[i] = Float(sin(2 * .pi * freq * t) * vol * env)
     }
 
-    player.pan = 0  // centered — object is ahead
+    player.pan = 0
+    player.volume = 1.0  // volume is baked into the buffer
     player.scheduleBuffer(buf, at: nil, options: .interrupts)
     if !player.isPlaying { player.play() }
     lastBeep = now
@@ -185,9 +273,10 @@ extension ReachingViewController {
   func say(_ text: String) {
     synth.stopSpeaking(at: .immediate)
     let u = AVSpeechUtterance(string: text)
-    // Use the user's app-wide TTS rate (matches Speaches/Zoe experience)
-    // AVSpeech rate range: 0.0-1.0, default ~0.5. User's ttsRate is 0.1-1.0.
-    u.rate = ttsRate * AVSpeechUtteranceDefaultSpeechRate
+    // ttsRate is already 0.1-1.0 (from user settings), which maps directly
+    // to AVSpeech's 0.0-1.0 range. DO NOT multiply by DefaultSpeechRate
+    // (that was causing 0.5 * 0.5 = 0.25 = half the expected speed)
+    u.rate = ttsRate
     u.voice = premiumVoice
     u.pitchMultiplier = 1.0
     u.preUtteranceDelay = 0.0

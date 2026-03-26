@@ -26,6 +26,8 @@ export interface AppSettings {
   developerMode: boolean;
   /** ARKit reaching mode: 'handFree' (default) or 'withHand' */
   reachingMode: 'handFree' | 'withHand';
+  /** Distance unit for reaching guidance: 'steps' (default) or 'cm' */
+  distanceUnit: 'steps' | 'cm';
 }
 
 interface SettingsContextValue {
@@ -35,6 +37,7 @@ interface SettingsContextValue {
   updateTtsRate: (rate: number) => Promise<void>;
   updateDeveloperMode: (value: boolean) => Promise<void>;
   updateReachingMode: (mode: 'handFree' | 'withHand') => Promise<void>;
+  updateDistanceUnit: (unit: 'steps' | 'cm') => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
    * Returns 'arkit' | 'standard' | 'none'.
@@ -54,6 +57,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   ttsRate: 0.5,
   developerMode: false,
   reachingMode: 'handFree',
+  distanceUnit: 'steps',
 };
 
 const STORAGE_KEY = '@cybersight_settings_v1';
@@ -151,6 +155,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateDistanceUnit = useCallback(
+    async (unit: 'steps' | 'cm') => {
+      const next = { ...settings, distanceUnit: unit };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Distance unit → ${unit === 'steps' ? 'Steps' : 'Centimeters'}`);
+    },
+    [settings, persist],
+  );
+
   // ── Pipeline resolver ─────────────────────────────────────────────────────
 
   const resolveReachingPipeline = useCallback(
@@ -183,6 +197,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateTtsRate,
     updateDeveloperMode,
     updateReachingMode,
+    updateDistanceUnit,
     resolveReachingPipeline,
   };
 

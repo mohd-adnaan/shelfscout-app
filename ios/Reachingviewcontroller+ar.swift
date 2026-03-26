@@ -207,20 +207,25 @@ extension ReachingViewController {
     NSLog("🎯 [Refine] Median=%.2fm IQR=%.2fm (need <%.2fm) hits=%d",
           median, iqr, refinementConvergeThreshold, n)
 
-    guard iqr < refinementConvergeThreshold else {
-      NSLog("🎯 [Refine] IQR too wide (%.2fm) — still accumulating", iqr)
+    // Hand-free: wider threshold since user is walking (depth is changing)
+    let convergeThreshold: Float = mode == .handFree ? 0.15 : refinementConvergeThreshold
+    guard iqr < convergeThreshold else {
+      NSLog("🎯 [Refine] IQR too wide (%.2fm, need <%.2fm) — still accumulating", iqr, convergeThreshold)
       return
     }
 
     if lastRefinementAppliedDepth > 0 && abs(median - lastRefinementAppliedDepth) < 0.02 {
-      NSLog("🎯 [Refine] ✅ CONVERGED at %.2fm (Δ=%.1fcm from last) — stopping",
-            median, abs(median - lastRefinementAppliedDepth) * 100)
-      anchorRefinementFrames = anchorRefinementLimit
-      // Hand-free: lock anchor permanently after first convergence.
-      // Re-detection can still run but cannot move the anchor.
-      if mode == .handFree && !anchorLockedForHandFree {
-        anchorLockedForHandFree = true
-        NSLog("🔒 [Refine] Hand-free anchor LOCKED at %.2fm — re-detection will not move it", median)
+      if mode == .handFree {
+        // Hand-free: depth converged — great! Clear buffer to start fresh
+        // from the new position as user continues walking.
+        NSLog("🎯 [Refine] ✅ CONVERGED at %.2fm (Δ=%.1fcm) — clearing buffer, continuing refinement",
+              median, abs(median - lastRefinementAppliedDepth) * 100)
+        refinementHits.removeAll()
+        // DON'T set anchorRefinementFrames = limit — keep refining
+      } else {
+        NSLog("🎯 [Refine] ✅ CONVERGED at %.2fm (Δ=%.1fcm from last) — stopping",
+              median, abs(median - lastRefinementAppliedDepth) * 100)
+        anchorRefinementFrames = anchorRefinementLimit
       }
       return
     }
@@ -496,15 +501,6 @@ extension ReachingViewController {
                              newDepth: Float?, fromFrame: ARFrame? = nil) {
     bboxUpdateCount += 1
 
-    // Hand-free: anchor is locked after first convergence. Log the detection
-    // for debugging but do NOT move the anchor — the user is walking and
-    // each new frame's bbox is at a completely different screen position.
-    if mode == .handFree && anchorLockedForHandFree {
-      NSLog("🔒 [Redetect] #%d SKIPPED — anchor locked in hand-free mode (bbox=[%.0f,%.0f,%.0f,%.0f])",
-            bboxUpdateCount, newBbox[0], newBbox[1], newBbox[2], newBbox[3])
-      return
-    }
-
     // ── Normalize the fresh bbox ──────────────────────────────────────────
     let x1 = min(newBbox[0], newBbox[2])
     let y1 = min(newBbox[1], newBbox[3])
@@ -548,20 +544,21 @@ extension ReachingViewController {
     let displacement = sqrt(dCx * dCx + dCy * dCy)
 
     // NOTE: This threshold is in normalized screen-space [0..1].
-    // 0.25 ≈ quarter of the screen — generous enough for walking approach,
-    // tight enough to reject cross-screen jumps to wrong objects.
-    let maxDisplacement: CGFloat = 0.25
+    // Hand-free: wider because user walks between re-detections (object moves more)
+    // With-hand: user is stationary, tighter gate rejects wrong objects
+    let maxDisplacement: CGFloat = mode == .handFree ? 0.40 : 0.25
 
     if displacement > maxDisplacement {
       consecutiveRejects += 1
-      NSLog("🔄 [Redetect] ❌ REJECTED #%d — displacement=%.3f (max=%.3f) center=(%.3f,%.3f) vs initial=(%.3f,%.3f) [%d consecutive]",
+      NSLog("🔄 [Redetect] ❌ REJECTED #%d — displacement=%.3f (max=%.3f) center=(%.3f,%.3f) vs ref=(%.3f,%.3f) [%d consecutive]",
             bboxUpdateCount, displacement, maxDisplacement,
             newCx, newCy, initialBboxCenter.cx, initialBboxCenter.cy,
             consecutiveRejects)
 
-      // After 5 consecutive rejects, the object may have genuinely moved
-      // (e.g. someone moved the bottle). Update the reference to allow recovery.
-      if consecutiveRejects >= 5 {
+      // Hand-free: accept after 3 consecutive rejects (user moved a lot)
+      // With-hand: accept after 5 (more conservative)
+      let rejectLimit = mode == .handFree ? 3 : 5
+      if consecutiveRejects >= rejectLimit {
         initialBboxCenter = (cx: newCx, cy: newCy)
         consecutiveRejects = 0
         NSLog("🔄 [Redetect] 🔁 Reference center UPDATED after 5 rejects → (%.3f,%.3f)", newCx, newCy)
@@ -605,23 +602,99 @@ extension ReachingViewController {
 
     // Update depth if provided and reasonable
     if let d = newDepth, d > 0.05, d < 10.0 {
-      anchorDepth = d
-      NSLog("🔄 [Redetect] Updated anchorDepth → %.2fm", d)
+      // Only use backend depth if we don't have ARKit refinement data
+      if mode == .handFree && !refinementHits.isEmpty {
+        NSLog("🔄 [Redetect] Ignoring backend depth %.2fm — using ARKit refinement (%.2fm)", d, anchorDepth)
+      } else {
+        anchorDepth = d
+        NSLog("🔄 [Redetect] Updated anchorDepth → %.2fm", d)
+      }
     }
 
-    // Reset anchor state so placeWorldAnchor fires with fresh position
-    anchorPlaced = false
-    anchorRefinementFrames = 0
-    refinementHits.removeAll()
-    lastRefinementAppliedDepth = 0
-    objectWorldPosition = nil
+    if mode == .handFree {
+      // ── Hand-free: smooth anchor update WITHOUT resetting refinement ────
+      // Update bbox for visual overlay
+      // Re-place anchor center using current best depth (from refinement)
+      // Refinement buffer stays intact and keeps running
+      // Update the spatial consistency reference to track the moving screen position
+      initialBboxCenter = (cx: (finalX1 + finalX2) / 2, cy: (finalY1 + finalY2) / 2)
 
-    // Re-anchor from the most recent AR frame (not the stale capture frame)
-    if let frame = fromFrame ?? lastARFrame {
-      placeWorldAnchor(frame: frame)
-      NSLog("🔄 [Redetect] ✅ Anchor RE-PLACED from fresh frame + fresh center")
+      if let frame = fromFrame ?? lastARFrame {
+        // Re-compute world position from fresh bbox center + current best depth
+        let sw = cachedSW, sh = cachedSH
+        let camera = frame.camera
+        let photoAspect = imageWidth / imageHeight
+        let screenAspect = sw / sh
+        var scaleX: CGFloat = 1, scaleY: CGFloat = 1
+        var offsetX: CGFloat = 0, offsetY: CGFloat = 0
+        if photoAspect > screenAspect {
+          scaleX = photoAspect / screenAspect; offsetX = (scaleX - 1) / 2
+        } else {
+          scaleY = screenAspect / photoAspect; offsetY = (scaleY - 1) / 2
+        }
+        let bx1 = (bboxNormalized[0] * scaleX - offsetX) * sw
+        let by1 = (bboxNormalized[1] * scaleY - offsetY) * sh
+        let bx2 = (bboxNormalized[2] * scaleX - offsetX) * sw
+        let by2 = (bboxNormalized[3] * scaleY - offsetY) * sh
+        let screenCenter = CGPoint(x: (bx1+bx2)/2, y: (by1+by2)/2)
+
+        let intrinsics = camera.intrinsics
+        let imgRes = camera.imageResolution
+        let arPxX = (screenCenter.y / sh) * imgRes.width
+        let arPxY = (1.0 - screenCenter.x / sw) * imgRes.height
+        let fx = CGFloat(intrinsics[0][0]), fy = CGFloat(intrinsics[1][1])
+        let cx = CGFloat(intrinsics[2][0]), cy = CGFloat(intrinsics[2][1])
+        let rX = Float((arPxX - cx) / fx)
+        let rY = Float((arPxY - cy) / fy)
+        let camT = camera.transform
+        let rayCam = simd_normalize(simd_float3(rX, -rY, -1.0))
+        let worldRay = simd_normalize(simd_make_float3(camT * simd_float4(rayCam, 0)))
+        let camPos = simd_make_float3(camT.columns.3)
+        let newWorldPos = camPos + worldRay * anchorDepth
+
+        // Smooth the position update — don't jump, blend
+        if let oldPos = objectWorldPosition {
+          let blendFactor: Float = 0.6  // 60% new, 40% old — smooth transition
+          objectWorldPosition = oldPos * (1 - blendFactor) + newWorldPos * blendFactor
+          NSLog("🔄 [Redetect] ✅ Hand-free anchor BLENDED #%d — old=(%.2f,%.2f,%.2f) new=(%.2f,%.2f,%.2f) → blend=(%.2f,%.2f,%.2f)",
+                bboxUpdateCount, oldPos.x, oldPos.y, oldPos.z,
+                newWorldPos.x, newWorldPos.y, newWorldPos.z,
+                objectWorldPosition!.x, objectWorldPosition!.y, objectWorldPosition!.z)
+        } else {
+          objectWorldPosition = newWorldPos
+          NSLog("🔄 [Redetect] ✅ Hand-free anchor PLACED #%d at (%.2f,%.2f,%.2f) depth=%.2fm",
+                bboxUpdateCount, newWorldPos.x, newWorldPos.y, newWorldPos.z, anchorDepth)
+        }
+
+        // Update corners for bbox projection (re-billboard from current camera)
+        let billboardRight = -simd_normalize(simd_make_float3(camT.columns.1))
+        let billboardUp = simd_normalize(simd_make_float3(camT.columns.0))
+        let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
+        let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
+        objectWorldHalfW = anchorDepth * Float(bboxNormW) * 0.5
+        objectWorldHalfH = anchorDepth * Float(bboxNormH) * 0.8
+        if let pos = objectWorldPosition {
+          objectWorldCornerTR = pos + billboardRight * objectWorldHalfW + billboardUp * objectWorldHalfH
+          objectWorldCornerBL = pos - billboardRight * objectWorldHalfW - billboardUp * objectWorldHalfH
+        }
+      }
+      // NOTE: anchorPlaced stays true, refinementHits stays intact, refinement keeps running
     } else {
-      NSLog("🔄 [Redetect] ⏳ Anchor reset — will re-place on next AR frame")
+      // ── With-hand: existing full reset behavior ────────────────────────
+      // Reset anchor state so placeWorldAnchor fires with fresh position
+      anchorPlaced = false
+      anchorRefinementFrames = 0
+      refinementHits.removeAll()
+      lastRefinementAppliedDepth = 0
+      objectWorldPosition = nil
+
+      // Re-anchor from the most recent AR frame (not the stale capture frame)
+      if let frame = fromFrame ?? lastARFrame {
+        placeWorldAnchor(frame: frame)
+        NSLog("🔄 [Redetect] ✅ Anchor RE-PLACED from fresh frame + fresh center")
+      } else {
+        NSLog("🔄 [Redetect] ⏳ Anchor reset — will re-place on next AR frame")
+      }
     }
   }
 }
