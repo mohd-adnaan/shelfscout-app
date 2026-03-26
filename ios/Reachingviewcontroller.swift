@@ -1,4 +1,3 @@
-
 //
 //  Reachingviewcontroller.swift
 //  shelfscout
@@ -144,12 +143,26 @@ class ReachingViewController: UIViewController {
   var directionStableThreshold = 4
   /// TTS rate passed from React Native (matches user's app-wide setting)
   var ttsRate: Float = 0.5
-  /// Cached premium voice (Zoe if available, else best English US)
+  /// Cached premium voice — mirrors iOSTtsClient.ts PREFERRED_VOICES exactly
+  /// Premium (Neural TTS) > Enhanced > Compact > system default
   lazy var premiumVoice: AVSpeechSynthesisVoice? = {
-    // Try premium Zoe first (matches the rest of the app)
-    if let zoe = AVSpeechSynthesisVoice(identifier: "com.apple.voice.premium.en-US.Zoe") { return zoe }
-    // Fallback: enhanced Samantha
-    if let sam = AVSpeechSynthesisVoice(identifier: "com.apple.voice.enhanced.en-US.Samantha") { return sam }
+    // Ordered by quality — MUST match iOSTtsClient.ts PREFERRED_VOICES list
+    let candidates: [(id: String, label: String)] = [
+      ("com.apple.voice.premium.en-US.Zoe",              "Zoe PREMIUM"),
+      ("com.apple.voice.premium.en-US.Samantha",          "Samantha PREMIUM"),
+      ("com.apple.voice.enhanced.en-US.Samantha",         "Samantha ENHANCED"),
+      ("com.apple.voice.enhanced.en-US.Ava",              "Ava ENHANCED"),
+      ("com.apple.voice.enhanced.en-AU.Karen",            "Karen ENHANCED"),
+      ("com.apple.voice.enhanced.en-GB.Serena",           "Serena ENHANCED"),
+      ("com.apple.voice.compact.en-US.Samantha",          "Samantha COMPACT"),
+    ]
+    for c in candidates {
+      if let voice = AVSpeechSynthesisVoice(identifier: c.id) {
+        NSLog("🎤 [ReachingVC] Selected voice: %@ [%@]", c.id, c.label)
+        return voice
+      }
+    }
+    NSLog("⚠️ [ReachingVC] No preferred voice found — using system default en-US")
     return AVSpeechSynthesisVoice(language: "en-US")
   }()
 

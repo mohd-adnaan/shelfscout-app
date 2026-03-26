@@ -280,7 +280,7 @@ extension ReachingViewController {
     u.voice = premiumVoice
     u.pitchMultiplier = 1.0
     u.preUtteranceDelay = 0.0
-    synth.speak(u); NSLog("🗣 [ReachingVC] %@", text)
+    synth.speak(u); NSLog("🗣 [ReachingVC] rate=%.2f voice=%@ | %@", ttsRate, premiumVoice?.identifier ?? "nil", text)
   }
 
   func speakDirectionIfNeeded(_ direction: Direction) {

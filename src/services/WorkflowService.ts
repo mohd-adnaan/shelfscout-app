@@ -16,18 +16,33 @@ import { debugLogger } from './DebugLogger';
 // iOS ARKit Native Module Bridge
 // =============================================================================
 
-// This will be the bridge toSwift ViewController
-const { CybsGuidanceModule } = NativeModules;
+// This will be the bridge to Swift ViewController
+const { ReachingModule: CybsGuidanceModule } = NativeModules;
 
 /**
  * Trigger iOS ARKit reaching with bounding box data
  * 
+ * @deprecated Use App.tsx handleiOSReaching() instead — it passes all required
+ *             params (ttsRate, mode, distanceUnit, detectionUrl, imageWidth,
+ *             imageHeight) from SettingsContext. This function is kept only as
+ *             a minimal fallback.
+ * 
  * @param bbox - [xmin, ymin, xmax, ymax] from Qwen detection
  * @param objectName - Name of the detected object
+ * @param options - Optional: ttsRate, mode, distanceUnit, depth, imageWidth, imageHeight, detectionUrl
  */
 export const triggerIOSReaching = async (
   bbox: [number, number, number, number],
-  objectName: string
+  objectName: string,
+  options?: {
+    ttsRate?: number;
+    mode?: 'handFree' | 'withHand';
+    distanceUnit?: 'steps' | 'cm';
+    depth?: number;
+    imageWidth?: number;
+    imageHeight?: number;
+    detectionUrl?: string;
+  }
 ): Promise<boolean> => {
   if (Platform.OS !== 'ios') {
     console.warn('🚫 triggerIOSReaching called on non-iOS platform');
@@ -43,6 +58,13 @@ export const triggerIOSReaching = async (
       await CybsGuidanceModule.startReaching({
         bbox: bbox,
         object: objectName,
+        ttsRate: options?.ttsRate ?? 0.5,
+        mode: options?.mode ?? 'handFree',
+        distanceUnit: options?.distanceUnit ?? 'steps',
+        ...(options?.depth != null && { depth: options.depth }),
+        ...(options?.imageWidth != null && { imageWidth: options.imageWidth }),
+        ...(options?.imageHeight != null && { imageHeight: options.imageHeight }),
+        ...(options?.detectionUrl != null && { detectionUrl: options.detectionUrl }),
       });
       console.log('✅ [iOS ARKit] Reaching started successfully');
       return true;
@@ -190,6 +212,7 @@ export const sendToWorkflow = async (
   request: WorkflowRequest,
   signal?: AbortSignal
 ): Promise<WorkflowResponse> => {
+  let requestStartTime = Date.now();
   try {
     if (signal?.aborted) {
       throw new Error('Request cancelled');
@@ -250,7 +273,7 @@ export const sendToWorkflow = async (
     console.log('🎯 Reaching:', reachingValue);
     console.log('🆔 Session:', SESSION_ID);
 
-    const requestStartTime = Date.now();
+    requestStartTime = Date.now();
     debugLogger.logAPI(
       `→ POST ${WORKFLOW_URL.replace('https://cybersight.cim.mcgill.ca', '')}`,
       `transcript="${(request.text || '').substring(0, 60)}" nav=${navigationValue} reach=${reachingValue} img=${!!request.imageUri}`,

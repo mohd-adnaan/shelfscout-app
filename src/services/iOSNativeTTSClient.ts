@@ -1,4 +1,16 @@
 // src/services/iOSNativeTTSClient.ts
+//
+// ⚠️ DEPRECATED — DO NOT IMPORT THIS FILE ⚠️
+//
+// This is an older TTS client with INCONSISTENT voice/rate behavior:
+//   - Uses Tts.setDefaultRate(0.52) — hardcoded, ignores user's setting
+//   - Selects voice by quality score, NOT by the explicit PREFERRED_VOICES list
+//   - Does not use per-utterance rate (crashes on New Architecture)
+//
+// The canonical TTS singleton is:  import { speachesTTS } from './iOSTtsClient';
+// That client uses Zoe Premium, per-utterance rate, and respects user settings.
+//
+// Kept for reference only. Will be removed in a future cleanup pass.
 
 import Tts from 'react-native-tts';
 import { Platform } from 'react-native';
