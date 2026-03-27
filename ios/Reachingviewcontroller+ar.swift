@@ -184,8 +184,11 @@ extension ReachingViewController {
       return
     }
 
-    // FIX 13: Reject raycasts beyond 2x backend estimate
-    if let bd = backendDepth, hitDepth > bd * 2.0 {
+    // FIX 13: Reject raycasts beyond 2x backend estimate (with-hand only)
+    // Hand-free: backend depth is unreliable (Qwen is not a depth estimator).
+    // ARKit plane hits at 2m when backend said 0.93m means backend was WRONG,
+    // not ARKit. Trust ARKit hits in hand-free mode.
+    if mode != .handFree, let bd = backendDepth, hitDepth > bd * 2.0 {
       NSLog("🎯 [Refine] Rejected hit at %.2fm (>2x backend %.2fm)", hitDepth, bd)
       return
     }
@@ -320,6 +323,16 @@ extension ReachingViewController {
   // anchor drift that made v9 unusable.
 
   func startRedetectionLoop() {
+    // Hand-free: re-detection DISABLED. The blend approach failed —
+    // each re-detection from a different camera angle computes a wrong
+    // world position, and blending wrong with less-wrong drifts the anchor
+    // further away with every update. ARKit continuous refinement is the
+    // only reliable depth source for walking users.
+    if mode == .handFree {
+      NSLog("🔄 [Redetect] DISABLED in hand-free mode — continuous ARKit refinement only")
+      return
+    }
+
     guard let url = detectionUrl, !url.isEmpty else {
       NSLog("🔄 [Redetect] No detectionUrl — progressive re-detection DISABLED")
       return
@@ -706,11 +719,18 @@ extension ReachingViewController {
 extension ReachingViewController: ARSessionDelegate {
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
     guard running, !hasCompleted else { return }
-    lastARFrame = frame  // store for re-detection capture
     let now = ProcessInfo.processInfo.systemUptime
     guard now - lastFrameProcessedAt >= frameProcessInterval else { return }
+    // Skip if visionQ is still processing a previous frame (prevents ARFrame retention buildup)
+    guard !isProcessingFrame else { return }
     lastFrameProcessedAt = now
-    visionQ.async { [weak self] in self?.processARFrame(frame) }
+    lastARFrame = frame
+    isProcessingFrame = true
+    visionQ.async { [weak self] in
+      guard let self = self else { return }
+      self.processARFrame(frame)
+      self.isProcessingFrame = false
+    }
   }
   func session(_ session: ARSession, didFailWithError error: Error) {
     say("Tracking failed.")

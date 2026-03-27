@@ -109,6 +109,8 @@ class ReachingViewController: UIViewController {
   var meshReconstructionEnabled = false
   var lastFrameProcessedAt: TimeInterval = 0
   let frameProcessInterval: TimeInterval = 0.05
+  /// Prevents ARFrame retention: skip new frames while visionQ is still processing
+  var isProcessingFrame = false
   var anchorRefinementFrames = 0
   let anchorRefinementLimit = 600
   var refinementHits: [Float] = []
