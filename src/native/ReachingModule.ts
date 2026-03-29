@@ -1,4 +1,3 @@
-//hehe
 /**
  * src/native/ReachingModule.ts
  * 
@@ -28,6 +27,10 @@ export interface ReachingConfig {
   imageHeight: number;
   /** Reaching mode: 'handFree' (default) or 'withHand' */
   mode?: 'handFree' | 'withHand';
+  /** Backend URL for acquisition validation (enables auto-exit in hand-free mode) */
+  acquisitionUrl?: string;
+  /** Workflow session ID forwarded to iOS acquisition requests */
+  sessionId?: string;
 }
 
 export type ReachingState = 'idle' | 'tracking' | 'locked' | 'reached' | 'lost';

@@ -67,6 +67,42 @@ class ReachingViewController: UIViewController {
   let mode: ReachingMode
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - LiDAR Detection
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// true if device has LiDAR (iPhone Pro / iPad Pro) — set once in startAR()
+  var hasLiDAR = false
+  /// true after first LiDAR depth sample used for anchor seeding
+  var lidarDepthSeeded = false
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Acquisition Validation (Hand-Free Auto-Exit)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Backend endpoint for acquisition validation (e.g. /validate-acquisition)
+  let acquisitionUrl: String?
+  /// Workflow session ID passed from React Native; required by backend acquisition endpoint.
+  let sessionId: String
+  /// Camera-to-anchor distance that triggers acquisition polling (meters)
+  let acquisitionDepthThreshold: Float = 0.40
+  /// Seconds between acquisition poll requests
+  let acquisitionPollInterval: TimeInterval = 2.0
+  /// Max seconds of polling before falling back to manual exit
+  let acquisitionTimeout: TimeInterval = 30.0
+  /// Network request in flight — skip poll if true
+  var isPollingAcquisition = false
+  /// Timestamp when acquisition polling started (for timeout)
+  var acquisitionPollStart: TimeInterval = 0
+  /// Timestamp of last poll request (for rate limiting)
+  var lastAcquisitionPollTime: TimeInterval = 0
+  /// User has entered <40cm zone at least once this session
+  var acquisitionTriggered = false
+  /// 30s timeout expired — no more polling, manual exit only
+  var acquisitionTimedOut = false
+  /// Number of acquisition polls sent (for logging + first-failure speech)
+  var acquisitionCheckCount = 0
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Progressive Re-detection
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -256,6 +292,8 @@ class ReachingViewController: UIViewController {
   init(bboxRaw: [CGFloat], objectName: String, backendDepth: Float?,
        imageWidth: CGFloat, imageHeight: CGFloat,
        detectionUrl: String? = nil,
+       acquisitionUrl: String? = nil,
+      sessionId: String? = nil,
        mode: ReachingMode = .handFree,
        ttsRate: Float = 0.5,
        distanceUnit: String = "steps",
@@ -266,6 +304,9 @@ class ReachingViewController: UIViewController {
     self.imageWidth   = imageWidth
     self.imageHeight  = imageHeight
     self.detectionUrl = detectionUrl
+    self.acquisitionUrl = acquisitionUrl
+    let cleanedSessionId = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    self.sessionId = cleanedSessionId.isEmpty ? UUID().uuidString : cleanedSessionId
     self.mode         = mode
     self.ttsRate      = ttsRate
     self.distanceUnit = distanceUnit
@@ -278,6 +319,8 @@ class ReachingViewController: UIViewController {
       speechCooldown = 2.0
       directionStableThreshold = 8
     }
+        NSLog("🎯 [ReachingVC] Init — mode=%@ acquisitionUrl=%@ detectionUrl=%@ sessionId=%@",
+          mode.rawValue, acquisitionUrl ?? "nil", detectionUrl ?? "nil", self.sessionId)
   }
   required init?(coder: NSCoder) { fatalError() }
 
@@ -471,6 +514,8 @@ class ReachingViewController: UIViewController {
       self.dismiss(animated: true) {
         self.onDone(["success": true, "object": self.objectName,
                      "reason": "reached", "mode": self.mode.rawValue,
+                     "hasLiDAR": self.hasLiDAR,
+                     "acquisitionChecks": self.acquisitionCheckCount,
                      "message": "\(self.objectName) reached!"])
       }
     }
@@ -490,6 +535,8 @@ class ReachingViewController: UIViewController {
         self.onDone(["success": success, "object": self.objectName,
                      "reason": reason,
                      "mode": self.mode.rawValue,
+                     "hasLiDAR": self.hasLiDAR,
+                     "acquisitionChecks": self.acquisitionCheckCount,
                      "message": msg])
       }
     }
@@ -503,6 +550,9 @@ class ReachingViewController: UIViewController {
     hapticEngine?.stop(); hapticEngine = nil
     synth.stopSpeaking(at: .immediate)
     sceneView?.session.pause()
+    // Reset acquisition polling state
+    isPollingAcquisition = false
+    acquisitionTriggered = false
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

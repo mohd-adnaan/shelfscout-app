@@ -117,6 +117,10 @@ export const WORKFLOW_URL = 'https://cybersight.cim.mcgill.ca/api/webhook/29ee13
 // Update this if the Traefik route differs.
 export const DETECTION_URL = 'https://cybersight.cim.mcgill.ca/vision/detect';
 
+// Acquisition validation — same backend webhook, called with reaching_ios=true
+// and mode flag so backend runs the acquisition validation block.
+export const ACQUISITION_URL = 'https://cybersight.cim.mcgill.ca/api/webhook/29ee1345-f789-4738-997f-ffdae65bba74';
+
 // Adnaan's workflow 
 //export const WORKFLOW_URL = 'https://cybersight.cim.mcgill.ca/api/webhook/2a6dcae3-c11b-4989-86ce-8a4224f18a7f';
 
@@ -192,6 +196,7 @@ export default {
   COLORS,
   WORKFLOW_URL,
   DETECTION_URL,
+  ACQUISITION_URL,
   SPEACHES_CONFIG,
   SILENCE_DETECTION_CONFIG,
   NAVIGATION_CONFIG,

@@ -283,45 +283,6 @@ extension ReachingViewController {
     synth.speak(u); NSLog("🗣 [ReachingVC] rate=%.2f voice=%@ | %@", ttsRate, premiumVoice?.identifier ?? "nil", text)
   }
 
-  func speakDirectionIfNeeded(_ direction: Direction) {
-    guard direction != .searching else { return }
-    let now = ProcessInfo.processInfo.systemUptime
-    if direction == currentDirection { directionStableFrames += 1 } else { directionStableFrames = 1 }
-
-    // Case 1: Aligned but still far — tell user to walk closer
-    if direction == .centered && liveDistanceToObject >= reachProximityThreshold {
-      if now - lastSpeechTime > 2.5 {
-        let remaining = max(0, Int((liveDistanceToObject - reachProximityThreshold) * 100))
-        if remaining <= 5 {
-          say("Aligned. Move your hand forward to grab it.")
-        } else {
-          say("Aligned. Move \(remaining) centimeters closer.")
-        }
-        lastSpeechTime = now
-      }
-      return
-    }
-
-    // Case 2: Aligned AND within reach — tell user to reach forward
-    if direction == .centered && liveDistanceToObject < reachProximityThreshold {
-      if direction != lastSpokenDirection {
-        // First time entering aligned+close — give the key instruction
-        say("Aligned. Move your hand forward to grab it.")
-        lastSpokenDirection = direction; lastSpeechTime = now
-      } else if (now - lastSpeechTime) > 3.0 {
-        // Repeated — remind to reach forward and tap
-        say("Move your hand forward. Tap anywhere when you have it.")
-        lastSpeechTime = now
-      }
-      return
-    }
-
-    // Case 3: Not aligned — speak direction
-    if direction == lastSpokenDirection { return }
-    if directionStableFrames >= directionStableThreshold && (now - lastSpeechTime) >= speechCooldown {
-      say(direction.rawValue)
-      lastSpokenDirection = direction; lastSpeechTime = now
-      if direction != .centered && direction != .searching { triggerHaptic(0.4) }
-    }
-  }
+  // NOTE: speakDirectionIfNeeded() moved to +withHand.swift
+  // NOTE: speakDirectionHandFree() lives in +handFree.swift
 }

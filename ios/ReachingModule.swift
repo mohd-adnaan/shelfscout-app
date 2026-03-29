@@ -66,12 +66,17 @@ class ReachingModule: NSObject {
     if let h = params["imageHeight"] as? NSNumber { imgH = CGFloat(h.doubleValue) }
 
     let detectionUrl = params["detectionUrl"] as? String
+    let acquisitionUrl = params["acquisitionUrl"] as? String
+    let sessionId = params["sessionId"] as? String
 
     let status = AVCaptureDevice.authorizationStatus(for: .video)
     let launch = { [weak self] in
       self?.presentReachingVC(bbox: bbox, objectName: objectName,
                               depth: backendDepth, imageW: imgW, imageH: imgH,
-                              detectionUrl: detectionUrl, mode: mode,
+                              detectionUrl: detectionUrl,
+                              acquisitionUrl: acquisitionUrl,
+                              sessionId: sessionId,
+                              mode: mode,
                               ttsRate: ttsRate, distanceUnit: distanceUnit,
                               resolver: resolver, rejecter: rejecter)
     }
@@ -150,6 +155,8 @@ class ReachingModule: NSObject {
     bbox: [CGFloat], objectName: String, depth: Float?,
     imageW: CGFloat, imageH: CGFloat,
     detectionUrl: String?,
+    acquisitionUrl: String?,
+    sessionId: String?,
     mode: ReachingViewController.ReachingMode,
     ttsRate: Float,
     distanceUnit: String,
@@ -166,7 +173,10 @@ class ReachingModule: NSObject {
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
             self.presentReachingVC(bbox: bbox, objectName: objectName, depth: depth,
                                    imageW: imageW, imageH: imageH,
-                                   detectionUrl: detectionUrl, mode: mode,
+                                   detectionUrl: detectionUrl,
+                                   acquisitionUrl: acquisitionUrl,
+                                   sessionId: sessionId,
+                                   mode: mode,
                                    ttsRate: ttsRate, distanceUnit: distanceUnit,
                                    resolver: resolver, rejecter: rejecter)
           }
@@ -177,6 +187,8 @@ class ReachingModule: NSObject {
         bboxRaw: bbox, objectName: objectName, backendDepth: depth,
         imageWidth: imageW, imageHeight: imageH,
         detectionUrl: detectionUrl,
+        acquisitionUrl: acquisitionUrl,
+        sessionId: sessionId,
         mode: mode,
         ttsRate: ttsRate,
         distanceUnit: distanceUnit,

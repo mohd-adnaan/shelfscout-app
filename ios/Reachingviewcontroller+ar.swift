@@ -30,7 +30,11 @@ extension ReachingViewController {
 
     if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
       config.frameSemantics.insert(.sceneDepth)
-      NSLog("📷 [ReachingVC] LiDAR scene depth ENABLED")
+      hasLiDAR = true
+      NSLog("📷 [ReachingVC] ✅ LiDAR DETECTED — using LiDAR depth for anchor seeding")
+    } else {
+      hasLiDAR = false
+      NSLog("📷 [ReachingVC] ❌ No LiDAR — using Qwen depth + ARKit raycast refinement")
     }
     if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
       config.sceneReconstruction = .mesh
@@ -43,7 +47,8 @@ extension ReachingViewController {
     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     startBeepLoop()
     startRedetectionLoop()
-    NSLog("📷 [ReachingVC] AR session started")
+    NSLog("📷 [ReachingVC] AR session started — mode=%@ hasLiDAR=%@",
+          mode.rawValue, hasLiDAR ? "YES" : "NO")
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -70,14 +75,26 @@ extension ReachingViewController {
     let screenCenter = CGPoint(x: (bx1+bx2)/2, y: (by1+by2)/2)
 
     let camera = frame.camera
-    // On re-detection, anchorDepth is updated by updateBboxFromBackend.
-    // On first placement, use backendDepth. anchorDepth default is 0.5.
+    // ── Depth source selection ───────────────────────────────────────────
+    // Priority: 1. LiDAR (instant metric, Pro devices)
+    //           2. Re-detection depth (from updateBboxFromBackend)
+    //           3. Backend depth (Qwen/DAv2 — relative, less accurate)
+    //           4. Fallback 0.5m
     let depth: Float
-    if bboxUpdateCount > 0, anchorDepth > 0.05 {
+    if hasLiDAR, let lidarDepth = sampleLiDARDepth(frame: frame, screenCenter: screenCenter) {
+      depth = lidarDepth
+      anchorDepth = lidarDepth
+      lidarDepthSeeded = true
+      NSLog("🎯 [ReachingVC] ✅ LiDAR depth seed: %.2fm (backend was %.2fm)",
+            depth, backendDepth ?? -1)
+    } else if bboxUpdateCount > 0, anchorDepth > 0.05 {
       depth = anchorDepth  // use re-detected depth
+      NSLog("🎯 [ReachingVC] Using re-detection depth: %.2fm", depth)
     } else {
       depth = backendDepth ?? 0.5
       anchorDepth = depth
+      NSLog("🎯 [ReachingVC] Using %@ depth: %.2fm",
+            hasLiDAR ? "backend (LiDAR miss)" : "Qwen/backend", depth)
     }
 
     let intrinsics = camera.intrinsics

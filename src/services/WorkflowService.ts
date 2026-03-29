@@ -42,6 +42,7 @@ export const triggerIOSReaching = async (
     imageWidth?: number;
     imageHeight?: number;
     detectionUrl?: string;
+    acquisitionUrl?: string;
   }
 ): Promise<boolean> => {
   if (Platform.OS !== 'ios') {
@@ -65,6 +66,7 @@ export const triggerIOSReaching = async (
         ...(options?.imageWidth != null && { imageWidth: options.imageWidth }),
         ...(options?.imageHeight != null && { imageHeight: options.imageHeight }),
         ...(options?.detectionUrl != null && { detectionUrl: options.detectionUrl }),
+        ...(options?.acquisitionUrl != null && { acquisitionUrl: options.acquisitionUrl }),
       });
       console.log('✅ [iOS ARKit] Reaching started successfully');
       return true;
@@ -239,7 +241,6 @@ export const sendToWorkflow = async (
 
     formData.append('navigation', navigationValue);
     formData.append('reaching_flag', reachingValue);
-
     formData.append('user_id', 'mobile-user');
     formData.append('request_id', `mobile-${Date.now()}`);
     formData.append('session_id', SESSION_ID);
