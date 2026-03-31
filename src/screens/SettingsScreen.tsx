@@ -104,13 +104,13 @@ function AccessibleSlider({
   // Sync animated thumb when value prop changes
   React.useEffect(() => {
     thumbX.setValue(valueToX(value));
-  }, [value, trackWidth]);
+  }, [thumbX, value, valueToX]);
 
   const panResponder = useRef(
     PanResponder.create({
       onStartShouldSetPanResponder: () => true,
       onMoveShouldSetPanResponder: () => true,
-      onPanResponderGrant: (_, gs) => {
+      onPanResponderGrant: (_, _gs) => {
         // Start from current pixel position
         thumbX.setOffset((thumbX as any)._value);
         thumbX.setValue(0);
@@ -121,7 +121,7 @@ function AccessibleSlider({
         thumbX.setValue(clamped - (thumbX as any)._offset);
         onChange(xToValue(clamped));
       },
-      onPanResponderRelease: (_, gs) => {
+      onPanResponderRelease: (_, _gs) => {
         thumbX.flattenOffset();
         const clamped = Math.max(
           0,
@@ -220,9 +220,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
   const handleReachingToggle = useCallback(
     async (value: boolean) => {
       await updatePreferAlternativeReaching(value);
-      const label = value
-        ? 'Standard reaching pipeline enabled.'
-        : 'A R Kit reaching pipeline enabled. This is the default.';
+      const label = value ? 'Standard pipeline enabled.' : 'ARKit pipeline enabled.';
       AccessibilityInfo.announceForAccessibility(label);
     },
     [updatePreferAlternativeReaching],
@@ -315,19 +313,14 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             </View>
           </View>
 
-          {/* Description */}
           <Text style={styles.settingDescription}>
-            By default, CyberSight uses Apple's{' '}
-            <Text style={styles.emphasisText}>ARKit</Text> for object-reaching
-            guidance on iOS. Toggle this to switch to the{' '}
-            <Text style={styles.emphasisText}>Standard</Text> reaching pipeline
-            instead.
+            Choose the guidance engine. <Text style={styles.emphasisText}>ARKit</Text> is recommended on iPhone.
           </Text>
 
           {/* Toggle row */}
           <View style={styles.settingRow}>
             <View style={styles.settingLabelBlock}>
-              <Text style={styles.settingLabel}>Use Standard Pipeline</Text>
+              <Text style={styles.settingLabel}>Standard Pipeline</Text>
               <Text style={styles.settingSubLabel}>
                 {settings.preferAlternativeReaching
                   ? 'Standard reaching active'
@@ -347,8 +340,8 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
               accessibilityLabel="Use Standard Reaching Pipeline"
               accessibilityHint={
                 settings.preferAlternativeReaching
-                  ? 'Currently using Standard pipeline. Double tap to switch to ARKit.'
-                  : 'Currently using ARKit. Double tap to switch to Standard pipeline.'
+                  ? 'Double tap to switch to ARKit.'
+                  : 'Double tap to switch to Standard.'
               }
               accessibilityValue={{
                 text: settings.preferAlternativeReaching
@@ -358,46 +351,6 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             />
           </View>
 
-          {/* Pipeline comparison */}
-          <View style={styles.comparisonRow}>
-            <View
-              style={[
-                styles.pipelineOption,
-                !settings.preferAlternativeReaching && styles.pipelineOptionActive,
-              ]}
-              accessible={true}
-              accessibilityLabel={`ARKit pipeline${!settings.preferAlternativeReaching ? ', currently selected' : ''}`}
-            >
-              <Text style={styles.pipelineOptionIcon}>✦</Text>
-              <Text style={styles.pipelineOptionName}>ARKit</Text>
-              <Text style={styles.pipelineOptionDesc}>
-                Depth-aware 3D guidance
-              </Text>
-              {!settings.preferAlternativeReaching && (
-                <View style={styles.activeDot} />
-              )}
-            </View>
-
-            <View style={styles.pipelineDivider} />
-
-            <View
-              style={[
-                styles.pipelineOption,
-                settings.preferAlternativeReaching && styles.pipelineOptionActiveAlt,
-              ]}
-              accessible={true}
-              accessibilityLabel={`Standard pipeline${settings.preferAlternativeReaching ? ', currently selected' : ''}`}
-            >
-              <Text style={styles.pipelineOptionIcon}>⚙</Text>
-              <Text style={styles.pipelineOptionName}>Standard</Text>
-              <Text style={styles.pipelineOptionDesc}>
-                Vision-based guidance
-              </Text>
-              {settings.preferAlternativeReaching && (
-                <View style={[styles.activeDot, { backgroundColor: C.warning }]} />
-              )}
-            </View>
-          </View>
         </Section>
 
         {/* ══════════════════════════════════════════
@@ -406,11 +359,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         {Platform.OS === 'ios' && !settings.preferAlternativeReaching && (
           <Section title="Reaching Mode">
             <Text style={styles.settingDescription}>
-              Choose how object guidance works.{' '}
-              <Text style={styles.emphasisText}>Hands-free</Text> guides you
-              using the camera direction — ideal when hands are occupied.{' '}
-              <Text style={styles.emphasisText}>With hand</Text> tracks your
-              hand to guide it toward the object.
+              Choose how guidance works: <Text style={styles.emphasisText}>Hands-free</Text> or <Text style={styles.emphasisText}>With hand</Text>.
             </Text>
 
             {/* Mode comparison */}
@@ -423,10 +372,10 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessible={true}
                 accessibilityRole="button"
                 accessibilityLabel={`Hands-free mode${settings.reachingMode === 'handFree' ? ', currently selected' : ''}`}
-                accessibilityHint="Double tap to select hands-free reaching"
+                accessibilityHint="Double tap to select"
                 onPress={async () => {
                   await updateReachingMode('handFree');
-                  AccessibilityInfo.announceForAccessibility('Hands-free reaching mode enabled. Camera guides you to the object.');
+                  AccessibilityInfo.announceForAccessibility('Hands-free mode enabled.');
                 }}
               >
                 <Text style={styles.pipelineOptionIcon}>📱</Text>
@@ -449,10 +398,10 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessible={true}
                 accessibilityRole="button"
                 accessibilityLabel={`With hand mode${settings.reachingMode === 'withHand' ? ', currently selected' : ''}`}
-                accessibilityHint="Double tap to select hand tracking reaching"
+                accessibilityHint="Double tap to select"
                 onPress={async () => {
                   await updateReachingMode('withHand');
-                  AccessibilityInfo.announceForAccessibility('Hand tracking reaching mode enabled. Show your hand to guide it to the object.');
+                  AccessibilityInfo.announceForAccessibility('With hand mode enabled.');
                 }}
               >
                 <Text style={styles.pipelineOptionIcon}>✋</Text>
@@ -474,7 +423,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         {Platform.OS === 'ios' && !settings.preferAlternativeReaching && (
           <Section title="Distance Feedback">
             <Text style={styles.settingDescription}>
-              Choose how distance is announced during reaching guidance.
+              Choose how distance is spoken during guidance.
             </Text>
 
             <View style={styles.comparisonRow}>
@@ -486,10 +435,10 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessible={true}
                 accessibilityRole="button"
                 accessibilityLabel={`Steps${settings.distanceUnit === 'steps' ? ', currently selected' : ''}`}
-                accessibilityHint="Double tap to use step-based distance"
+                accessibilityHint="Double tap to select"
                 onPress={async () => {
                   await updateDistanceUnit('steps');
-                  AccessibilityInfo.announceForAccessibility('Distance announced in steps.');
+                  AccessibilityInfo.announceForAccessibility('Distance set to steps.');
                 }}
               >
                 <Text style={styles.pipelineOptionIcon}>👣</Text>
@@ -512,10 +461,10 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessible={true}
                 accessibilityRole="button"
                 accessibilityLabel={`Centimeters${settings.distanceUnit === 'cm' ? ', currently selected' : ''}`}
-                accessibilityHint="Double tap to use centimeter-based distance"
+                accessibilityHint="Double tap to select"
                 onPress={async () => {
                   await updateDistanceUnit('cm');
-                  AccessibilityInfo.announceForAccessibility('Distance announced in centimeters.');
+                  AccessibilityInfo.announceForAccessibility('Distance set to centimeters.');
                 }}
               >
                 <Text style={styles.pipelineOptionIcon}>📏</Text>
@@ -536,14 +485,14 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         ══════════════════════════════════════════ */}
         <Section title="Voice Speed">
           <Text style={styles.settingDescription}>
-            Control how fast CyberSight speaks responses. Changes apply
-            immediately — tap a preset or drag the slider.
+            Adjust speaking speed. Changes apply immediately.
           </Text>
 
-          {/* Current value display */}
-          <View style={styles.rateDisplayRow}>
-            <Text style={styles.rateValue}>{ratePercent(localRate)}</Text>
-            <Text style={styles.rateLabel}>{rateLabel(localRate)}</Text>
+          <View style={styles.rateDisplayCompact}>
+            <Text style={styles.rateLabelCompact}>Current speed</Text>
+            <Text style={styles.rateValueCompact}>
+              {ratePercent(localRate)} • {rateLabel(localRate)}
+            </Text>
           </View>
 
           {/* Slider */}
@@ -559,8 +508,8 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
 
           {/* Min / Max labels */}
           <View style={styles.sliderEndLabels}>
-            <Text style={styles.sliderEndLabel}>Slowest</Text>
-            <Text style={styles.sliderEndLabel}>Fastest</Text>
+            <Text style={styles.sliderEndLabel}>🐢 Slow</Text>
+            <Text style={styles.sliderEndLabel}>Fast 🐇</Text>
           </View>
 
           {/* Preset buttons */}
@@ -576,7 +525,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessible={true}
                 accessibilityRole="button"
                 accessibilityLabel={`${p.label} speed, ${ratePercent(p.value)}`}
-                accessibilityHint="Double tap to set this voice speed"
+                accessibilityHint="Double tap to set speed"
                 accessibilityState={{
                   selected: Math.abs(localRate - p.value) < 0.03,
                 }}
@@ -608,8 +557,8 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             }}
             accessible={true}
             accessibilityRole="button"
-            accessibilityLabel="Preview voice speed"
-            accessibilityHint="Double tap to hear a sample at the current speed"
+            accessibilityLabel="Preview voice"
+            accessibilityHint="Double tap to hear a sample"
           >
             <Text style={styles.testBtnText}>▶  Preview Voice</Text>
           </TouchableOpacity>
@@ -620,10 +569,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         ══════════════════════════════════════════ */}
         <Section title="Developer Options">
           <Text style={styles.settingDescription}>
-            Enable the debug overlay to inspect API calls, backend responses,
-            errors, and timing in real-time. Use with{' '}
-            <Text style={styles.emphasisText}>VoiceOver OFF</Text> during
-            testing.
+            Show the debug overlay during testing. Use with <Text style={styles.emphasisText}>VoiceOver off</Text>.
           </Text>
 
           <View style={styles.settingRow}>
@@ -648,7 +594,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         </Section>
 
         {/* Footer padding */}
-        <View style={{ height: 48 }} />
+        <View style={styles.footerSpacer} />
       </ScrollView>
     </View>
   );
@@ -690,8 +636,8 @@ const styles = StyleSheet.create({
   headerTitle: {
     color: C.text,
     fontSize: 17,
-    fontWeight: '600',
-    letterSpacing: 0.3,
+    fontWeight: '700',
+    letterSpacing: 0.6,
   },
 
   // ── Scroll ──
@@ -704,7 +650,7 @@ const styles = StyleSheet.create({
     color: C.textMuted,
     fontSize: 11,
     fontWeight: '700',
-    letterSpacing: 1.2,
+    letterSpacing: 0.9,
     textTransform: 'uppercase',
     marginBottom: 10,
     marginLeft: 4,
@@ -768,12 +714,14 @@ const styles = StyleSheet.create({
   settingLabel: {
     color: C.text,
     fontSize: 16,
-    fontWeight: '500',
+    fontWeight: '600',
+    letterSpacing: 0.2,
   },
   settingSubLabel: {
     color: C.textMuted,
     fontSize: 12,
     marginTop: 2,
+    letterSpacing: 0.15,
   },
 
   // ── Pipeline comparison ──
@@ -830,22 +778,19 @@ const styles = StyleSheet.create({
   },
 
   // ── Rate display ──
-  rateDisplayRow: {
-    flexDirection: 'row',
-    alignItems: 'baseline',
-    marginBottom: 20,
-    gap: 10,
+  rateDisplayCompact: {
+    marginBottom: 12,
   },
-  rateValue: {
+  rateLabelCompact: {
+    color: C.textMuted,
+    fontSize: 12,
+    marginBottom: 2,
+  },
+  rateValueCompact: {
     color: C.primary,
-    fontSize: 36,
+    fontSize: 24,
     fontWeight: '700',
-    letterSpacing: -1,
-  },
-  rateLabel: {
-    color: C.textSecondary,
-    fontSize: 16,
-    fontWeight: '500',
+    letterSpacing: -0.3,
   },
 
   // ── Slider ──
@@ -941,5 +886,9 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '600',
     letterSpacing: 0.3,
+  },
+
+  footerSpacer: {
+    height: 48,
   },
 });

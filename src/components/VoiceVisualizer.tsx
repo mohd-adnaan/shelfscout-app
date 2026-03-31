@@ -14,14 +14,13 @@
 //  
 */
 
-import React, { useEffect, useRef } from 'react';
+import React, { useEffect, useMemo, useRef } from 'react';
 import {
   View,
   Text,
   StyleSheet,
   Animated,
   Dimensions,
-  AccessibilityInfo,
   Easing,
 } from 'react-native';
 import { Mic, MicOff, Speaker, Brain } from './Icons';
@@ -33,6 +32,68 @@ const NUM_BARS = 56;
 const INNER_RADIUS = CIRCLE_SIZE * 0.36;
 const MAX_BAR_LENGTH = 42;
 const BAR_WIDTH = 3.5;
+const ACTIVE_BASE = 0.18;
+
+type VisualizerState =
+  | 'ready'
+  | 'listening'
+  | 'thinking'
+  | 'speaking'
+  | 'navigating'
+  | 'reaching';
+
+interface MotionProfile {
+  speed: number;
+  waveAmplitude: number;
+  pulseAmplitude: number;
+  baseline: number;
+  outerGlowOpacity: number;
+}
+
+const MOTION: Record<VisualizerState, MotionProfile> = {
+  ready: {
+    speed: 0,
+    waveAmplitude: 0,
+    pulseAmplitude: 0,
+    baseline: 0.16,
+    outerGlowOpacity: 0.16,
+  },
+  listening: {
+    speed: 1.65,
+    waveAmplitude: 0.15,
+    pulseAmplitude: 0.08,
+    baseline: 0.28,
+    outerGlowOpacity: 0.29,
+  },
+  thinking: {
+    speed: 2.3,
+    waveAmplitude: 0.22,
+    pulseAmplitude: 0.05,
+    baseline: 0.31,
+    outerGlowOpacity: 0.35,
+  },
+  speaking: {
+    speed: 1.9,
+    waveAmplitude: 0.18,
+    pulseAmplitude: 0.12,
+    baseline: 0.34,
+    outerGlowOpacity: 0.4,
+  },
+  navigating: {
+    speed: 1.45,
+    waveAmplitude: 0.2,
+    pulseAmplitude: 0.07,
+    baseline: 0.3,
+    outerGlowOpacity: 0.37,
+  },
+  reaching: {
+    speed: 1.45,
+    waveAmplitude: 0.18,
+    pulseAmplitude: 0.08,
+    baseline: 0.3,
+    outerGlowOpacity: 0.38,
+  },
+};
 
 interface VoiceVisualizerProps {
   isListening: boolean;
@@ -46,23 +107,95 @@ interface VoiceVisualizerProps {
   audioLevel?: number;
 }
 
-// Simple icons
+const STATUS_TEXT: Record<VisualizerState, string> = {
+  ready: 'Ready',
+  listening: 'Listening',
+  thinking: 'Thinking',
+  speaking: 'Speaking',
+  navigating: 'Navigating',
+  reaching: 'Reaching',
+};
+
+const STATUS_INSTRUCTION: Record<VisualizerState, string> = {
+  ready: 'Tap to speak',
+  listening: 'Speak naturally, tap to stop',
+  thinking: 'Tap to interrupt',
+  speaking: 'Tap to interrupt',
+  navigating: 'Tap to stop',
+  reaching: 'Tap to stop',
+};
+
+const STATUS_COLOR: Record<VisualizerState, string> = {
+  ready: '#8A8F98',
+  listening: '#2AA4FF',
+  thinking: '#FFC24A',
+  speaking: '#4CCB6E',
+  navigating: COLORS.NAVIGATION || '#FF6B35',
+  reaching: COLORS.REACHING || '#9B59B6',
+};
+
+// Minimal symbolic icons, consistent with HUD style.
 const NavigationIcon = ({ size, color }: { size: number; color: string }) => (
-  <View style={{ width: size, height: size, justifyContent: 'center', alignItems: 'center' }}>
-    <View style={{
-      width: 0, height: 0,
-      borderLeftWidth: size * 0.28, borderRightWidth: size * 0.28, borderBottomWidth: size * 0.55,
-      borderLeftColor: 'transparent', borderRightColor: 'transparent', borderBottomColor: color,
-    }} />
-    <View style={{ width: size * 0.11, height: size * 0.22, backgroundColor: color, marginTop: -3 }} />
+  <View style={[styles.symbolContainer, { width: size, height: size }]}>
+    <View
+      style={[
+        styles.navArrow,
+        {
+          borderLeftWidth: size * 0.28,
+          borderRightWidth: size * 0.28,
+          borderBottomWidth: size * 0.55,
+          borderBottomColor: color,
+        },
+      ]}
+    />
+    <View
+      style={[
+        styles.navStem,
+        {
+          width: size * 0.11,
+          height: size * 0.22,
+          backgroundColor: color,
+        },
+      ]}
+    />
   </View>
 );
 
 const ReachingIcon = ({ size, color }: { size: number; color: string }) => (
-  <View style={{ width: size, height: size, justifyContent: 'center', alignItems: 'center' }}>
-    <View style={{ width: size * 0.75, height: size * 0.75, borderRadius: size * 0.375, borderWidth: 2, borderColor: color, position: 'absolute' }} />
-    <View style={{ width: size * 0.45, height: size * 0.45, borderRadius: size * 0.225, borderWidth: 2, borderColor: color, position: 'absolute' }} />
-    <View style={{ width: size * 0.18, height: size * 0.18, borderRadius: size * 0.09, backgroundColor: color, position: 'absolute' }} />
+  <View style={[styles.symbolContainer, { width: size, height: size }]}>
+    <View
+      style={[
+        styles.targetOuter,
+        {
+          width: size * 0.75,
+          height: size * 0.75,
+          borderRadius: size * 0.375,
+          borderColor: color,
+        },
+      ]}
+    />
+    <View
+      style={[
+        styles.targetInner,
+        {
+          width: size * 0.45,
+          height: size * 0.45,
+          borderRadius: size * 0.225,
+          borderColor: color,
+        },
+      ]}
+    />
+    <View
+      style={[
+        styles.targetCore,
+        {
+          width: size * 0.16,
+          height: size * 0.16,
+          borderRadius: size * 0.08,
+          backgroundColor: color,
+        },
+      ]}
+    />
   </View>
 );
 
@@ -74,84 +207,66 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   isReaching = false,
   transcript,
   pulseAnim,
-  opacityAnim,
-  audioLevel = 0,
+  opacityAnim: _opacityAnim,
+  audioLevel: _audioLevel = 0,
 }) => {
-  const rotateAnim = useRef(new Animated.Value(0)).current;
-  const previousState = useRef('');
+  const ringRotateAnim = useRef(new Animated.Value(0)).current;
   
   // Animated scale for each bar (0 to 1)
   const barScales = useRef<Animated.Value[]>(
-    Array.from({ length: NUM_BARS }, () => new Animated.Value(0.15))
+    Array.from({ length: NUM_BARS }, () => new Animated.Value(ACTIVE_BASE))
   ).current;
   
   const animFrameRef = useRef<number | null>(null);
 
-  const getStatusText = () => {
-    if (isReaching) return 'Reaching';
-    if (isNavigation) return 'Navigating';
-    if (isSpeaking) return 'Speaking';
-    if (isProcessing) return 'Thinking';
-    if (isListening) return 'Listening';
-    return 'Ready';
-  };
+  const state: VisualizerState = useMemo(() => {
+    if (isReaching) return 'reaching';
+    if (isNavigation) return 'navigating';
+    if (isSpeaking) return 'speaking';
+    if (isProcessing) return 'thinking';
+    if (isListening) return 'listening';
+    return 'ready';
+  }, [isListening, isNavigation, isProcessing, isReaching, isSpeaking]);
 
-  const getStatusColor = () => {
-    if (isReaching) return COLORS.REACHING || '#9B59B6';
-    if (isNavigation) return COLORS.NAVIGATION || '#FF6B35';
-    if (isSpeaking) return '#4CAF50';
-    if (isProcessing) return '#FFC107';
-    if (isListening) return '#2196F3';
-    return '#555';
-  };
+  const statusText = STATUS_TEXT[state];
+  const instructionText = STATUS_INSTRUCTION[state];
+  const statusColor = STATUS_COLOR[state];
+  const motion = MOTION[state];
 
-  const getInstructionText = () => {
-    if (isReaching || isNavigation) return 'Tap to stop';
-    if (isSpeaking || isProcessing) return 'Tap to interrupt';
-    if (isListening) return 'Speak naturally, tap to stop';
-    return 'Tap to speak';
-  };
-
-  // ── State change tracking ──────────────────────────────────────────────
-  // VoiceVisualizer does NOT announce state changes via announceForAccessibility.
-  // Reason: App.tsx already handles all announcements at correct timing:
-  //   - Listening: nothing (earcon only, VoiceOver label updates)
-  //   - Thinking: handleAutoSubmit announces "Thinking"
-  //   - Speaking: no announcement needed (TTS response IS the audio)
-  //   - Ready: handleVoiceCommand announces "Ready. Tap to speak."
-  //
-  // Previous approach caused:
-  //   - "Tap to interrupt" overlapping with "Thinking" 
-  //   - "Speaking. Tap to interrupt" fighting with TTS response audio
-  //   - Duplicate announcements (both VoiceVisualizer AND App.tsx)
+  // Single clockwise ring rotation language for active states.
   useEffect(() => {
-    previousState.current = getStatusText();
-  }, [isListening, isProcessing, isSpeaking, isNavigation, isReaching]);
-
-  // Slow rotation for processing/navigation/reaching
-  useEffect(() => {
-    if (isProcessing || isNavigation || isReaching) {
+    const isActive = state !== 'ready';
+    if (isActive) {
       Animated.loop(
-        Animated.timing(rotateAnim, {
+        Animated.timing(ringRotateAnim, {
           toValue: 1,
-          duration: isReaching ? 8000 : isNavigation ? 10000 : 6000,
+          duration:
+            state === 'thinking'
+              ? 5400
+              : state === 'navigating' || state === 'reaching'
+                ? 7600
+                : 8400,
           easing: Easing.linear,
           useNativeDriver: true,
         })
       ).start();
     } else {
-      rotateAnim.stopAnimation();
-      rotateAnim.setValue(0);
+      ringRotateAnim.stopAnimation();
+      ringRotateAnim.setValue(0);
     }
-  }, [isProcessing, isNavigation, isReaching, rotateAnim]);
+  }, [ringRotateAnim, state]);
 
-  // Bar animation loop
+  // Unified circular motion engine with per-state profile tuning.
   useEffect(() => {
-    const isActive = isListening || isProcessing || isSpeaking || isNavigation || isReaching;
-    
+    const isActive = state !== 'ready';
+
     if (!isActive) {
       barScales.forEach(scale => {
-        Animated.timing(scale, { toValue: 0.15, duration: 400, useNativeDriver: true }).start();
+        Animated.timing(scale, {
+          toValue: MOTION.ready.baseline,
+          duration: 360,
+          useNativeDriver: true,
+        }).start();
       });
       if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current);
       return;
@@ -162,31 +277,26 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
       
       barScales.forEach((scale, i) => {
         const angle = (i / NUM_BARS) * Math.PI * 2;
-        let value = 0.15;
-        
-        if (isListening) {
-          // Organic, voice-reactive pattern
-          value = 0.25 + 
-            Math.sin(t * 4 + angle * 3) * 0.22 +
-            Math.sin(t * 7 + i * 0.4) * 0.18 +
-            Math.sin(t * 2.5 + angle * 2) * 0.15;
-        } else if (isProcessing) {
-          // Smooth wave traveling around
-          value = 0.35 + Math.sin(angle - t * 2.5) * 0.35;
-        } else if (isSpeaking) {
-          // Rhythmic pulse
-          value = 0.4 + Math.sin(t * 5 + angle * 2) * 0.28 + Math.sin(t * 2) * 0.12;
-        } else if (isNavigation) {
-          // Directional with forward emphasis
-          value = 0.3 + Math.cos(angle) * 0.2 + Math.sin(angle - t * 1.8) * 0.22;
-        } else if (isReaching) {
-          // Radar ping sweep
-          const sweep = (t * 1.5) % (Math.PI * 2);
-          const diff = Math.min(Math.abs(angle - sweep), Math.PI * 2 - Math.abs(angle - sweep));
-          value = 0.2 + Math.max(0, 1 - diff / 0.7) * 0.55;
+        const travelWave = Math.sin(angle - t * motion.speed) * motion.waveAmplitude;
+        const microPulse = Math.sin(t * (motion.speed + 2.1) + i * 0.32) * motion.pulseAmplitude;
+        let stateBias = 0;
+
+        if (state === 'navigating') {
+          const forwardBias = Math.max(0, Math.cos(angle - Math.PI / 2));
+          stateBias = forwardBias * 0.18;
         }
-        
-        scale.setValue(Math.max(0.1, Math.min(1, value)));
+
+        if (state === 'reaching') {
+          const sweep = (t * 1.5) % (Math.PI * 2);
+          const diff = Math.min(
+            Math.abs(angle - sweep),
+            Math.PI * 2 - Math.abs(angle - sweep)
+          );
+          stateBias = Math.max(0, 1 - diff / 0.68) * 0.25;
+        }
+
+        const value = motion.baseline + travelWave + microPulse + stateBias;
+        scale.setValue(Math.max(0.12, Math.min(1, value)));
       });
       
       animFrameRef.current = requestAnimationFrame(animate);
@@ -194,17 +304,15 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     
     animate();
     return () => { if (animFrameRef.current) cancelAnimationFrame(animFrameRef.current); };
-  }, [isListening, isProcessing, isSpeaking, isNavigation, isReaching, barScales]);
+  }, [barScales, motion, state]);
 
-  const rotation = rotateAnim.interpolate({
+  const rotation = ringRotateAnim.interpolate({
     inputRange: [0, 1],
     outputRange: ['0deg', '360deg'],
   });
 
-  const statusColor = getStatusColor();
-
   // Pre-calculate bar positions - bars are positioned at their CENTER along the radial line
-  const barPositions = React.useMemo(() => {
+  const barPositions = useMemo(() => {
     const centerX = CIRCLE_SIZE / 2;
     const centerY = CIRCLE_SIZE / 2;
     
@@ -228,95 +336,238 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     });
   }, []);
 
+  const statusTextStyle = useMemo(
+    () => [
+      styles.statusText,
+      state === 'ready' ? styles.statusTextReady : styles.statusTextActive,
+      {
+        color: statusColor,
+        opacity: state === 'ready' ? 0.88 : 1,
+      },
+    ],
+    [state, statusColor]
+  );
+
+  const instructionTextStyle = useMemo(
+    () => [
+      styles.instructionText,
+      {
+        opacity:
+          state === 'ready'
+            ? 0.78
+            : state === 'listening'
+              ? 0.9
+              : 0.72,
+      },
+    ],
+    [state]
+  );
+
+  const ringGlowStyle = useMemo(
+    () => [
+      styles.outerGlow,
+      {
+        borderColor: statusColor,
+        opacity: motion.outerGlowOpacity,
+        transform: [{ scale: pulseAnim }],
+      },
+    ],
+    [motion.outerGlowOpacity, pulseAnim, statusColor]
+  );
+
+  const ringBarsRotationStyle = useMemo(
+    () => [
+      styles.barsContainer,
+      {
+        transform: [{ rotate: rotation }],
+        opacity: state === 'ready' ? 0.5 : 1,
+      },
+    ],
+    [rotation, state]
+  );
+
+  const innerCircleStyle = useMemo(
+    () => [styles.innerCircle, { borderColor: statusColor }],
+    [statusColor]
+  );
+
+  const transcriptBoxStyle = useMemo(
+    () => [styles.transcriptBox, { borderLeftColor: statusColor }],
+    [statusColor]
+  );
+
+  const barStyleMap = useMemo(
+    () =>
+      barPositions.map(pos => ({
+        position: 'absolute' as const,
+        width: BAR_WIDTH,
+        height: MAX_BAR_LENGTH,
+        left: pos.x,
+        top: pos.y,
+        backgroundColor: statusColor,
+        borderRadius: BAR_WIDTH / 2,
+        opacity: 0.88,
+      })),
+    [barPositions, statusColor]
+  );
+
+  const getAccessibleLabel = () => {
+    return `${statusText}. ${instructionText}`;
+  };
+
   const renderIcon = () => {
     const size = 65;
-    if (isReaching) return <ReachingIcon size={size} color={COLORS.REACHING || '#9B59B6'} />;
-    if (isNavigation) return <NavigationIcon size={size} color={COLORS.NAVIGATION || '#FF6B35'} />;
+    if (state === 'reaching') return <ReachingIcon size={size} color={statusColor} />;
+    if (state === 'navigating') return <NavigationIcon size={size} color={statusColor} />;
     if (isSpeaking) return <Speaker size={size} color="#4CAF50" />;
     if (isProcessing) return <Brain size={size} color="#FFC107" />;
     if (isListening) return <Mic size={size} color="#2196F3" />;
-    return <MicOff size={size} color="#555" />;
+    return <MicOff size={size} color={STATUS_COLOR.ready} />;
   };
 
   return (
-    <View style={styles.container} accessible accessibilityLabel={`${getStatusText()}. ${getInstructionText()}`} accessibilityRole="text">
+    <View
+      style={styles.container}
+      accessible={true}
+      accessibilityLabel={getAccessibleLabel()}
+      accessibilityRole="text"
+    >
       
       <View style={styles.visualizer} accessible={false} importantForAccessibility="no-hide-descendants">
         
-        {/* Outer glow */}
-        <Animated.View style={[styles.outerGlow, { borderColor: statusColor, opacity: opacityAnim, transform: [{ scale: pulseAnim }] }]} />
-        
-        {/* Bars container */}
-        <Animated.View style={[styles.barsContainer, { transform: [{ rotate: (isProcessing || isNavigation || isReaching) ? rotation : '0deg' }] }]}>
+        <Animated.View style={ringGlowStyle} />
+
+        <Animated.View style={ringBarsRotationStyle}>
           {barPositions.map((pos, i) => (
             <Animated.View
               key={i}
-              style={{
-                position: 'absolute',
-                width: BAR_WIDTH,
-                height: MAX_BAR_LENGTH,
-                left: pos.x,
-                top: pos.y,
-                backgroundColor: statusColor,
-                borderRadius: BAR_WIDTH / 2,
-                opacity: 0.88,
-                transform: [
-                  { scaleY: barScales[i] }, // Scale FIRST (along bar's length)
-                  { rotate: `${pos.angleDeg}deg` }, // Then rotate to face outward
-                ],
-              }}
+              style={[
+                barStyleMap[i],
+                {
+                  transform: [
+                    { scaleY: barScales[i] },
+                    { rotate: `${pos.angleDeg}deg` },
+                  ],
+                },
+              ]}
             />
           ))}
         </Animated.View>
-        
-        {/* Inner circle */}
-        <View style={[styles.innerCircle, { borderColor: statusColor }]} />
-        
-        {/* Icon */}
+
+        <View style={innerCircleStyle} />
+
         <View style={styles.iconContainer}>{renderIcon()}</View>
       </View>
 
-      <Text style={[styles.statusText, { color: statusColor }]}>{getStatusText()}</Text>
+      <Text style={statusTextStyle}>{statusText}</Text>
 
-      {transcript && isListening && !isNavigation && !isReaching && (
-        <View style={styles.transcriptBox}>
+      {transcript && state === 'listening' && (
+        <View style={transcriptBoxStyle}>
           <Text style={styles.transcriptText}>{transcript}</Text>
         </View>
       )}
 
-      <Text style={styles.instructionText}>{getInstructionText()}</Text>
+      <Text style={instructionTextStyle}>{instructionText}</Text>
     </View>
   );
 };
 
 const styles = StyleSheet.create({
-  container: { flex: 1, justifyContent: 'center', alignItems: 'center' },
-  visualizer: { width: CIRCLE_SIZE, height: CIRCLE_SIZE, justifyContent: 'center', alignItems: 'center' },
+  container: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  visualizer: {
+    width: CIRCLE_SIZE,
+    height: CIRCLE_SIZE,
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
   outerGlow: {
     position: 'absolute',
-    width: CIRCLE_SIZE + 25,
-    height: CIRCLE_SIZE + 25,
-    borderRadius: (CIRCLE_SIZE + 25) / 2,
-    borderWidth: 1.5,
+    width: CIRCLE_SIZE + 20,
+    height: CIRCLE_SIZE + 20,
+    borderRadius: (CIRCLE_SIZE + 20) / 2,
+    borderWidth: 1,
   },
-  barsContainer: { position: 'absolute', width: CIRCLE_SIZE, height: CIRCLE_SIZE },
+  barsContainer: {
+    position: 'absolute',
+    width: CIRCLE_SIZE,
+    height: CIRCLE_SIZE,
+  },
   innerCircle: {
     position: 'absolute',
     width: INNER_RADIUS * 2,
     height: INNER_RADIUS * 2,
     borderRadius: INNER_RADIUS,
-    borderWidth: 1.5,
-    backgroundColor: 'rgba(0,0,0,0.5)',
+    borderWidth: 1.8,
+    backgroundColor: 'rgba(0, 0, 0, 0.56)',
   },
-  iconContainer: { position: 'absolute' },
-  statusText: { marginTop: 28, fontSize: 26, fontWeight: '600', letterSpacing: 1.2 },
+  iconContainer: {
+    position: 'absolute',
+  },
+  symbolContainer: {
+    justifyContent: 'center',
+    alignItems: 'center',
+  },
+  navArrow: {
+    width: 0,
+    height: 0,
+    borderLeftColor: 'transparent',
+    borderRightColor: 'transparent',
+  },
+  navStem: {
+    marginTop: -3,
+  },
+  targetOuter: {
+    position: 'absolute',
+    borderWidth: 2,
+  },
+  targetInner: {
+    position: 'absolute',
+    borderWidth: 2,
+  },
+  targetCore: {
+    position: 'absolute',
+  },
+  statusText: {
+    marginTop: 30,
+    fontSize: 24,
+  },
+  statusTextReady: {
+    fontWeight: '600',
+    letterSpacing: 0.6,
+  },
+  statusTextActive: {
+    fontWeight: '700',
+    letterSpacing: 0.85,
+  },
   transcriptBox: {
-    position: 'absolute', bottom: 105, left: 20, right: 20,
-    backgroundColor: 'rgba(33,150,243,0.12)', padding: 16, borderRadius: 12,
-    borderLeftWidth: 3, borderLeftColor: '#2196F3',
+    position: 'absolute',
+    bottom: 105,
+    left: 20,
+    right: 20,
+    backgroundColor: 'rgba(15, 30, 52, 0.7)',
+    padding: 16,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: 'rgba(122, 172, 255, 0.28)',
+    borderLeftWidth: 4,
   },
-  transcriptText: { color: '#fff', fontSize: 17, lineHeight: 23 },
-  instructionText: { position: 'absolute', bottom: 42, color: '#777', fontSize: 15, letterSpacing: 0.4 },
+  transcriptText: {
+    color: '#F5F8FF',
+    fontSize: 17,
+    lineHeight: 23,
+  },
+  instructionText: {
+    position: 'absolute',
+    bottom: 42,
+    color: 'rgba(218, 223, 234, 0.72)',
+    fontSize: 15,
+    letterSpacing: 0.28,
+    fontWeight: '500',
+  },
 });
 
 export default VoiceVisualizer;
