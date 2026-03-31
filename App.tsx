@@ -48,6 +48,7 @@ import {
   playSuccessChime,
   playErrorSound,
   prepareForRecording,
+  configurePlaybackSession,
 } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
@@ -726,6 +727,9 @@ function AppInner(): React.JSX.Element {
 
       // Skip earcons/SFX when VoiceOver is on — audio session conflicts
       if (!screenReaderEnabledRef.current) {
+        // FIX: Restore full-volume audio session after STT's Record+Measurement
+        await configurePlaybackSession();
+
         audioFeedback.playEarcon('thinking');
         playThinkingStarted();
       }
@@ -999,6 +1003,12 @@ function AppInner(): React.JSX.Element {
       // producing glitchy/screamy artifacts. VoiceOver announcements replace
       // earcon feedback for blind users.
       if (!screenReaderEnabled) {
+        // FIX: After STT leaves the audio session in Record+Measurement mode,
+        // react-native-sound's setCategory alone doesn't restore full volume.
+        // This native call sets .playback + .default mode + setActive + speaker
+        // route — matching the reaching pipeline's audio config.
+        await configurePlaybackSession();
+
         audioFeedback.playEarcon('listening');
         playListenSound();
 

@@ -151,6 +151,39 @@ class ReachingModule: NSObject {
     }
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Audio Session Configuration
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // After @react-native-voice/voice runs, the iOS audio session is left in
+  // Record+Measurement mode (deactivated). react-native-sound's setCategory
+  // only calls [session setCategory:error:] — it never calls setActive:YES
+  // or sets the mode/options explicitly. This produces noticeably lower
+  // volume on the RN side compared to the native reaching pipeline which
+  // calls setCategory(.playback, mode:.default, options:[]) + setActive(true).
+  //
+  // This method mirrors the reaching pipeline's audio session config so
+  // all RN audio (earcons + TTS) plays at the same level.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  @objc func configurePlaybackSession(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    do {
+      let session = AVAudioSession.sharedInstance()
+      try session.setCategory(.playback, mode: .default, options: [])
+      try session.setActive(true)
+      try session.overrideOutputAudioPort(.speaker)
+      NSLog("🔊 [ReachingModule] Audio session configured for playback (speaker, active)")
+      resolver(["success": true])
+    } catch {
+      NSLog("⚠️ [ReachingModule] configurePlaybackSession error: %@", error.localizedDescription)
+      // Non-fatal — audio will still play, just possibly quieter
+      resolver(["success": false, "error": error.localizedDescription])
+    }
+  }
+
   private func presentReachingVC(
     bbox: [CGFloat], objectName: String, depth: Float?,
     imageW: CGFloat, imageH: CGFloat,

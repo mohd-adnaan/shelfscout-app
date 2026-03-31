@@ -17,7 +17,32 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 import Sound from 'react-native-sound';
-import { Platform } from 'react-native';
+import { Platform, NativeModules } from 'react-native';
+
+// ── Native audio session helper ──────────────────────────────────────────
+// react-native-sound's Sound.setCategory('Playback', false) only calls
+// [session setCategory:error:] — it never calls setActive:YES, never sets
+// mode to .default, and never overrides the output port to speaker.
+// After @react-native-voice/voice leaves the session in Record+Measurement
+// mode, this produces noticeably lower volume for ALL subsequent RN audio.
+//
+// configurePlaybackSession() calls our native ReachingModule method that
+// mirrors the reaching pipeline's audio session setup:
+//   setCategory(.playback, mode: .default)  +  setActive(true)  +  overrideOutputAudioPort(.speaker)
+//
+// Call this ONCE after STT ends, before any SFX or TTS output.
+// ──────────────────────────────────────────────────────────────────────────
+const { ReachingModule } = NativeModules;
+
+export const configurePlaybackSession = async (): Promise<void> => {
+  if (Platform.OS !== 'ios' || !ReachingModule?.configurePlaybackSession) return;
+  try {
+    await ReachingModule.configurePlaybackSession();
+  } catch (e: any) {
+    // Non-fatal — Sound.setCategory is still called as a fallback
+    console.warn('⚠️ [SFX] configurePlaybackSession failed:', e?.message);
+  }
+};
 
 // ── Configure sound to play through the speaker, not earpiece ─────────────
 // MUST be called before any Sound() constructors

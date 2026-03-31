@@ -1,4 +1,3 @@
-//hehe
 // ReachingModule.m
 // Objective-C bridge for the ReachingModule Swift native module.
 
@@ -15,6 +14,9 @@ RCT_EXTERN_METHOD(updateBbox:(NSDictionary *)params
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 
 RCT_EXTERN_METHOD(stopReaching:(RCTPromiseResolveBlock)resolver
+                  rejecter:(RCTPromiseRejectBlock)rejecter)
+
+RCT_EXTERN_METHOD(configurePlaybackSession:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 
 @end
