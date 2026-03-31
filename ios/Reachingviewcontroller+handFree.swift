@@ -21,10 +21,20 @@ extension ReachingViewController {
   // MARK: - Hand-Free Frame Processing (3D world-space directions)
   // ═══════════════════════════════════════════════════════════════════════════
   //
-  // Direction = dot product of (camera → anchor) against camera's own axes.
-  // Only 3 directions: left / right / straight ahead.
-  // "Up"/"down" suppressed — user is walking, phone tilt is noise.
-  // Exception: "Tilt phone down" at extreme vertical angle.
+  // Direction = dot product of (camera → anchor) against camera's PORTRAIT axes.
+  //
+  // ⚠️  ARKit camera.transform columns are LANDSCAPE-NATIVE:
+  //   columns.0 (landscape right) → portrait DOWN
+  //   columns.1 (landscape up)    → portrait RIGHT
+  // We swap & negate for correct portrait orientation:
+  //   camRight =  columns.1          (portrait right)
+  //   camUp    = -columns.0          (portrait up)
+  //   camFwd   = -columns.2          (unchanged — depth axis)
+  //
+  // Directions: left / right / straight ahead / tilt up / tilt down / behind.
+  // "Tilt phone down" = user pointing at ceiling (object below view).
+  // "Tilt phone up"   = user pointing at floor  (object above view).
+  // "Turn around"     = object directly behind user.
   //
   // State-change sounds (Nicolas approach):
   //   centered_sound.wav → plays ONCE when entering alignment
@@ -41,8 +51,11 @@ extension ReachingViewController {
     let camera = frame.camera
     let camPos = simd_make_float3(camera.transform.columns.3)
     let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
-    let camRight = simd_normalize(simd_make_float3(camera.transform.columns.0))
-    let camUp = simd_normalize(simd_make_float3(camera.transform.columns.1))
+    // Portrait axis correction: ARKit native axes are landscape-rotated.
+    //   columns.0 (landscape right) = portrait DOWN
+    //   columns.1 (landscape up)    = portrait RIGHT
+    let camRight =  simd_normalize(simd_make_float3(camera.transform.columns.1))  // portrait right
+    let camUp    = -simd_normalize(simd_make_float3(camera.transform.columns.0))  // portrait up (negate)
 
     let toObj = anchorPos - camPos
     let dist = simd_length(toObj)
@@ -55,7 +68,8 @@ extension ReachingViewController {
     lastRightDot = rightDot
 
     // Track last known horizontal for beep panning and "out of view" memory
-    if abs(rightDot) > 0.05 {
+    // Threshold 0.15: ignore minor sway so "behind you" can fire cleanly
+    if abs(rightDot) > 0.15 {
       lastKnownHorizontalSign = rightDot > 0 ? 1.0 : -1.0
       lastKnownDirectionLabel = rightDot > 0 ? "to your right" : "to your left"
     }
@@ -65,7 +79,6 @@ extension ReachingViewController {
       objectOffScreen = true
       proximityZone = .far
 
-      let turnDir = rightDot >= 0 ? "right" : "left"
       let now = ProcessInfo.processInfo.systemUptime
 
       // State-change: was centered → now lost
@@ -74,37 +87,55 @@ extension ReachingViewController {
         playUncenteredSound()
       }
 
+      // Determine if object is directly behind or off to one side
+      let behindCentered = abs(rightDot) < 0.30  // roughly centered behind
+
       if now - lastSpeechTime > 3.0 {
-        if lastKnownDirectionLabel.isEmpty {
-          say("Object is behind you. Turn \(turnDir).")
+        if behindCentered {
+          // Object directly behind — don't confuse with left/right, just turn around
+          say("Turn around. Object is behind you.")
         } else {
-          say("Out of view, was \(lastKnownDirectionLabel). Turn \(turnDir).")
+          let turnDir = rightDot > 0 ? "right" : "left"
+          if lastKnownDirectionLabel.isEmpty {
+            say("Object is behind you. Turn \(turnDir).")
+          } else {
+            say("Out of view, was \(lastKnownDirectionLabel). Turn \(turnDir).")
+          }
         }
         lastSpeechTime = now
         lastSpokenDirection = .searching
       }
 
+      let uiText = behindCentered ? "Turn around" : (rightDot > 0 ? "Turn right" : "Turn left")
+      let uiMethod = behindCentered ? "behind → turn around" : "behind → \(rightDot > 0 ? "right" : "left")"
       DispatchQueue.main.async { [weak self] in
         guard let self = self else { return }
-        self.directionLabel.text = "Turn \(turnDir)"
+        self.directionLabel.text = uiText
         self.directionLabel.textColor = .systemOrange
         self.depthHintLabel.isHidden = true
         self.bboxLayer.isHidden = true; self.innerBboxLayer.isHidden = true
         self.distanceLabel.text = "\(Int(dist * 100)) cm"
-        self.depthMethodLabel.text = "behind → \(turnDir)"
+        self.depthMethodLabel.text = uiMethod
       }
       return
     }
 
     // ── Object in front of camera ────────────────────────────────────────
     let horizThreshold: Float = 0.20
+    let vertThreshold: Float  = 0.50   // extreme tilt — user pointing at ceiling/floor
 
     let direction: Direction
-    if abs(rightDot) < horizThreshold && upDot < 0.40 {
+    if abs(rightDot) < horizThreshold && abs(upDot) < 0.40 {
+      // Horizontally & vertically aligned — on target
       direction = .centered
       objectOffScreen = false
-    } else if upDot > 0.50 {
-      direction = .top  // spoken as "Tilt phone down"
+    } else if upDot > vertThreshold {
+      // Object above camera view → user pointing at floor → "Tilt phone up"
+      direction = .top
+      objectOffScreen = true
+    } else if upDot < -vertThreshold {
+      // Object below camera view → user pointing at ceiling → "Tilt phone down"
+      direction = .down
       objectOffScreen = true
     } else if abs(rightDot) >= horizThreshold {
       direction = rightDot > 0 ? .right : .left
@@ -141,8 +172,8 @@ extension ReachingViewController {
     proximityZone = newProx
 
     // ── Speech — suppressed during active acquisition polling ────────────
-    // Exception: "Tilt phone down" always speaks (safety-critical orientation)
-    if acquisitionTriggered && !acquisitionTimedOut && direction != .top {
+    // Exception: tilt guidance always speaks (safety-critical orientation)
+    if acquisitionTriggered && !acquisitionTimedOut && direction != .top && direction != .down {
       // Acquisition zone — suppress normal guidance speech.
       // Acquisition callbacks handle speech. Parking sensor + state-change
       // sounds continue to give non-verbal proximity/alignment feedback.
@@ -226,8 +257,11 @@ extension ReachingViewController {
       return
     }
 
-    // ── Case 2: Very close (<75cm) — "arm's reach" ─────────────────────
-    if direction == .centered && dist < 0.75 {
+    // ── Case 2: Very close (<50cm) — "arm's reach" ─────────────────────
+    // Threshold 50cm (not 75cm): non-LiDAR estimated-plane depth can
+    // undershoot by ~15-25cm, so keep tight to avoid false "arm's reach"
+    // announcements at 80-100cm actual distance.
+    if direction == .centered && dist < 0.50 {
       if direction != lastSpokenDirection {
         say("Arm's reach. Keep going.")
         lastSpokenDirection = direction; lastSpeechTime = now
@@ -260,10 +294,16 @@ extension ReachingViewController {
       return
     }
 
-    // ── Case 4: "Tilt phone down" for extreme vertical ──────────────────
-    if direction == .top {
+    // ── Case 4: Extreme vertical tilt — phone pointed at ceiling or floor ─
+    if direction == .top || direction == .down {
       if direction != lastSpokenDirection && (now - lastSpeechTime) >= speechCooldown {
-        say("Tilt phone down.")
+        if direction == .top {
+          // Object is above camera → user pointing at floor → tilt up
+          say("Tilt phone up.")
+        } else {
+          // Object is below camera → user pointing at ceiling → tilt down
+          say("Tilt phone down.")
+        }
         lastSpokenDirection = direction; lastSpeechTime = now
       }
       return

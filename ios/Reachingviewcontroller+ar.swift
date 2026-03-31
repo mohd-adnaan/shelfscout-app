@@ -49,7 +49,12 @@ extension ReachingViewController {
     startRedetectionLoop()
     NSLog("📷 [ReachingVC] AR session started — mode=%@ hasLiDAR=%@",
           mode.rawValue, hasLiDAR ? "YES" : "NO")
+    
+    NSLog("📐 [AR] imageResolution: %.0f×%.0f",
+          sceneView.session.currentFrame?.camera.imageResolution.width ?? 0,
+          sceneView.session.currentFrame?.camera.imageResolution.height ?? 0)
   }
+  
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Place World Anchor
