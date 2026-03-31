@@ -164,32 +164,22 @@ extension ReachingViewController {
     guard let currentPos = objectWorldPosition else { return }
 
     let camera = frame.camera
-    let intrinsics = camera.intrinsics
-    let imgRes = camera.imageResolution
-    let arW = imgRes.width, arH = imgRes.height
+    let camPos = simd_make_float3(camera.transform.columns.3)
+    let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
 
-    // ── FOV Crop Correction (same as placeWorldAnchor) ──────────────────
-    let arPortraitAspect = arH / arW
-    let photoPortraitAspect = imageWidth / imageHeight
-    let horizScale: CGFloat = (photoPortraitAspect < arPortraitAspect - 0.01)
-      ? photoPortraitAspect / arPortraitAspect : 1.0
-    let horizOffset: CGFloat = (1.0 - horizScale) / 2.0
+    // ── Guard: skip refinement if object is behind or far off-axis ──────
+    let toObj = simd_normalize(currentPos - camPos)
+    let fwdAlignment = simd_dot(toObj, camFwd)
+    if fwdAlignment < 0.4 {
+      return  // Object behind or far off-axis — raycast would hit wrong surfaces
+    }
 
-    let photoCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
-    let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
-    let arNormX = photoCenterX * horizScale + horizOffset
-    let arNormY = photoCenterY
-
-    let arPxX = arNormY * arW
-    let arPxY = (1.0 - arNormX) * arH
-    let fx = Float(intrinsics[0][0]), fy = Float(intrinsics[1][1])
-    let cx = Float(intrinsics[2][0]), cy = Float(intrinsics[2][1])
-    let rX = (Float(arPxX) - cx) / fx
-    let rY = (Float(arPxY) - cy) / fy
-    let rayCam   = simd_normalize(simd_float3(rX, -rY, -1.0))
-    let camT     = camera.transform
-    let worldDir = simd_normalize(simd_make_float3(camT * simd_float4(rayCam, 0)))
-    let camPos   = simd_make_float3(camT.columns.3)
+    // ── Raycast toward the 3D anchor (not fixed bbox pixels) ────────────
+    // As the user walks, fixed bbox pixel coordinates drift away from the
+    // object in the camera frame, causing the ray to hit the far wall.
+    // Instead, raycast directly from camera → anchor position. This tracks
+    // the anchor correctly regardless of how the camera has moved.
+    let worldDir = toObj  // already normalized above
 
     var hitPos: simd_float3? = nil
     var hitSource = ""
@@ -271,6 +261,7 @@ extension ReachingViewController {
     let newWorldPos = camPos + worldDir * median
     objectWorldPosition = newWorldPos
 
+    let camT = camera.transform
     let placementRight = -simd_normalize(simd_make_float3(camT.columns.1))
     let placementUp    =  simd_normalize(simd_make_float3(camT.columns.0))
     objectWorldCornerTR = newWorldPos + placementRight * objectWorldHalfW + placementUp * objectWorldHalfH
