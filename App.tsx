@@ -691,6 +691,7 @@ function AppInner(): React.JSX.Element {
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
+    await stopLatencyLoop(); // FIX: was missing — latency SFX survived nav interrupt
     await speachesSentenceChunker.stop();
     stopContinuousMode('user interrupt', false);
     setIsNavigation(false);
@@ -818,6 +819,7 @@ function AppInner(): React.JSX.Element {
         error.message?.includes('aborted') ||
         error.message?.includes('cancel')
       ) {
+        await stopLatencyLoop(); // FIX: abort path was leaking latency loop
         console.log('✅ Request cancelled');
         return;
       }
@@ -1059,6 +1061,10 @@ function AppInner(): React.JSX.Element {
       const photoPath = await reactivateCameraAndCapture();
       isCapturingPhotoRef.current = false;
 
+      // FIX: Check emergency flag AFTER capture — user may have tapped
+      // emergency stop while the camera was taking the photo
+      if (isEmergencyStopped.current) return;
+
       // ✅ DON'T set isProcessingRef here — handleVoiceCommand sets it itself
       await handleVoiceCommand(finalText, photoPath);
     } catch (error) {
@@ -1082,6 +1088,7 @@ function AppInner(): React.JSX.Element {
       abortControllerRef.current = null;
     }
 
+    await stopLatencyLoop(); // FIX: kill thinking SFX immediately on emergency stop
     await speachesSentenceChunker.stop();
     try { await cancelSTT(); } catch { }
 
@@ -1098,7 +1105,10 @@ function AppInner(): React.JSX.Element {
 
     stopContinuousMode('emergency stop', false);
     setIsCameraActive(true);
-    isEmergencyStopped.current = false;
+    // NOTE: Do NOT clear isEmergencyStopped here. It is cleared in
+    // startListening() when the user initiates a new interaction.
+    // Clearing it here allows in-flight async ops (photo capture in
+    // handleAutoSubmit) to resume and restart the latency loop.
 
     // Skip earcon when VoiceOver is on — audio session conflict
     if (!screenReaderEnabled) {

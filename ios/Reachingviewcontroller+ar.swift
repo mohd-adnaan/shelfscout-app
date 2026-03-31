@@ -171,7 +171,14 @@ extension ReachingViewController {
     let toObj = simd_normalize(currentPos - camPos)
     let fwdAlignment = simd_dot(toObj, camFwd)
     if fwdAlignment < 0.4 {
-      return  // Object behind or far off-axis — raycast would hit wrong surfaces
+      // Object behind or far off-axis — flush stale hits so the buffer
+      // starts clean when the user faces the object again.
+      if !refinementHits.isEmpty {
+        refinementHits.removeAll()
+        lastRefinementAppliedDepth = 0
+        NSLog("🎯 [Refine] Buffer CLEARED — object off-axis (fwdDot=%.2f)", fwdAlignment)
+      }
+      return
     }
 
     // ── Raycast toward the 3D anchor (not fixed bbox pixels) ────────────
@@ -180,6 +187,7 @@ extension ReachingViewController {
     // Instead, raycast directly from camera → anchor position. This tracks
     // the anchor correctly regardless of how the camera has moved.
     let worldDir = toObj  // already normalized above
+    let currentAnchorDist = simd_length(currentPos - camPos)
 
     var hitPos: simd_float3? = nil
     var hitSource = ""
@@ -215,6 +223,19 @@ extension ReachingViewController {
     if mode != .handFree, let bd = backendDepth, hitDepth > bd * 2.0 {
       NSLog("🎯 [Refine] Rejected hit at %.2fm (>2x backend %.2fm)", hitDepth, bd)
       return
+    }
+
+    // Hand-free: reject hits that overshoot the anchor by >50cm.
+    // The ray points camera→anchor, so hits beyond the anchor are the WALL
+    // behind the object. Only apply after first convergence (before that,
+    // the anchor depth from backend may be inaccurate).
+    if mode == .handFree && lastRefinementAppliedDepth > 0 {
+      let maxAllowed = currentAnchorDist + 0.50
+      if hitDepth > maxAllowed {
+        NSLog("🎯 [Refine] Rejected wall hit at %.2fm (anchor at %.2fm, max %.2fm)",
+              hitDepth, currentAnchorDist, maxAllowed)
+        return
+      }
     }
 
     refinementHits.append(hitDepth)
