@@ -49,42 +49,61 @@ extension ReachingViewController {
     startRedetectionLoop()
     NSLog("📷 [ReachingVC] AR session started — mode=%@ hasLiDAR=%@",
           mode.rawValue, hasLiDAR ? "YES" : "NO")
-    
-    NSLog("📐 [AR] imageResolution: %.0f×%.0f",
-          sceneView.session.currentFrame?.camera.imageResolution.width ?? 0,
-          sceneView.session.currentFrame?.camera.imageResolution.height ?? 0)
   }
-  
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Place World Anchor
   // ═══════════════════════════════════════════════════════════════════════════
 
   func placeWorldAnchor(frame: ARFrame) {
-    let sw = cachedSW, sh = cachedSH
-    let photoAspect = imageWidth / imageHeight
-    let screenAspect = sw / sh
+    let camera = frame.camera
 
-    var scaleX: CGFloat = 1, scaleY: CGFloat = 1
-    var offsetX: CGFloat = 0, offsetY: CGFloat = 0
-    if photoAspect > screenAspect {
-      scaleX = photoAspect / screenAspect; offsetX = (scaleX - 1) / 2
+    // ── FOV Crop Correction ────────────────────────────────────────────
+    // VisionCamera captures 16:9 (center-cropped from 4:3 sensor).
+    // ARKit uses the full 4:3 sensor.
+    // Map photo-normalized bbox directly to AR camera pixels, bypassing
+    // screen coordinates entirely — this eliminates the double aspect-fill
+    // error that caused the bbox to drift horizontally.
+    let intrinsics = camera.intrinsics
+    let imgRes = camera.imageResolution      // AR camera resolution (landscape-native)
+    let arW = imgRes.width, arH = imgRes.height  // e.g., 1920×1440
+
+    // AR camera in portrait: width=arH, height=arW
+    let arPortraitAspect = arH / arW             // e.g., 1440/1920 = 0.75
+    let photoPortraitAspect = imageWidth / imageHeight  // e.g., 1152/2048 = 0.5625
+
+    // Compute horizontal crop factor: photo is narrower than AR camera in portrait
+    let horizScale: CGFloat
+    let horizOffset: CGFloat
+    if photoPortraitAspect < arPortraitAspect - 0.01 {
+      horizScale = photoPortraitAspect / arPortraitAspect  // e.g., 0.75
+      horizOffset = (1.0 - horizScale) / 2.0               // e.g., 0.125
     } else {
-      scaleY = screenAspect / photoAspect; offsetY = (scaleY - 1) / 2
+      horizScale = 1.0; horizOffset = 0.0  // same aspect — no correction
     }
 
-    let bx1 = (bboxNormalized[0] * scaleX - offsetX) * sw
-    let by1 = (bboxNormalized[1] * scaleY - offsetY) * sh
-    let bx2 = (bboxNormalized[2] * scaleX - offsetX) * sw
-    let by2 = (bboxNormalized[3] * scaleY - offsetY) * sh
-    let screenCenter = CGPoint(x: (bx1+bx2)/2, y: (by1+by2)/2)
+    // Bbox center in photo-normalized coords
+    let photoCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
+    let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
 
-    let camera = frame.camera
+    // Convert to AR-camera-normalized portrait coords
+    let arNormX = photoCenterX * horizScale + horizOffset  // horizontal crop correction
+    let arNormY = photoCenterY                              // vertical: same FOV, no correction
+
+    // Convert AR portrait-normalized → AR landscape pixels
+    // Portrait (X,Y) → Landscape: pxX = Y * arW, pxY = (1-X) * arH
+    let arPxX = arNormY * arW
+    let arPxY = (1.0 - arNormX) * arH
+
+    NSLog("📐 [FOV] Photo=%.4f AR=%.4f horizScale=%.3f offset=%.3f | photo(%.3f,%.3f)→AR(%.3f,%.3f)→px(%.0f,%.0f) arRes=%.0f×%.0f",
+          photoPortraitAspect, arPortraitAspect, horizScale, horizOffset,
+          photoCenterX, photoCenterY, arNormX, arNormY, arPxX, arPxY, arW, arH)
+
+    // ── LiDAR screen center (approximate — only for depth sampling) ────
+    let sw = cachedSW, sh = cachedSH
+    let screenCenter = CGPoint(x: arNormX * sw, y: arNormY * sh)
+
     // ── Depth source selection ───────────────────────────────────────────
-    // Priority: 1. LiDAR (instant metric, Pro devices)
-    //           2. Re-detection depth (from updateBboxFromBackend)
-    //           3. Backend depth (Qwen/DAv2 — relative, less accurate)
-    //           4. Fallback 0.5m
     let depth: Float
     if hasLiDAR, let lidarDepth = sampleLiDARDepth(frame: frame, screenCenter: screenCenter) {
       depth = lidarDepth
@@ -93,7 +112,7 @@ extension ReachingViewController {
       NSLog("🎯 [ReachingVC] ✅ LiDAR depth seed: %.2fm (backend was %.2fm)",
             depth, backendDepth ?? -1)
     } else if bboxUpdateCount > 0, anchorDepth > 0.05 {
-      depth = anchorDepth  // use re-detected depth
+      depth = anchorDepth
       NSLog("🎯 [ReachingVC] Using re-detection depth: %.2fm", depth)
     } else {
       depth = backendDepth ?? 0.5
@@ -102,11 +121,6 @@ extension ReachingViewController {
             hasLiDAR ? "backend (LiDAR miss)" : "Qwen/backend", depth)
     }
 
-    let intrinsics = camera.intrinsics
-    let imgRes = camera.imageResolution
-    let arW = imgRes.width, arH = imgRes.height
-    let arPxX = (screenCenter.y / sh) * arW
-    let arPxY = (1.0 - screenCenter.x / sw) * arH
     let fx = CGFloat(intrinsics[0][0]), fy = CGFloat(intrinsics[1][1])
     let cx = CGFloat(intrinsics[2][0]), cy = CGFloat(intrinsics[2][1])
     let rX = Float((arPxX - cx) / fx)
@@ -120,10 +134,11 @@ extension ReachingViewController {
 
     objectWorldPosition = worldPos
 
+    // Bbox size in world space — correct width for photo→AR crop
     let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
     let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-    objectWorldHalfW = depth * Float(bboxNormW) * 0.5
-    objectWorldHalfH = depth * Float(bboxNormH) * 0.8
+    objectWorldHalfW = depth * Float(bboxNormW * horizScale) * 0.5  // crop-corrected width
+    objectWorldHalfH = depth * Float(bboxNormH) * 0.8               // vertical: no correction
 
     let placementRight = -simd_normalize(simd_make_float3(camT.columns.1))
     let placementUp    =  simd_normalize(simd_make_float3(camT.columns.0))
@@ -148,28 +163,25 @@ extension ReachingViewController {
   func tryRefineAnchorDepth(frame: ARFrame) {
     guard let currentPos = objectWorldPosition else { return }
 
-    let sw = cachedSW, sh = cachedSH
     let camera = frame.camera
     let intrinsics = camera.intrinsics
     let imgRes = camera.imageResolution
+    let arW = imgRes.width, arH = imgRes.height
 
-    let photoAspect = imageWidth / imageHeight
-    let screenAspect = sw / sh
-    var scaleX: CGFloat = 1, scaleY: CGFloat = 1
-    var offsetX: CGFloat = 0, offsetY: CGFloat = 0
-    if photoAspect > screenAspect {
-      scaleX = photoAspect / screenAspect; offsetX = (scaleX - 1) / 2
-    } else {
-      scaleY = screenAspect / photoAspect; offsetY = (scaleY - 1) / 2
-    }
-    let bx1 = (bboxNormalized[0] * scaleX - offsetX) * sw
-    let by1 = (bboxNormalized[1] * scaleY - offsetY) * sh
-    let bx2 = (bboxNormalized[2] * scaleX - offsetX) * sw
-    let by2 = (bboxNormalized[3] * scaleY - offsetY) * sh
-    let screenCenter = CGPoint(x: (bx1+bx2)/2, y: (by1+by2)/2)
+    // ── FOV Crop Correction (same as placeWorldAnchor) ──────────────────
+    let arPortraitAspect = arH / arW
+    let photoPortraitAspect = imageWidth / imageHeight
+    let horizScale: CGFloat = (photoPortraitAspect < arPortraitAspect - 0.01)
+      ? photoPortraitAspect / arPortraitAspect : 1.0
+    let horizOffset: CGFloat = (1.0 - horizScale) / 2.0
 
-    let arPxX = (screenCenter.y / sh) * imgRes.width
-    let arPxY = (1.0 - screenCenter.x / sw) * imgRes.height
+    let photoCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
+    let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
+    let arNormX = photoCenterX * horizScale + horizOffset
+    let arNormY = photoCenterY
+
+    let arPxX = arNormY * arW
+    let arPxY = (1.0 - arNormX) * arH
     let fx = Float(intrinsics[0][0]), fy = Float(intrinsics[1][1])
     let cx = Float(intrinsics[2][0]), cy = Float(intrinsics[2][1])
     let rX = (Float(arPxX) - cx) / fx
@@ -656,27 +668,25 @@ extension ReachingViewController {
 
       if let frame = fromFrame ?? lastARFrame {
         // Re-compute world position from fresh bbox center + current best depth
-        let sw = cachedSW, sh = cachedSH
         let camera = frame.camera
-        let photoAspect = imageWidth / imageHeight
-        let screenAspect = sw / sh
-        var scaleX: CGFloat = 1, scaleY: CGFloat = 1
-        var offsetX: CGFloat = 0, offsetY: CGFloat = 0
-        if photoAspect > screenAspect {
-          scaleX = photoAspect / screenAspect; offsetX = (scaleX - 1) / 2
-        } else {
-          scaleY = screenAspect / photoAspect; offsetY = (scaleY - 1) / 2
-        }
-        let bx1 = (bboxNormalized[0] * scaleX - offsetX) * sw
-        let by1 = (bboxNormalized[1] * scaleY - offsetY) * sh
-        let bx2 = (bboxNormalized[2] * scaleX - offsetX) * sw
-        let by2 = (bboxNormalized[3] * scaleY - offsetY) * sh
-        let screenCenter = CGPoint(x: (bx1+bx2)/2, y: (by1+by2)/2)
-
         let intrinsics = camera.intrinsics
         let imgRes = camera.imageResolution
-        let arPxX = (screenCenter.y / sh) * imgRes.width
-        let arPxY = (1.0 - screenCenter.x / sw) * imgRes.height
+        let arW = imgRes.width, arH = imgRes.height
+
+        // FOV crop correction (same as placeWorldAnchor)
+        let arPortraitAspect = arH / arW
+        let photoPortraitAspect = imageWidth / imageHeight
+        let horizScale: CGFloat = (photoPortraitAspect < arPortraitAspect - 0.01)
+          ? photoPortraitAspect / arPortraitAspect : 1.0
+        let horizOffset: CGFloat = (1.0 - horizScale) / 2.0
+
+        let photoCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
+        let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
+        let arNormX = photoCenterX * horizScale + horizOffset
+        let arNormY = photoCenterY
+
+        let arPxX = arNormY * arW
+        let arPxY = (1.0 - arNormX) * arH
         let fx = CGFloat(intrinsics[0][0]), fy = CGFloat(intrinsics[1][1])
         let cx = CGFloat(intrinsics[2][0]), cy = CGFloat(intrinsics[2][1])
         let rX = Float((arPxX - cx) / fx)
@@ -706,7 +716,7 @@ extension ReachingViewController {
         let billboardUp = simd_normalize(simd_make_float3(camT.columns.0))
         let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
         let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-        objectWorldHalfW = anchorDepth * Float(bboxNormW) * 0.5
+        objectWorldHalfW = anchorDepth * Float(bboxNormW * horizScale) * 0.5
         objectWorldHalfH = anchorDepth * Float(bboxNormH) * 0.8
         if let pos = objectWorldPosition {
           objectWorldCornerTR = pos + billboardRight * objectWorldHalfW + billboardUp * objectWorldHalfH
