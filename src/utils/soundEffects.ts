@@ -158,17 +158,22 @@ const _startLatencyLoop = (): void => {
 /**
  * Stop the latency loop (call when backend response arrives).
  * Returns a Promise that resolves when the loop has fully stopped.
+ *
+ * FIX: Always call s.stop() regardless of latencyLooping flag.
+ * Previously, if the play callback fired early (e.g. audio session
+ * contention) it set latencyLooping = false — then stopLatencyLoop()
+ * would short-circuit and never call s.stop(), leaving the sound
+ * physically playing on device.
  */
 export const stopLatencyLoop = (): Promise<void> => {
   return new Promise((resolve) => {
     const s = sounds.latency;
-    if (!s || !latencyLooping) {
-      latencyLooping = false;
+    latencyLooping = false; // clear flag immediately — always
+    if (!s) {
       resolve();
       return;
     }
     s.stop(() => {
-      latencyLooping = false;
       console.log('⏹️ [SFX] Latency loop stopped');
       resolve();
     });
@@ -192,10 +197,12 @@ export const playSuccessChime = (): Promise<void> => {
 
 /**
  * Play when the backend returns an error.
- * Non-blocking — fire and forget.
+ * Returns a Promise that resolves when the sound finishes playing,
+ * so callers can await it before starting TTS (prevents AVSpeechSynthesizer
+ * from stealing the audio session mid-playback and cutting the sound short).
  */
-export const playErrorSound = (): void => {
-  _playOnce('stopped');
+export const playErrorSound = (): Promise<void> => {
+  return new Promise((resolve) => _playOnce('stopped', resolve));
 };
 
 /**

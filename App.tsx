@@ -829,13 +829,14 @@ function AppInner(): React.JSX.Element {
         await stopLatencyLoop();
         if (!screenReaderEnabledRef.current) {
           audioFeedback.playEarcon('cancel');
-          playErrorSound();
+          // FIX: await the error sound so AVSpeechSynthesizer can't steal
+          // the audio session mid-playback and cut the sound short.
+          // The sound's natural duration replaces the old 600ms timeout.
+          await playErrorSound();
         }
 
-        await new Promise(resolve => setTimeout(resolve, 600));
-
         await speachesSentenceChunker.synthesizeSpeechChunked(
-          'Error processing your request.'
+          'Error processing your request. Try again.'
         );
 
         setIsCameraActive(true);
