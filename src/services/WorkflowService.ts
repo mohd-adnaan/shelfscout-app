@@ -238,9 +238,11 @@ export const sendToWorkflow = async (
     // THREE-FLAG SYSTEM
     const navigationValue = request.navigation === true ? 'true' : 'false';
     const reachingValue = request.reaching_flag === true ? 'true' : 'false';
+    const reachingIOSValue = request.reaching_ios === true ? 'true' : 'false';
 
     formData.append('navigation', navigationValue);
     formData.append('reaching_flag', reachingValue);
+    formData.append('reaching_ios', reachingIOSValue);
     formData.append('user_id', 'mobile-user');
     formData.append('request_id', `mobile-${Date.now()}`);
     formData.append('session_id', SESSION_ID);
@@ -272,12 +274,13 @@ export const sendToWorkflow = async (
     console.log('📝 Transcript:', request.text || '(continuous mode)');
     console.log('🔄 Navigation:', navigationValue);
     console.log('🎯 Reaching:', reachingValue);
+    console.log('🍎 Reaching iOS:', reachingIOSValue);
     console.log('🆔 Session:', SESSION_ID);
 
     requestStartTime = Date.now();
     debugLogger.logAPI(
       `→ POST ${WORKFLOW_URL.replace('https://cybersight.cim.mcgill.ca', '')}`,
-      `transcript="${(request.text || '').substring(0, 60)}" nav=${navigationValue} reach=${reachingValue} img=${!!request.imageUri}`,
+      `transcript="${(request.text || '').substring(0, 60)}" nav=${navigationValue} reach=${reachingValue} ios=${reachingIOSValue} img=${!!request.imageUri}`,
     );
 
     if (signal?.aborted) {

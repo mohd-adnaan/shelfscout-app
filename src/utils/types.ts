@@ -6,6 +6,7 @@ export interface WorkflowRequest {
   imageHeight?: number;
   navigation?: boolean;
   reaching_flag?: boolean;
+  reaching_ios?: boolean;
 }
 
 export interface WorkflowResponse {
