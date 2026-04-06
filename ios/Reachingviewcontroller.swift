@@ -76,7 +76,22 @@ class ReachingViewController: UIViewController {
   var lidarDepthSeeded = false
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MARK: - Acquisition Validation (Hand-Free Auto-Exit)
+  // MARK: - With-Hand Phase Control
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Distance (meters) at which with-hand switches from Phase 1 (navigation)
+  /// to Phase 2 (hand guidance). 0.50m gives user time to raise hand before
+  /// acquisition threshold (0.40m).
+  let handGuidanceThreshold: Float = 0.50
+  /// Hysteresis: must exceed this to drop BACK to Phase 1 (prevents oscillation)
+  let handGuidanceExitThreshold: Float = 0.65
+  /// Phase 2 is currently active — hand tracking running
+  var handGuidanceActive = false
+  /// Transition announcement has been made ("Raise your hand")
+  var handGuidanceAnnounced = false
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Acquisition Validation (Auto-Exit — both modes)
   // ═══════════════════════════════════════════════════════════════════════════
 
   /// Backend endpoint for acquisition validation (e.g. /validate-acquisition)
@@ -314,6 +329,10 @@ class ReachingViewController: UIViewController {
     super.init(nibName: nil, bundle: nil)
     if mode == .withHand {
       handReq.maximumHandCount = 1
+      // Phase 1 (navigation) uses the same walk-tolerant thresholds as hand-free.
+      // Phase 2 (hand guidance) will use tighter thresholds locally.
+      speechCooldown = 2.0
+      directionStableThreshold = 8
     } else {
       // Hand-free: wider stability thresholds — user is walking, directions flicker
       speechCooldown = 2.0
@@ -365,7 +384,7 @@ class ReachingViewController: UIViewController {
       if self.mode == .handFree {
         self.say("Guiding to \(self.objectName). Point phone toward it. Tap anywhere when you have it.")
       } else {
-        self.say("Guiding to \(self.objectName). Show your hand. Tap anywhere when you have it.")
+        self.say("Guiding to \(self.objectName). Point phone toward it. I'll tell you when to raise your hand.")
       }
     }
   }
@@ -553,6 +572,9 @@ class ReachingViewController: UIViewController {
     // Reset acquisition polling state
     isPollingAcquisition = false
     acquisitionTriggered = false
+    // Reset with-hand phase state
+    handGuidanceActive = false
+    handGuidanceAnnounced = false
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -606,16 +628,14 @@ class ReachingViewController: UIViewController {
     view.addSubview(bottomBar)
 
     directionLabel = UILabel()
-    directionLabel.text = mode == .handFree ? "Point camera…" : "Show your hand…"
+    directionLabel.text = "Point camera…"
     directionLabel.font = .systemFont(ofSize: 24, weight: .bold)
     directionLabel.textColor = .white; directionLabel.textAlignment = .center
     directionLabel.translatesAutoresizingMaskIntoConstraints = false
     bottomBar.contentView.addSubview(directionLabel)
 
     depthHintLabel = UILabel()
-    depthHintLabel.text = mode == .handFree
-      ? "Move closer — tap anywhere when done"
-      : "Move hand forward — tap anywhere when done"
+    depthHintLabel.text = "Move closer — tap anywhere when done"
     depthHintLabel.font = .systemFont(ofSize: 15, weight: .medium)
     depthHintLabel.textColor = .systemYellow; depthHintLabel.textAlignment = .center
     depthHintLabel.isHidden = true
@@ -679,18 +699,14 @@ class ReachingViewController: UIViewController {
       cancelButton.heightAnchor.constraint(equalToConstant: 44),
     ])
 
-    view.accessibilityLabel = mode == .handFree
-      ? "Reaching guidance for \(objectName). Point camera toward object. Tap anywhere to confirm."
-      : "Reaching guidance for \(objectName). Double tap anywhere to confirm."
+    view.accessibilityLabel = "Reaching guidance for \(objectName). Point camera toward object. Tap anywhere to confirm."
 
     // ── VoiceOver Configuration ──────────────────────────────────────────────
     // Make the objectNameLabel (which gets initial VoiceOver focus) actionable.
     // UILabel doesn't respond to VoiceOver double-tap by default — we need
     // userInteractionEnabled + a tap gesture so VoiceOver's synthetic tap fires.
     objectNameLabel.isAccessibilityElement = true
-    objectNameLabel.accessibilityLabel = mode == .handFree
-      ? "Guiding to \(objectName). Point camera toward it. Double tap to confirm."
-      : "Guiding to \(objectName). Double tap anywhere to confirm."
+    objectNameLabel.accessibilityLabel = "Guiding to \(objectName). Point camera toward it. Double tap to confirm."
     objectNameLabel.accessibilityTraits = .button
     objectNameLabel.isUserInteractionEnabled = true
     let nameTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))

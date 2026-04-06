@@ -135,8 +135,13 @@ extension ReachingViewController {
   func tickBeep() {
     guard running, proximityZone != .searching else { return }
 
-    // Hand-free parking sensor: gentle continuous tone at very close + aligned
-    if mode == .handFree && !objectOffScreen
+    // ── Phase-aware mode selection ────────────────────────────────────────
+    // With-hand Phase 1 (navigation) uses hand-free style beeps.
+    // With-hand Phase 2 (hand guidance) uses with-hand style beeps.
+    let useNavigationBeeps = mode == .handFree || (mode == .withHand && !handGuidanceActive)
+
+    // Parking sensor: gentle continuous tone when very close + aligned
+    if useNavigationBeeps && !objectOffScreen
        && (proximityZone == .centered || proximityZone == .veryClose) {
       tickParkingSensor()
       return
@@ -147,25 +152,26 @@ extension ReachingViewController {
     let vol: Float
     let pan: Float
 
-    if mode == .handFree {
+    if useNavigationBeeps {
+      // ── Navigation beeps (hand-free style — both modes Phase 1) ──────
       if objectOffScreen {
-        // ── Object off-screen: slow sparse beeps, hard-panned toward object ──
+        // Object off-screen: slow sparse beeps, hard-panned toward object
         iv = 1.2
-        vol = 0.15  // quiet — just a directional hint
-        pan = Float(lastKnownHorizontalSign) * 0.9  // hard left or right
+        vol = 0.15
+        pan = Float(lastKnownHorizontalSign) * 0.9
       } else {
-        // ── Object on-screen: normal progressive beeps ──
+        // Object on-screen: normal progressive beeps
         switch proximityZone {
         case .searching: iv = 99; vol = 0; pan = 0
         case .far:       iv = 0.7; vol = 0.25; pan = 0
         case .medium:    iv = 0.35; vol = 0.35; pan = 0
         case .close:     iv = 0.15; vol = 0.45; pan = 0
-        case .veryClose: iv = 0.06; vol = 0.5; pan = 0  // caught by parking sensor above
-        case .centered:  iv = 0.03; vol = 0.5; pan = 0  // caught by parking sensor above
+        case .veryClose: iv = 0.06; vol = 0.5; pan = 0
+        case .centered:  iv = 0.03; vol = 0.5; pan = 0
         }
       }
     } else {
-      // With-hand: existing behavior — unchanged
+      // ── Hand guidance beeps (with-hand Phase 2) ──────────────────────
       vol = 0.5
       switch proximityZone {
       case .searching: iv = 99

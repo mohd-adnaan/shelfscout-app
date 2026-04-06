@@ -31,10 +31,12 @@ extension ReachingViewController {
     if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
       config.frameSemantics.insert(.sceneDepth)
       hasLiDAR = true
-      NSLog("📷 [ReachingVC] ✅ LiDAR DETECTED — using LiDAR depth for anchor seeding")
+      NSLog("📷 [ReachingVC] ✅ LiDAR DETECTED (Pro device) — using LiDAR metric depth for anchor seeding")
+      NSLog("📷 [ReachingVC] 🔬 Depth source: LiDAR sceneDepth (metric, no calibration needed)")
     } else {
       hasLiDAR = false
-      NSLog("📷 [ReachingVC] ❌ No LiDAR — using Qwen depth + ARKit raycast refinement")
+      NSLog("📷 [ReachingVC] ❌ No LiDAR (non-Pro device) — using Qwen backend depth + ARKit raycast refinement")
+      NSLog("📷 [ReachingVC] 🔬 Depth source: Qwen/backend relative depth → ARKit estimatedPlane refinement")
     }
     if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
       config.sceneReconstruction = .mesh
@@ -369,29 +371,18 @@ extension ReachingViewController {
   // anchor drift that made v9 unusable.
 
   func startRedetectionLoop() {
-    // Hand-free: re-detection DISABLED. The blend approach failed —
-    // each re-detection from a different camera angle computes a wrong
-    // world position, and blending wrong with less-wrong drifts the anchor
-    // further away with every update. ARKit continuous refinement is the
-    // only reliable depth source for walking users.
-    if mode == .handFree {
-      NSLog("🔄 [Redetect] DISABLED in hand-free mode — continuous ARKit refinement only")
-      return
-    }
-
-    guard let url = detectionUrl, !url.isEmpty else {
-      NSLog("🔄 [Redetect] No detectionUrl — progressive re-detection DISABLED")
-      return
-    }
-    NSLog("🔄 [Redetect] Starting loop (every %.0fs) → %@", redetectInterval, url)
-
-    DispatchQueue.main.async { [weak self] in
-      guard let self = self else { return }
-      self.redetectTimer = Timer.scheduledTimer(withTimeInterval: self.redetectInterval,
-                                                repeats: true) { [weak self] _ in
-        self?.captureAndRedetect()
-      }
-    }
+    // Re-detection DISABLED for BOTH modes.
+    //
+    // Hand-free: The blend approach failed — each re-detection from a different
+    // camera angle computes a wrong world position, and blending wrong with
+    // less-wrong drifts the anchor further away with every update.
+    //
+    // With-hand: Same anchor drift problem. Re-detection while user walks
+    // causes bbox to jump to wrong objects and anchor to destabilize.
+    //
+    // Both modes use: one-shot Qwen detection + continuous ARKit refinement.
+    NSLog("🔄 [Redetect] DISABLED — one-shot detection + continuous ARKit refinement only (mode=%@)", mode.rawValue)
+    return
   }
 
   func captureAndRedetect() {
