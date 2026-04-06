@@ -587,52 +587,43 @@ function AppInner(): React.JSX.Element {
           AccessibilityInfo.announceForAccessibility('Switching to object guidance.');
         }
 
-        // ── Speak + optional pre-fetch ─────────────────────────────────────
+        // ── Speak (fire-and-forget) + immediately continue loop ───────────
+        //
+        // KEY FIX: Do NOT await TTS before starting the next cycle.
+        // Old pattern:  await backend → await TTS (7s) → next capture
+        //               cycle time = backend RTT + TTS duration = 8–10s
+        //
+        // New pattern:  await backend → fire TTS (no await) → next capture
+        //               cycle time = backend RTT + MIN_CYCLE_COOLDOWN = ~2s
+        //               TTS plays in background while next backend call runs.
+        //
+        // "Latest wins": if a new response arrives before current TTS finishes,
+        // speachesSentenceChunker.stop() (called at the start of each new TTS
+        // call) cuts off the stale guidance and plays the fresher one.
+        // This is correct behaviour — the user has moved since the old guidance.
+        //
         if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
           setIsSpeaking(true);
-
-          if (PREFETCH_CONFIG.ENABLED) {
-            await Promise.all([
-              speachesSentenceChunker.synthesizeSpeechChunked(result.text),
-
-              (async () => {
-                try {
-                  await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_TTS_TIME_BEFORE_PREFETCH));
-                  if (continuousModeAbortRef.current || isEmergencyStopped.current) return;
-
-                  while (speachesSentenceChunker.isCurrentlyPlaying()) {
-                    if (continuousModeAbortRef.current || isEmergencyStopped.current) return;
-                    const progress = speachesSentenceChunker.getProgress();
-                    if (progress.percentage >= PREFETCH_CONFIG.PREFETCH_TRIGGER_PERCENT) {
-                      const path = await reactivateCameraAndCapture();
-                      if (path) {
-                        prefetchedPhotoRef.current = path;
-                        console.log('🔮 [Prefetch] ✅ Photo ready for next cycle');
-                      }
-                      return;
-                    }
-                    await new Promise(r => setTimeout(r, PREFETCH_CONFIG.PROGRESS_POLL_INTERVAL));
-                  }
-                } catch (e) {
-                  console.warn('🔮 [Prefetch] Error (non-fatal):', e);
-                }
-              })(),
-            ]);
-          } else {
-            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-          }
-
-          setIsSpeaking(false);
-          await new Promise(resolve =>
-            setTimeout(resolve, PREFETCH_CONFIG.ENABLED
-              ? PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN
-              : TTS_COMPLETION_BUFFER_MS)
-          );
+          // Fire TTS — do NOT await. Loop proceeds to next capture immediately.
+          speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+            .then(() => { setIsSpeaking(false); })
+            .catch((e: any) => {
+              setIsSpeaking(false);
+              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+                console.warn('🔄 [ContinuousMode] TTS error (non-fatal):', e?.message);
+              }
+            });
         } else if (isNullResponse) {
           // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
-          // This gives ~2 polls/sec so we catch the real response quickly.
           console.log(`🔄 ⏭️ Null fast-poll — waiting 500ms before next cycle`);
           await new Promise(resolve => setTimeout(resolve, 500));
+        }
+
+        // Brief cooldown before next capture — gives JS thread a breath and
+        // prevents hammering the backend faster than it can handle.
+        // TTS is already playing in background; this does NOT wait for it.
+        if (!isNullResponse && !continuousModeAbortRef.current) {
+          await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN));
         }
 
         const cycleMs = Date.now() - cycleStart;

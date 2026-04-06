@@ -12,19 +12,22 @@
  *   }
  *   → backend called every ~11 s (matches 7–10 s log gaps)
  *
- * AFTER (fixed — mirrors reaching acquisition pattern):
- *   captureLoop (independent, 2 s gated):
- *     if (!isProcessingFrame) {
- *       isProcessingFrame = true
- *       capture → POST → on response: push to ttsQueue
- *       isProcessingFrame = false   ← ready for next 2 s tick
- *     }
+ * AFTER v2 (setTimeout chain — eliminates wasted interval gap):
+ *
+ *   Problem with v1 (setInterval):
+ *     setInterval fires at fixed T=0, 2, 4, 6… regardless of when response arrives.
+ *     Response arrives at T=4.5s → isProcessingFrame clears → next tick T=6s.
+ *     Up to 2s wasted every cycle. Actual gap = RTT + up to 2s = 6-8s.
+ *
+ *   Fix (setTimeout chain):
+ *     capture → POST → response arrives → setTimeout(MIN_DELAY) → capture
+ *     Next call fires MIN_DELAY ms after response, not at the next fixed tick.
+ *     Actual gap = RTT + MIN_DELAY (no wasted interval).
  *
  *   ttsQueue (independent, plays responses as they arrive):
- *     plays one response at a time, loops when done
+ *     plays one response at a time — never blocks the capture chain
  *
- *   → backend called every ~5–6 s (RTT-limited, same as reaching)
- *   → TTS never blocks next photo capture
+ *   → backend called every RTT + 300ms ≈ 4-5s (vs 6-8s before)
  */
 
 import { useState, useRef, useCallback, useEffect } from 'react';
@@ -39,12 +42,16 @@ import { audioFeedback } from '../services/AudioFeedbackService';
 
 const NAV_CONFIG = {
   /**
-   * How often to attempt a new capture (ms).
-   * Acts as the time gate — same role as acquisitionPollInterval in Swift.
-   * If the backend round-trip is longer than this, the next poll fires
-   * immediately when isProcessingFrame clears (RTT-limited, not interval-limited).
+   * Minimum delay (ms) after a response arrives before the next capture fires.
+   *
+   * This is NOT a poll interval. The next call fires MIN_DELAY_AFTER_RESPONSE ms
+   * after the previous response returns — not on a fixed wall-clock tick.
+   * Eliminates the up-to-2s "missed tick" waste that setInterval caused.
+   *
+   * Gap = client RTT (upload + n8n + download) + MIN_DELAY_AFTER_RESPONSE
+   * At ~4s RTT this gives ~4.3s between n8n calls (vs ~7-8s before).
    */
-  POLL_INTERVAL_MS: 2000,
+  MIN_DELAY_AFTER_RESPONSE: 300,
 
   /** Maximum retries before pausing navigation */
   MAX_CONSECUTIVE_ERRORS: 3,
@@ -116,7 +123,8 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const consecutiveErrorsRef = useRef(0);
-  const pollIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  // setTimeout handle for the self-chaining capture loop (replaces setInterval)
+  const nextCaptureTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   /**
    * ttsQueueRef — responses waiting to be spoken.
@@ -187,9 +195,13 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
   }, [log, updateCycleState, onInstructionAnnounced]);
 
   // ============================================================================
-  // SINGLE CAPTURE + SEND
-  // Fire-and-forget: called by the poll interval, does NOT await before returning.
-  // Mirrors pollAcquisitionEndpoint() in +handFree.swift.
+  // SINGLE CAPTURE + SEND  (self-chaining via setTimeout in finally)
+  //
+  // Pattern:
+  //   captureAndSend() runs once, completes (success or error), then schedules
+  //   itself again via setTimeout(captureAndSend, MIN_DELAY_AFTER_RESPONSE).
+  //   This means the next call fires exactly MIN_DELAY ms after the response
+  //   arrives — NOT on a fixed wall-clock tick the way setInterval would.
   // ============================================================================
   const captureAndSend = useCallback(async () => {
     if (!isNavigatingRef.current) return;
@@ -288,14 +300,26 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
         consecutiveErrorsRef.current = 0;
       }
     } finally {
-      // Always clear the processing flag so the next tick can fire
+      // Clear the in-flight flag regardless of outcome.
       isProcessingFrameRef.current = false;
+
+      // ── Self-chain: schedule next capture ──────────────────────────────────
+      // Fires MIN_DELAY_AFTER_RESPONSE ms after THIS response returned.
+      // Because we schedule here (not from a fixed-tick setInterval), there is
+      // no "missed interval" waste — the next call is always exactly MIN_DELAY
+      // after we're done, not at the next arbitrary wall-clock boundary.
+      if (isNavigatingRef.current) {
+        nextCaptureTimeoutRef.current = setTimeout(
+          captureAndSend,
+          NAV_CONFIG.MIN_DELAY_AFTER_RESPONSE,
+        );
+      }
     }
   }, [cameraRef, drainTTSQueue, updateCycleState, onError, log]);
 
   // ============================================================================
   // PUBLIC API: startNavigation
-  // Starts the interval-based poll loop.
+  // Kicks off the first captureAndSend(); the chain is self-perpetuating.
   // ============================================================================
   const startNavigation = useCallback(async () => {
     if (isNavigatingRef.current) {
@@ -303,7 +327,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
       return;
     }
 
-    log('🟢 Starting navigation — poll interval: ${NAV_CONFIG.POLL_INTERVAL_MS}ms');
+    log(`🟢 Starting navigation — min delay after response: ${NAV_CONFIG.MIN_DELAY_AFTER_RESPONSE}ms`);
     isNavigatingRef.current = true;
     isProcessingFrameRef.current = false;
     isSpeakingRef.current = false;
@@ -329,14 +353,8 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
       'Continuous navigation started. Walk slowly and listen for guidance.',
     );
 
-    // Fire immediately on start, then on interval
+    // Kick off the first cycle — the finally block schedules subsequent ones
     captureAndSend();
-
-    pollIntervalRef.current = setInterval(() => {
-      if (isNavigatingRef.current) {
-        captureAndSend();
-      }
-    }, NAV_CONFIG.POLL_INTERVAL_MS);
   }, [captureAndSend, updateCycleState, log]);
 
   // ============================================================================
@@ -347,9 +365,10 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     isNavigatingRef.current = false;
     ttsQueueRef.current = [];
 
-    if (pollIntervalRef.current) {
-      clearInterval(pollIntervalRef.current);
-      pollIntervalRef.current = null;
+    // Cancel any pending next-capture timeout
+    if (nextCaptureTimeoutRef.current) {
+      clearTimeout(nextCaptureTimeoutRef.current);
+      nextCaptureTimeoutRef.current = null;
     }
 
     abortControllerRef.current?.abort();
@@ -374,7 +393,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
   // ============================================================================
   useEffect(() => {
     return () => {
-      if (pollIntervalRef.current) clearInterval(pollIntervalRef.current);
+      if (nextCaptureTimeoutRef.current) clearTimeout(nextCaptureTimeoutRef.current);
       if (isNavigatingRef.current) {
         isNavigatingRef.current = false;
         abortControllerRef.current?.abort();
