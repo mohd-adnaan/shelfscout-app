@@ -168,6 +168,12 @@ class ReachingViewController: UIViewController {
   let refinementMinHits = 5
   let refinementConvergeThreshold: Float = 0.05
   var lastRefinementAppliedDepth: Float = 0
+  /// Hand-free: max allowed first refinement jump from seeded anchor depth.
+  /// Prevents early wall-plane hijack before anchor is stable.
+  let handFreeInitialRefineMaxJump: Float = 1.2
+  /// Hand-free: after first refinement lock, per-update depth jumps above this
+  /// are considered implausible and rejected as wrong-surface grabs.
+  let handFreePerUpdateMaxJump: Float = 0.7
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Vision
