@@ -218,6 +218,18 @@ extension ReachingViewController {
       return
     }
 
+    // Hand-free early lock guard: before first accepted refinement, reject
+    // large jumps away from seeded depth (typically wall-plane hijack).
+    if mode == .handFree && lastRefinementAppliedDepth == 0 {
+      let seededDepth = max(anchorDepth, 0.15)
+      let initialJump = abs(hitDepth - seededDepth)
+      if initialJump > handFreeInitialRefineMaxJump {
+        NSLog("🎯 [Refine] Rejected early jump hit %.2fm (seed %.2fm, Δ=%.2fm > %.2fm)",
+              hitDepth, seededDepth, initialJump, handFreeInitialRefineMaxJump)
+        return
+      }
+    }
+
     // FIX 13: Reject raycasts beyond 2x backend estimate (with-hand only)
     // Hand-free: backend depth is unreliable (Qwen is not a depth estimator).
     // ARKit plane hits at 2m when backend said 0.93m means backend was WRONG,
@@ -281,6 +293,19 @@ extension ReachingViewController {
     }
 
     let prevDepth = simd_length(currentPos - camPos)
+
+    // Hand-free stability guard: after first lock, reject abrupt depth jumps.
+    // This keeps refinement from snapping to far planes as user moves.
+    if mode == .handFree && lastRefinementAppliedDepth > 0 {
+      let updateJump = abs(median - prevDepth)
+      if updateJump > handFreePerUpdateMaxJump {
+        NSLog("🎯 [Refine] Rejected median jump %.2fm (prev %.2fm → %.2fm, Δ=%.2fm > %.2fm)",
+              updateJump, prevDepth, median, updateJump, handFreePerUpdateMaxJump)
+        refinementHits.removeAll()
+        return
+      }
+    }
+
     let newWorldPos = camPos + worldDir * median
     objectWorldPosition = newWorldPos
 

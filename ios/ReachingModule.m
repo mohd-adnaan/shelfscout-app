@@ -16,6 +16,9 @@ RCT_EXTERN_METHOD(updateBbox:(NSDictionary *)params
 RCT_EXTERN_METHOD(stopReaching:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 
+RCT_EXTERN_METHOD(enableGuidanceAudio:(RCTPromiseResolveBlock)resolver
+                  rejecter:(RCTPromiseRejectBlock)rejecter)
+
 RCT_EXTERN_METHOD(configurePlaybackSession:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 

@@ -298,7 +298,13 @@ function AppInner(): React.JSX.Element {
   // Accepts the full result + image dims, calls ReachingModule, resets state.
   // Returns true if reaching module was invoked.
   // ============================================================================
-  const handleiOSReaching = useCallback(async (result: any): Promise<boolean> => {
+  const handleiOSReaching = useCallback(async (
+    result: any,
+    options?: {
+      startupSilent?: boolean;
+      introSpeechPromise?: Promise<void>;
+    }
+  ): Promise<boolean> => {
     // ── Resolve user preference ───────────────────────────────────────────
     const pipeline = resolveReachingPipeline({
       reaching_ios: result.reaching_ios,
@@ -356,7 +362,7 @@ function AppInner(): React.JSX.Element {
     try {
       const { ReachingModule } = NativeModules;
       if (ReachingModule?.startReaching) {
-        const reachingResult = await ReachingModule.startReaching({
+        const reachingPromise = ReachingModule.startReaching({
           bbox,
           object: result.object || 'object',
           sessionId: getSessionId(),
@@ -366,9 +372,30 @@ function AppInner(): React.JSX.Element {
           detectionUrl: DETECTION_URL,
           acquisitionUrl: ACQUISITION_URL,
           mode: settingsRef.current.reachingMode,
+          startupSilent: options?.startupSilent === true,
           ttsRate: settingsRef.current.ttsRate,
           distanceUnit: settingsRef.current.distanceUnit,
         });
+
+        // Parallel handoff: ARKit session boots silently while intro TTS plays.
+        if (options?.introSpeechPromise) {
+          try {
+            await options.introSpeechPromise;
+          } catch (e: any) {
+            console.warn('⚠️ [ARKit] Intro TTS ended with warning:', e?.message || e);
+          }
+
+          if (ReachingModule?.enableGuidanceAudio) {
+            try {
+              await ReachingModule.enableGuidanceAudio();
+              console.log('🔊 [ARKit] Guidance audio enabled after intro TTS');
+            } catch (e: any) {
+              console.warn('⚠️ [ARKit] Could not enable guidance audio:', e?.message || e);
+            }
+          }
+        }
+
+        const reachingResult = await reachingPromise;
 
         console.log('✅ [ARKit] Native result:', reachingResult);
 
@@ -520,16 +547,29 @@ function AppInner(): React.JSX.Element {
           });
 
           if (loopPipeline === 'arkit') {
-            // ── ARKit path: speak, abort loop, hand off ──────────────────
+            // ── ARKit path: intro TTS + silent ARKit bootstrap in parallel ─
+            let introSpeechPromise: Promise<void> | undefined;
             if (result.text) {
               setIsSpeaking(true);
-              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-              setIsSpeaking(false);
+              introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+                .then(() => {
+                  setIsSpeaking(false);
+                })
+                .catch((e: any) => {
+                  setIsSpeaking(false);
+                  if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+                    console.warn('⚠️ [ARKit] Intro TTS error (non-fatal):', e?.message);
+                  }
+                });
             }
+
             isContinuousModeRunning.current = true; // keep until handoff complete
             continuousModeAbortRef.current = true;
             stopContinuousMode('iOS reaching takeover', false);
-            const handled = await handleiOSReaching(result);
+            const handled = await handleiOSReaching(result, {
+              startupSilent: !!introSpeechPromise,
+              introSpeechPromise,
+            });
             if (handled) {
               setIsNavigation(false);
               setIsReaching(false);
@@ -759,29 +799,48 @@ function AppInner(): React.JSX.Element {
       });
 
       setIsProcessing(false);
-      setIsSpeaking(true);
-      // Skip earcon when VoiceOver is on — it would overlap with TTS response
-      if (!screenReaderEnabledRef.current) {
-        audioFeedback.playEarcon('speaking');
+      let introSpeechPromise: Promise<void> | undefined;
+      if (result.text) {
+        setIsSpeaking(true);
+        // Skip earcon when VoiceOver is on — it would overlap with TTS response
+        if (!screenReaderEnabledRef.current) {
+          audioFeedback.playEarcon('speaking');
+        }
+
+        introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+          .then(() => {
+            setIsSpeaking(false);
+          })
+          .catch((e: any) => {
+            setIsSpeaking(false);
+            if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+              console.warn('⚠️ Intro TTS error (non-fatal):', e?.message);
+            }
+          });
+      } else {
+        setIsSpeaking(false);
       }
 
-
-
       if (isEmergencyStopped.current) return;
 
-      await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-
-      if (isEmergencyStopped.current) return;
-
-      setIsSpeaking(false);
       finalTranscriptRef.current = '';
 
       // ── iOS ARKit reaching on first response (respects user preference) ──
       if (Platform.OS === 'ios' && result.reaching_ios === true) {
-        const handled = await handleiOSReaching(result);
+        const handled = await handleiOSReaching(result, {
+          startupSilent: !!introSpeechPromise,
+          introSpeechPromise,
+        });
         if (handled) return; // ARKit took over or gave fallback message
         // If not handled (e.g. user prefers standard pipeline), fall through
       }
+
+      // Keep existing behavior for non-ARKit paths: finish response speech first.
+      if (introSpeechPromise) {
+        await introSpeechPromise;
+      }
+
+      if (isEmergencyStopped.current) return;
 
       // ── Continuous mode activation ─────────────────────────────────────
       const navigationActive = result.navigation === true;
