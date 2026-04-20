@@ -30,5 +30,23 @@ target 'shelfscout' do
       :mac_catalyst_enabled => false,
       # :ccache_enabled => true
     )
+
+    # Workaround for fmt compile-time format checks failing on newer Apple clang.
+    # Disables fmt consteval/NTTP paths and uses runtime parsing path instead.
+    installer.pods_project.targets.each do |target|
+      target.build_configurations.each do |build_config|
+        defs = build_config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] || ['$(inherited)']
+        defs = [defs] unless defs.is_a?(Array)
+        defs << 'FMT_USE_CONSTEVAL=0' unless defs.include?('FMT_USE_CONSTEVAL=0')
+        defs << 'FMT_USE_NONTYPE_TEMPLATE_ARGS=0' unless defs.include?('FMT_USE_NONTYPE_TEMPLATE_ARGS=0')
+        build_config.build_settings['GCC_PREPROCESSOR_DEFINITIONS'] = defs
+
+        # fmt 11 still hits consteval issues with some Apple clang + c++20 combos.
+        # Keep scope narrow: only downgrade the fmt pod to C++17.
+        if target.name == 'fmt'
+          build_config.build_settings['CLANG_CXX_LANGUAGE_STANDARD'] = 'gnu++17'
+        end
+      end
+    end
   end
 end

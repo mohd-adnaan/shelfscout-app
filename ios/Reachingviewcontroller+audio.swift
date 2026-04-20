@@ -104,18 +104,21 @@ extension ReachingViewController {
   // targetLost.wav → object completely lost from view
 
   func playCenteredSound() {
+    guard guidanceAudioEnabled else { return }
     centeredPlayer?.currentTime = 0
     centeredPlayer?.play()
     NSLog("🔔 [Audio] centered_sound")
   }
 
   func playUncenteredSound() {
+    guard guidanceAudioEnabled else { return }
     uncenteredPlayer?.currentTime = 0
     uncenteredPlayer?.play()
     NSLog("🔔 [Audio] uncentered_sound")
   }
 
   func playTargetLostSound() {
+    guard guidanceAudioEnabled else { return }
     targetLostPlayer?.currentTime = 0
     targetLostPlayer?.play()
     NSLog("🔔 [Audio] targetLost")
@@ -133,7 +136,7 @@ extension ReachingViewController {
   }
 
   func tickBeep() {
-    guard running, proximityZone != .searching else { return }
+    guard running, guidanceAudioEnabled, proximityZone != .searching else { return }
 
     // ── Phase-aware mode selection ────────────────────────────────────────
     // With-hand Phase 1 (navigation) uses hand-free style beeps.
@@ -210,6 +213,7 @@ extension ReachingViewController {
   // Volume stays moderate. This is "you're close" not "danger".
 
   func tickParkingSensor() {
+    guard guidanceAudioEnabled else { return }
     guard let player = playerNode, let fmt = audioFmt else { return }
     let now = ProcessInfo.processInfo.systemUptime
     guard now - lastBeep >= 0.18 else { return }
@@ -244,6 +248,7 @@ extension ReachingViewController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   func playSuccessTone() {
+    guard guidanceAudioEnabled else { return }
     guard let player = playerNode, let fmt = audioFmt else { return }
     let sr: Double = 44100; let dur: Double = 0.5; let fc = AVAudioFrameCount(sr * dur)
     guard let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: fc) else { return }
@@ -277,6 +282,10 @@ extension ReachingViewController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   func say(_ text: String) {
+    guard guidanceAudioEnabled else {
+      NSLog("🔇 [ReachingVC] Suppressing speech during silent bootstrap: %@", text)
+      return
+    }
     synth.stopSpeaking(at: .immediate)
     let u = AVSpeechUtterance(string: text)
     // ttsRate is already 0.1-1.0 (from user settings), which maps directly

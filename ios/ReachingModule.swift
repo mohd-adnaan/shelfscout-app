@@ -48,6 +48,7 @@ class ReachingModule: NSObject {
 
     // Parse distance unit preference: "steps" (default) or "cm"
     let distanceUnit = (params["distanceUnit"] as? String) ?? "steps"
+    let startupSilent = (params["startupSilent"] as? Bool) ?? false
 
     var backendDepth: Float? = nil
     if let d = params["depth"] {
@@ -77,6 +78,7 @@ class ReachingModule: NSObject {
                               acquisitionUrl: acquisitionUrl,
                               sessionId: sessionId,
                               mode: mode,
+                              startupSilent: startupSilent,
                               ttsRate: ttsRate, distanceUnit: distanceUnit,
                               resolver: resolver, rejecter: rejecter)
     }
@@ -151,6 +153,20 @@ class ReachingModule: NSObject {
     }
   }
 
+  @objc func enableGuidanceAudio(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      guard let vc = ReachingModule.activeVC, !vc.hasCompleted else {
+        resolver(["success": false, "reason": "no_active_vc"])
+        return
+      }
+      vc.enableGuidanceAudio()
+      resolver(["success": true])
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Audio Session Configuration
   // ═══════════════════════════════════════════════════════════════════════════
@@ -191,6 +207,7 @@ class ReachingModule: NSObject {
     acquisitionUrl: String?,
     sessionId: String?,
     mode: ReachingViewController.ReachingMode,
+    startupSilent: Bool,
     ttsRate: Float,
     distanceUnit: String,
     resolver: @escaping RCTPromiseResolveBlock,
@@ -210,6 +227,7 @@ class ReachingModule: NSObject {
                                    acquisitionUrl: acquisitionUrl,
                                    sessionId: sessionId,
                                    mode: mode,
+                                   startupSilent: startupSilent,
                                    ttsRate: ttsRate, distanceUnit: distanceUnit,
                                    resolver: resolver, rejecter: rejecter)
           }
@@ -223,6 +241,7 @@ class ReachingModule: NSObject {
         acquisitionUrl: acquisitionUrl,
         sessionId: sessionId,
         mode: mode,
+        startupSilent: startupSilent,
         ttsRate: ttsRate,
         distanceUnit: distanceUnit,
         onDone: { result in
