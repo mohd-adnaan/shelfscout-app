@@ -22,6 +22,7 @@ import {
   useCameraPermission,
   useMicrophonePermission,
 } from 'react-native-vision-camera';
+import Video from 'react-native-video';
 import { useTTS } from './src/hooks/useTTS';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
 import {
@@ -67,6 +68,7 @@ const { width, height } = Dimensions.get('window');
 const CAMERA_REACTIVATION_DELAY_MS = 800;
 const AUDIO_SESSION_RELEASE_DELAY_MS = 300;
 const TTS_COMPLETION_BUFFER_MS = 500;
+const STARTUP_LOADER_MIN_MS = 1800;
 
 // =============================================================================
 // PIPELINE PRE-FETCH CONFIGURATION
@@ -93,6 +95,7 @@ function AppInner(): React.JSX.Element {
   const [reduceMotionEnabled, setReduceMotionEnabled] = useState(false);
   const [isCameraActive, setIsCameraActive] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
+  const [showStartupLoader, setShowStartupLoader] = useState(true);
 
   // ── Settings ───────────────────────────────────────────────────────────────
   const { settings, resolveReachingPipeline } = useSettings();
@@ -214,6 +217,15 @@ function AppInner(): React.JSX.Element {
     if (!hasCameraPermission) requestCameraPermission();
     if (!hasMicPermission) requestMicPermission();
   }, [hasCameraPermission, hasMicPermission]);
+
+  // Keep a short branded startup loader visible so users can see the animated logo.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setShowStartupLoader(false);
+    }, STARTUP_LOADER_MIN_MS);
+
+    return () => clearTimeout(timer);
+  }, []);
 
   // ── Sync transcript ref ────────────────────────────────────────────────────
   useEffect(() => {
@@ -1255,16 +1267,44 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Render
   // ============================================================================
-  if (!hasCameraPermission || !device) {
-    return (
-      <View
-        style={styles.container}
-        accessible={true}
-        accessibilityLabel="Waiting for camera permission."
-      >
-        <StatusBar barStyle="light-content" backgroundColor="#000" />
+  const renderLoaderScreen = (label: string) => (
+    <View
+      style={styles.loaderContainer}
+      accessible={true}
+      accessibilityLabel={label}
+    >
+      <StatusBar barStyle="light-content" backgroundColor="#000" />
+      <Text style={styles.loaderTitle} accessible={false}>shelfscout</Text>
+
+      <View style={styles.loaderBottomMediaContainer} accessible={false}>
+        <Video
+          source={require('./src/assets/videos/srlLogo.mp4')}
+          style={styles.loaderBottomMedia}
+          resizeMode="contain"
+          repeat={true}
+          muted={true}
+          paused={false}
+          playWhenInactive={false}
+          playInBackground={false}
+          ignoreSilentSwitch="ignore"
+          onLoad={() => {
+            console.log('✅ Startup logo video loaded');
+          }}
+          onError={(error) => {
+            console.error('❌ Startup logo video error:', error);
+          }}
+          accessible={false}
+        />
       </View>
-    );
+    </View>
+  );
+
+  if (showStartupLoader) {
+    return renderLoaderScreen('Starting ShelfScout. Please wait.');
+  }
+
+  if (!hasCameraPermission || !device) {
+    return renderLoaderScreen('Waiting for camera permission.');
   }
 
   // ── Settings overlay (full-screen, sits above everything) ─────────────────
@@ -1368,6 +1408,31 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#000',
+  },
+  loaderContainer: {
+    flex: 1,
+    backgroundColor: '#000',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loaderTitle: {
+    color: '#FFF',
+    fontSize: 48,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    marginBottom: 24,
+    textTransform: 'lowercase',
+  },
+  loaderBottomMediaContainer: {
+    position: 'absolute',
+    bottom: 28,
+    width: 280,
+    height: 110,
+    overflow: 'hidden',
+  },
+  loaderBottomMedia: {
+    width: '100%',
+    height: '100%',
   },
   darkOverlay: {
     ...StyleSheet.absoluteFillObject,
