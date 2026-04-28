@@ -59,7 +59,7 @@ class ReachingViewController: UIViewController {
 
   let bboxRaw: [CGFloat]
   let objectName: String
-  let backendDepth: Float?
+  var backendDepth: Float?
   var imageWidth:   CGFloat          // var — updated by progressive re-detection
   var imageHeight:  CGFloat          // var — updated by progressive re-detection
   let onDone: ([String: Any]) -> Void
@@ -181,6 +181,23 @@ class ReachingViewController: UIViewController {
 
   let handReq = VNDetectHumanHandPoseRequest()
   let visionQ = DispatchQueue(label: "reach.vision", qos: .userInitiated)
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Visual Tracking (VNTrackObjectRequest)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Master feature flag. false → original behavior, true → tracker drives refinement.
+  let trackerEnabled: Bool = true
+
+  var trackerSequenceHandler = VNSequenceRequestHandler()
+  var lastTrackedObservation: VNDetectedObjectObservation?
+  var trackingActive: Bool = false
+  var consecutiveLowConfFrames: Int = 0
+  let trackerLowConfThreshold: Float = 0.40
+  let trackerLowConfFramesNeeded: Int = 12
+  let trackerReseedCooldown: TimeInterval = 4.0
+  var lastTrackerReseedTime: TimeInterval = 0
+  var isTrackerReseeding: Bool = false
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Audio / Speech / Haptics
@@ -600,6 +617,12 @@ class ReachingViewController: UIViewController {
     // Reset with-hand phase state
     handGuidanceActive = false
     handGuidanceAnnounced = false
+    // Reset tracker state — fresh handler on next session
+    trackingActive = false
+    lastTrackedObservation = nil
+    consecutiveLowConfFrames = 0
+    isTrackerReseeding = false
+    trackerSequenceHandler = VNSequenceRequestHandler()
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

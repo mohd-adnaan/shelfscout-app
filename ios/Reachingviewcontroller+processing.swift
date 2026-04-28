@@ -33,6 +33,19 @@ extension ReachingViewController {
       return
     }
 
+    // ── Visual tracker update — runs every frame after anchor placement ──
+    // The tracker locks onto the object's 2D pixels in the live AR feed.
+    // Subsequent depth refinement uses the tracker's bbox center as the
+    // ray target, so the anchor stays accurate even if the initial depth
+    // was wrong. When tracker confidence drops for ~12 frames straight,
+    // we ask the backend for a fresh bbox and re-seed.
+    if trackerEnabled && trackingActive {
+      _ = updateTracker(frame: frame)
+      if shouldReseedTracker() {
+        reseedTrackerFromBackend(frame: frame)
+      }
+    }
+
     // ── Continuous ARKit refinement — BOTH modes ────────────────────────
     // One-shot Qwen detection seeds the anchor. ARKit raycasts continuously
     // refine depth as the user walks closer and planes are detected.
