@@ -1,6 +1,6 @@
 // src/services/SpeachesSentenceChunker.ts
 
-import { speachesTTS } from './iOSTtsClient';
+import { iOSTts } from './iOSTtsClient';
 import { AccessibilityService } from './AccessibilityService';
 
 class SpeachesSentenceChunker {
@@ -90,7 +90,7 @@ class SpeachesSentenceChunker {
         console.log(`🎙️ Session ${mySession} — chunk ${i + 1}/${chunks.length}: "${preview}"`);
 
         try {
-          await speachesTTS.synthesizeSpeech(chunk);
+          await iOSTts.synthesizeSpeech(chunk);
           console.log(`✅ Session ${mySession} — chunk ${i + 1}/${chunks.length} done`);
         } catch (chunkError: any) {
           console.error(`❌ Session ${mySession} — chunk ${i + 1} error:`, chunkError);
@@ -153,7 +153,7 @@ class SpeachesSentenceChunker {
       this.isPlaying = false;
 
       // Stop underlying audio
-      await speachesTTS.stop();
+      await iOSTts.stop();
 
       console.log('✅ SpeachesSentenceChunker: stopped');
     } catch (error: any) {

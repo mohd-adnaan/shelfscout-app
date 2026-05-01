@@ -13,7 +13,7 @@
 
 import { Vibration, Platform } from 'react-native';
 //old :import { speachesTTS } from './speachesTtsClient';
-import { speachesTTS } from './iOSTtsClient';
+import { iOSTts } from './iOSTtsClient';
 import { AccessibilityService } from './AccessibilityService';
 
 class AudioFeedbackService {
@@ -119,7 +119,7 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
   }
 
   /**
-   * Speak announcement for state using Speaches TTS
+  * Speak announcement for state using native iOS TTS
    * 
    * WCAG 4.1.3: Provides audio feedback for state changes
    * WCAG 3.3.1: Handles TTS errors gracefully
@@ -156,8 +156,8 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
       this.isSpeakingAnnouncement = true;
       console.log(`📢 Announcing: "${text}"`);
       
-      // Use Speaches TTS for announcement
-      await speachesTTS.synthesizeSpeech(text);
+      // Use native iOS TTS for announcement
+      await iOSTts.synthesizeSpeech(text);
       
       this.isSpeakingAnnouncement = false;
       console.log(`✅ Announcement complete: "${text}"`);
@@ -202,7 +202,7 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
         try {
           this.isSpeakingAnnouncement = true;
           
-          await speachesTTS.synthesizeSpeech(message);
+          await iOSTts.synthesizeSpeech(message);
           
           this.isSpeakingAnnouncement = false;
           console.log('✅ Error spoken via TTS');
@@ -265,7 +265,7 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
     try {
       if (this.isSpeakingAnnouncement) {
         console.log('🛑 Stopping audio announcements');
-        await speachesTTS.stop();
+        await iOSTts.stop();
         this.isSpeakingAnnouncement = false;
         console.log('✅ Announcements stopped');
       }

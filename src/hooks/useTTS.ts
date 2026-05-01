@@ -13,23 +13,23 @@
 import { useEffect } from 'react';
 import { Alert } from 'react-native';
 //OLD: import { speachesTTS } from '../services/speachesTtsClient';
-import { speachesTTS } from '../services/iOSTtsClient';
+import { iOSTts } from '../services/iOSTtsClient';
 import { AccessibilityService } from '../services/AccessibilityService';
 
 export const useTTS = () => {
   useEffect(() => {
-    console.log('✅ Speaches TTS ready (N8N config)');
+    console.log('✅ iOS native TTS ready');
 
     // Cleanup on unmount
     return () => {
-      speachesTTS.stop().catch((err) => {
+      iOSTts.stop().catch((err) => {
         console.warn('⚠️ TTS cleanup error:', err);
       });
     };
   }, []);
 
   /**
-   * Speak the given text using Speaches TTS API
+  * Speak the given text using native iOS TTS
    * 
    * WCAG 3.3.1: Includes comprehensive error handling with clear messages
    * WCAG 4.1.3: Announces TTS state changes to screen reader
@@ -37,10 +37,8 @@ export const useTTS = () => {
    * This function:
    * 1. Validates input text
    * 2. Stops any currently playing speech
-   * 3. Sends text to Speaches API (https://cybersight.cim.mcgill.ca/audio/speech)
-   * 4. Downloads the MP3 audio
-   * 5. Plays the audio
-   * 6. Announces errors if they occur
+  * 3. Plays the audio via native TTS
+  * 4. Announces errors if they occur
    * 
    * @param text - Text to convert to speech
    * @returns Promise that resolves when audio starts playing
@@ -61,13 +59,13 @@ export const useTTS = () => {
         throw new Error(message);
       }
 
-      console.log('🔊 Speaking with Speaches TTS (N8N config)...');
+      console.log('🔊 Speaking with native iOS TTS...');
       console.log('📝 Text length:', trimmedText.length, 'characters');
       
       // WCAG 4.1.3: Announce that we're about to speak
       // (This is handled by the calling code, so we don't duplicate it here)
       
-      await speachesTTS.synthesizeSpeech(trimmedText);
+      await iOSTts.synthesizeSpeech(trimmedText);
       
       console.log('✅ TTS playback started');
       
@@ -116,16 +114,16 @@ export const useTTS = () => {
    * 
    * WCAG 4.1.3: Announces when speech is stopped
    * 
-   * This immediately stops any audio that is currently playing.
-   * Unlike native iOS TTS, this stop method is reliable and fast.
+  * This immediately stops any audio that is currently playing.
+  * Patched react-native-tts makes native stop reliable on iOS.
    * 
    * @returns Promise that resolves when audio is stopped
    */
   const stop = async (): Promise<void> => {
     try {
-      console.log('🛑 Stopping Speaches TTS...');
+      console.log('🛑 Stopping native iOS TTS...');
       
-      await speachesTTS.stop();
+      await iOSTts.stop();
       
       console.log('✅ TTS stopped successfully');
       
@@ -150,7 +148,7 @@ export const useTTS = () => {
    */
   const isPlaying = (): boolean => {
     try {
-      return speachesTTS.isCurrentlyPlaying();
+      return iOSTts.isCurrentlyPlaying();
     } catch (error: any) {
       console.warn('⚠️ Error checking TTS playing state:', error);
       // Return false if we can't determine state
