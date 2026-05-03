@@ -219,10 +219,28 @@ class WearablesCameraModule: NSObject {
   }
 
   private func ensureStreamSession(_ deviceSession: DeviceSession) async throws -> StreamSession {
-    if let stream = streamSession, stream.state != .stopped {
-      return stream
+    if let stream = streamSession {
+      if stream.state == .streaming {
+        return stream
+      }
+
+      if stream.state != .stopped {
+        NSLog("♻️ [Wearables] Existing stream in state=%@ — attempting start",
+              "\(stream.state)")
+        if stream.state != .starting {
+          await stream.start()
+        }
+        if try await waitForStreaming(stream) {
+          return stream
+        }
+      }
+
+      await stream.stop()
+      streamSession = nil
+      stateListenerToken = nil
+      errorListenerToken = nil
+      photoListenerToken = nil
     }
-    streamSession = nil
 
     let config = StreamSessionConfig(
       videoCodec: .raw,
@@ -253,14 +271,14 @@ class WearablesCameraModule: NSObject {
       throw NSError(
         domain: "WearablesCamera",
         code: 1003,
-        userInfo: [NSLocalizedDescriptionKey: "Stream did not reach streaming state within 8s"]
+        userInfo: [NSLocalizedDescriptionKey: "Stream did not reach streaming state within 15s"]
       )
     }
     return stream
   }
 
   private func waitForStreaming(_ stream: StreamSession) async throws -> Bool {
-    let timeoutSeconds: TimeInterval = 8
+    let timeoutSeconds: TimeInterval = 15
     let pollIntervalNs: UInt64 = 200_000_000
     let start = Date()
     while Date().timeIntervalSince(start) < timeoutSeconds {
@@ -275,21 +293,57 @@ class WearablesCameraModule: NSObject {
   }
 
   private func capturePhotoData(from stream: StreamSession) async throws -> Data {
+    let timeoutNs: UInt64 = 8_000_000_000
+
     return try await withCheckedThrowingContinuation { continuation in
-      photoListenerToken = stream.photoDataPublisher.listen { [weak self] photoData in
-        self?.photoListenerToken = nil
-        continuation.resume(returning: photoData.data)
+      let lock = NSLock()
+      var didFinish = false
+
+      func finish(_ result: Result<Data, Error>) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !didFinish else { return }
+        didFinish = true
+        photoListenerToken = nil
+        switch result {
+        case .success(let data):
+          NSLog("✅ [Wearables] Photo received: %d bytes", data.count)
+          continuation.resume(returning: data)
+        case .failure(let error):
+          continuation.resume(throwing: error)
+        }
       }
+
+      photoListenerToken = stream.photoDataPublisher.listen { photoData in
+        let data = photoData.data
+        if data.isEmpty {
+          finish(.failure(NSError(
+            domain: "WearablesCamera",
+            code: 1006,
+            userInfo: [NSLocalizedDescriptionKey: "Photo data was empty"]
+          )))
+          return
+        }
+        finish(.success(data))
+      }
+
       let accepted = stream.capturePhoto(format: .jpeg)
       if !accepted {
-        photoListenerToken = nil
-        continuation.resume(
-          throwing: NSError(
-            domain: "WearablesCamera",
-            code: 1004,
-            userInfo: [NSLocalizedDescriptionKey: "Photo capture rejected by stream"]
-          )
-        )
+        finish(.failure(NSError(
+          domain: "WearablesCamera",
+          code: 1004,
+          userInfo: [NSLocalizedDescriptionKey: "Photo capture rejected by stream"]
+        )))
+        return
+      }
+
+      Task {
+        try await Task.sleep(nanoseconds: timeoutNs)
+        finish(.failure(NSError(
+          domain: "WearablesCamera",
+          code: 1005,
+          userInfo: [NSLocalizedDescriptionKey: "Photo capture timed out"]
+        )))
       }
     }
   }
