@@ -20,6 +20,8 @@ import { iOSTts } from '../services/iOSTtsClient';
 export interface AppSettings {
   /** When true, ignore reaching_ios → use the generic "reaching" pipeline */
   preferAlternativeReaching: boolean;
+  /** When true, use Meta Ray-Ban camera feed instead of phone camera */
+  useWearablesCamera: boolean;
   /** iOS TTS speech rate (0.1 = slowest, 1.0 = fastest). Default 0.5 */
   ttsRate: number;
   /** When true, shows the debug overlay bug button. Default false. */
@@ -34,6 +36,7 @@ interface SettingsContextValue {
   settings: AppSettings;
   isLoaded: boolean;
   updatePreferAlternativeReaching: (value: boolean) => Promise<void>;
+  updateUseWearablesCamera: (value: boolean) => Promise<void>;
   updateTtsRate: (rate: number) => Promise<void>;
   updateDeveloperMode: (value: boolean) => Promise<void>;
   updateReachingMode: (mode: 'handFree' | 'withHand') => Promise<void>;
@@ -54,6 +57,7 @@ interface SettingsContextValue {
 
 const DEFAULT_SETTINGS: AppSettings = {
   preferAlternativeReaching: false,
+  useWearablesCamera: false,
   ttsRate: 0.5,
   developerMode: false,
   reachingMode: 'handFree',
@@ -118,6 +122,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       console.log(
         `[Settings] Reaching pipeline → ${value ? 'Standard (reaching)' : 'ARKit (reaching_ios)'}`,
       );
+    },
+    [settings, persist],
+  );
+
+  const updateUseWearablesCamera = useCallback(
+    async (value: boolean) => {
+      const next = { ...settings, useWearablesCamera: value };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Wearables camera → ${value ? 'ON' : 'OFF'}`);
     },
     [settings, persist],
   );
@@ -194,6 +208,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     settings,
     isLoaded,
     updatePreferAlternativeReaching,
+    updateUseWearablesCamera,
     updateTtsRate,
     updateDeveloperMode,
     updateReachingMode,

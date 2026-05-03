@@ -117,10 +117,15 @@ extension ReachingViewController {
       depth = anchorDepth
       NSLog("🎯 [ReachingVC] Using re-detection depth: %.2fm", depth)
     } else {
-      depth = backendDepth ?? 0.5
+      // BAND-AID: when backend depth is missing (Qwen returned undefined),
+      // 1.5m is a far better default than 0.5m for shelf-reaching scenarios.
+      // Most targets are 0.5–3m away; 1.5m sits at the median, so the worst-
+      // case error in either direction is bounded. 0.5m put us at the close
+      // end and made the divergence gate inactive against the all-nil path.
+      depth = backendDepth ?? 1.5
       anchorDepth = depth
       NSLog("🎯 [ReachingVC] Using %@ depth: %.2fm",
-            hasLiDAR ? "backend (LiDAR miss)" : "Qwen/backend", depth)
+            hasLiDAR ? "backend (LiDAR miss)" : (backendDepth != nil ? "Qwen/backend" : "fallback (nil backend)"), depth)
     }
 
     let fx = CGFloat(intrinsics[0][0]), fy = CGFloat(intrinsics[1][1])
@@ -152,6 +157,14 @@ extension ReachingViewController {
     NSLog("🎯 [ReachingVC] ✅ Anchor SEEDED at (%.3f, %.3f, %.3f) depth=%.2fm (refining with ARKit...)",
           worldPos.x, worldPos.y, worldPos.z, depth)
 
+    // ── Seed visual tracker so subsequent refinement uses fresh 2D pixel target ──
+    // Tracker locks onto the object in the live AR feed; tryRefineAnchorDepth
+    // will raycast through the tracker's bbox center each frame instead of
+    // toward the (possibly drifted) 3D anchor.
+    if trackerEnabled {
+      seedTracker(initialBboxPhotoNorm: bboxNormalized, frame: frame)
+    }
+
     DispatchQueue.main.async { [weak self] in
       guard let self = self else { return }
       self.distanceLabel.text = "\(Int(depth * 100)) cm"
@@ -169,38 +182,101 @@ extension ReachingViewController {
     let camPos = simd_make_float3(camera.transform.columns.3)
     let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
 
-    // ── Guard: skip refinement if object is behind or far off-axis ──────
-    let toObj = simd_normalize(currentPos - camPos)
-    let fwdAlignment = simd_dot(toObj, camFwd)
-    if fwdAlignment < 0.4 {
-      // Object behind or far off-axis — flush stale hits so the buffer
-      // starts clean when the user faces the object again.
-      if !refinementHits.isEmpty {
-        refinementHits.removeAll()
-        lastRefinementAppliedDepth = 0
-        NSLog("🎯 [Refine] Buffer CLEARED — object off-axis (fwdDot=%.2f)", fwdAlignment)
+    // ── Choose ray direction: tracker-driven (preferred) or anchor-driven (fallback) ──
+    //
+    // Tracker-driven ray: camera through the tracker's CURRENT 2D bbox center.
+    // This is the fix for the "anchor floating in mid-air" problem — depth is
+    // sampled at the actual object pixels every frame, so a wrong initial
+    // anchor depth no longer causes self-reinforcing drift.
+    //
+    // Anchor-driven ray (legacy): camera through the existing 3D anchor.
+    // Used when tracker is disabled, hasn't seeded yet, or has lost the object.
+    let toObj = currentPos - camPos
+    let toObjNorm = simd_normalize(toObj)
+    let fwdAlignment = simd_dot(toObjNorm, camFwd)
+
+    var worldDir: simd_float3
+    var raySource: String
+
+    let trackerHealthy = trackerEnabled && trackingActive &&
+                         (lastTrackedObservation?.confidence ?? 0) >= trackerLowConfThreshold * 0.5
+
+    if trackerHealthy, let obs = lastTrackedObservation {
+      worldDir = trackerWorldRay(observation: obs, camera: camera)
+      raySource = "tracker"
+    } else {
+      // Legacy: skip refinement when object is behind or far off-axis,
+      // because the anchor-driven ray can't be corrected without a 2D signal.
+      if fwdAlignment < 0.4 {
+        if !refinementHits.isEmpty {
+          refinementHits.removeAll()
+          lastRefinementAppliedDepth = 0
+          NSLog("🎯 [Refine] Buffer CLEARED — object off-axis (fwdDot=%.2f)", fwdAlignment)
+        }
+        return
       }
-      return
+      worldDir = toObjNorm
+      raySource = "anchor"
     }
 
-    // ── Raycast toward the 3D anchor (not fixed bbox pixels) ────────────
-    // As the user walks, fixed bbox pixel coordinates drift away from the
-    // object in the camera frame, causing the ray to hit the far wall.
-    // Instead, raycast directly from camera → anchor position. This tracks
-    // the anchor correctly regardless of how the camera has moved.
-    let worldDir = toObj  // already normalized above
     let currentAnchorDist = simd_length(currentPos - camPos)
 
+    // BAND-AID: effective baseline depth.
+    // When the backend returned a depth, use it. When it didn't (nil), use a
+    // shelf-scenario-reasonable default of 1.5m. Tracking whether the baseline
+    // is "real" lets the gates apply tighter tolerance when we trust the
+    // baseline and looser tolerance when we're guessing.
+    let effectiveBaseline: Float = backendDepth ?? 1.5
+    let hasRealBackendDepth = (backendDepth != nil) && ((backendDepth ?? 0) > 0.05)
+
+    // ── Raycast with chosen direction ────────────────────────────────────────
+    //
+    // FLOOR FILTER (hand-free): on non-LiDAR devices, the FIRST plane hit along
+    // the ray is usually the floor (large, mapped early), not the table-top
+    // (small, mapped late). For shelf-reaching, the object is on a surface
+    // ABOVE floor level. We scan ALL hits per target and skip horizontal
+    // planes more than 1.0m below the camera — those are floor hits regardless
+    // of how confidently ARKit reports them. Vertical planes (walls) and any
+    // plane within 1m of camera height are kept.
+    //
+    // BACK-WALL FILTER (band-aid): pre-convergence, also reject vertical
+    // planes more than 2× the effective baseline away. The room's back wall
+    // is the most common false hit when the object is on a table in front
+    // of it — a 1.5m baseline + a 3m+ wall hit is the bicycle-and-back-wall
+    // failure mode we saw in the field test.
     var hitPos: simd_float3? = nil
     var hitSource = ""
+    let camWorldY = camera.transform.columns.3.y
+    let floorRejectMargin: Float = 1.0  // 1m below camera = likely floor
+
     for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
       let query = ARRaycastQuery(origin: camPos, direction: worldDir,
                                  allowing: target, alignment: .any)
-      if let hit = sceneView.session.raycast(query).first {
+      for hit in sceneView.session.raycast(query) {
+        if mode == .handFree && hit.targetAlignment == .horizontal {
+          let hitWorldY = hit.worldTransform.columns.3.y
+          let depthBelowCam = camWorldY - hitWorldY
+          if depthBelowCam > floorRejectMargin {
+            NSLog("🎯 [Refine] Skipped floor candidate: %.2fm below cam, target=%@",
+                  depthBelowCam, target == .existingPlaneGeometry ? "existing" : "estimated")
+            continue
+          }
+        }
+        // BAND-AID: pre-convergence vertical-plane back-wall filter
+        if mode == .handFree && lastRefinementAppliedDepth == 0
+           && hit.targetAlignment == .vertical {
+          let hitDistVal = simd_length(simd_make_float3(hit.worldTransform.columns.3) - camPos)
+          if hitDistVal > effectiveBaseline * 2.0 {
+            NSLog("🎯 [Refine] Skipped back-wall hit: %.2fm > 2× baseline %.2fm (vertical)",
+                  hitDistVal, effectiveBaseline)
+            continue
+          }
+        }
         hitPos = simd_make_float3(hit.worldTransform.columns.3)
         hitSource = target == .existingPlaneGeometry ? "existingPlane" : "estimatedPlane"
         break
       }
+      if hitPos != nil { break }
     }
 
     guard let hp = hitPos else {
@@ -218,6 +294,35 @@ extension ReachingViewController {
       return
     }
 
+    // ── PRE-CONVERGENCE DIVERGENCE GATE (both modes) ─────────────────────────
+    //
+    // Backend Qwen depth is approximate but in the right ballpark (typically
+    // ±25% of truth). ARKit estimatedPlane raycasts on non-LiDAR devices can
+    // land on the FLOOR or BACK WALL before the object's actual surface is
+    // mapped, producing 4-10x depth overshoots. Once five of these wrong hits
+    // agree (consistently hitting the same wrong surface), the median locks
+    // in and the anchor is poisoned.
+    //
+    // Pre-convergence (lastRefinementAppliedDepth == 0), reject any hit that
+    // diverges too far from the effective baseline:
+    //   - 60% tolerance when backend depth is real (tight, trust backend)
+    //   - 80% tolerance when using fallback baseline (looser, we're guessing)
+    //
+    // Once first convergence happens, the gate self-disables — refinement
+    // is then trusted to track the user as they walk closer. On tracker
+    // reseed, lastRefinementAppliedDepth is reset to 0, re-engaging the gate.
+    if lastRefinementAppliedDepth == 0 {
+      let divergence = abs(hitDepth - effectiveBaseline) / effectiveBaseline
+      let maxDiv: Float = hasRealBackendDepth ? 0.6 : 0.8
+      if divergence > maxDiv {
+        NSLog("🎯 [Refine] Rejected pre-convergence hit %.2fm — diverges %.0f%% from %@ %.2fm",
+              hitDepth, divergence * 100,
+              hasRealBackendDepth ? "backend" : "fallback",
+              effectiveBaseline)
+        return
+      }
+    }
+
     // FIX 13: Reject raycasts beyond 2x backend estimate (with-hand only)
     // Hand-free: backend depth is unreliable (Qwen is not a depth estimator).
     // ARKit plane hits at 2m when backend said 0.93m means backend was WRONG,
@@ -231,11 +336,17 @@ extension ReachingViewController {
     // The ray points camera→anchor, so hits beyond the anchor are the WALL
     // behind the object. Only apply after first convergence (before that,
     // the anchor depth from backend may be inaccurate).
+    //
+    // When the tracker is driving the ray, the new ray points at the actual
+    // object pixels — a depth that differs from the old anchor distance is
+    // EXPECTED (lateral correction). Relax the guard to 1.0m so genuine
+    // depth corrections aren't rejected, but wild hits still are.
     if mode == .handFree && lastRefinementAppliedDepth > 0 {
-      let maxAllowed = currentAnchorDist + 0.50
+      let overshootBudget: Float = (raySource == "tracker") ? 1.00 : 0.50
+      let maxAllowed = currentAnchorDist + overshootBudget
       if hitDepth > maxAllowed {
-        NSLog("🎯 [Refine] Rejected wall hit at %.2fm (anchor at %.2fm, max %.2fm)",
-              hitDepth, currentAnchorDist, maxAllowed)
+        NSLog("🎯 [Refine] Rejected wall hit at %.2fm (anchor at %.2fm, max %.2fm, src=%@)",
+              hitDepth, currentAnchorDist, maxAllowed, raySource)
         return
       }
     }
@@ -243,8 +354,8 @@ extension ReachingViewController {
     refinementHits.append(hitDepth)
     if refinementHits.count > 20 { refinementHits.removeFirst() }
 
-    NSLog("🎯 [Refine] Hit #%d: %.2fm (%@) | buffer: %d hits",
-          refinementHits.count, hitDepth, hitSource, refinementHits.count)
+    NSLog("🎯 [Refine] Hit #%d: %.2fm (%@, ray=%@) | buffer: %d hits",
+          refinementHits.count, hitDepth, hitSource, raySource, refinementHits.count)
 
     guard refinementHits.count >= refinementMinHits else { return }
 
@@ -262,6 +373,40 @@ extension ReachingViewController {
     guard iqr < convergeThreshold else {
       NSLog("🎯 [Refine] IQR too wide (%.2fm, need <%.2fm) — still accumulating", iqr, convergeThreshold)
       return
+    }
+
+    // ── BAND-AID: FIRST-CONVERGENCE SANITY CHECK ────────────────────────────
+    //
+    // Defense-in-depth against the "5 hits all on the wall agree → median
+    // converges to wrong depth" failure. Pre-convergence, if the proposed
+    // median represents a major jump from the effective baseline, demand
+    // more evidence before applying:
+    //   - >50% jump from baseline → require 10 hits (real backend) / 15 (fallback)
+    //   - No real backend depth at all → demand IQR < 0.08 (tighter than 0.15)
+    //
+    // This is a backstop. The divergence gate above should already have
+    // rejected wildly off hits; this catches the slow-creep case where many
+    // marginal hits average to a wrong but consistent depth.
+    if lastRefinementAppliedDepth == 0 {
+      let medianDivergence = abs(median - effectiveBaseline) / effectiveBaseline
+      if medianDivergence > 0.5 {
+        let needHits = hasRealBackendDepth ? 10 : 15
+        if refinementHits.count < needHits {
+          NSLog("🎯 [Refine] First-conv sanity: median %.2fm differs %.0f%% from %@ %.2fm — need %d hits (have %d)",
+                median, medianDivergence * 100,
+                hasRealBackendDepth ? "backend" : "fallback",
+                effectiveBaseline, needHits, refinementHits.count)
+          return
+        }
+      }
+      if !hasRealBackendDepth {
+        let strictIqr: Float = 0.08
+        if iqr >= strictIqr {
+          NSLog("🎯 [Refine] First-conv sanity: no backend depth — IQR %.2fm too wide (need <%.2fm)",
+                iqr, strictIqr)
+          return
+        }
+      }
     }
 
     if lastRefinementAppliedDepth > 0 && abs(median - lastRefinementAppliedDepth) < 0.02 {

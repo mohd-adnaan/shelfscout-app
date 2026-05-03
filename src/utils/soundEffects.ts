@@ -34,10 +34,10 @@ import { Platform, NativeModules } from 'react-native';
 // ──────────────────────────────────────────────────────────────────────────
 const { ReachingModule } = NativeModules;
 
-export const configurePlaybackSession = async (): Promise<void> => {
+export const configurePlaybackSession = async (useSpeaker: boolean = true): Promise<void> => {
   if (Platform.OS !== 'ios' || !ReachingModule?.configurePlaybackSession) return;
   try {
-    await ReachingModule.configurePlaybackSession();
+    await ReachingModule.configurePlaybackSession(useSpeaker);
   } catch (e: any) {
     // Non-fatal — Sound.setCategory is still called as a fallback
     console.warn('⚠️ [SFX] configurePlaybackSession failed:', e?.message);

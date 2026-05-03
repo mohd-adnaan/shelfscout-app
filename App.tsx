@@ -22,6 +22,7 @@ import {
   useCameraPermission,
   useMicrophonePermission,
 } from 'react-native-vision-camera';
+import Video from 'react-native-video';
 import { useTTS } from './src/hooks/useTTS';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
 import {
@@ -58,6 +59,7 @@ import { SettingsProvider, useSettings } from './src/context/SettingsContext';
 import SettingsScreen from './src/screens/SettingsScreen';
 import { debugLogger } from './src/services/DebugLogger';
 import { DebugOverlay } from './src/components/DebugOverlay';
+import { wearablesCamera } from './src/services/WearablesCamera';
 
 const { width, height } = Dimensions.get('window');
 
@@ -67,6 +69,7 @@ const { width, height } = Dimensions.get('window');
 const CAMERA_REACTIVATION_DELAY_MS = 800;
 const AUDIO_SESSION_RELEASE_DELAY_MS = 300;
 const TTS_COMPLETION_BUFFER_MS = 500;
+const STARTUP_LOADER_MIN_MS = 1800;
 
 // =============================================================================
 // PIPELINE PRE-FETCH CONFIGURATION
@@ -93,6 +96,7 @@ function AppInner(): React.JSX.Element {
   const [reduceMotionEnabled, setReduceMotionEnabled] = useState(false);
   const [isCameraActive, setIsCameraActive] = useState(true);
   const [showSettings, setShowSettings] = useState(false);
+  const [showStartupLoader, setShowStartupLoader] = useState(true);
 
   // ── Settings ───────────────────────────────────────────────────────────────
   const { settings, resolveReachingPipeline } = useSettings();
@@ -211,9 +215,23 @@ function AppInner(): React.JSX.Element {
   }, []);
 
   useEffect(() => {
+    if (settings.useWearablesCamera) {
+      if (!hasMicPermission) requestMicPermission();
+      return;
+    }
+
     if (!hasCameraPermission) requestCameraPermission();
     if (!hasMicPermission) requestMicPermission();
-  }, [hasCameraPermission, hasMicPermission]);
+  }, [hasCameraPermission, hasMicPermission, requestCameraPermission, requestMicPermission, settings.useWearablesCamera]);
+
+  // Keep a short branded startup loader visible so users can see the animated logo.
+  useEffect(() => {
+    const timer = setTimeout(() => {
+      setShowStartupLoader(false);
+    }, STARTUP_LOADER_MIN_MS);
+
+    return () => clearTimeout(timer);
+  }, []);
 
   // ── Sync transcript ref ────────────────────────────────────────────────────
   useEffect(() => {
@@ -258,6 +276,17 @@ function AppInner(): React.JSX.Element {
     console.log('📷 Reactivating camera for capture...');
     setIsCameraActive(true);
 
+    if (settingsRef.current.useWearablesCamera) {
+      try {
+        const wearablesPhoto = await wearablesCamera.capturePhoto();
+        lastImageDimensions.current = { width: 0, height: 0 };
+        return wearablesPhoto;
+      } catch (error) {
+        console.error('❌ Wearables capture failed:', error);
+        throw error;
+      }
+    }
+
     await new Promise(resolve => setTimeout(resolve, CAMERA_REACTIVATION_DELAY_MS));
 
     if (!cameraRef.current) {
@@ -298,7 +327,13 @@ function AppInner(): React.JSX.Element {
   // Accepts the full result + image dims, calls ReachingModule, resets state.
   // Returns true if reaching module was invoked.
   // ============================================================================
-  const handleiOSReaching = useCallback(async (result: any): Promise<boolean> => {
+  const handleiOSReaching = useCallback(async (
+    result: any,
+    options?: {
+      startupSilent?: boolean;
+      introSpeechPromise?: Promise<void>;
+    }
+  ): Promise<boolean> => {
     // ── Resolve user preference ───────────────────────────────────────────
     const pipeline = resolveReachingPipeline({
       reaching_ios: result.reaching_ios,
@@ -356,7 +391,7 @@ function AppInner(): React.JSX.Element {
     try {
       const { ReachingModule } = NativeModules;
       if (ReachingModule?.startReaching) {
-        const reachingResult = await ReachingModule.startReaching({
+        const reachingPromise = ReachingModule.startReaching({
           bbox,
           object: result.object || 'object',
           sessionId: getSessionId(),
@@ -366,9 +401,30 @@ function AppInner(): React.JSX.Element {
           detectionUrl: DETECTION_URL,
           acquisitionUrl: ACQUISITION_URL,
           mode: settingsRef.current.reachingMode,
+          startupSilent: options?.startupSilent === true,
           ttsRate: settingsRef.current.ttsRate,
           distanceUnit: settingsRef.current.distanceUnit,
         });
+
+        // Parallel handoff: ARKit session boots silently while intro TTS plays.
+        if (options?.introSpeechPromise) {
+          try {
+            await options.introSpeechPromise;
+          } catch (e: any) {
+            console.warn('⚠️ [ARKit] Intro TTS ended with warning:', e?.message || e);
+          }
+
+          if (ReachingModule?.enableGuidanceAudio) {
+            try {
+              await ReachingModule.enableGuidanceAudio();
+              console.log('🔊 [ARKit] Guidance audio enabled after intro TTS');
+            } catch (e: any) {
+              console.warn('⚠️ [ARKit] Could not enable guidance audio:', e?.message || e);
+            }
+          }
+        }
+
+        const reachingResult = await reachingPromise;
 
         console.log('✅ [ARKit] Native result:', reachingResult);
 
@@ -520,16 +576,29 @@ function AppInner(): React.JSX.Element {
           });
 
           if (loopPipeline === 'arkit') {
-            // ── ARKit path: speak, abort loop, hand off ──────────────────
+            // ── ARKit path: intro TTS + silent ARKit bootstrap in parallel ─
+            let introSpeechPromise: Promise<void> | undefined;
             if (result.text) {
               setIsSpeaking(true);
-              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-              setIsSpeaking(false);
+              introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+                .then(() => {
+                  setIsSpeaking(false);
+                })
+                .catch((e: any) => {
+                  setIsSpeaking(false);
+                  if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+                    console.warn('⚠️ [ARKit] Intro TTS error (non-fatal):', e?.message);
+                  }
+                });
             }
+
             isContinuousModeRunning.current = true; // keep until handoff complete
             continuousModeAbortRef.current = true;
             stopContinuousMode('iOS reaching takeover', false);
-            const handled = await handleiOSReaching(result);
+            const handled = await handleiOSReaching(result, {
+              startupSilent: !!introSpeechPromise,
+              introSpeechPromise,
+            });
             if (handled) {
               setIsNavigation(false);
               setIsReaching(false);
@@ -719,7 +788,7 @@ function AppInner(): React.JSX.Element {
       // Skip earcons/SFX when VoiceOver is on — audio session conflicts
       if (!screenReaderEnabledRef.current) {
         // FIX: Restore full-volume audio session after STT's Record+Measurement
-        await configurePlaybackSession();
+        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
         audioFeedback.playEarcon('thinking');
         playThinkingStarted();
@@ -759,29 +828,48 @@ function AppInner(): React.JSX.Element {
       });
 
       setIsProcessing(false);
-      setIsSpeaking(true);
-      // Skip earcon when VoiceOver is on — it would overlap with TTS response
-      if (!screenReaderEnabledRef.current) {
-        audioFeedback.playEarcon('speaking');
+      let introSpeechPromise: Promise<void> | undefined;
+      if (result.text) {
+        setIsSpeaking(true);
+        // Skip earcon when VoiceOver is on — it would overlap with TTS response
+        if (!screenReaderEnabledRef.current) {
+          audioFeedback.playEarcon('speaking');
+        }
+
+        introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+          .then(() => {
+            setIsSpeaking(false);
+          })
+          .catch((e: any) => {
+            setIsSpeaking(false);
+            if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+              console.warn('⚠️ Intro TTS error (non-fatal):', e?.message);
+            }
+          });
+      } else {
+        setIsSpeaking(false);
       }
 
-
-
       if (isEmergencyStopped.current) return;
 
-      await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-
-      if (isEmergencyStopped.current) return;
-
-      setIsSpeaking(false);
       finalTranscriptRef.current = '';
 
       // ── iOS ARKit reaching on first response (respects user preference) ──
       if (Platform.OS === 'ios' && result.reaching_ios === true) {
-        const handled = await handleiOSReaching(result);
+        const handled = await handleiOSReaching(result, {
+          startupSilent: !!introSpeechPromise,
+          introSpeechPromise,
+        });
         if (handled) return; // ARKit took over or gave fallback message
         // If not handled (e.g. user prefers standard pipeline), fall through
       }
+
+      // Keep existing behavior for non-ARKit paths: finish response speech first.
+      if (introSpeechPromise) {
+        await introSpeechPromise;
+      }
+
+      if (isEmergencyStopped.current) return;
 
       // ── Continuous mode activation ─────────────────────────────────────
       const navigationActive = result.navigation === true;
@@ -998,7 +1086,7 @@ function AppInner(): React.JSX.Element {
         // react-native-sound's setCategory alone doesn't restore full volume.
         // This native call sets .playback + .default mode + setActive + speaker
         // route — matching the reaching pipeline's audio config.
-        await configurePlaybackSession();
+        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
         audioFeedback.playEarcon('listening');
         playListenSound();
@@ -1196,16 +1284,44 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Render
   // ============================================================================
-  if (!hasCameraPermission || !device) {
-    return (
-      <View
-        style={styles.container}
-        accessible={true}
-        accessibilityLabel="Waiting for camera permission."
-      >
-        <StatusBar barStyle="light-content" backgroundColor="#000" />
+  const renderLoaderScreen = (label: string) => (
+    <View
+      style={styles.loaderContainer}
+      accessible={true}
+      accessibilityLabel={label}
+    >
+      <StatusBar barStyle="light-content" backgroundColor="#000" />
+      <Text style={styles.loaderTitle} accessible={false}>shelfscout</Text>
+
+      <View style={styles.loaderBottomMediaContainer} accessible={false}>
+        <Video
+          source={require('./src/assets/videos/srlLogo.mp4')}
+          style={styles.loaderBottomMedia}
+          resizeMode="contain"
+          repeat={true}
+          muted={true}
+          paused={false}
+          playWhenInactive={false}
+          playInBackground={false}
+          ignoreSilentSwitch="ignore"
+          onLoad={() => {
+            console.log('✅ Startup logo video loaded');
+          }}
+          onError={(error) => {
+            console.error('❌ Startup logo video error:', error);
+          }}
+          accessible={false}
+        />
       </View>
-    );
+    </View>
+  );
+
+  if (showStartupLoader) {
+    return renderLoaderScreen('Starting ShelfScout. Please wait.');
+  }
+
+  if (!settings.useWearablesCamera && (!hasCameraPermission || !device)) {
+    return renderLoaderScreen('Waiting for camera permission.');
   }
 
   // ── Settings overlay (full-screen, sits above everything) ─────────────────
@@ -1238,15 +1354,17 @@ function AppInner(): React.JSX.Element {
           <StatusBar barStyle="light-content" backgroundColor="#000" />
 
           {/* Camera */}
-          <Camera
-            ref={cameraRef}
-            style={StyleSheet.absoluteFill}
-            device={device}
-            isActive={isCameraActive}
-            photo={true}
-            accessible={false}
-            accessibilityElementsHidden={true}
-          />
+          {!settings.useWearablesCamera && (
+            <Camera
+              ref={cameraRef}
+              style={StyleSheet.absoluteFill}
+              device={device}
+              isActive={isCameraActive}
+              photo={true}
+              accessible={false}
+              accessibilityElementsHidden={true}
+            />
+          )}
 
           <View
             style={styles.darkOverlay}
@@ -1309,6 +1427,31 @@ const styles = StyleSheet.create({
   container: {
     flex: 1,
     backgroundColor: '#000',
+  },
+  loaderContainer: {
+    flex: 1,
+    backgroundColor: '#000',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  loaderTitle: {
+    color: '#FFF',
+    fontSize: 48,
+    fontWeight: '700',
+    letterSpacing: 0.6,
+    marginBottom: 24,
+    textTransform: 'lowercase',
+  },
+  loaderBottomMediaContainer: {
+    position: 'absolute',
+    bottom: 28,
+    width: 280,
+    height: 110,
+    overflow: 'hidden',
+  },
+  loaderBottomMedia: {
+    width: '100%',
+    height: '100%',
   },
   darkOverlay: {
     ...StyleSheet.absoluteFillObject,

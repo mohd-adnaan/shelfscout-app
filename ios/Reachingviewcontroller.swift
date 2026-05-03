@@ -59,7 +59,7 @@ class ReachingViewController: UIViewController {
 
   let bboxRaw: [CGFloat]
   let objectName: String
-  let backendDepth: Float?
+  var backendDepth: Float?
   var imageWidth:   CGFloat          // var — updated by progressive re-detection
   var imageHeight:  CGFloat          // var — updated by progressive re-detection
   let onDone: ([String: Any]) -> Void
@@ -168,6 +168,12 @@ class ReachingViewController: UIViewController {
   let refinementMinHits = 5
   let refinementConvergeThreshold: Float = 0.05
   var lastRefinementAppliedDepth: Float = 0
+  /// Hand-free: max allowed first refinement jump from seeded anchor depth.
+  /// Prevents early wall-plane hijack before anchor is stable.
+  let handFreeInitialRefineMaxJump: Float = 1.2
+  /// Hand-free: after first refinement lock, per-update depth jumps above this
+  /// are considered implausible and rejected as wrong-surface grabs.
+  let handFreePerUpdateMaxJump: Float = 0.7
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Vision
@@ -175,6 +181,23 @@ class ReachingViewController: UIViewController {
 
   let handReq = VNDetectHumanHandPoseRequest()
   let visionQ = DispatchQueue(label: "reach.vision", qos: .userInitiated)
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Visual Tracking (VNTrackObjectRequest)
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Master feature flag. false → original behavior, true → tracker drives refinement.
+  let trackerEnabled: Bool = true
+
+  var trackerSequenceHandler = VNSequenceRequestHandler()
+  var lastTrackedObservation: VNDetectedObjectObservation?
+  var trackingActive: Bool = false
+  var consecutiveLowConfFrames: Int = 0
+  let trackerLowConfThreshold: Float = 0.40
+  let trackerLowConfFramesNeeded: Int = 12
+  let trackerReseedCooldown: TimeInterval = 4.0
+  var lastTrackerReseedTime: TimeInterval = 0
+  var isTrackerReseeding: Bool = false
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Audio / Speech / Haptics
@@ -281,6 +304,10 @@ class ReachingViewController: UIViewController {
   var lastKnownDirectionLabel: String = ""
   /// Distance unit: "steps" or "cm"
   var distanceUnit: String = "steps"
+  /// If true, ARKit boots silently until JS enables guidance audio.
+  var startupSilent: Bool = false
+  /// Runtime gate for all AR guidance audio output.
+  var guidanceAudioEnabled: Bool = true
 
   // ── Nicolas-style state-change audio players ───────────────────────────
   var centeredPlayer: AVAudioPlayer?
@@ -310,6 +337,7 @@ class ReachingViewController: UIViewController {
        acquisitionUrl: String? = nil,
       sessionId: String? = nil,
        mode: ReachingMode = .handFree,
+      startupSilent: Bool = false,
        ttsRate: Float = 0.5,
        distanceUnit: String = "steps",
        onDone: @escaping ([String: Any]) -> Void) {
@@ -323,6 +351,8 @@ class ReachingViewController: UIViewController {
     let cleanedSessionId = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.sessionId = cleanedSessionId.isEmpty ? UUID().uuidString : cleanedSessionId
     self.mode         = mode
+    self.startupSilent = startupSilent
+    self.guidanceAudioEnabled = !startupSilent
     self.ttsRate      = ttsRate
     self.distanceUnit = distanceUnit
     self.onDone       = onDone
@@ -381,12 +411,24 @@ class ReachingViewController: UIViewController {
       guard let self = self, !self.hasCompleted else { return }
       self.startAR()
       self.running = true
-      if self.mode == .handFree {
-        self.say("Guiding to \(self.objectName). Point phone toward it. Tap anywhere when you have it.")
+      if self.guidanceAudioEnabled {
+        if self.mode == .handFree {
+          self.say("Guiding to \(self.objectName). Point phone toward it. Tap anywhere when you have it.")
+        } else {
+          self.say("Guiding to \(self.objectName). Point phone toward it. I'll tell you when to raise your hand.")
+        }
       } else {
-        self.say("Guiding to \(self.objectName). Point phone toward it. I'll tell you when to raise your hand.")
+        NSLog("🔇 [ReachingVC] Silent bootstrap active — delaying AR guidance audio")
       }
     }
+  }
+
+  func enableGuidanceAudio() {
+    if guidanceAudioEnabled {
+      return
+    }
+    guidanceAudioEnabled = true
+    NSLog("🔊 [ReachingVC] Guidance audio enabled by JS handoff")
   }
 
   override func viewWillDisappear(_ animated: Bool) {
@@ -575,6 +617,12 @@ class ReachingViewController: UIViewController {
     // Reset with-hand phase state
     handGuidanceActive = false
     handGuidanceAnnounced = false
+    // Reset tracker state — fresh handler on next session
+    trackingActive = false
+    lastTrackedObservation = nil
+    consecutiveLowConfFrames = 0
+    isTrackerReseeding = false
+    trackerSequenceHandler = VNSequenceRequestHandler()
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

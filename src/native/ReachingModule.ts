@@ -31,6 +31,8 @@ export interface ReachingConfig {
   acquisitionUrl?: string;
   /** Workflow session ID forwarded to iOS acquisition requests */
   sessionId?: string;
+  /** Start AR session silently; JS will enable guidance audio later */
+  startupSilent?: boolean;
 }
 
 export type ReachingState = 'idle' | 'tracking' | 'locked' | 'reached' | 'lost';
@@ -46,6 +48,11 @@ export interface ReachingModuleInterface {
    * Stop reaching mode and dismiss ARKit view
    */
   stopReaching(): Promise<void>;
+
+  /**
+   * Enable AR guidance audio after a silent bootstrap.
+   */
+  enableGuidanceAudio(): Promise<{ success: boolean; reason?: string }>;
   
   /**
    * Check if ARKit reaching is available on this device
@@ -95,6 +102,9 @@ const AndroidStub: ReachingModuleInterface = {
   },
   stopReaching: async () => {
     console.log('[ReachingModule] stopReaching called on Android (no-op)');
+  },
+  enableGuidanceAudio: async () => {
+    return { success: false, reason: 'ios_only' };
   },
   isAvailable: async () => {
     console.log('[ReachingModule] isAvailable: false (Android)');

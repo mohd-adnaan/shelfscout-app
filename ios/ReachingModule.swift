@@ -48,6 +48,7 @@ class ReachingModule: NSObject {
 
     // Parse distance unit preference: "steps" (default) or "cm"
     let distanceUnit = (params["distanceUnit"] as? String) ?? "steps"
+    let startupSilent = (params["startupSilent"] as? Bool) ?? false
 
     var backendDepth: Float? = nil
     if let d = params["depth"] {
@@ -77,6 +78,7 @@ class ReachingModule: NSObject {
                               acquisitionUrl: acquisitionUrl,
                               sessionId: sessionId,
                               mode: mode,
+                              startupSilent: startupSilent,
                               ttsRate: ttsRate, distanceUnit: distanceUnit,
                               resolver: resolver, rejecter: rejecter)
     }
@@ -151,6 +153,20 @@ class ReachingModule: NSObject {
     }
   }
 
+  @objc func enableGuidanceAudio(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.main.async {
+      guard let vc = ReachingModule.activeVC, !vc.hasCompleted else {
+        resolver(["success": false, "reason": "no_active_vc"])
+        return
+      }
+      vc.enableGuidanceAudio()
+      resolver(["success": true])
+    }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Audio Session Configuration
   // ═══════════════════════════════════════════════════════════════════════════
@@ -167,19 +183,38 @@ class ReachingModule: NSObject {
   // ═══════════════════════════════════════════════════════════════════════════
 
   @objc func configurePlaybackSession(
-    _ resolver: @escaping RCTPromiseResolveBlock,
+    _ useSpeaker: NSNumber?,
+    resolver: @escaping RCTPromiseResolveBlock,
     rejecter: @escaping RCTPromiseRejectBlock
   ) {
     do {
+      let shouldUseSpeaker = useSpeaker?.boolValue ?? true
       let session = AVAudioSession.sharedInstance()
-      try session.setCategory(.playback, mode: .default, options: [])
-      try session.setActive(true)
-      try session.overrideOutputAudioPort(.speaker)
-      NSLog("🔊 [ReachingModule] Audio session configured for playback (speaker, active)")
+
+      if shouldUseSpeaker {
+        // Force phone speaker — requires .playAndRecord + .defaultToSpeaker.
+        // overrideOutputAudioPort(.speaker) on .playback throws OSStatus -50.
+        try session.setCategory(
+          .playAndRecord,
+          mode: .default,
+          options: [.defaultToSpeaker, .allowBluetoothA2DP]
+        )
+        try session.setActive(true)
+        NSLog("🔊 [ReachingModule] Audio → playAndRecord + speaker")
+      } else {
+        // Let iOS route to the active Bluetooth sink (Ray-Bans).
+        // No port override — .playback routes via system route automatically.
+        try session.setCategory(
+          .playback,
+          mode: .default,
+          options: [.allowBluetoothA2DP]
+        )
+        try session.setActive(true)
+        NSLog("🔊 [ReachingModule] Audio → playback (Bluetooth)")
+      }
       resolver(["success": true])
     } catch {
       NSLog("⚠️ [ReachingModule] configurePlaybackSession error: %@", error.localizedDescription)
-      // Non-fatal — audio will still play, just possibly quieter
       resolver(["success": false, "error": error.localizedDescription])
     }
   }
@@ -191,6 +226,7 @@ class ReachingModule: NSObject {
     acquisitionUrl: String?,
     sessionId: String?,
     mode: ReachingViewController.ReachingMode,
+    startupSilent: Bool,
     ttsRate: Float,
     distanceUnit: String,
     resolver: @escaping RCTPromiseResolveBlock,
@@ -210,6 +246,7 @@ class ReachingModule: NSObject {
                                    acquisitionUrl: acquisitionUrl,
                                    sessionId: sessionId,
                                    mode: mode,
+                                   startupSilent: startupSilent,
                                    ttsRate: ttsRate, distanceUnit: distanceUnit,
                                    resolver: resolver, rejecter: rejecter)
           }
@@ -223,6 +260,7 @@ class ReachingModule: NSObject {
         acquisitionUrl: acquisitionUrl,
         sessionId: sessionId,
         mode: mode,
+        startupSilent: startupSilent,
         ttsRate: ttsRate,
         distanceUnit: distanceUnit,
         onDone: { result in

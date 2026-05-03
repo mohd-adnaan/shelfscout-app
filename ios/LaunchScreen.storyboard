@@ -25,20 +25,11 @@
                                 <color key="textColor" white="1" alpha="1" colorSpace="custom" customColorSpace="genericGamma22GrayColorSpace"/>
                                 <nil key="highlightedColor"/>
                             </label>
-                            <imageView clipsSubviews="YES" userInteractionEnabled="NO" contentMode="scaleAspectFit" horizontalHuggingPriority="251" verticalHuggingPriority="251" image="SRLLogo" translatesAutoresizingMaskIntoConstraints="NO" id="SRL-Logo-ImageView">
-                                <rect key="frame" x="71" y="557" width="233" height="90"/>
-                                <constraints>
-                                    <constraint firstAttribute="height" constant="90" id="SRL-Height-Constraint"/>
-                                    <constraint firstAttribute="width" constant="233" id="SRL-Width-Constraint"/>
-                                </constraints>
-                            </imageView>
                         </subviews>
                         <viewLayoutGuide key="safeArea" id="Bcu-3y-fUS"/>
                         <color key="backgroundColor" red="0.0" green="0.0" blue="0.0" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
                         <constraints>
                             <constraint firstItem="Bcu-3y-fUS" firstAttribute="trailing" secondItem="GJd-Yh-RWb" secondAttribute="trailing" constant="68" id="GJd-trailing"/>
-                            <constraint firstItem="Bcu-3y-fUS" firstAttribute="bottom" secondItem="SRL-Logo-ImageView" secondAttribute="bottom" constant="20" id="SRL-Bottom"/>
-                            <constraint firstItem="SRL-Logo-ImageView" firstAttribute="centerX" secondItem="Bcu-3y-fUS" secondAttribute="centerX" id="SRL-CenterX"/>
                             <constraint firstItem="GJd-Yh-RWb" firstAttribute="top" secondItem="Bcu-3y-fUS" secondAttribute="top" constant="172" id="k8B-Ek-jNF"/>
                             <constraint firstItem="GJd-Yh-RWb" firstAttribute="leading" secondItem="Bcu-3y-fUS" secondAttribute="leading" constant="67" id="x7j-FC-K8j"/>
                         </constraints>
@@ -49,7 +40,4 @@
             <point key="canvasLocation" x="52" y="374.66266866566718"/>
         </scene>
     </scenes>
-    <resources>
-        <image name="SRLLogo" width="200" height="130"/>
-    </resources>
 </document>
