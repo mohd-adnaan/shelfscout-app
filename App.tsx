@@ -59,6 +59,7 @@ import { SettingsProvider, useSettings } from './src/context/SettingsContext';
 import SettingsScreen from './src/screens/SettingsScreen';
 import { debugLogger } from './src/services/DebugLogger';
 import { DebugOverlay } from './src/components/DebugOverlay';
+import { wearablesCamera } from './src/services/WearablesCamera';
 
 const { width, height } = Dimensions.get('window');
 
@@ -214,9 +215,14 @@ function AppInner(): React.JSX.Element {
   }, []);
 
   useEffect(() => {
+    if (settings.useWearablesCamera) {
+      if (!hasMicPermission) requestMicPermission();
+      return;
+    }
+
     if (!hasCameraPermission) requestCameraPermission();
     if (!hasMicPermission) requestMicPermission();
-  }, [hasCameraPermission, hasMicPermission]);
+  }, [hasCameraPermission, hasMicPermission, requestCameraPermission, requestMicPermission, settings.useWearablesCamera]);
 
   // Keep a short branded startup loader visible so users can see the animated logo.
   useEffect(() => {
@@ -269,6 +275,17 @@ function AppInner(): React.JSX.Element {
   const reactivateCameraAndCapture = async (): Promise<string> => {
     console.log('📷 Reactivating camera for capture...');
     setIsCameraActive(true);
+
+    if (settingsRef.current.useWearablesCamera) {
+      try {
+        const wearablesPhoto = await wearablesCamera.capturePhoto();
+        lastImageDimensions.current = { width: 0, height: 0 };
+        return wearablesPhoto;
+      } catch (error) {
+        console.error('❌ Wearables capture failed:', error);
+        throw error;
+      }
+    }
 
     await new Promise(resolve => setTimeout(resolve, CAMERA_REACTIVATION_DELAY_MS));
 
@@ -771,7 +788,7 @@ function AppInner(): React.JSX.Element {
       // Skip earcons/SFX when VoiceOver is on — audio session conflicts
       if (!screenReaderEnabledRef.current) {
         // FIX: Restore full-volume audio session after STT's Record+Measurement
-        await configurePlaybackSession();
+        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
         audioFeedback.playEarcon('thinking');
         playThinkingStarted();
@@ -1069,7 +1086,7 @@ function AppInner(): React.JSX.Element {
         // react-native-sound's setCategory alone doesn't restore full volume.
         // This native call sets .playback + .default mode + setActive + speaker
         // route — matching the reaching pipeline's audio config.
-        await configurePlaybackSession();
+        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
         audioFeedback.playEarcon('listening');
         playListenSound();
@@ -1303,7 +1320,7 @@ function AppInner(): React.JSX.Element {
     return renderLoaderScreen('Starting ShelfScout. Please wait.');
   }
 
-  if (!hasCameraPermission || !device) {
+  if (!settings.useWearablesCamera && (!hasCameraPermission || !device)) {
     return renderLoaderScreen('Waiting for camera permission.');
   }
 
@@ -1337,15 +1354,17 @@ function AppInner(): React.JSX.Element {
           <StatusBar barStyle="light-content" backgroundColor="#000" />
 
           {/* Camera */}
-          <Camera
-            ref={cameraRef}
-            style={StyleSheet.absoluteFill}
-            device={device}
-            isActive={isCameraActive}
-            photo={true}
-            accessible={false}
-            accessibilityElementsHidden={true}
-          />
+          {!settings.useWearablesCamera && (
+            <Camera
+              ref={cameraRef}
+              style={StyleSheet.absoluteFill}
+              device={device}
+              isActive={isCameraActive}
+              photo={true}
+              accessible={false}
+              accessibilityElementsHidden={true}
+            />
+          )}
 
           <View
             style={styles.darkOverlay}

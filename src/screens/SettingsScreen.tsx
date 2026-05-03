@@ -1,7 +1,7 @@
 // src/screens/SettingsScreen.tsx
 
 
-import React, { useState, useCallback, useRef } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View,
   Text,
@@ -10,6 +10,7 @@ import {
   TouchableOpacity,
   ScrollView,
   AccessibilityInfo,
+  Alert,
   Platform,
   Animated,
   PanResponder,
@@ -18,6 +19,7 @@ import {
 } from 'react-native';
 import { useSettings } from '../context/SettingsContext';
 import { iOSTts } from '../services/iOSTtsClient';
+import { wearablesCamera, WearablesCameraStatus } from '../services/WearablesCamera';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const SLIDER_TRACK_WIDTH = SCREEN_WIDTH - 80; // 40px padding each side
@@ -210,10 +212,19 @@ interface SettingsScreenProps {
 }
 
 export default function SettingsScreen({ onClose }: SettingsScreenProps) {
-  const { settings, updatePreferAlternativeReaching, updateTtsRate, updateDeveloperMode, updateReachingMode, updateDistanceUnit } =
+  const {
+    settings,
+    updatePreferAlternativeReaching,
+    updateUseWearablesCamera,
+    updateTtsRate,
+    updateDeveloperMode,
+    updateReachingMode,
+    updateDistanceUnit,
+  } =
     useSettings();
 
   const [localRate, setLocalRate] = useState(settings.ttsRate);
+  const [wearablesStatus, setWearablesStatus] = useState<WearablesCameraStatus>('unknown');
 
   // ── Reaching toggle ───────────────────────────────────────────────────────
 
@@ -225,6 +236,53 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     },
     [updatePreferAlternativeReaching],
   );
+
+  // ── Meta Ray-Ban camera toggle ──────────────────────────────────────────
+
+  const handleWearablesToggle = useCallback(
+    async (value: boolean) => {
+      await updateUseWearablesCamera(value);
+
+      if (value && Platform.OS === 'ios') {
+        try {
+          await wearablesCamera.startRegistration();
+          // Pre-warm: grant permission + start device session + start stream.
+          // Without this, the first capturePhoto loses a race against the
+          // permission/device handshake and throws "No eligible device available".
+          wearablesCamera.preWarm().catch(e => {
+          console.warn('[Wearables] Pre-warm failed (non-fatal):', e?.message);
+        });
+        } catch (error: any) {
+          console.warn('[Wearables] Registration error:', error);
+          const message =
+            error?.message ||
+            'Unable to start glasses registration. Open the Meta AI app and try again.';
+          AccessibilityInfo.announceForAccessibility(message);
+          Alert.alert('Glasses Registration', message, [{ text: 'OK', style: 'default' }]);
+        }
+      }
+
+      const label = value
+        ? 'Meta Ray-Ban camera enabled. Pair your glasses in the Meta AI app and enable Developer Mode.'
+        : 'Phone camera enabled.';
+      AccessibilityInfo.announceForAccessibility(label);
+    },
+    [updateUseWearablesCamera],
+  );
+
+  const refreshWearablesStatus = useCallback(async () => {
+    try {
+      const status = await wearablesCamera.getStatus();
+      setWearablesStatus(status);
+    } catch (error) {
+      console.warn('[Wearables] Status refresh failed:', error);
+      setWearablesStatus('unknown');
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshWearablesStatus();
+  }, [refreshWearablesStatus, settings.useWearablesCamera]);
 
   // ── TTS rate ──────────────────────────────────────────────────────────────
 
@@ -351,6 +409,74 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             />
           </View>
 
+        </Section>
+
+        {/* ══════════════════════════════════════════
+            SECTION 1.25 — Meta Ray-Ban Glasses
+        ══════════════════════════════════════════ */}
+        <Section title="Meta Ray-Ban Glasses">
+          <Text style={styles.settingDescription}>
+            Use the glasses camera feed when connected via the Meta AI app. Audio
+            plays through the current Bluetooth output automatically.
+          </Text>
+
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabelBlock}>
+              <Text style={styles.settingLabel}>Use glasses camera feed</Text>
+              <Text style={styles.settingSubLabel}>
+                {settings.useWearablesCamera
+                  ? 'Glasses feed selected'
+                  : 'iPhone camera active'}
+              </Text>
+            </View>
+            <Switch
+              value={settings.useWearablesCamera}
+              onValueChange={handleWearablesToggle}
+              trackColor={{ false: C.border, true: C.primary }}
+              thumbColor={settings.useWearablesCamera ? C.primary : C.sliderThumb}
+              ios_backgroundColor={C.border}
+              accessible={true}
+              accessibilityRole="switch"
+              accessibilityLabel="Use Meta Ray-Ban camera feed"
+              accessibilityHint={
+                settings.useWearablesCamera
+                  ? 'Double tap to switch back to the iPhone camera.'
+                  : 'Double tap to use the glasses camera feed.'
+              }
+              accessibilityValue={{
+                text: settings.useWearablesCamera
+                  ? 'Glasses camera enabled'
+                  : 'Phone camera enabled',
+              }}
+            />
+          </View>
+
+          <View
+            style={styles.statusRow}
+            accessible={true}
+            accessibilityRole="text"
+            accessibilityLabel={`Glasses connection status: ${wearablesStatus}`}
+          >
+            <View
+              style={[
+                styles.statusDot,
+                wearablesStatus === 'connected'
+                  ? styles.statusDotConnected
+                  : wearablesStatus === 'disconnected'
+                  ? styles.statusDotDisconnected
+                  : styles.statusDotUnknown,
+              ]}
+            />
+            <Text style={styles.statusText}>
+              {wearablesStatus === 'connected'
+                ? 'Connected'
+                : wearablesStatus === 'disconnected'
+                ? 'Not connected'
+                : wearablesStatus === 'unsupported'
+                ? 'Unsupported'
+                : 'Status unknown'}
+            </Text>
+          </View>
         </Section>
 
         {/* ══════════════════════════════════════════
@@ -709,6 +835,30 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     marginBottom: 20,
     paddingVertical: 4,
+  },
+  statusRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    marginTop: 4,
+  },
+  statusDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    marginRight: 8,
+  },
+  statusDotConnected: {
+    backgroundColor: C.success,
+  },
+  statusDotDisconnected: {
+    backgroundColor: C.warning,
+  },
+  statusDotUnknown: {
+    backgroundColor: C.textMuted,
+  },
+  statusText: {
+    color: C.textSecondary,
+    fontSize: 12,
   },
   settingLabelBlock: { flex: 1, marginRight: 16 },
   settingLabel: {

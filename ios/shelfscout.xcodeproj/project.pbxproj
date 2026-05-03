@@ -34,6 +34,10 @@
 		5FC095F72FA082DD00D015AC /* Reachingviewcontroller+visualTracking.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC095F62FA082C600D015AC /* Reachingviewcontroller+visualTracking.swift */; };
 		5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263892F395B19006AEE6F /* ReachingModule.swift */; };
 		5FC2638C2F395B19006AEE6F /* ReachingModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FC263882F395B19006AEE6F /* ReachingModule.m */; };
+		5FD1C1013C00000100000001 /* WearablesCameraModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FD1C0013C00000100000001 /* WearablesCameraModule.swift */; };
+		5FD1C1023C00000100000001 /* WearablesCameraModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FD1C0023C00000100000001 /* WearablesCameraModule.m */; };
+		5FD1D2013C00000100000001 /* MWDATCore in Frameworks */ = {isa = PBXBuildFile; productRef = 5FD1D1013C00000100000001 /* MWDATCore */; };
+		5FD1D2023C00000100000001 /* MWDATCamera in Frameworks */ = {isa = PBXBuildFile; productRef = 5FD1D1023C00000100000001 /* MWDATCamera */; };
 		761780ED2CA45674006654EE /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = 761780EC2CA45674006654EE /* AppDelegate.swift */; };
 /* End PBXBuildFile section */
 
@@ -68,6 +72,8 @@
 		5FC263882F395B19006AEE6F /* ReachingModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ReachingModule.m; sourceTree = "<group>"; };
 		5FC263892F395B19006AEE6F /* ReachingModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ReachingModule.swift; sourceTree = "<group>"; };
 		5FC2638A2F395B19006AEE6F /* shelfscout-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = "shelfscout-Bridging-Header.h"; sourceTree = "<group>"; };
+		5FD1C0013C00000100000001 /* WearablesCameraModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = WearablesCameraModule.swift; sourceTree = "<group>"; };
+		5FD1C0023C00000100000001 /* WearablesCameraModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = WearablesCameraModule.m; sourceTree = "<group>"; };
 		761780EC2CA45674006654EE /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = shelfscout/AppDelegate.swift; sourceTree = "<group>"; };
 		91A0E013D37AF84C87741EAB /* Pods-shelfscout.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-shelfscout.release.xcconfig"; path = "Target Support Files/Pods-shelfscout/Pods-shelfscout.release.xcconfig"; sourceTree = "<group>"; };
 		D77AD19DD9CA77EDEB6F1393 /* libPods-shelfscout.a */ = {isa = PBXFileReference; explicitFileType = archive.ar; includeInIndex = 0; path = "libPods-shelfscout.a"; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -79,6 +85,8 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				5FD1D2013C00000100000001 /* MWDATCore in Frameworks */,
+				5FD1D2023C00000100000001 /* MWDATCamera in Frameworks */,
 				3EBE37D2CAA76029178E7240 /* libPods-shelfscout.a in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -106,6 +114,8 @@
 				5FC043E92F59269500DA3B66 /* Reachingviewcontroller+processing.swift */,
 				5FC043E72F59264300DA3B66 /* Reachingviewcontroller.swift */,
 				5FC263892F395B19006AEE6F /* ReachingModule.swift */,
+				5FD1C0013C00000100000001 /* WearablesCameraModule.swift */,
+				5FD1C0023C00000100000001 /* WearablesCameraModule.m */,
 				5FC2638A2F395B19006AEE6F /* shelfscout-Bridging-Header.h */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				761780EC2CA45674006654EE /* AppDelegate.swift */,
@@ -189,6 +199,10 @@
 			dependencies = (
 			);
 			name = shelfscout;
+			packageProductDependencies = (
+				5FD1D1013C00000100000001 /* MWDATCore */,
+				5FD1D1023C00000100000001 /* MWDATCamera */,
+			);
 			productName = shelfscout;
 			productReference = 13B07F961A680F5B00A75B9A /* shelfscout.app */;
 			productType = "com.apple.product-type.application";
@@ -215,6 +229,9 @@
 				Base,
 			);
 			mainGroup = 83CBB9F61A601CBA00E9B192;
+			packageReferences = (
+				5FD1D0013C00000100000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */,
+			);
 			productRefGroup = 83CBBA001A601CBA00E9B192 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
@@ -330,6 +347,7 @@
 			files = (
 				5FC043EA2F59269800DA3B66 /* Reachingviewcontroller+processing.swift in Sources */,
 				5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */,
+				5FD1C1013C00000100000001 /* WearablesCameraModule.swift in Sources */,
 				5FC095F72FA082DD00D015AC /* Reachingviewcontroller+visualTracking.swift in Sources */,
 				5F92E8262F784DAD0036D6A4 /* Reachingviewcontroller+withHand.swift in Sources */,
 				5FC043EC2F5926D100DA3B66 /* Reachingviewcontroller+ar.swift in Sources */,
@@ -339,6 +357,7 @@
 				5F92E8242F784D8A0036D6A4 /* Reachingviewcontroller+handFree.swift in Sources */,
 				5FC043F02F59277700DA3B66 /* Reachingviewcontroller+audio.swift in Sources */,
 				5FC2638C2F395B19006AEE6F /* ReachingModule.m in Sources */,
+				5FD1C1023C00000100000001 /* WearablesCameraModule.m in Sources */,
 				761780ED2CA45674006654EE /* AppDelegate.swift in Sources */,
 				5F3C03852F3A945F001B0A13 /* Imageorientationfixer.swift in Sources */,
 			);
@@ -588,6 +607,30 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		5FD1D0013C00000100000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/facebook/meta-wearables-dat-ios";
+			requirement = {
+				kind = upToNextMinorVersion;
+				minimumVersion = 0.6.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		5FD1D1013C00000100000001 /* MWDATCore */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 5FD1D0013C00000100000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATCore;
+		};
+		5FD1D1023C00000100000001 /* MWDATCamera */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 5FD1D0013C00000100000001 /* XCRemoteSwiftPackageReference "meta-wearables-dat-ios" */;
+			productName = MWDATCamera;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 83CBB9F71A601CBA00E9B192 /* Project object */;
 }

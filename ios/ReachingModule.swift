@@ -183,19 +183,38 @@ class ReachingModule: NSObject {
   // ═══════════════════════════════════════════════════════════════════════════
 
   @objc func configurePlaybackSession(
-    _ resolver: @escaping RCTPromiseResolveBlock,
+    _ useSpeaker: NSNumber?,
+    resolver: @escaping RCTPromiseResolveBlock,
     rejecter: @escaping RCTPromiseRejectBlock
   ) {
     do {
+      let shouldUseSpeaker = useSpeaker?.boolValue ?? true
       let session = AVAudioSession.sharedInstance()
-      try session.setCategory(.playback, mode: .default, options: [])
-      try session.setActive(true)
-      try session.overrideOutputAudioPort(.speaker)
-      NSLog("🔊 [ReachingModule] Audio session configured for playback (speaker, active)")
+
+      if shouldUseSpeaker {
+        // Force phone speaker — requires .playAndRecord + .defaultToSpeaker.
+        // overrideOutputAudioPort(.speaker) on .playback throws OSStatus -50.
+        try session.setCategory(
+          .playAndRecord,
+          mode: .default,
+          options: [.defaultToSpeaker, .allowBluetoothA2DP]
+        )
+        try session.setActive(true)
+        NSLog("🔊 [ReachingModule] Audio → playAndRecord + speaker")
+      } else {
+        // Let iOS route to the active Bluetooth sink (Ray-Bans).
+        // No port override — .playback routes via system route automatically.
+        try session.setCategory(
+          .playback,
+          mode: .default,
+          options: [.allowBluetoothA2DP]
+        )
+        try session.setActive(true)
+        NSLog("🔊 [ReachingModule] Audio → playback (Bluetooth)")
+      }
       resolver(["success": true])
     } catch {
       NSLog("⚠️ [ReachingModule] configurePlaybackSession error: %@", error.localizedDescription)
-      // Non-fatal — audio will still play, just possibly quieter
       resolver(["success": false, "error": error.localizedDescription])
     }
   }
