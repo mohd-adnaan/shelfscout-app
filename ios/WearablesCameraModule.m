@@ -17,4 +17,7 @@ RCT_EXTERN_METHOD(capturePhoto:(RCTPromiseResolveBlock)resolver
 RCT_EXTERN_METHOD(preWarm:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 
+RCT_EXTERN_METHOD(disconnect:(RCTPromiseResolveBlock)resolver
+                  rejecter:(RCTPromiseRejectBlock)rejecter)
+
 @end

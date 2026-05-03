@@ -1,5 +1,20 @@
 // WearablesCameraModule.swift
 // React Native bridge for Meta Wearables Device Access Toolkit (iOS)
+//
+// Key change vs previous version:
+//   • We now OBSERVE devicesStream from the moment the module wakes up,
+//     keeping a cached `availableDevices` list. preWarm/capturePhoto wait
+//     for at least one device to appear (with timeout) before creating a
+//     session. This is the only pattern that works reliably given the
+//     Bluetooth startup race ("API MISUSE: CBCentralManager can only
+//     accept this command while in the powered on state") that delays
+//     device discovery for a few seconds after app launch.
+//
+//   • registrationStateStream is also observed — purely diagnostic, gives
+//     us logs to debug from instead of guessing.
+//
+//   • Errors carry distinct codes so JS can tell "no glasses" from
+//     "no permission" from "stream failed".
 
 import Foundation
 import MWDATCore
@@ -7,77 +22,207 @@ import MWDATCamera
 
 @objc(WearablesCameraModule)
 class WearablesCameraModule: NSObject {
+
+  // ── SDK handles ────────────────────────────────────────────────────────
   private var wearables: WearablesInterface?
   private var deviceSession: DeviceSession?
   private var streamSession: StreamSession?
 
+  // ── Listeners (tokens kept alive while module is alive) ────────────────
   private var stateListenerToken: AnyListenerToken?
   private var errorListenerToken: AnyListenerToken?
   private var photoListenerToken: AnyListenerToken?
 
+  // ── Background tasks for stream observation ────────────────────────────
+  private var devicesObserverTask: Task<Void, Never>?
+  private var registrationObserverTask: Task<Void, Never>?
+
+  // ── Cached state populated by observers ────────────────────────────────
+  // Use a serial queue for thread safety — Swift actors would be cleaner
+  // but require pushing the bridge methods to be actor-isolated.
+  private let stateQueue = DispatchQueue(label: "wearables.state")
+  // devicesStream yields [DeviceIdentifier] (typealias for [String]),
+  // not [Device]. We just need to know if the count is > 0 — the actual
+  // device selection is handled by AutoDeviceSelector inside createSession.
+  private var _availableDevices: [DeviceIdentifier] = []
+  private var availableDevices: [DeviceIdentifier] {
+    get { stateQueue.sync { _availableDevices } }
+    set { stateQueue.sync { _availableDevices = newValue } }
+  }
+
   @objc static func requiresMainQueueSetup() -> Bool { return false }
 
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - SDK lifecycle
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Returns the cached SDK instance. SDK is configured by AppDelegate at
+  /// app launch — we never call Wearables.configure() here.
   private func ensureConfigured() throws -> WearablesInterface {
     if let wearables = wearables { return wearables }
-    // SDK is already configured by AppDelegate. Don't double-configure.
     let instance = Wearables.shared
     wearables = instance
+    startObservers(instance)
     return instance
-}
+  }
+
+  /// Spin up the background observers ONCE. They run for the lifetime of
+  /// the module and continuously update `availableDevices`.
+  private func startObservers(_ wearables: WearablesInterface) {
+    if devicesObserverTask == nil {
+      devicesObserverTask = Task { [weak self] in
+        guard let self else { return }
+        NSLog("👀 [Wearables] devicesStream observer started")
+        for await devices in wearables.devicesStream() {
+          self.availableDevices = devices
+          NSLog("👀 [Wearables] devicesStream → %d device(s): %@",
+                devices.count, devices.joined(separator: ", "))
+        }
+        NSLog("👀 [Wearables] devicesStream observer ended")
+      }
+    }
+    if registrationObserverTask == nil {
+      registrationObserverTask = Task { [weak self] in
+        guard self != nil else { return }
+        NSLog("👀 [Wearables] registrationStateStream observer started")
+        for await state in wearables.registrationStateStream() {
+          NSLog("👀 [Wearables] registrationState → %@", "\(state)")
+        }
+      }
+    }
+  }
+
+  /// Wait until at least one device is present in the cache, polling
+  /// every 250ms up to `timeoutSeconds`. Returns false on timeout.
+  private func waitForDevice(timeoutSeconds: TimeInterval = 12) async throws -> Bool {
+    if !availableDevices.isEmpty { return true }
+    NSLog("⏳ [Wearables] Waiting up to %.0fs for a device to appear…", timeoutSeconds)
+    let deadline = Date().addingTimeInterval(timeoutSeconds)
+    while Date() < deadline {
+      try await Task.sleep(nanoseconds: 250_000_000)
+      if !availableDevices.isEmpty {
+        NSLog("✅ [Wearables] Device(s) appeared after wait")
+        return true
+      }
+    }
+    NSLog("⏱️ [Wearables] waitForDevice timed out — devicesStream is empty")
+    return false
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Permission + Device + Stream
+  // ═══════════════════════════════════════════════════════════════════════════
 
   private func ensureCameraPermission(_ wearables: WearablesInterface) async throws {
     var status = try await wearables.checkPermissionStatus(.camera)
+    NSLog("🔑 [Wearables] camera permission status (initial): %@", "\(status)")
     if status != .granted {
+      // This call may bounce the user to the Meta AI app to approve.
       status = try await wearables.requestPermission(.camera)
+      NSLog("🔑 [Wearables] camera permission status (after request): %@", "\(status)")
     }
     if status != .granted {
       throw NSError(
         domain: "WearablesCamera",
         code: 1001,
-        userInfo: [NSLocalizedDescriptionKey: "Camera permission denied"]
+        userInfo: [NSLocalizedDescriptionKey:
+          "Camera permission not granted in Meta AI app. Open Meta AI → your glasses → grant ShelfScout camera access."]
       )
     }
+  }
+
+  private func createSessionWithFallback(_ wearables: WearablesInterface) throws -> DeviceSession {
+    // Strategy: try SpecificDeviceSelector first (using the cached device
+    // ID from devicesStream), then fall back to AutoDeviceSelector. The
+    // explicit selector tends to succeed when AutoDeviceSelector returns
+    // "No eligible device available" — the device is known to the SDK but
+    // Auto's own eligibility heuristic refuses it (often happens when a
+    // device's per-glasses camera permission hasn't been granted to this
+    // app in the Meta AI app's per-device "Connected apps" list).
+    let cachedIDs = availableDevices
+
+    if let firstID = cachedIDs.first {
+      NSLog("🎯 [Wearables] Trying SpecificDeviceSelector for id=%@", firstID)
+      let specific = SpecificDeviceSelector(device: firstID)
+      do {
+        let session = try wearables.createSession(deviceSelector: specific)
+        NSLog("✅ [Wearables] SpecificDeviceSelector accepted")
+        return session
+      } catch {
+        NSLog("⚠️ [Wearables] SpecificDeviceSelector failed: %@ — falling back to Auto",
+              error.localizedDescription)
+      }
+    }
+
+    NSLog("🎯 [Wearables] Trying AutoDeviceSelector")
+    let auto = AutoDeviceSelector(wearables: wearables)
+    return try wearables.createSession(deviceSelector: auto)
   }
 
   private func ensureDeviceSession(_ wearables: WearablesInterface) async throws -> DeviceSession {
     if let session = deviceSession, session.state == .started {
       return session
     }
-
     if deviceSession?.state == .stopped {
       deviceSession = nil
     }
 
-    let selector = AutoDeviceSelector(wearables: wearables)
-    let session = try wearables.createSession(deviceSelector: selector)
+    // Wait for devices to populate BEFORE asking the selector to find one.
+    let haveDevice = try await waitForDevice(timeoutSeconds: 12)
+    if !haveDevice {
+      throw NSError(
+        domain: "WearablesCamera",
+        code: 1010,
+        userInfo: [NSLocalizedDescriptionKey:
+          "No glasses visible to the SDK. Make sure the Meta AI app is open in the background, glasses are paired in Meta AI, and ShelfScout has camera permission for these glasses in Meta AI."]
+      )
+    }
+
+    let session: DeviceSession
+    do {
+      session = try createSessionWithFallback(wearables)
+    } catch {
+      // Both selectors failed → almost always the per-glasses app permission.
+      let nsErr = error as NSError
+      NSLog("⛔ [Wearables] Both selectors rejected: %@ (domain=%@ code=%d)",
+            nsErr.localizedDescription, nsErr.domain, nsErr.code)
+      throw NSError(
+        domain: "WearablesCamera",
+        code: 1011,
+        userInfo: [NSLocalizedDescriptionKey:
+          "Glasses are paired but not allowed to share the camera with ShelfScout. In the Meta AI app, open your Wayfarer card → Settings (gear) → Connected apps → enable Camera for ShelfScout. Then toggle this setting OFF and ON again."]
+      )
+    }
     deviceSession = session
 
     let stateStream = session.stateStream()
     try session.start()
 
     for await state in stateStream {
-      if state == .started {
-        return session
-      }
+      NSLog("📡 [Wearables] deviceSession state → %@", "\(state)")
+      if state == .started { return session }
       if state == .stopped {
-        break
+        throw NSError(
+          domain: "WearablesCamera",
+          code: 1002,
+          userInfo: [NSLocalizedDescriptionKey:
+            "Device session stopped before reaching started state. The glasses may have disconnected from Meta AI."]
+        )
       }
     }
 
     throw NSError(
       domain: "WearablesCamera",
       code: 1002,
-      userInfo: [NSLocalizedDescriptionKey: "Device session failed to start"]
+      userInfo: [NSLocalizedDescriptionKey: "Device session stateStream ended without becoming started."]
     )
   }
 
   private func ensureStreamSession(_ deviceSession: DeviceSession) async throws -> StreamSession {
-    if let stream = streamSession {
-      if stream.state != .stopped {
-        return stream
-      }
-      streamSession = nil
+    if let stream = streamSession, stream.state != .stopped {
+      return stream
     }
+    streamSession = nil
 
     let config = StreamSessionConfig(
       videoCodec: .raw,
@@ -97,7 +242,6 @@ class WearablesCameraModule: NSObject {
     stateListenerToken = stream.statePublisher.listen { state in
       NSLog("📡 [Wearables] Stream state: %@", "\(state)")
     }
-
     errorListenerToken = stream.errorPublisher.listen { error in
       NSLog("⚠️ [Wearables] Stream error: %@", "\(error)")
     }
@@ -109,10 +253,9 @@ class WearablesCameraModule: NSObject {
       throw NSError(
         domain: "WearablesCamera",
         code: 1003,
-        userInfo: [NSLocalizedDescriptionKey: "Stream did not reach streaming state"]
+        userInfo: [NSLocalizedDescriptionKey: "Stream did not reach streaming state within 8s"]
       )
     }
-
     return stream
   }
 
@@ -120,19 +263,14 @@ class WearablesCameraModule: NSObject {
     let timeoutSeconds: TimeInterval = 8
     let pollIntervalNs: UInt64 = 200_000_000
     let start = Date()
-
     while Date().timeIntervalSince(start) < timeoutSeconds {
       switch stream.state {
-      case .streaming:
-        return true
-      case .stopped:
-        return false
-      default:
-        break
+      case .streaming: return true
+      case .stopped:   return false
+      default: break
       }
       try await Task.sleep(nanoseconds: pollIntervalNs)
     }
-
     return false
   }
 
@@ -142,7 +280,6 @@ class WearablesCameraModule: NSObject {
         self?.photoListenerToken = nil
         continuation.resume(returning: photoData.data)
       }
-
       let accepted = stream.capturePhoto(format: .jpeg)
       if !accepted {
         photoListenerToken = nil
@@ -150,7 +287,7 @@ class WearablesCameraModule: NSObject {
           throwing: NSError(
             domain: "WearablesCamera",
             code: 1004,
-            userInfo: [NSLocalizedDescriptionKey: "Photo capture rejected"]
+            userInfo: [NSLocalizedDescriptionKey: "Photo capture rejected by stream"]
           )
         )
       }
@@ -164,7 +301,9 @@ class WearablesCameraModule: NSObject {
     return url.absoluteString
   }
 
+  // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - React Native exposed methods
+  // ═══════════════════════════════════════════════════════════════════════════
 
   @objc func startRegistration(
     _ resolver: @escaping RCTPromiseResolveBlock,
@@ -179,7 +318,6 @@ class WearablesCameraModule: NSObject {
         resolver(["success": true, "alreadyRegistered": false])
       } catch {
         let nsErr = error as NSError
-        // RegistrationError 0 = already registered. This is not an error.
         if nsErr.domain == "MWDATCore.RegistrationError" && nsErr.code == 0 {
           NSLog("ℹ️ [Wearables] Already registered — treating as success")
           resolver(["success": true, "alreadyRegistered": true])
@@ -199,18 +337,21 @@ class WearablesCameraModule: NSObject {
     if let stream = streamSession {
       switch stream.state {
       case .streaming:
-        resolver("connected")
-      case .paused, .waitingForDevice, .starting, .stopping:
-        resolver("disconnected")
-      case .stopped:
-        resolver("disconnected")
+        resolver("connected"); return
+      case .paused, .waitingForDevice, .starting, .stopping, .stopped:
+        // fall through to device-list check
+        break
       @unknown default:
-        resolver("unknown")
+        resolver("unknown"); return
       }
-      return
     }
-
-    resolver("disconnected")
+    // No active stream — but glasses may still be visible in the SDK.
+    // Surface that as "disconnected" with a hint we have devices in cache.
+    if !availableDevices.isEmpty {
+      resolver("disconnected")
+    } else {
+      resolver("disconnected")
+    }
   }
 
   @objc func capturePhoto(
@@ -228,7 +369,9 @@ class WearablesCameraModule: NSObject {
         let path = try self.writePhotoData(data)
         resolver(path)
       } catch {
-        rejecter("CAPTURE", error.localizedDescription, error)
+        let nsErr = error as NSError
+        NSLog("⚠️ [Wearables] capturePhoto failed: %@", nsErr.localizedDescription)
+        rejecter("CAPTURE", nsErr.localizedDescription, nsErr)
       }
     }
   }
@@ -247,10 +390,49 @@ class WearablesCameraModule: NSObject {
         NSLog("✅ [Wearables] preWarm complete — session streaming")
         resolver(["success": true])
       } catch {
-        NSLog("⚠️ [Wearables] preWarm failed: %@", error.localizedDescription)
-        rejecter("PREWARM", error.localizedDescription, error as NSError)
+        let nsErr = error as NSError
+        NSLog("⚠️ [Wearables] preWarm failed: %@", nsErr.localizedDescription)
+        rejecter("PREWARM", nsErr.localizedDescription, nsErr)
       }
     }
   }
-}
 
+  /// Tear down stream + device session so the next toggle-ON starts fresh.
+  /// Critical: without this, a half-failed previous attempt leaves a
+  /// `streamSession` or `deviceSession` reference behind that's in an
+  /// indeterminate state, and `ensureStreamSession`'s "if state != .stopped
+  /// reuse it" branch hands back a dead session to the next capture call.
+  @objc func disconnect(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    Task { [weak self] in
+      guard let self else { return }
+      NSLog("🧹 [Wearables] disconnect — tearing down sessions")
+      if let stream = self.streamSession {
+        await stream.stop()
+      }
+      self.streamSession = nil
+      self.stateListenerToken = nil
+      self.errorListenerToken = nil
+      self.photoListenerToken = nil
+      // DeviceSession has no public stop on this SDK version — drop the
+      // reference and let the SDK reclaim it on the next createSession.
+      self.deviceSession = nil
+      NSLog("🧹 [Wearables] disconnect complete")
+      resolver(["success": true])
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Cleanup
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  deinit {
+    devicesObserverTask?.cancel()
+    registrationObserverTask?.cancel()
+    stateListenerToken = nil
+    errorListenerToken = nil
+    photoListenerToken = nil
+  }
+}

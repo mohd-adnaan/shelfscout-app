@@ -246,12 +246,27 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       if (value && Platform.OS === 'ios') {
         try {
           await wearablesCamera.startRegistration();
-          // Pre-warm: grant permission + start device session + start stream.
+
+          // Pre-warm: grant permission → wait for device → start session/stream.
           // Without this, the first capturePhoto loses a race against the
           // permission/device handshake and throws "No eligible device available".
-          wearablesCamera.preWarm().catch(e => {
-          console.warn('[Wearables] Pre-warm failed (non-fatal):', e?.message);
-        });
+          //
+          // We DO surface preWarm failures because they are user-actionable
+          // ("open Meta AI app", "grant camera permission", etc).
+          try {
+            await wearablesCamera.preWarm();
+            // Refresh status pill so it flips from "Not connected" to "Connected"
+            await refreshWearablesStatus();
+          } catch (preWarmErr: any) {
+            const msg =
+              preWarmErr?.message ||
+              'Could not start the glasses camera stream.';
+            console.warn('[Wearables] Pre-warm failed:', msg);
+            AccessibilityInfo.announceForAccessibility(msg);
+            Alert.alert('Glasses Camera', msg, [{ text: 'OK', style: 'default' }]);
+            // Don't auto-revert the toggle — capturePhoto will retry on next tap
+            // and the user might fix the issue (open Meta AI, grant perm) in between.
+          }
         } catch (error: any) {
           console.warn('[Wearables] Registration error:', error);
           const message =
@@ -263,11 +278,11 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       }
 
       const label = value
-        ? 'Meta Ray-Ban camera enabled. Pair your glasses in the Meta AI app and enable Developer Mode.'
+        ? 'Meta Ray-Ban camera enabled. Make sure the Meta AI app is open in the background and ShelfScout has camera permission for your glasses.'
         : 'Phone camera enabled.';
       AccessibilityInfo.announceForAccessibility(label);
     },
-    [updateUseWearablesCamera],
+    [updateUseWearablesCamera, refreshWearablesStatus],
   );
 
   const refreshWearablesStatus = useCallback(async () => {
@@ -463,18 +478,18 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 wearablesStatus === 'connected'
                   ? styles.statusDotConnected
                   : wearablesStatus === 'disconnected'
-                  ? styles.statusDotDisconnected
-                  : styles.statusDotUnknown,
+                    ? styles.statusDotDisconnected
+                    : styles.statusDotUnknown,
               ]}
             />
             <Text style={styles.statusText}>
               {wearablesStatus === 'connected'
                 ? 'Connected'
                 : wearablesStatus === 'disconnected'
-                ? 'Not connected'
-                : wearablesStatus === 'unsupported'
-                ? 'Unsupported'
-                : 'Status unknown'}
+                  ? 'Not connected'
+                  : wearablesStatus === 'unsupported'
+                    ? 'Unsupported'
+                    : 'Status unknown'}
             </Text>
           </View>
         </Section>
@@ -660,7 +675,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                   style={[
                     styles.presetBtnText,
                     Math.abs(localRate - p.value) < 0.03 &&
-                      styles.presetBtnTextActive,
+                    styles.presetBtnTextActive,
                   ]}
                 >
                   {p.label}
