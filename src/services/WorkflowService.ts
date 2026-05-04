@@ -581,14 +581,47 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     return undefined;
   };
 
-  // Extract text (prefer short hand direction when available)
-  const hand_direction = pickString(['hand_direction', 'handDirection']);
+  // ─── Normalize values that come from the n8n backend ─────────────────────
+  // Mansi's standard reaching path writes `hand_direction` to Redis via
+  // JSON.stringify(...). That means populated values arrive at the app
+  // wrapped in literal escaped quotes (e.g. `"\"top left\""`) and null
+  // arrives as the literal 4-char string `"null"`. Strip those artifacts
+  // so downstream TTS doesn't speak the word "null" or pronounce the
+  // surrounding quote characters. Safe to apply to plain strings too —
+  // it only strips a leading+trailing `"` pair if both are present.
+  const normalizeBackendString = (value: string): string => {
+    if (!value) return '';
+    let s = value.trim();
+    if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+      s = s.slice(1, -1).trim();
+    }
+    const lower = s.toLowerCase();
+    if (lower === 'null' || lower === 'undefined' || lower === 'none' || lower === '') {
+      return '';
+    }
+    return s;
+  };
+
+  // Extract text per Mansi's contract:
+  //   • backend always returns the long guidance in `text` (= session.response)
+  //   • backend additionally returns `hand_direction` (short, e.g. "top left")
+  //     ONLY when a hand is detected in the standard reaching pipeline
+  //   • when hand_direction is non-null, speak that instead of the long text
+  // We also include `reaching` as a final fallback because the standard
+  // reaching pipeline writes its per-iteration guidance to session.reaching,
+  // and we do NOT want an empty-text error if session.response wasn't
+  // refreshed for that iteration.
+  const hand_direction = normalizeBackendString(
+    pickString(['hand_direction', 'handDirection']),
+  );
 
   let text = '';
   if (hand_direction) {
     text = hand_direction;
   } else {
-    text = pickString(['text', 'response', 'message']);
+    text = normalizeBackendString(
+      pickString(['text', 'response', 'message', 'reaching']),
+    );
   }
 
   // =========================================================================
