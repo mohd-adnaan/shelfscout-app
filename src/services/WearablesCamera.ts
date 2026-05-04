@@ -63,10 +63,34 @@ export const wearablesCamera = {
       }
       return path;
     } catch (error: any) {
-      if (error?.message?.toLowerCase().includes('permission')) {
-        throw new Error('Camera permission denied. Please grant access in the Meta AI app.');
+      if (error?.code) {
+        throw error;
       }
-      throw new Error(error?.message || notConnectedMessage);
+
+      const message = error?.message || notConnectedMessage;
+      const lower = String(message).toLowerCase();
+      const enriched = new Error(message) as Error & { code?: string };
+
+      if (lower.includes('permission')) {
+        enriched.code = 'PERMISSION';
+      } else if (
+        lower.includes('stream did not reach streaming state') ||
+        lower.includes('device session stopped') ||
+        lower.includes('internalerror')
+      ) {
+        enriched.code = 'CAPTURE';
+      }
+
+      throw enriched;
+    }
+  },
+
+  async disconnect(): Promise<void> {
+    if (!isIOSSupported) return;
+    try {
+      await WearablesCameraModule.disconnect();
+    } catch (error) {
+      console.warn('[WearablesCamera] Disconnect failed:', error);
     }
   },
 };

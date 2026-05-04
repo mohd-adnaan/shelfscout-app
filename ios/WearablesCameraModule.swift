@@ -168,49 +168,97 @@ class WearablesCameraModule: NSObject {
       )
     }
 
-    let session: DeviceSession
-    do {
-      session = try createSessionWithFallback(wearables)
-    } catch {
-      let nsErr = error as NSError
-      NSLog("⛔ [Wearables] Both selectors rejected: %@", nsErr.localizedDescription)
-      throw NSError(
-        domain: "WearablesCamera",
-        code: 1011,
-        userInfo: [NSLocalizedDescriptionKey:
-          "Glasses paired but not allowed to share camera. In Meta AI app: open your glasses card → Settings → Connected apps → enable Camera for ShelfScout."]
-      )
-    }
-    deviceSession = session
+    let maxAttempts = 3
+    var lastError: NSError?
 
-    let stateStream = session.stateStream()
-    try session.start()
+    for attempt in 1...maxAttempts {
+      let session: DeviceSession
+      do {
+        session = try createSessionWithFallback(wearables)
+      } catch {
+        let nsErr = error as NSError
+        NSLog("⛔ [Wearables] Both selectors rejected: %@", nsErr.localizedDescription)
+        throw NSError(
+          domain: "WearablesCamera",
+          code: 1011,
+          userInfo: [NSLocalizedDescriptionKey:
+            "Glasses paired but not allowed to share camera. In Meta AI app: open your glasses card → Settings → Connected apps → enable Camera for ShelfScout."]
+        )
+      }
+      deviceSession = session
 
-    for await state in stateStream {
-      NSLog("📡 [Wearables] deviceSession state → %@", "\(state)")
-      if state == .started { return session }
-      if state == .stopped {
+      do {
+        let stateStream = session.stateStream()
+        try session.start()
+
+        for await state in stateStream {
+          NSLog("📡 [Wearables] deviceSession state → %@", "\(state)")
+          if state == .started { return session }
+          if state == .stopped {
+            throw NSError(
+              domain: "WearablesCamera",
+              code: 1002,
+              userInfo: [NSLocalizedDescriptionKey: "Device session stopped before becoming started."]
+            )
+          }
+        }
+
         throw NSError(
           domain: "WearablesCamera",
           code: 1002,
-          userInfo: [NSLocalizedDescriptionKey: "Device session stopped before becoming started."]
+          userInfo: [NSLocalizedDescriptionKey: "Device session stateStream ended without becoming started."]
         )
+      } catch {
+        let nsErr = error as NSError
+        lastError = nsErr
+        NSLog("⚠️ [Wearables] Device session start failed (attempt %d/%d): %@",
+              attempt, maxAttempts, nsErr.localizedDescription)
+        if session.state != .stopped {
+          await session.stop()
+        }
+        deviceSession = nil
+        if attempt < maxAttempts {
+          try? await Task.sleep(nanoseconds: 1_000_000_000)
+        }
       }
     }
 
-    throw NSError(
+    throw lastError ?? NSError(
       domain: "WearablesCamera",
       code: 1002,
-      userInfo: [NSLocalizedDescriptionKey: "Device session stateStream ended without becoming started."]
+      userInfo: [NSLocalizedDescriptionKey: "Device session failed to start."]
     )
   }
 
   private func ensureStreamSession(_ deviceSession: DeviceSession) async throws -> StreamSession {
-    if let stream = streamSession, stream.state != .stopped {
-      return stream
+    if let stream = streamSession {
+      switch stream.state {
+      case .streaming:
+        return stream
+      case .starting, .waitingForDevice:
+        if stream.state != .starting {
+          await stream.start()
+        }
+        if try await waitForStreaming(stream) {
+          return stream
+        }
+      case .stopping, .stopped:
+        break
+      @unknown default:
+        break
+      }
+
+      // Stream exists but never reached .streaming; reset and recreate it.
+      if stream.state != .stopped {
+        await stream.stop()
+      }
+      streamSession = nil
+      latestVideoFrame = nil
+      stateListenerToken = nil
+      errorListenerToken = nil
+      photoListenerToken = nil
+      videoFrameListenerToken = nil
     }
-    streamSession = nil
-    latestVideoFrame = nil
 
     let config = StreamSessionConfig(
       videoCodec: .raw,

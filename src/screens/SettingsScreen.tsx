@@ -275,6 +275,13 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
           AccessibilityInfo.announceForAccessibility(message);
           Alert.alert('Glasses Registration', message, [{ text: 'OK', style: 'default' }]);
         }
+
+        await refreshWearablesStatus();
+      }
+
+      if (!value && Platform.OS === 'ios') {
+        await wearablesCamera.disconnect();
+        await refreshWearablesStatus();
       }
 
       const label = value

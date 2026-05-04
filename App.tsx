@@ -15,6 +15,7 @@ import {
   StatusBar,
   AccessibilityInfo,
   NativeModules,
+  AppState,
 } from 'react-native';
 import {
   Camera,
@@ -126,6 +127,7 @@ function AppInner(): React.JSX.Element {
   const continuousModeAbortRef = useRef(false);
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
   const prefetchedPhotoRef = useRef<string | null>(null);
+  const wearablesPrewarmAttemptedRef = useRef(false);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -224,6 +226,47 @@ function AppInner(): React.JSX.Element {
     if (!hasMicPermission) requestMicPermission();
   }, [hasCameraPermission, hasMicPermission, requestCameraPermission, requestMicPermission, settings.useWearablesCamera]);
 
+  // Auto-prewarm wearables on app start when toggle is already ON.
+  useEffect(() => {
+    if (!settings.useWearablesCamera || Platform.OS !== 'ios') return;
+    if (wearablesPrewarmAttemptedRef.current) return;
+
+    let timeoutId: ReturnType<typeof setTimeout> | null = null;
+    let sub: { remove: () => void } | null = null;
+
+    const runPrewarm = async () => {
+      wearablesPrewarmAttemptedRef.current = true;
+      try {
+        await wearablesCamera.startRegistration();
+        await wearablesCamera.preWarm();
+      } catch (error) {
+        console.warn('[Wearables] Auto-prewarm failed:', error);
+      }
+    };
+
+    if (AppState.currentState === 'active') {
+      timeoutId = setTimeout(() => {
+        runPrewarm().catch((error) => {
+          console.warn('[Wearables] Auto-prewarm failed:', error);
+        });
+      }, 1500);
+    } else {
+      sub = AppState.addEventListener('change', (state) => {
+        if (state === 'active' && !wearablesPrewarmAttemptedRef.current) {
+          runPrewarm().catch((error) => {
+            console.warn('[Wearables] Auto-prewarm failed:', error);
+          });
+          sub?.remove();
+        }
+      });
+    }
+
+    return () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      sub?.remove();
+    };
+  }, [settings.useWearablesCamera]);
+
   // Keep a short branded startup loader visible so users can see the animated logo.
   useEffect(() => {
     const timer = setTimeout(() => {
@@ -272,6 +315,43 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Camera capture helper
   // ============================================================================
+  const isWearablesCaptureError = (err: any): boolean => {
+    // The native WearablesCameraModule rejects with code "CAPTURE",
+    // "PREWARM", or "PERMISSION" — and only when wearables is the source.
+    // We also gate on the live setting to be safe in case error shapes drift.
+    if (!settingsRef.current.useWearablesCamera) return false;
+    const msg = String(err?.message || err || '').toLowerCase();
+    return (
+      err?.code === 'CAPTURE' ||
+      err?.code === 'PREWARM' ||
+      err?.code === 'PERMISSION' ||
+      msg.includes('stream did not reach streaming state') ||
+      msg.includes('device session stopped') ||
+      msg.includes('activitymanagererror') ||
+      msg.includes('internalerror') ||
+      msg.includes('glasses') ||
+      msg.includes('wearables') ||
+      msg.includes('eligible device')
+    );
+  };
+
+  const speakWearablesError = async (err: any): Promise<void> => {
+    // Pull the most useful sentence out of the native error message.
+    // Native error messages are written for end users (we authored them
+    // in WearablesCameraModule.swift), so we can speak them verbatim.
+    const raw = String(err?.message || '').trim();
+    const fallback =
+      'The glasses camera did not respond. Please toggle glasses camera off and on, ' +
+      'or restart the Meta AI app and try again.';
+    const spoken = raw && raw.length < 200 ? raw : fallback;
+
+    if (!screenReaderEnabledRef.current) {
+      audioFeedback.playEarcon('cancel');
+      await playErrorSound();
+    }
+    AccessibilityInfo.announceForAccessibility(spoken);
+    await speachesSentenceChunker.synthesizeSpeechChunked(spoken);
+  };
   const reactivateCameraAndCapture = async (): Promise<string> => {
     console.log('📷 Reactivating camera for capture...');
     setIsCameraActive(true);
@@ -796,6 +876,13 @@ function AppInner(): React.JSX.Element {
 
 
       if (!photoPath) {
+        if (settingsRef.current.useWearablesCamera) {
+          await speakWearablesError(new Error(
+            'Could not get an image from the glasses. Try toggling the glasses camera off and on.'
+          ));
+          return;
+        }
+
         console.warn('⚠️ No photo — voice-only mode');
         AccessibilityInfo.announceForAccessibility('Processing without photo.');
       }
@@ -1002,9 +1089,30 @@ function AppInner(): React.JSX.Element {
       }
 
       let photoPath = '';
-      try { photoPath = await reactivateCameraAndCapture(); } catch (e) { console.error('❌ Camera error:', e); }
+      try {
+        photoPath = await reactivateCameraAndCapture();
+      } catch (e: any) {
+        console.error('❌ Camera error:', e);
 
-      if (!photoPath) {
+        // ── Glasses path: hard-fail with a clear message, do NOT call backend ─
+        if (isWearablesCaptureError(e)) {
+          await stopLatencyLoop();
+          await speakWearablesError(e);
+          setIsProcessing(false);
+          isProcessingRef.current = false;
+          isCapturingPhotoRef.current = false;
+          finalTranscriptRef.current = '';
+          // Reset to ready state so the next tap starts fresh.
+          setIsCameraActive(true);
+          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+          return;
+        }
+        // iPhone path: keep existing voice-only fallback.
+      }
+
+      if (!photoPath && !settingsRef.current.useWearablesCamera) {
+        // Voice-only fallback only applies when iPhone camera is selected.
         AccessibilityInfo.announceForAccessibility(
           'Warning: Failed to capture photo. Continuing with voice only.'
         );
@@ -1147,7 +1255,24 @@ function AppInner(): React.JSX.Element {
       await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
       if (isEmergencyStopped.current) { isCapturingPhotoRef.current = false; return; }
 
-      const photoPath = await reactivateCameraAndCapture();
+      let photoPath = '';
+      try {
+        photoPath = await reactivateCameraAndCapture();
+      } catch (e: any) {
+        console.error('❌ Camera error (manual stop):', e);
+        isCapturingPhotoRef.current = false;
+        if (isWearablesCaptureError(e)) {
+          await stopLatencyLoop();
+          await speakWearablesError(e);
+          setIsProcessing(false);
+          isProcessingRef.current = false;
+          setIsCameraActive(true);
+          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+          return;
+        }
+        // iPhone path: fall through with empty photoPath, voice-only.
+      }
       isCapturingPhotoRef.current = false;
 
       // FIX: Check emergency flag AFTER capture — user may have tapped
