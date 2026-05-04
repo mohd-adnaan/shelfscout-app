@@ -30,6 +30,13 @@ class WearablesCameraModule: NSObject {
   private var deviceSession: DeviceSession?
   private var streamSession: StreamSession?
 
+  /// Long-lived AutoDeviceSelector. The SDK's `activeDeviceStream()` requires
+  /// the selector instance to be retained across the wait — recreating it
+  /// each call loses the active-device watcher. This is the same pattern
+  /// Meta's v0.6 sample CameraAccess app uses to work around the "glasses
+  /// not yet active" race that surfaces as ActivityManagerError code 11.
+  private var sharedDeviceSelector: AutoDeviceSelector?
+
   // ── Listeners (tokens kept alive while module is alive) ────────────────
   private var stateListenerToken: AnyListenerToken?
   private var errorListenerToken: AnyListenerToken?
@@ -66,6 +73,11 @@ class WearablesCameraModule: NSObject {
     if let wearables = wearables { return wearables }
     let instance = Wearables.shared
     wearables = instance
+    // Construct AutoDeviceSelector ONCE and retain it — the SDK's
+    // activeDeviceStream is backed by this instance's lifetime.
+    if sharedDeviceSelector == nil {
+      sharedDeviceSelector = AutoDeviceSelector(wearables: instance)
+    }
     startObservers(instance)
     return instance
   }
@@ -93,6 +105,51 @@ class WearablesCameraModule: NSObject {
     }
   }
 
+  /// Wait for the SDK to report an ACTIVE device — not just a paired one.
+  ///
+  /// Background: `wearables.devicesStream()` returns the catalog of paired
+  /// devices and emits as soon as the user has paired glasses in Meta AI.
+  /// That is NOT the same as "the BT link is up and the device-side
+  /// ActivityManagerService is ready to honor a session start". Calling
+  /// `wearables.createSession(...).start()` while the device is paired
+  /// but not yet active causes the device's ActivityManagerService to
+  /// reject the activity ~5s later with error code 11 (the symptom we
+  /// see in logs as `MediaStreamSession - connect complete: 11` followed
+  /// by `Stream did not reach streaming state within 8s`).
+  ///
+  /// `AutoDeviceSelector.activeDeviceStream()` only emits a non-nil value
+  /// when the device is actually reachable. This is the gate Meta's v0.6
+  /// sample app uses (see DeviceSessionManager.swift in the SDK sample).
+  private func waitForActiveDevice(timeoutSeconds: TimeInterval = 20) async -> Bool {
+    guard let selector = sharedDeviceSelector else {
+      NSLog("⚠️ [Wearables] waitForActiveDevice: no shared selector")
+      return false
+    }
+    NSLog("⏳ [Wearables] Waiting up to %.0fs for an ACTIVE device…", timeoutSeconds)
+
+    return await withTaskGroup(of: Bool.self) { group in
+      group.addTask {
+        for await device in selector.activeDeviceStream() {
+          if device != nil {
+            NSLog("✅ [Wearables] activeDeviceStream emitted an active device")
+            return true
+          }
+        }
+        return false
+      }
+      group.addTask {
+        try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+        NSLog("⏱️ [Wearables] waitForActiveDevice timed out after %.0fs", timeoutSeconds)
+        return false
+      }
+      let result = await group.next() ?? false
+      group.cancelAll()
+      return result
+    }
+  }
+
+  /// Legacy helper kept for any non-streaming callers — checks the paired
+  /// catalog only. Streaming paths must use `waitForActiveDevice` instead.
   private func waitForDevice(timeoutSeconds: TimeInterval = 12) async throws -> Bool {
     if !availableDevices.isEmpty { return true }
     NSLog("⏳ [Wearables] Waiting up to %.0fs for a device to appear…", timeoutSeconds)
@@ -112,40 +169,105 @@ class WearablesCameraModule: NSObject {
   // MARK: - Permission + Device + Stream
   // ═══════════════════════════════════════════════════════════════════════════
 
-  private func ensureCameraPermission(_ wearables: WearablesInterface) async throws {
-    var status = try await wearables.checkPermissionStatus(.camera)
-    NSLog("🔑 [Wearables] camera permission status (initial): %@", "\(status)")
-    if status != .granted {
-      status = try await wearables.requestPermission(.camera)
-      NSLog("🔑 [Wearables] camera permission status (after request): %@", "\(status)")
+  private func humanizePermissionError(_ rawValue: Int) -> String {
+    // From MWDATCore.PermissionError (Int-backed enum, v0.6):
+    //   0 noDevice              — No paired wearables visible to the SDK
+    //   1 noDeviceWithConnection — Paired but EA-channel disconnected
+    //   2 connectionError       — EA channel error
+    //   3 metaAINotInstalled    — Meta AI app missing
+    //   4 requestInProgress     — Another permission flow active
+    //   5 requestTimeout        — User didn't respond in time
+    //   6 internalError         — SDK-internal failure
+    switch rawValue {
+    case 0:
+      return "No glasses found. Pair Ray-Ban Meta in the Meta AI app and try again."
+    case 1:
+      return "Glasses paired but not actively connected to ShelfScout. " +
+             "Open the Meta AI app, confirm the glasses card shows 'Connected'. " +
+             "If it does and this still fails, enable Developer Mode on the glasses " +
+             "(Meta AI → glasses card → Settings → About → tap Version 5x → turn on Developer Mode), " +
+             "then power-cycle the glasses with the frame switch."
+    case 2:
+      return "Connection error talking to glasses. Power-cycle the glasses and try again."
+    case 3:
+      return "Meta AI app not installed. Install it from the App Store."
+    case 4:
+      return "A permission request is already in progress. Wait a few seconds and try again."
+    case 5:
+      return "Permission request timed out. Open the Meta AI app and accept when prompted."
+    case 6:
+      return "Internal SDK error. Toggle Bluetooth off/on, then try again."
+    default:
+      return "Unknown permission error (\(rawValue))."
     }
-    if status != .granted {
-      throw NSError(
-        domain: "WearablesCamera",
-        code: 1001,
-        userInfo: [NSLocalizedDescriptionKey:
-          "Camera permission not granted in Meta AI app."]
-      )
+  }
+
+  private func ensureCameraPermission(_ wearables: WearablesInterface) async throws {
+    do {
+      var status = try await wearables.checkPermissionStatus(.camera)
+      NSLog("🔑 [Wearables] camera permission status (initial): %@", "\(status)")
+      if status != .granted {
+        status = try await wearables.requestPermission(.camera)
+        NSLog("🔑 [Wearables] camera permission status (after request): %@", "\(status)")
+      }
+      if status != .granted {
+        throw NSError(
+          domain: "WearablesCamera",
+          code: 1001,
+          userInfo: [NSLocalizedDescriptionKey:
+            "Camera permission not granted in Meta AI app."]
+        )
+      }
+    } catch {
+      let nsErr = error as NSError
+      // MWDATCore.PermissionError surfaces as `MWDATCore.PermissionError`
+      // domain with `code` = the raw value of the enum case. Translate so
+      // the user sees what's actually wrong (not "error 1").
+      if nsErr.domain == "MWDATCore.PermissionError" {
+        let humanMsg = humanizePermissionError(nsErr.code)
+        NSLog("⚠️ [Wearables] PermissionError(%d): %@", nsErr.code, humanMsg)
+        throw NSError(
+          domain: "WearablesCamera",
+          code: 1000 + nsErr.code,
+          userInfo: [NSLocalizedDescriptionKey: humanMsg]
+        )
+      }
+      throw error
     }
   }
 
   private func createSessionWithFallback(_ wearables: WearablesInterface) throws -> DeviceSession {
-    let cachedIDs = availableDevices
-
-    if let firstID = cachedIDs.first {
-      NSLog("🎯 [Wearables] Trying SpecificDeviceSelector for id=%@", firstID)
-      let specific = SpecificDeviceSelector(device: firstID)
+    // Auto FIRST — this is the path Meta's v0.6 sample uses exclusively.
+    // SpecificDeviceSelector targets a paired-but-not-necessarily-active
+    // device by ID, which is exactly what triggers the
+    // ActivityManagerError code 11 race. Auto picks only currently-active
+    // devices (per v0.6 changelog: "AutoDeviceSelector now selects or
+    // drops devices based on connectivity state").
+    if let selector = sharedDeviceSelector {
+      NSLog("🎯 [Wearables] Trying shared AutoDeviceSelector")
       do {
-        let session = try wearables.createSession(deviceSelector: specific)
-        NSLog("✅ [Wearables] SpecificDeviceSelector accepted")
+        let session = try wearables.createSession(deviceSelector: selector)
+        NSLog("✅ [Wearables] AutoDeviceSelector accepted")
         return session
       } catch {
-        NSLog("⚠️ [Wearables] SpecificDeviceSelector failed: %@ — falling back to Auto",
-              error.localizedDescription)
+        NSLog("⚠️ [Wearables] AutoDeviceSelector rejected: %@ — trying SpecificDeviceSelector",
+              (error as NSError).localizedDescription)
       }
     }
 
-    NSLog("🎯 [Wearables] Trying AutoDeviceSelector")
+    // Last-resort fallback: SpecificDeviceSelector. Only used if Auto fails
+    // (e.g. selector not yet initialized, or no active device the SDK can
+    // pick automatically). Prefer Auto in normal operation.
+    if let firstID = availableDevices.first {
+      NSLog("🎯 [Wearables] Falling back to SpecificDeviceSelector for id=%@", firstID)
+      let specific = SpecificDeviceSelector(device: firstID)
+      let session = try wearables.createSession(deviceSelector: specific)
+      NSLog("✅ [Wearables] SpecificDeviceSelector accepted (fallback)")
+      return session
+    }
+
+    // Nothing worked — surface a fresh AutoDeviceSelector attempt so the
+    // caller gets a consistent error path.
     let auto = AutoDeviceSelector(wearables: wearables)
     return try wearables.createSession(deviceSelector: auto)
   }
@@ -158,14 +280,20 @@ class WearablesCameraModule: NSObject {
       deviceSession = nil
     }
 
-    let haveDevice = try await waitForDevice(timeoutSeconds: 12)
-    if !haveDevice {
-      throw NSError(
-        domain: "WearablesCamera",
-        code: 1010,
-        userInfo: [NSLocalizedDescriptionKey:
-          "No glasses visible to the SDK. Make sure the Meta AI app is open and glasses are paired in Meta AI."]
-      )
+    // Active-device wait is now ADVISORY, not gating.
+    //
+    // Background: in some environments (Developer Mode off on glasses,
+    // release-channel attestation pending, EA channel stuck) the SDK
+    // never emits a non-nil device on activeDeviceStream — but a session
+    // start can still succeed against the paired device, OR fail with a
+    // more specific device-side error code that's much more useful for
+    // debugging than "no active device". So we wait briefly, then try
+    // anyway and let the SDK's own error reporting do the diagnosis.
+    let haveActive = await waitForActiveDevice(timeoutSeconds: 5)
+    if !haveActive {
+      NSLog("⚠️ [Wearables] activeDeviceStream silent after 5s — attempting session anyway. " +
+            "Likely causes: Developer Mode off on glasses, app not on user's release channel, " +
+            "or EA channel stuck (try power-cycling the glasses with the frame switch).")
     }
 
     let maxAttempts = 3
@@ -182,7 +310,8 @@ class WearablesCameraModule: NSObject {
           domain: "WearablesCamera",
           code: 1011,
           userInfo: [NSLocalizedDescriptionKey:
-            "Glasses paired but not allowed to share camera. In Meta AI app: open your glasses card → Settings → Connected apps → enable Camera for ShelfScout."]
+            "Glasses paired but not allowed to share camera. In Meta AI app: open your glasses card → Settings → Connected apps → enable Camera for ShelfScout. " +
+            "If the option is missing, enable Developer Mode on the glasses first."]
         )
       }
       deviceSession = session
@@ -211,14 +340,15 @@ class WearablesCameraModule: NSObject {
       } catch {
         let nsErr = error as NSError
         lastError = nsErr
-        NSLog("⚠️ [Wearables] Device session start failed (attempt %d/%d): %@",
-              attempt, maxAttempts, nsErr.localizedDescription)
+        NSLog("⚠️ [Wearables] Device session start failed (attempt %d/%d) [%@:%d]: %@",
+              attempt, maxAttempts, nsErr.domain, nsErr.code, nsErr.localizedDescription)
         if session.state != .stopped {
           await session.stop()
         }
         deviceSession = nil
         if attempt < maxAttempts {
-          try? await Task.sleep(nanoseconds: 1_000_000_000)
+          // Brief pause; re-poll active device but don't block on it.
+          _ = await waitForActiveDevice(timeoutSeconds: 3)
         }
       }
     }
