@@ -403,27 +403,192 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     session_id: SESSION_ID,
   };
 
+  const parseBoolean = (value: any): boolean | null => {
+    if (value === true || value === false) {
+      return value;
+    }
+    if (value === null || value === undefined) {
+      return null;
+    }
+    if (typeof value === 'number') {
+      return value !== 0;
+    }
+    if (typeof value === 'string') {
+      const normalized = value.trim().toLowerCase();
+      if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'y') {
+        return true;
+      }
+      if (
+        normalized === 'false' ||
+        normalized === '0' ||
+        normalized === 'no' ||
+        normalized === 'n' ||
+        normalized === 'null' ||
+        normalized === 'undefined' ||
+        normalized === ''
+      ) {
+        return false;
+      }
+    }
+    return null;
+  };
+
   if (!data) {
     console.warn('⚠️ Empty response data');
     return defaultResponse;
   }
 
-  const payload = Array.isArray(data) ? data[0] : data;
-  if (!payload) {
+  const rawItems = Array.isArray(data) ? data : [data];
+  const normalizedPayloads = rawItems
+    .filter((item: any) => item && typeof item === 'object')
+    .map((item: any) => {
+      let jsonPayload: any | null = null;
+      if (typeof item.json === 'string') {
+        try {
+          jsonPayload = JSON.parse(item.json);
+        } catch (e) {
+          console.warn('⚠️ Failed to parse payload.json string');
+        }
+      } else if (item.json && typeof item.json === 'object') {
+        jsonPayload = item.json;
+      }
+
+      return jsonPayload ? { ...item, ...jsonPayload } : item;
+    });
+
+  if (normalizedPayloads.length === 0) {
     console.warn('⚠️ No payload after unwrap');
     return defaultResponse;
   }
 
-  const innerPayload = payload.json || payload;
+  const parseBboxValue = (value: any): [number, number, number, number] | null => {
+    if (Array.isArray(value) && value.length === 4) {
+      const parsed = value.map((v: any) => Number(v));
+      if (parsed.every((n: number) => !Number.isNaN(n))) {
+        return parsed as [number, number, number, number];
+      }
+    }
+    if (typeof value === 'string') {
+      try {
+        let bboxString = value.trim();
+        if (bboxString.startsWith('[') && bboxString.endsWith(']')) {
+          bboxString = bboxString.slice(1, -1);
+        }
+        const parts = bboxString.split(',').map((v: string) => Number(v.trim()));
+        if (parts.length === 4 && parts.every((n: number) => !Number.isNaN(n))) {
+          return parts as [number, number, number, number];
+        }
+      } catch (e) {
+        return null;
+      }
+    }
+    return null;
+  };
 
-  // Extract text
+  const scorePayload = (payload: any): number => {
+    let score = 0;
+
+    if (
+      parseBoolean(payload.reaching_ios) === true ||
+      parseBoolean(payload.reachingIos) === true
+    ) {
+      score += 4;
+    }
+    if (
+      parseBoolean(payload.reaching_flag) === true ||
+      parseBoolean(payload.reachingFlag) === true ||
+      parseBoolean(payload.reaching) === true
+    ) {
+      score += 3;
+    }
+    if (
+      parseBoolean(payload.navigation) === true ||
+      parseBoolean(payload.navigation_flag) === true
+    ) {
+      score += 2;
+    }
+
+    const bboxCandidate = parseBboxValue(payload.bbox);
+    if (bboxCandidate && bboxCandidate.some((value) => value !== 0)) {
+      score += 2;
+    }
+
+    if (typeof payload.response === 'string' && payload.response.trim()) {
+      score += 1;
+    }
+    if (typeof payload.text === 'string' && payload.text.trim()) {
+      score += 1;
+    }
+    if (typeof payload.message === 'string' && payload.message.trim()) {
+      score += 1;
+    }
+
+    return score;
+  };
+
+  const orderedPayloads = [...normalizedPayloads].sort(
+    (a, b) => scorePayload(b) - scorePayload(a),
+  );
+
+  const pickString = (keys: string[]): string => {
+    for (const payload of orderedPayloads) {
+      for (const key of keys) {
+        const value = payload[key];
+        if (typeof value === 'string' && value.trim()) {
+          return value.trim();
+        }
+      }
+    }
+    return '';
+  };
+
+  const pickNumber = (keys: string[]): number | undefined => {
+    for (const payload of orderedPayloads) {
+      for (const key of keys) {
+        const value = payload[key];
+        if (typeof value === 'number' && !Number.isNaN(value)) {
+          return value;
+        }
+        if (typeof value === 'string' && value.trim()) {
+          const parsed = Number(value);
+          if (!Number.isNaN(parsed)) {
+            return parsed;
+          }
+        }
+      }
+    }
+    return undefined;
+  };
+
+  const pickBbox = (): [number, number, number, number] | undefined => {
+    const isNonZero = (bbox: [number, number, number, number]) =>
+      bbox.some((value) => value !== 0);
+
+    for (const payload of orderedPayloads) {
+      const candidate = parseBboxValue(payload.bbox);
+      if (candidate && isNonZero(candidate)) {
+        return candidate;
+      }
+    }
+
+    for (const payload of orderedPayloads) {
+      const candidate = parseBboxValue(payload.bbox);
+      if (candidate) {
+        return candidate;
+      }
+    }
+
+    return undefined;
+  };
+
+  // Extract text (prefer short hand direction when available)
+  const hand_direction = pickString(['hand_direction', 'handDirection']);
+
   let text = '';
-  if (typeof innerPayload.text === 'string') {
-    text = innerPayload.text.trim();
-  } else if (typeof innerPayload.response === 'string') {
-    text = innerPayload.response.trim();
-  } else if (typeof innerPayload.message === 'string') {
-    text = innerPayload.message.trim();
+  if (hand_direction) {
+    text = hand_direction;
+  } else {
+    text = pickString(['text', 'response', 'message']);
   }
 
   // =========================================================================
@@ -431,90 +596,53 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   // =========================================================================
 
   // Navigation flag
-  let navigation = false;
-  if (typeof innerPayload.navigation === 'boolean') {
-    navigation = innerPayload.navigation;
-  } else if (typeof innerPayload.navigation === 'string') {
-    navigation = innerPayload.navigation.toLowerCase() === 'true';
-  }
+  const navigation = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.navigation) === true ||
+    parseBoolean(payload.navigation_flag) === true
+  );
 
   // Reaching flag (Android LLM-based)
-  let reaching_flag = false;
-  if (typeof innerPayload.reaching_flag === 'boolean') {
-    reaching_flag = innerPayload.reaching_flag;
-  } else if (typeof innerPayload.reaching_flag === 'string') {
-    reaching_flag = innerPayload.reaching_flag.toLowerCase() === 'true';
-  }
-  if (!reaching_flag && typeof innerPayload.reachingFlag === 'boolean') {
-    reaching_flag = innerPayload.reachingFlag;
-  }
+  const reaching_flag = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.reaching_flag) === true ||
+    parseBoolean(payload.reachingFlag) === true ||
+    parseBoolean(payload.reaching) === true
+  );
 
   // =========================================================================
   // reaching_ios flag (iOS native ARKit) - HIGHEST PRIORITY
   // =========================================================================
-  let reaching_ios = false;
-  if (typeof innerPayload.reaching_ios === 'boolean') {
-    reaching_ios = innerPayload.reaching_ios;
-  } else if (typeof innerPayload.reaching_ios === 'string') {
-    reaching_ios = innerPayload.reaching_ios.toLowerCase() === 'true';
-  }
-  // Also check camelCase variant
-  if (!reaching_ios && typeof innerPayload.reachingIos === 'boolean') {
-    reaching_ios = innerPayload.reachingIos;
-  }
+  const reaching_ios = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.reaching_ios) === true ||
+    parseBoolean(payload.reachingIos) === true
+  );
 
   // =========================================================================
   // BBOX extraction (when reaching_ios is true)
   // =========================================================================
-  let bbox: [number, number, number, number] | undefined;
-
-  if (innerPayload.bbox) {
-    if (Array.isArray(innerPayload.bbox) && innerPayload.bbox.length === 4) {
-      bbox = innerPayload.bbox.map((v: any) => Number(v)) as [number, number, number, number];
-    } else if (typeof innerPayload.bbox === 'string') {
-      try {
-        // Handle both "[1,2,3,4]" and "1,2,3,4" formats
-        let bboxString = innerPayload.bbox.trim();
-        if (bboxString.startsWith('[') && bboxString.endsWith(']')) {
-          bboxString = bboxString.slice(1, -1);
-        }
-        const parts = bboxString.split(',').map((v: string) => Number(v.trim()));
-        if (parts.length === 4 && parts.every((n: number) => !isNaN(n))) {
-          bbox = parts as [number, number, number, number];
-        }
-      } catch (e) {
-        console.warn('⚠️ Failed to parse bbox string:', innerPayload.bbox);
-      }
-    }
-  }
+  const bbox = pickBbox();
 
   // =========================================================================
   // Object name extraction
   // =========================================================================
-  let object: string | undefined;
-  if (typeof innerPayload.object === 'string' && innerPayload.object.trim()) {
-    object = innerPayload.object.trim();
-  } else if (typeof innerPayload.objectName === 'string' && innerPayload.objectName.trim()) {
-    object = innerPayload.objectName.trim();
-  }
+  const object = pickString(['object', 'objectName']) || undefined;
 
   // Depth from backend (meters)
-  let depth: string | undefined;
-  if (innerPayload.depth !== undefined && innerPayload.depth !== null) {
-    depth = String(innerPayload.depth);
-  }
+  const depthValue = pickNumber(['depth']);
+  const depth = depthValue !== undefined ? String(depthValue) : undefined;
 
   // Loop delay
   let loopDelay = NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS;
-  if (typeof innerPayload.loopDelay === 'number' && innerPayload.loopDelay > 0) {
-    loopDelay = innerPayload.loopDelay;
+  const loopDelayValue = pickNumber(['loopDelay']);
+  if (loopDelayValue && loopDelayValue > 0) {
+    loopDelay = loopDelayValue;
   }
 
   // Session ID from response (or use current)
-  const session_id = innerPayload.session_id || SESSION_ID;
+  const session_id = pickString(['session_id']) || SESSION_ID;
 
   console.log('📋 Parsed:', {
     text: text.substring(0, 50),
+    hand_direction: hand_direction || 'none',
     navigation,
     reaching_flag,
     reaching_ios,
@@ -531,6 +659,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     bbox,
     object,
     depth,
+    hand_direction: hand_direction || undefined,
     loopDelay,
     session_id,
   };

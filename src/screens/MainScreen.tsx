@@ -55,6 +55,7 @@ const MainScreen: React.FC = () => {
   const [currentTranscript, setCurrentTranscript] = useState('');
   const [screenReaderEnabled, setScreenReaderEnabled] = useState(false);
   const [reduceMotionEnabled, setReduceMotionEnabled] = useState(false);
+  const [handDirectionBanner, setHandDirectionBanner] = useState<string | null>(null);
   
   // ============================================================================
   // Hooks
@@ -68,6 +69,7 @@ const MainScreen: React.FC = () => {
   // ============================================================================
   const previousStateRef = useRef<string>('');
   const isProcessingRef = useRef(false);
+  const handDirectionTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ============================================================================
   // WCAG 2.3.3 & 1.4.13: Check Accessibility Preferences
@@ -141,6 +143,18 @@ const MainScreen: React.FC = () => {
     
     previousStateRef.current = currentState;
   }, [isRecording, isProcessing, isSpeaking]);
+
+  // ==========================================================================
+  // Cleanup: avoid dangling banner timeouts
+  // ==========================================================================
+  useEffect(() => {
+    return () => {
+      if (handDirectionTimeoutRef.current) {
+        clearTimeout(handDirectionTimeoutRef.current);
+        handDirectionTimeoutRef.current = null;
+      }
+    };
+  }, []);
 
   // ============================================================================
   // Helper: Get current state description
@@ -427,6 +441,18 @@ const MainScreen: React.FC = () => {
 
       console.log('✅ Response:', response.text.substring(0, 50) + '...');
 
+      if (response.hand_direction?.trim()) {
+        const direction = response.hand_direction.trim();
+        setHandDirectionBanner(direction);
+        if (handDirectionTimeoutRef.current) {
+          clearTimeout(handDirectionTimeoutRef.current);
+        }
+        handDirectionTimeoutRef.current = setTimeout(() => {
+          setHandDirectionBanner(null);
+          handDirectionTimeoutRef.current = null;
+        }, 2500);
+      }
+
       if (!response.text) {
         throw new Error('No response received from server');
       }
@@ -566,6 +592,19 @@ const MainScreen: React.FC = () => {
         isProcessing={isProcessing}
         isSpeaking={isSpeaking}
       />
+
+      {handDirectionBanner && (
+        <View
+          style={styles.handDirectionBanner}
+          accessible={false}
+          accessibilityElementsHidden={true}
+          importantForAccessibility="no-hide-descendants"
+        >
+          <Text style={styles.handDirectionText}>
+            hand_direction: {handDirectionBanner}
+          </Text>
+        </View>
+      )}
       
       {/* Button Container - WCAG 2.4.3: Logical focus order */}
       <View style={styles.buttonContainer}>
@@ -704,6 +743,23 @@ const styles = StyleSheet.create({
     color: COLORS.WHITE,
     fontSize: 16,
     fontWeight: '600',
+  },
+  handDirectionBanner: {
+    position: 'absolute',
+    top: 90,
+    alignSelf: 'center',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
+    borderRadius: 8,
+    backgroundColor: 'rgba(0, 0, 0, 0.6)',
+    borderWidth: 1,
+    borderColor: 'rgba(255, 255, 255, 0.2)',
+  },
+  handDirectionText: {
+    color: COLORS.WHITE,
+    fontSize: 12,
+    fontWeight: '600',
+    letterSpacing: 0.2,
   },
 });
 

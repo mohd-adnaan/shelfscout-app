@@ -23,6 +23,7 @@ export interface WorkflowResponse {
   bbox?: [number, number, number, number];  // [xmin, ymin, xmax, ymax] from Qwen detection
   object?: string;                           // Name of detected object
   depth?: string;
+  hand_direction?: string;
   
   // Loop control
   loopDelay: number;
