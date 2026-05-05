@@ -133,7 +133,31 @@ extension ReachingViewController {
     let rX = Float((arPxX - cx) / fx)
     let rY = Float((arPxY - cy) / fy)
 
-    let camT     = camera.transform
+    // ── Pose for unprojection ──────────────────────────────────────────
+    // When the bbox came from a fresh-detection AR frame, its coordinates
+    // live in the view of the camera AT THE MOMENT THAT FRAME WAS CAPTURED.
+    // The live `frame.camera.transform` has moved since then (the request
+    // took 3–5 s and the user inevitably drifts). We must unproject the
+    // bbox through the SAVED detection-time transform, not the live one.
+    // Otherwise the world point lands a few cm off the target — the exact
+    // bug we are here to fix.
+    //
+    // Intrinsics are constant across the session (no autofocus on the
+    // back wide camera while ARKit is configured for world tracking),
+    // so the live frame's intrinsics are fine.
+    //
+    // Refinement after this placement uses the LIVE camera transform,
+    // which is correct: the world point is now in world coords and the
+    // refinement raycasts originate at the camera's current world pose.
+    let camT: simd_float4x4
+    let poseSource: String
+    if let saved = detectionFrameCameraTransform {
+      camT = saved
+      poseSource = "saved detection-time"
+    } else {
+      camT = camera.transform
+      poseSource = "live frame"
+    }
     let rayCam   = simd_normalize(simd_float3(rX, -rY, -1.0))
     let worldRay = simd_normalize(simd_make_float3(camT * simd_float4(rayCam, 0)))
     let camPos   = simd_make_float3(camT.columns.3)
@@ -147,6 +171,8 @@ extension ReachingViewController {
     objectWorldHalfW = depth * Float(bboxNormW * horizScale) * 0.5  // crop-corrected width
     objectWorldHalfH = depth * Float(bboxNormH) * 0.8               // vertical: no correction
 
+    // Billboard corners use the SAME transform we unprojected through, so
+    // the rectangle sits in the plane perpendicular to the detection ray.
     let placementRight = -simd_normalize(simd_make_float3(camT.columns.1))
     let placementUp    =  simd_normalize(simd_make_float3(camT.columns.0))
     objectWorldCornerTR = worldPos + placementRight * objectWorldHalfW + placementUp * objectWorldHalfH
@@ -154,8 +180,12 @@ extension ReachingViewController {
 
     anchorPlaced = true
     anchorRefinementFrames = 1
-    NSLog("🎯 [ReachingVC] ✅ Anchor SEEDED at (%.3f, %.3f, %.3f) depth=%.2fm (refining with ARKit...)",
-          worldPos.x, worldPos.y, worldPos.z, depth)
+    NSLog("🎯 [ReachingVC] ✅ Anchor SEEDED at (%.3f, %.3f, %.3f) depth=%.2fm pose=%@ (refining with ARKit...)",
+          worldPos.x, worldPos.y, worldPos.z, depth, poseSource)
+
+    // Saved transform's job is done — clear it so any subsequent reseeds
+    // (tracker drift recovery) operate from the live transform as intended.
+    detectionFrameCameraTransform = nil
 
     // ── Seed visual tracker so subsequent refinement uses fresh 2D pixel target ──
     // Tracker locks onto the object in the live AR feed; tryRefineAnchorDepth

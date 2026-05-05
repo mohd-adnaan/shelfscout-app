@@ -200,6 +200,55 @@ class ReachingViewController: UIViewController {
   var isTrackerReseeding: Bool = false
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Initial Bbox Refresh (with detection-frame pose)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // The bbox passed into this VC was computed from a photo VisionCamera took
+  // SECONDS before the AR session started (Qwen processing + VisionCamera
+  // teardown + ARKit boot = 5–15s typical). Even when the user holds still,
+  // 2° of unintended rotation over that window puts the bbox ~7 cm off the
+  // object at 2 m depth — bad enough that the indicator lands on the floor
+  // or back wall instead of the target.
+  //
+  // The fix has TWO halves:
+  //
+  //   A. Re-detect the object on a LIVE AR frame before initial placement,
+  //      so the bbox lives in AR-camera coordinates instead of stale photo
+  //      coordinates.
+  //
+  //   B. Save the AR camera's WORLD-SPACE TRANSFORM at the moment we capture
+  //      the AR frame for detection, and use that saved transform for the
+  //      unprojection in placeWorldAnchor. Otherwise the bbox (T_detect)
+  //      would still be unprojected through transform(T_place), and the
+  //      ~3–5 s of residual drift between request and response would put
+  //      the anchor a few cm off the object on its first frame.
+  //
+  // After successful placement the saved transform is cleared, and ARKit
+  // refinement uses live-frame transforms as before.
+
+  enum InitialReseedStatus {
+    case pending      // not yet started
+    case inFlight     // request out, waiting for response
+    case succeeded    // fresh bbox + saved pose available, proceed to placement
+    case failed       // backend gave nothing / timed out — fall back to photo bbox
+    case skipped      // no detectionUrl available — fall back to photo bbox
+  }
+  var initialReseedStatus: InitialReseedStatus = .pending
+  var initialReseedStartTime: TimeInterval = 0
+  /// Deadline for the initial reseed request — beyond this we give up
+  /// and place from the photo bbox (broken-but-no-worse-than-before).
+  let initialReseedTimeoutSec: TimeInterval = 6.0
+  /// Wait at least this many AR frames before firing the request, so the
+  /// AR camera buffer has produced something stable to send to the backend.
+  let initialReseedFrameWait: Int = 2
+  /// World-space camera transform AT THE MOMENT the detection AR frame was
+  /// captured. Set inside requestInitialBboxFromAR. Read by placeWorldAnchor
+  /// to unproject the bbox through the SAME pose that produced the image
+  /// that produced the bbox. Cleared after successful placement and on
+  /// any failure path so the live frame's transform is used as fallback.
+  var detectionFrameCameraTransform: simd_float4x4? = nil
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Audio / Speech / Haptics
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -623,6 +672,10 @@ class ReachingViewController: UIViewController {
     consecutiveLowConfFrames = 0
     isTrackerReseeding = false
     trackerSequenceHandler = VNSequenceRequestHandler()
+    // Reset initial bbox refresh state
+    initialReseedStatus = .pending
+    initialReseedStartTime = 0
+    detectionFrameCameraTransform = nil
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

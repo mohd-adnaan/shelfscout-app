@@ -387,4 +387,205 @@ extension ReachingViewController {
       }
     }.resume()
   }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Initial Bbox Refresh from Live AR Frame (with pose save)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Called ONCE before initial anchor placement. Captures the current AR
+  // frame as a JPEG, posts to /vision/detect, and replaces the photo bbox
+  // with one in AR-frame coordinates. CRUCIALLY also saves the AR camera's
+  // world-space transform AT THE MOMENT THE AR FRAME WAS CAPTURED, so
+  // placeWorldAnchor can unproject through the SAME pose that produced
+  // the image the bbox lives in — eliminating the residual 3–5 s drift
+  // between the detection request firing and the response coming back.
+  //
+  // Differences from reseedTrackerFromBackend:
+  //   - Saves frame.camera.transform synchronously to detectionFrameCameraTransform.
+  //   - No spatial-consistency gate (we are DEFINING the initial reference).
+  //   - No seedTracker call (no anchor exists yet — that happens in placeWorldAnchor).
+  //   - On completion, flips initialReseedStatus to drive the placement gate.
+  //
+  // On any failure, status is set to .failed/.skipped, detectionFrameCameraTransform
+  // is cleared, and processARFrame falls back to the photo bbox + live transform —
+  // no worse than the prior behaviour.
+
+  func requestInitialBboxFromAR(frame: ARFrame) {
+    guard let urlStr = detectionUrl, let url = URL(string: urlStr) else {
+      NSLog("🎯 [InitialReseed] ⚠️ No detectionUrl — skipping refresh, using photo bbox")
+      initialReseedStatus = .skipped
+      detectionFrameCameraTransform = nil
+      return
+    }
+
+    // ── Save the camera transform NOW, before doing anything async ──
+    // This is the world-space pose of the AR camera at the moment we
+    // sample the pixel buffer. The bbox we receive from the backend
+    // will live in coordinates of THIS image, taken from THIS pose.
+    let savedTransform = frame.camera.transform
+    detectionFrameCameraTransform = savedTransform
+
+    initialReseedStartTime = ProcessInfo.processInfo.systemUptime
+    NSLog("🎯 [InitialReseed] requesting fresh bbox for '%@' — saved cam pose t=(%.3f,%.3f,%.3f)",
+          objectName,
+          savedTransform.columns.3.x, savedTransform.columns.3.y, savedTransform.columns.3.z)
+
+    // ── Capture JPEG synchronously — do NOT retain `frame` in async closure ──
+    let pixelBuffer = frame.capturedImage
+    let ciImage = CIImage(cvPixelBuffer: pixelBuffer)
+    let context = CIContext()
+    guard let cgImage = context.createCGImage(ciImage, from: ciImage.extent) else {
+      NSLog("🎯 [InitialReseed] CGImage creation failed — falling back to photo bbox")
+      initialReseedStatus = .failed
+      detectionFrameCameraTransform = nil
+      return
+    }
+    // AR camera is landscape; rotate to portrait so bbox arrives in portrait coords
+    // matching what placeWorldAnchor's FOV-crop logic expects.
+    let fullImage = UIImage(cgImage: cgImage, scale: 1.0, orientation: .right)
+    let maxDim: CGFloat = 750
+    let scale = min(maxDim / fullImage.size.width, maxDim / fullImage.size.height, 1.0)
+    let newSize = CGSize(width: fullImage.size.width * scale, height: fullImage.size.height * scale)
+    UIGraphicsBeginImageContextWithOptions(newSize, true, 1.0)
+    fullImage.draw(in: CGRect(origin: .zero, size: newSize))
+    let resized = UIGraphicsGetImageFromCurrentImageContext() ?? fullImage
+    UIGraphicsEndImageContext()
+
+    guard let jpegData = resized.jpegData(compressionQuality: 0.5) else {
+      NSLog("🎯 [InitialReseed] JPEG encode failed — falling back to photo bbox")
+      initialReseedStatus = .failed
+      detectionFrameCameraTransform = nil
+      return
+    }
+
+    let base64Str = "data:image/jpeg;base64," + jpegData.base64EncodedString()
+    let imgW = resized.size.width
+    let imgH = resized.size.height
+
+    var request = URLRequest(url: url)
+    request.httpMethod = "POST"
+    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    request.timeoutInterval = initialReseedTimeoutSec
+
+    let body: [String: Any] = [
+      "image": base64Str,
+      "object": objectName,
+      "score_threshold": 0.1
+    ]
+    guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
+      initialReseedStatus = .failed
+      detectionFrameCameraTransform = nil
+      return
+    }
+    request.httpBody = bodyData
+
+    URLSession.shared.dataTask(with: request) { [weak self] data, response, error in
+      guard let self = self else { return }
+      guard self.running, !self.hasCompleted else { return }
+
+      let httpStatus = (response as? HTTPURLResponse)?.statusCode ?? 0
+
+      // Helper to record failure and clear saved pose.
+      func failAndFallback(_ reason: String) {
+        NSLog("🎯 [InitialReseed] %@ — falling back to photo bbox + live pose", reason)
+        self.visionQ.async {
+          self.initialReseedStatus = .failed
+          self.detectionFrameCameraTransform = nil
+        }
+      }
+
+      if let error = error {
+        failAndFallback("HTTP request failed: \(error.localizedDescription)")
+        return
+      }
+      guard let data = data,
+            let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        failAndFallback("response parse failed (HTTP \(httpStatus))")
+        return
+      }
+
+      // Parse bbox — same logic as reseedTrackerFromBackend
+      var newBbox: [CGFloat]?
+      if let arr = json["bbox"] as? [Any] {
+        let mapped = arr.compactMap { v -> CGFloat? in
+          if let n = v as? NSNumber { return CGFloat(n.doubleValue) }
+          if let i = v as? Int { return CGFloat(i) }
+          if let d = v as? Double { return CGFloat(d) }
+          return nil
+        }
+        if mapped.count == 4 { newBbox = mapped }
+      } else if let s = json["bbox"] as? String {
+        let cleaned = s.trimmingCharacters(in: CharacterSet(charactersIn: "[] "))
+        let parts = cleaned.split(separator: ",").compactMap {
+          Double($0.trimmingCharacters(in: .whitespaces))
+        }
+        if parts.count == 4 { newBbox = parts.map { CGFloat($0) } }
+      }
+
+      guard let bbox = newBbox else {
+        failAndFallback("no bbox in response (object may not be visible in current AR frame)")
+        return
+      }
+
+      // Optional fresh depth
+      var freshDepth: Float? = nil
+      if let dNum = json["depth"] as? NSNumber {
+        let d = dNum.floatValue
+        if d > 0.05 && d < 10.0 { freshDepth = d }
+      } else if let dStr = json["depth"] as? String, let d = Float(dStr) {
+        if d > 0.05 && d < 10.0 { freshDepth = d }
+      }
+
+      // Normalize to [0..1] in the AR-frame's portrait coords
+      let x1 = min(bbox[0], bbox[2])
+      let y1 = min(bbox[1], bbox[3])
+      let x2 = max(bbox[0], bbox[2])
+      let y2 = max(bbox[1], bbox[3])
+      var newNorm: [CGFloat]
+      if imgW > 0 && imgH > 0 {
+        newNorm = [x1/imgW, y1/imgH, x2/imgW, y2/imgH]
+      } else {
+        let maxVal = max(x1, y1, x2, y2)
+        if maxVal <= 1.0 { newNorm = [x1, y1, x2, y2] }
+        else if maxVal <= 1000 { newNorm = [x1/1000, y1/1000, x2/1000, y2/1000] }
+        else {
+          failAndFallback("bbox unparseable")
+          return
+        }
+      }
+      newNorm = newNorm.map { min(max($0, 0), 1) }
+
+      let newW = newNorm[2] - newNorm[0]
+      let newH = newNorm[3] - newNorm[1]
+      if newW < 0.02 || newH < 0.02 {
+        failAndFallback("bbox degenerate (\(String(format: "%.3f×%.3f", newW, newH)))")
+        return
+      }
+
+      let newCx = (newNorm[0] + newNorm[2]) / 2
+      let newCy = (newNorm[1] + newNorm[3]) / 2
+
+      // Apply on visionQ to match other state-mutation thread.
+      // NB: NO spatial gate here — we are DEFINING the spatial reference.
+      // detectionFrameCameraTransform was already set synchronously above
+      // and remains valid; placeWorldAnchor will read it on the next frame.
+      self.visionQ.async {
+        // Update the values used by placeWorldAnchor on the next frame
+        self.imageWidth = imgW
+        self.imageHeight = imgH
+        self.bboxNormalized = newNorm
+        self.initialBboxCenter = (cx: newCx, cy: newCy)
+        self.initialBboxSize = (w: newW, h: newH)
+        if let d = freshDepth {
+          self.backendDepth = d
+          self.anchorDepth = d
+          NSLog("🎯 [InitialReseed] depth refreshed → %.2fm", d)
+        }
+        self.initialReseedStatus = .succeeded
+        let elapsed = ProcessInfo.processInfo.systemUptime - self.initialReseedStartTime
+        NSLog("🎯 [InitialReseed] ✅ fresh bbox in AR coords: center=(%.3f,%.3f) size=%.3f×%.3f imgDims=%.0f×%.0f (elapsed %.1fs) — saved pose retained for placement",
+              newCx, newCy, newW, newH, imgW, imgH, elapsed)
+      }
+    }.resume()
+  }
 }

@@ -29,7 +29,42 @@ extension ReachingViewController {
     arFrameCount += 1
 
     if !anchorPlaced {
-      if arFrameCount >= anchorWaitFrames { placeWorldAnchor(frame: frame); say("Target locked.") }
+      // ── INITIAL BBOX REFRESH GATE ─────────────────────────────────────
+      // The bbox passed in came from a VisionCamera photo seconds ago.
+      // Hand tremor over that delay puts it off the actual object in
+      // the current AR camera view. Refresh it from a live AR frame
+      // before placement. State machine:
+      //   .pending  → wait initialReseedFrameWait frames, then fire request
+      //                (also saves frame.camera.transform for placement)
+      //   .inFlight → wait for response (or timeout)
+      //   .succeeded / .failed / .skipped → proceed with placement
+      switch initialReseedStatus {
+      case .pending:
+        if arFrameCount >= initialReseedFrameWait {
+          initialReseedStatus = .inFlight
+          requestInitialBboxFromAR(frame: frame)
+        }
+        return
+      case .inFlight:
+        let elapsed = ProcessInfo.processInfo.systemUptime - initialReseedStartTime
+        if elapsed > initialReseedTimeoutSec {
+          NSLog("🎯 [InitialReseed] timed out after %.1fs — falling back to photo bbox + live pose", elapsed)
+          initialReseedStatus = .failed
+          detectionFrameCameraTransform = nil
+        }
+        return
+      case .succeeded, .failed, .skipped:
+        break  // fall through to placement gate below
+      }
+
+      if arFrameCount >= anchorWaitFrames {
+        let usingFresh = (initialReseedStatus == .succeeded)
+        let usingSavedPose = (detectionFrameCameraTransform != nil)
+        NSLog("🎯 [Placement] Using %@ bbox + %@ pose",
+              usingFresh ? "FRESH AR-frame" : "stale photo",
+              usingSavedPose ? "SAVED detection-time" : "live")
+        placeWorldAnchor(frame: frame); say("Target locked.")
+      }
       return
     }
 
