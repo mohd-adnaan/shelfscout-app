@@ -1031,7 +1031,7 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Handle Auto-Submit (silence detection)
   // ============================================================================
-  const handleAutoSubmit = useCallback(async (passedTranscript: string) => {
+  const handleAutoSubmit = useCallback(async (passedTranscript?: string) => {
     console.log('🎯 Auto-submit triggered by silence detection');
 
     if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) {
@@ -1039,7 +1039,8 @@ function AppInner(): React.JSX.Element {
       return;
     }
 
-    const finalText = (passedTranscript || finalTranscriptRef.current).trim();
+    const hasPassedTranscript = typeof passedTranscript === 'string';
+    const finalText = (hasPassedTranscript ? passedTranscript : finalTranscriptRef.current).trim();
 
     if (!finalText) {
       AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');

@@ -82,6 +82,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
   const lastSpeechTimeRef = useRef<number>(Date.now());
   const isManualStopRef = useRef(false);
   const openAIVadRequestSeqRef = useRef(0);
+  const hasHeardSpeechRef = useRef(false);
   
   // ✅ FIX: Track if we've already auto-submitted for this utterance
   const hasAutoSubmittedRef = useRef(false);
@@ -285,6 +286,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       transcriptRef.current = finalResult;
       setTranscript(finalResult);
       lastSpeechTimeRef.current = Date.now();
+      hasHeardSpeechRef.current = true;
       
       console.log("'📝 Final:'", `'${finalResult}'`);
       
@@ -310,6 +312,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       transcriptRef.current = partialResult;
       setTranscript(partialResult);
       lastSpeechTimeRef.current = Date.now();
+      hasHeardSpeechRef.current = true;
       
       console.log("'📝 Partial:'", `'${partialResult}'`);
 
@@ -350,6 +353,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     clearSilenceTimer();
     openAIVadRequestSeqRef.current += 1;
     setIsListening(false);
+    hasHeardSpeechRef.current = false;
   }, [clearSilenceTimer]);
 
   // ============================================================================
@@ -383,6 +387,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       // ✅ FIX: Reset auto-submit flag for new listening session
       hasAutoSubmittedRef.current = false;
       isAutoSubmittingRef.current = false;
+      hasHeardSpeechRef.current = false;
 
       // ✅ VOICEOVER FIX: Set grace period for discarding early results
       gracePeriodMsRef.current = gracePeriodMs;
@@ -427,7 +432,6 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
         console.log(`♿ Grace period active: ${gracePeriodMs}ms (discarding VoiceOver noise)`);
       }
 
-      startSilenceTimer();
     } catch (err: any) {
       console.error('❌ Failed to start voice:', err);
       setError(err.message || 'Failed to start voice recognition');
