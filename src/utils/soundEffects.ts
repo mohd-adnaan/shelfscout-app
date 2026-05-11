@@ -156,6 +156,13 @@ export const playThinkingStarted = (): void => {
 
 /**
  * Internal — start the latency loop. Called after "begin" sound finishes.
+ *
+ * Bug 4 hardening: a fast cycle (stopLatencyLoop → next cycle's
+ * playThinkingStarted) could call this while iOS was still processing
+ * the previous s.stop(), leaving the loop physically playing after a
+ * later state transition to Ready. We now call s.stop() defensively
+ * before every s.play() so any in-flight loop is guaranteed dead before
+ * we restart it. iOS treats stop() on an already-stopped sound as a no-op.
  */
 const _startLatencyLoop = (): void => {
   const s = sounds.latency;
@@ -168,14 +175,18 @@ const _startLatencyLoop = (): void => {
   // FIX: Re-assert Playback category + full volume before looping audio
   Sound.setCategory('Playback', false);
   s.setVolume(1.0);
-  s.setCurrentTime(0);
-  s.setNumberOfLoops(-1); // infinite loop
-  s.play((success) => {
-    // This callback fires when play() is manually stopped or fails
-    latencyLooping = false;
-    if (!success) {
-      console.log('[SFX] Latency loop stopped');
-    }
+  // Defensive: ensure no previous play is still queued/active before
+  // we restart the loop. Prevents Bug 4 (latency surviving a recent stop).
+  s.stop(() => {
+    s.setCurrentTime(0);
+    s.setNumberOfLoops(-1); // infinite loop
+    s.play((success) => {
+      // This callback fires when play() is manually stopped or fails
+      latencyLooping = false;
+      if (!success) {
+        console.log('[SFX] Latency loop stopped');
+      }
+    });
   });
   console.log('🔁 [SFX] Latency loop started');
 };

@@ -411,10 +411,6 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     [barPositions, statusColor]
   );
 
-  const getAccessibleLabel = () => {
-    return `${statusText}. ${instructionText}`;
-  };
-
   const renderIcon = () => {
     const size = 65;
     if (state === 'reaching') return <ReachingIcon size={size} color={statusColor} />;
@@ -428,9 +424,17 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   return (
     <View
       style={styles.container}
-      accessible={true}
-      accessibilityLabel={getAccessibleLabel()}
-      accessibilityRole="text"
+      // ── Bug 8: do NOT compete with the parent TouchableWithoutFeedback's
+      // accessibility region. Previously this View was `accessible={true}`
+      // with its own `accessibilityRole="text"` — that, combined with the
+      // visible <Text>"Ready"</Text> below using a wide letterSpacing,
+      // caused VoiceOver to spell the word as letters ("R-e-a-d-y" /
+      // "L-I-S-T-E-N-I-N-G") on some iOS versions. We hide the entire
+      // subtree from accessibility; the parent TouchableWithoutFeedback in
+      // App.tsx owns the spoken label ("Ready. Tap to speak").
+      accessible={false}
+      accessibilityElementsHidden={true}
+      importantForAccessibility="no-hide-descendants"
     >
       
       <View style={styles.visualizer} accessible={false} importantForAccessibility="no-hide-descendants">
@@ -459,15 +463,17 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
         <View style={styles.iconContainer}>{renderIcon()}</View>
       </View>
 
-      <Text style={statusTextStyle}>{statusText}</Text>
+      {/* Visible status text — explicitly hidden from accessibility so
+          VoiceOver does not fall back to reading the on-screen letters. */}
+      <Text style={statusTextStyle} accessible={false} importantForAccessibility="no">{statusText}</Text>
 
       {transcript && state === 'listening' && (
-        <View style={transcriptBoxStyle}>
-          <Text style={styles.transcriptText}>{transcript}</Text>
+        <View style={transcriptBoxStyle} accessible={false} importantForAccessibility="no-hide-descendants">
+          <Text style={styles.transcriptText} accessible={false} importantForAccessibility="no">{transcript}</Text>
         </View>
       )}
 
-      <Text style={instructionTextStyle}>{instructionText}</Text>
+      <Text style={instructionTextStyle} accessible={false} importantForAccessibility="no">{instructionText}</Text>
     </View>
   );
 };

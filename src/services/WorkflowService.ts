@@ -100,8 +100,16 @@ const generateSessionId = (): string => {
 let SESSION_ID = generateSessionId();
 console.log('📱 [Workflow] Session initialized:', SESSION_ID);
 
+// ─── session_start signal (Melody's tracker reinit) ─────────────────────────
+// True at app launch and after every resetSessionId(). Cleared after the
+// first request that successfully advertises it. Backend reads this on
+// the first request of a new session and reinitializes Melody's tracker
+// so it doesn't stay locked on a stale target from the previous session.
+let isNewSession = true;
+
 export const resetSessionId = (): string => {
   SESSION_ID = generateSessionId();
+  isNewSession = true;
   console.log('🔄 [Workflow] Session RESET:', SESSION_ID);
   return SESSION_ID;
 };
@@ -248,6 +256,22 @@ export const sendToWorkflow = async (
     formData.append('session_id', SESSION_ID);
     formData.append('continuousMode', isContinuousIteration ? 'true' : 'false');
 
+    // ── session_start signal — fires once per fresh session ─────────────
+    // Coordinated with Melody's backend tracker container: when this is
+    // true, the backend reinitializes the tracker for this session_id
+    // instead of carrying over state from a previous app run.
+    const sessionStartValue = (isNewSession || request.session_start === true)
+      ? 'true'
+      : 'false';
+    formData.append('session_start', sessionStartValue);
+    if (sessionStartValue === 'true') {
+      console.log('🆕 [Workflow] session_start=true (fresh session, tracker reinit)');
+    }
+    // Clear the module-level flag — only the FIRST request after a new
+    // session advertises session_start; subsequent requests in the same
+    // session_id send session_start=false.
+    isNewSession = false;
+
     // Add image if provided
     if (request.imageUri) {
       let imageUri = request.imageUri;
@@ -329,25 +353,35 @@ export const sendToWorkflow = async (
     });
 
     debugLogger.logAPI(
-      `← Parsed: nav=${parsedResponse.navigation} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox}`,
+      `← Parsed: nav=${parsedResponse.navigation} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox} track=${!!parsedResponse.tracking_active} reached=${!!parsedResponse.reached}`,
       `text="${(parsedResponse.text || '').substring(0, 80)}"`,
     );
 
     // ========================================================================
     // Validate response
+    //
+    // Mansi confirmed (chat): when the backend returns null guidance_text
+    // but still has navigation/reaching flags set, the app must stay
+    // silent rather than emitting a hardcoded "Continue". The continuous
+    // loop's TTS block at App.tsx is already guarded by `if (result.text)`,
+    // so leaving text empty is the correct behaviour — TTS just skips
+    // for that iteration and the next backend poll fires.
+    //
+    // We still keep the reaching_ios fallback intro because the ARKit
+    // pipeline relies on a non-empty intro line to drive its parallel
+    // handoff (introSpeechPromise).
     // ========================================================================
     if (!parsedResponse.text || !parsedResponse.text.trim()) {
       if (!isContinuousIteration && !parsedResponse.reaching_ios) {
         const message = 'Server returned empty response. Please try again.';
         AccessibilityService.announceError(message, false);
         throw new Error(message);
-      } else {
-        parsedResponse.text = parsedResponse.navigation || parsedResponse.reaching_flag
-          ? 'Continue'
-          : parsedResponse.reaching_ios
-            ? `Guiding you to ${parsedResponse.object || 'the object'}`
-            : 'Task complete';
+      } else if (parsedResponse.reaching_ios) {
+        parsedResponse.text = `Guiding you to ${parsedResponse.object || 'the object'}`;
       }
+      // else: continuous-mode iteration with empty guidance → leave text
+      //       empty, downstream TTS guard skips speak. NO "Continue"
+      //       fallback (Mansi-confirmed).
     }
 
     return parsedResponse;
@@ -607,10 +641,13 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   //   • backend additionally returns `hand_direction` (short, e.g. "top left")
   //     ONLY when a hand is detected in the standard reaching pipeline
   //   • when hand_direction is non-null, speak that instead of the long text
-  // We also include `reaching` as a final fallback because the standard
-  // reaching pipeline writes its per-iteration guidance to session.reaching,
-  // and we do NOT want an empty-text error if session.response wasn't
-  // refreshed for that iteration.
+  //
+  // Melody's pipeline update (chat: "scrap the summarizer response for my
+  // pipeline"): the standard reaching container now writes the long
+  // guidance to `session.reaching` directly, NOT `session.response`. We
+  // therefore promote `reaching` above `response` in the fallback chain.
+  // For non-reaching responses (voice command, navigation), `text` is
+  // still set first so this reorder is a no-op for those paths.
   const hand_direction = normalizeBackendString(
     pickString(['hand_direction', 'handDirection']),
   );
@@ -620,7 +657,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     text = hand_direction;
   } else {
     text = normalizeBackendString(
-      pickString(['text', 'response', 'message', 'reaching']),
+      pickString(['text', 'reaching', 'response', 'message']),
     );
   }
 
@@ -647,6 +684,36 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   const reaching_ios = normalizedPayloads.some((payload) =>
     parseBoolean(payload.reaching_ios) === true ||
     parseBoolean(payload.reachingIos) === true
+  );
+
+  // =========================================================================
+  // tracking_active flag — Melody's tracker is locked on the target.
+  //
+  // When this is true, the backend has stopped issuing fresh Qwen detection
+  // calls for this iteration and is reusing the tracker's running bbox.
+  // The app does not currently change its request behaviour based on this
+  // flag (the backend is the gatekeeper for Qwen calls), but we surface
+  // it on the response so it can be logged and used by debug overlays.
+  // =========================================================================
+  const tracking_active = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.tracking_active) === true ||
+    parseBoolean(payload.trackingActive) === true
+  );
+
+  // =========================================================================
+  // reached flag — RTAB navigation completion (Kasra).
+  //
+  // When the navigation pipeline determines the user has arrived at the
+  // navigation target, the backend returns text="You have arrived" with
+  // reached=true. The continuous loop in App.tsx uses this as an explicit
+  // handoff signal to switch from navigation → reaching mode, regardless
+  // of whether the navigation/reaching_flag toggling on the backend is
+  // currently aligned. This makes the auto-handoff resilient to backend
+  // flag-routing regressions.
+  // =========================================================================
+  const reached = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.reached) === true ||
+    parseBoolean(payload.navigation_completed) === true
   );
 
   // =========================================================================
@@ -682,6 +749,8 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
     object,
     depth,
+    tracking_active,
+    reached,
   });
 
   return {
@@ -693,6 +762,8 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     object,
     depth,
     hand_direction: hand_direction || undefined,
+    tracking_active,
+    reached,
     loopDelay,
     session_id,
   };

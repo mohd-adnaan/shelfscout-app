@@ -663,9 +663,12 @@ function AppInner(): React.JSX.Element {
               introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
                 .then(() => {
                   setIsSpeaking(false);
+                  // Bug 4 defense — see continuous-mode .then() above.
+                  stopLatencyLoop().catch(() => {});
                 })
                 .catch((e: any) => {
                   setIsSpeaking(false);
+                  stopLatencyLoop().catch(() => {});
                   if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
                     console.warn('⚠️ [ARKit] Intro TTS error (non-fatal):', e?.message);
                   }
@@ -716,6 +719,53 @@ function AppInner(): React.JSX.Element {
         setIsNavigation(navigationActive);
         setIsReaching(reachingActive);
 
+        // ── RTAB → Reaching auto-handoff (Kasra) ──────────────────────────
+        //
+        // When the navigation pipeline returns reached=true (text "You have
+        // arrived"), force a transition into reaching mode regardless of how
+        // the backend toggled navigation/reaching_flag in the same response.
+        // This makes the handoff resilient to backend flag-routing glitches
+        // that previously left the loop stuck or exited it via bothInactive.
+        //
+        // We:
+        //   1. speak the arrival message (await — short and important),
+        //   2. flip loopMode to 'reaching' so the next iteration polls the
+        //      reaching pipeline,
+        //   3. `continue` to the next iteration.
+        //
+        // Only triggers from navigation mode. If we're already in reaching
+        // (e.g. a stale `reached=true` echoes), fall through to existing
+        // logic so reaching_completed/bothInactive can finish the session.
+        if (result.reached === true && loopMode === 'navigation') {
+          console.log('🎯 [RTAB→Reaching] reached=true in navigation mode — handoff');
+          debugLogger.logAPI('🎯 RTAB→Reaching handoff', `text="${(result.text || '').substring(0, 60)}"`);
+
+          if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
+            setIsSpeaking(true);
+            try {
+              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+            } catch (e: any) {
+              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+                console.warn('⚠️ [RTAB→Reaching] arrival TTS error (non-fatal):', e?.message);
+              }
+            }
+            setIsSpeaking(false);
+          }
+
+          if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
+
+          // Flip the loop mode so the next iteration sends reaching_flag=true
+          // even if the current response did not have it set.
+          startContinuousMode('reaching', result.loopDelay);
+          setIsNavigation(false);
+          setIsReaching(true);
+          AccessibilityInfo.announceForAccessibility('Arrived. Switching to object guidance.');
+
+          // Cooldown before next capture (skip null fast-poll path).
+          await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN));
+          continue; // ★ next iteration runs with loopMode='reaching'
+        }
+
         if (bothInactive) {
           if (result.text) {
             setIsSpeaking(true);
@@ -755,9 +805,20 @@ function AppInner(): React.JSX.Element {
           setIsSpeaking(true);
           // Fire TTS — do NOT await. Loop proceeds to next capture immediately.
           speachesSentenceChunker.synthesizeSpeechChunked(result.text)
-            .then(() => { setIsSpeaking(false); })
+            .then(() => {
+              setIsSpeaking(false);
+              // Bug 4 defense: if no next cycle is running yet (e.g. the
+              // loop aborted between fire-and-forget start and now),
+              // make sure the latency thinking sound isn't left playing.
+              if (!isContinuousModeRunning.current) {
+                stopLatencyLoop().catch(() => {});
+              }
+            })
             .catch((e: any) => {
               setIsSpeaking(false);
+              if (!isContinuousModeRunning.current) {
+                stopLatencyLoop().catch(() => {});
+              }
               if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
                 console.warn('🔄 [ContinuousMode] TTS error (non-fatal):', e?.message);
               }
@@ -926,9 +987,14 @@ function AppInner(): React.JSX.Element {
         introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
           .then(() => {
             setIsSpeaking(false);
+            // Bug 4 defense: kill any latency loop that may have been
+            // re-started by a downstream code path (or that survived an
+            // earlier stop's iOS audio race) when speech naturally ends.
+            stopLatencyLoop().catch(() => {});
           })
           .catch((e: any) => {
             setIsSpeaking(false);
+            stopLatencyLoop().catch(() => {});
             if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
               console.warn('⚠️ Intro TTS error (non-fatal):', e?.message);
             }
@@ -1031,7 +1097,7 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Handle Auto-Submit (silence detection)
   // ============================================================================
-  const handleAutoSubmit = useCallback(async (passedTranscript?: string) => {
+  const handleAutoSubmit = useCallback(async (passedTranscript: string) => {
     console.log('🎯 Auto-submit triggered by silence detection');
 
     if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) {
@@ -1039,8 +1105,7 @@ function AppInner(): React.JSX.Element {
       return;
     }
 
-    const hasPassedTranscript = typeof passedTranscript === 'string';
-    const finalText = (hasPassedTranscript ? passedTranscript : finalTranscriptRef.current).trim();
+    const finalText = (passedTranscript || finalTranscriptRef.current).trim();
 
     if (!finalText) {
       AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
@@ -1168,6 +1233,16 @@ function AppInner(): React.JSX.Element {
       return;
     }
     isStartingRef.current = true;
+
+    // ── Bug 7: immediate "Listening" announcement so the user knows ─────
+    // their tap registered. Without this, VoiceOver users heard nothing
+    // until the STT pipeline was ready (~350ms+ later) — leaving them
+    // unsure whether the tap landed. The announcement fires before any
+    // audio-session juggling so VoiceOver speaks it right away. The
+    // 3500ms grace period in startSTT (below) discards any echo of this
+    // announcement that the mic picks up, and the VoiceOver noise filter
+    // (isVoiceOverNoise / handleAutoSubmit) catches any stragglers.
+    AccessibilityInfo.announceForAccessibility('Listening');
 
     try {
       if (Platform.OS === 'android') {
