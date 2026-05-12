@@ -28,6 +28,7 @@ import { useTTS } from './src/hooks/useTTS';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
 import {
   sendToWorkflow,
+  sendToSmartGuidance,
   isContinuousModeActive,
   getCurrentMode,
   startContinuousMode,
@@ -61,6 +62,7 @@ import SettingsScreen from './src/screens/SettingsScreen';
 import { debugLogger } from './src/services/DebugLogger';
 import { DebugOverlay } from './src/components/DebugOverlay';
 import { wearablesCamera } from './src/services/WearablesCamera';
+import RNFS from 'react-native-fs';
 
 const { width, height } = Dimensions.get('window');
 
@@ -82,6 +84,8 @@ const PREFETCH_CONFIG = {
   PROGRESS_POLL_INTERVAL: 500,
   MIN_CYCLE_COOLDOWN: 300,
 };
+
+const SMART_GUIDANCE_MIN_CYCLE_MS = Math.ceil(2000 / 3);
 
 // =============================================================================
 // AppInner
@@ -128,6 +132,13 @@ function AppInner(): React.JSX.Element {
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
   const prefetchedPhotoRef = useRef<string | null>(null);
   const wearablesPrewarmAttemptedRef = useRef(false);
+  const smartGuidanceActiveRef = useRef(false);
+  const smartGuidanceResumeMainRef = useRef(false);
+  const smartGuidanceCacheRef = useRef<{
+    object?: string;
+    bbox?: any;
+    annotatedImage?: string;
+  } | null>(null);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -402,6 +413,89 @@ function AppInner(): React.JSX.Element {
     }
   };
 
+  const toDataUrl = (value: string): string => {
+    if (!value) return '';
+    return value.startsWith('data:') ? value : `data:image/jpeg;base64,${value}`;
+  };
+
+  const readImageAsDataUrl = async (uri: string): Promise<string | null> => {
+    if (!uri) return null;
+    const path = uri.startsWith('file://') ? uri.replace('file://', '') : uri;
+    try {
+      const base64 = await RNFS.readFile(path, 'base64');
+      return toDataUrl(base64);
+    } catch (e) {
+      console.warn('⚠️ Failed to read image for smart guidance:', e);
+      return null;
+    }
+  };
+
+  const normalizeTextValue = (value?: string | null): string => {
+    if (!value) return '';
+    let s = String(value).trim();
+    if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+      s = s.slice(1, -1).trim();
+    }
+    const lower = s.toLowerCase();
+    if (lower === 'null' || lower === 'undefined' || lower === 'none' || lower === '') {
+      return '';
+    }
+    return s;
+  };
+
+  const bboxToString = (bbox: any): string => {
+    if (!bbox) return '';
+    if (typeof bbox === 'string') {
+      const trimmed = bbox.trim();
+      const lower = trimmed.toLowerCase();
+      if (lower === 'none' || lower === 'null' || lower === 'undefined') return '';
+      return trimmed;
+    }
+    if (Array.isArray(bbox) && bbox.length === 4) {
+      const parsed = bbox.map((v) => Number(v));
+      if (parsed.some(Number.isNaN)) return '';
+      return `[${parsed.join(',')}]`;
+    }
+    if (typeof bbox === 'object') {
+      const x = Number(bbox.x);
+      const y = Number(bbox.y);
+      const w = Number(bbox.width);
+      const h = Number(bbox.height);
+      if (![x, y, w, h].some(Number.isNaN)) {
+        return `[${x},${y},${x + w},${y + h}]`;
+      }
+    }
+    return '';
+  };
+
+  const bboxToArray = (bbox: any): [number, number, number, number] | undefined => {
+    if (!bbox) return undefined;
+    if (Array.isArray(bbox) && bbox.length === 4) {
+      const parsed = bbox.map((v) => Number(v));
+      if (parsed.some(Number.isNaN)) return undefined;
+      return parsed as [number, number, number, number];
+    }
+    if (typeof bbox === 'string') {
+      const lower = bbox.trim().toLowerCase();
+      if (lower === 'none' || lower === 'null' || lower === 'undefined') return undefined;
+      const cleaned = bbox.replace(/[\[\]]/g, '');
+      const parts = cleaned.split(',').map((v) => Number(v.trim()));
+      if (parts.length === 4 && !parts.some(Number.isNaN)) {
+        return parts as [number, number, number, number];
+      }
+    }
+    if (typeof bbox === 'object') {
+      const x = Number(bbox.x);
+      const y = Number(bbox.y);
+      const w = Number(bbox.width);
+      const h = Number(bbox.height);
+      if (![x, y, w, h].some(Number.isNaN)) {
+        return [x, y, x + w, y + h];
+      }
+    }
+    return undefined;
+  };
+
   // ============================================================================
   // iOS Reaching helper — shared by both reaching blocks
   // Accepts the full result + image dims, calls ReachingModule, resets state.
@@ -560,7 +654,17 @@ function AppInner(): React.JSX.Element {
     AccessibilityInfo.announceForAccessibility(`${currentMode} started. Tap to stop.`);
 
     while (!continuousModeAbortRef.current && !isEmergencyStopped.current) {
-      if (shouldPreventInfiniteLoop()) {
+      const intervalMode = getCurrentMode();
+      if (intervalMode !== 'reaching' && smartGuidanceActiveRef.current) {
+        smartGuidanceActiveRef.current = false;
+        smartGuidanceResumeMainRef.current = false;
+        smartGuidanceCacheRef.current = null;
+      }
+
+      const minIntervalOverride = smartGuidanceActiveRef.current
+        ? SMART_GUIDANCE_MIN_CYCLE_MS
+        : undefined;
+      if (shouldPreventInfiniteLoop(minIntervalOverride)) {
         AccessibilityInfo.announceForAccessibility('Stopped due to time limit.');
         break;
       }
@@ -594,17 +698,95 @@ function AppInner(): React.JSX.Element {
         }
 
         const loopMode = getCurrentMode();
-        const result = await sendToWorkflow(
-          {
-            text: '',
-            imageUri: photoPath || '',
-            imageWidth: lastImageDimensions.current.width,
-            imageHeight: lastImageDimensions.current.height,
-            navigation: loopMode === 'navigation',
-            reaching_flag: loopMode === 'reaching',
-          },
-          abortCtrl.signal
-        );
+        const shouldUseSmartGuidance = loopMode === 'reaching' && smartGuidanceActiveRef.current;
+        let usedSmartGuidance = false;
+        let result: any;
+
+        if (shouldUseSmartGuidance) {
+          const cached = smartGuidanceCacheRef.current;
+          const imageDataUrl = await readImageAsDataUrl(photoPath || '');
+          const bboxString = bboxToString(cached?.bbox);
+          const objectName = cached?.object || 'object';
+          const annotatedImage = cached?.annotatedImage
+            ? toDataUrl(cached.annotatedImage)
+            : (imageDataUrl || '');
+
+          if (!imageDataUrl || !bboxString) {
+            console.warn('⚠️ [SmartGuidance] Missing payload, resuming main workflow');
+            smartGuidanceActiveRef.current = false;
+            smartGuidanceResumeMainRef.current = true;
+          } else {
+            usedSmartGuidance = true;
+            const smartResponse = await sendToSmartGuidance(
+              {
+                object: objectName,
+                bbox: bboxString,
+                image: imageDataUrl,
+                annotated_image: annotatedImage,
+                success: true,
+                session_id: getSessionId(),
+              },
+              abortCtrl.signal
+            );
+
+            const handDirection = normalizeTextValue(smartResponse?.hand_direction);
+            const guidance = normalizeTextValue(smartResponse?.guidance);
+            const trackingActive = smartResponse?.tracking_active === true;
+            const reachingCompleted = smartResponse?.reaching_completed === true;
+            const responseBbox = bboxToArray(smartResponse?.bbox) || bboxToArray(cached?.bbox);
+
+            result = {
+              text: handDirection || guidance,
+              navigation: false,
+              reaching_flag: false,
+              reaching_ios: false,
+              tracking_active: trackingActive,
+              reaching_completed: reachingCompleted,
+              bbox: responseBbox,
+              object: smartResponse?.class_name || objectName,
+              hand_direction: handDirection || undefined,
+              loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
+            };
+
+            smartGuidanceCacheRef.current = {
+              object: smartResponse?.class_name || objectName,
+              bbox: smartResponse?.bbox || cached?.bbox,
+              annotatedImage: cached?.annotatedImage || annotatedImage,
+            };
+
+            if (smartResponse?.tracking_active === false) {
+              smartGuidanceActiveRef.current = false;
+              smartGuidanceResumeMainRef.current = true;
+            }
+          }
+        }
+
+        if (!usedSmartGuidance) {
+          result = await sendToWorkflow(
+            {
+              text: '',
+              imageUri: photoPath || '',
+              imageWidth: lastImageDimensions.current.width,
+              imageHeight: lastImageDimensions.current.height,
+              navigation: loopMode === 'navigation',
+              reaching_flag: loopMode === 'reaching',
+            },
+            abortCtrl.signal
+          );
+
+          if (smartGuidanceResumeMainRef.current) {
+            smartGuidanceResumeMainRef.current = false;
+          }
+
+          if (loopMode === 'reaching' && result?.tracking_active === true && result?.bbox && result?.object) {
+            smartGuidanceActiveRef.current = true;
+            smartGuidanceCacheRef.current = {
+              object: result?.object || smartGuidanceCacheRef.current?.object,
+              bbox: result?.bbox || smartGuidanceCacheRef.current?.bbox,
+              annotatedImage: result?.annotated_image || smartGuidanceCacheRef.current?.annotatedImage,
+            };
+          }
+        }
 
         await stopLatencyLoop(); // ← stop thinking SFX when result arrives
         setIsProcessing(false);
@@ -612,16 +794,17 @@ function AppInner(): React.JSX.Element {
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
 
-        console.log('🔄 Backend result:', {
+        console.log('🔄 Loop result:', {
           text: result.text?.substring(0, 50),
           navigation: result.navigation,
           reaching_flag: result.reaching_flag,
           reaching_ios: result.reaching_ios,
           bbox: result.bbox,
           loopDelay: result.loopDelay,
+          smart_guidance: usedSmartGuidance,
         });
 
-        if (result.loopDelay) updateLoopDelay(result.loopDelay);
+        if (!usedSmartGuidance && result.loopDelay) updateLoopDelay(result.loopDelay);
 
         // ── "Null" response detection ──────────────────────────────────────
         // The n8n synthesizer returns the literal string "Null" when Redis
@@ -640,7 +823,7 @@ function AppInner(): React.JSX.Element {
         const cycleElapsed = Date.now() - cycleStart;
         debugLogger.logAPI(
           `🔄 Cycle #${cycleCount} | ${isNullResponse ? '⏭️ NULL' : '🔊 SPEAK'} | ${cycleElapsed}ms`,
-          `mode=${loopMode} nav=${result.navigation} reach=${result.reaching_flag} ios=${result.reaching_ios} text="${(rawText || '').substring(0, 80)}"`,
+          `mode=${loopMode} nav=${result.navigation} reach=${result.reaching_flag} ios=${result.reaching_ios} smart=${usedSmartGuidance} text="${(rawText || '').substring(0, 80)}"`,
         );
 
         if (isNullResponse) {
@@ -711,9 +894,24 @@ function AppInner(): React.JSX.Element {
           }
         }
 
+        if (smartGuidanceActiveRef.current && result.reaching_completed === true) {
+          if (result.text) {
+            setIsSpeaking(true);
+            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+            setIsSpeaking(false);
+          }
+          console.log('✅ [SmartGuidance] reaching_completed=true — resetting session');
+          smartGuidanceActiveRef.current = false;
+          smartGuidanceResumeMainRef.current = false;
+          resetSessionId();
+          stopContinuousMode('smart guidance complete', true);
+          break;
+        }
+
         // ── Flag check ─────────────────────────────────────────────────────
         const navigationActive = result.navigation === true;
-        const reachingActive = result.reaching_flag === true;
+        const smartGuidanceActive = smartGuidanceActiveRef.current;
+        const reachingActive = result.reaching_flag === true || smartGuidanceActive || smartGuidanceResumeMainRef.current;
         const bothInactive = !navigationActive && !reachingActive;
 
         setIsNavigation(navigationActive);
@@ -825,15 +1023,25 @@ function AppInner(): React.JSX.Element {
             });
         } else if (isNullResponse) {
           // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
-          console.log(`🔄 ⏭️ Null fast-poll — waiting 500ms before next cycle`);
-          await new Promise(resolve => setTimeout(resolve, 500));
+          const nullCooldown = smartGuidanceActiveRef.current
+            ? SMART_GUIDANCE_MIN_CYCLE_MS
+            : 500;
+          console.log(`🔄 ⏭️ Null fast-poll — waiting ${nullCooldown}ms before next cycle`);
+          await new Promise(resolve => setTimeout(resolve, nullCooldown));
         }
 
         // Brief cooldown before next capture — gives JS thread a breath and
         // prevents hammering the backend faster than it can handle.
         // TTS is already playing in background; this does NOT wait for it.
         if (!isNullResponse && !continuousModeAbortRef.current) {
-          await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN));
+          const minCycleMs = smartGuidanceActiveRef.current
+            ? SMART_GUIDANCE_MIN_CYCLE_MS
+            : PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN;
+          const elapsed = Date.now() - cycleStart;
+          const cooldown = Math.max(0, minCycleMs - elapsed);
+          if (cooldown > 0) {
+            await new Promise(r => setTimeout(r, cooldown));
+          }
         }
 
         const cycleMs = Date.now() - cycleStart;
@@ -855,6 +1063,9 @@ function AppInner(): React.JSX.Element {
     await stopLatencyLoop();
     isContinuousModeRunning.current = false;
     stopContinuousMode('loop ended', false);
+    smartGuidanceActiveRef.current = false;
+    smartGuidanceResumeMainRef.current = false;
+    smartGuidanceCacheRef.current = null;
     setIsNavigation(false);
     setIsReaching(false);
     setIsProcessing(false);

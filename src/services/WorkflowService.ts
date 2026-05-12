@@ -7,7 +7,7 @@
 
 import axios, { AxiosError } from 'axios';
 import { Platform, Alert, NativeModules } from 'react-native';
-import { WORKFLOW_URL, CONFIG, NAVIGATION_CONFIG } from '../utils/constants';
+import { WORKFLOW_URL, SMART_GUIDANCE_URL, CONFIG, NAVIGATION_CONFIG } from '../utils/constants';
 import { WorkflowRequest, WorkflowResponse, ContinuousModeState } from '../utils/types';
 import { AccessibilityService } from './AccessibilityService';
 import { debugLogger } from './DebugLogger';
@@ -197,7 +197,7 @@ export const stopContinuousMode = (reason?: string, resetSession: boolean = fals
   }
 };
 
-export const shouldPreventInfiniteLoop = (): boolean => {
+export const shouldPreventInfiniteLoop = (minIntervalMs?: number): boolean => {
   const { iterationCount, lastRequestTime } = continuousModeState;
 
   if (iterationCount >= NAVIGATION_CONFIG.MAX_LOOP_ITERATIONS) {
@@ -206,7 +206,8 @@ export const shouldPreventInfiniteLoop = (): boolean => {
   }
 
   const timeSinceLastRequest = Date.now() - lastRequestTime;
-  if (lastRequestTime > 0 && timeSinceLastRequest < NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS) {
+  const minInterval = minIntervalMs ?? NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS;
+  if (lastRequestTime > 0 && timeSinceLastRequest < minInterval) {
     console.warn('⚠️ Request rate too high');
     return true;
   }
@@ -424,6 +425,76 @@ export const sendToWorkflow = async (
 };
 
 // =============================================================================
+// SMART GUIDANCE (tracker-driven reaching)
+// =============================================================================
+
+export interface SmartGuidanceRequest {
+  object: string;
+  bbox: string;
+  image: string;
+  annotated_image: string;
+  success: boolean;
+  session_id?: string;
+}
+
+export interface SmartGuidanceResponse {
+  guidance?: string;
+  hand_direction?: string | null;
+  tracking_active?: boolean;
+  reaching_completed?: boolean;
+  bbox?: { x: number; y: number; width: number; height: number } | string | [number, number, number, number];
+  class_name?: string;
+  confidence?: number;
+  depth_estimate?: number;
+}
+
+export const sendToSmartGuidance = async (
+  payload: SmartGuidanceRequest,
+  signal?: AbortSignal
+): Promise<SmartGuidanceResponse> => {
+  const requestStartTime = Date.now();
+
+  debugLogger.logAPI(
+    `→ POST ${SMART_GUIDANCE_URL.replace('https://cybersight.cim.mcgill.ca', '')}`,
+    `object=${payload.object} bbox=${payload.bbox}`,
+  );
+
+  const response = await axios.post<any>(
+    SMART_GUIDANCE_URL,
+    {
+      session: {
+        object: payload.object,
+        bbox: payload.bbox,
+        image: payload.image,
+        annotated_image: payload.annotated_image,
+        success: payload.success,
+        ...(payload.session_id ? { session_id: payload.session_id } : {}),
+      },
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      timeout: CONFIG.REQUEST_TIMEOUT,
+      signal,
+    }
+  );
+
+  const elapsed = Date.now() - requestStartTime;
+  debugLogger.logAPI(
+    `← ${response.status} OK (${elapsed}ms)`,
+  );
+
+  const data = response.data;
+  const payloadData = Array.isArray(data) ? data[0] : data;
+  if (payloadData && typeof payloadData === 'object' && payloadData.json) {
+    return payloadData.json as SmartGuidanceResponse;
+  }
+  return payloadData as SmartGuidanceResponse;
+};
+
+// =============================================================================
 // RESPONSE PARSER (with reaching_ios support)
 // =============================================================================
 
@@ -636,33 +707,8 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     return s;
   };
 
-  // Extract text per Mansi's contract:
-  //   • backend always returns the long guidance in `text` (= session.response)
-  //   • backend additionally returns `hand_direction` (short, e.g. "top left")
-  //     ONLY when a hand is detected in the standard reaching pipeline
-  //   • when hand_direction is non-null, speak that instead of the long text
-  //
-  // Melody's pipeline update (chat: "scrap the summarizer response for my
-  // pipeline"): the standard reaching container now writes the long
-  // guidance to `session.reaching` directly, NOT `session.response`. We
-  // therefore promote `reaching` above `response` in the fallback chain.
-  // For non-reaching responses (voice command, navigation), `text` is
-  // still set first so this reorder is a no-op for those paths.
-  const hand_direction = normalizeBackendString(
-    pickString(['hand_direction', 'handDirection']),
-  );
-
-  let text = '';
-  if (hand_direction) {
-    text = hand_direction;
-  } else {
-    text = normalizeBackendString(
-      pickString(['text', 'reaching', 'response', 'message']),
-    );
-  }
-
   // =========================================================================
-  // THREE-FLAG EXTRACTION
+  // FLAG EXTRACTION
   // =========================================================================
 
   // Navigation flag
@@ -678,43 +724,45 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     parseBoolean(payload.reaching) === true
   );
 
-  // =========================================================================
   // reaching_ios flag (iOS native ARKit) - HIGHEST PRIORITY
-  // =========================================================================
   const reaching_ios = normalizedPayloads.some((payload) =>
     parseBoolean(payload.reaching_ios) === true ||
     parseBoolean(payload.reachingIos) === true
   );
 
-  // =========================================================================
   // tracking_active flag — Melody's tracker is locked on the target.
-  //
-  // When this is true, the backend has stopped issuing fresh Qwen detection
-  // calls for this iteration and is reusing the tracker's running bbox.
-  // The app does not currently change its request behaviour based on this
-  // flag (the backend is the gatekeeper for Qwen calls), but we surface
-  // it on the response so it can be logged and used by debug overlays.
-  // =========================================================================
   const tracking_active = normalizedPayloads.some((payload) =>
     parseBoolean(payload.tracking_active) === true ||
     parseBoolean(payload.trackingActive) === true
   );
 
-  // =========================================================================
   // reached flag — RTAB navigation completion (Kasra).
-  //
-  // When the navigation pipeline determines the user has arrived at the
-  // navigation target, the backend returns text="You have arrived" with
-  // reached=true. The continuous loop in App.tsx uses this as an explicit
-  // handoff signal to switch from navigation → reaching mode, regardless
-  // of whether the navigation/reaching_flag toggling on the backend is
-  // currently aligned. This makes the auto-handoff resilient to backend
-  // flag-routing regressions.
-  // =========================================================================
   const reached = normalizedPayloads.some((payload) =>
     parseBoolean(payload.reached) === true ||
     parseBoolean(payload.navigation_completed) === true
   );
+
+  // Extract guidance text with hand-direction precedence.
+  const hand_direction = normalizeBackendString(
+    pickString(['hand_direction', 'handDirection']),
+  );
+
+  const reachingText = normalizeBackendString(
+    pickString(['reaching', 'guidance']),
+  );
+
+  const nonReachingText = normalizeBackendString(
+    pickString(['text', 'message', 'response']),
+  );
+
+  let text = '';
+  if (hand_direction) {
+    text = hand_direction;
+  } else if (reaching_flag || tracking_active) {
+    text = reachingText || normalizeBackendString(pickString(['text', 'message']));
+  } else {
+    text = nonReachingText || reachingText;
+  }
 
   // =========================================================================
   // BBOX extraction (when reaching_ios is true)
@@ -725,6 +773,11 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   // Object name extraction
   // =========================================================================
   const object = pickString(['object', 'objectName']) || undefined;
+
+  const annotatedImageRaw = normalizeBackendString(
+    pickString(['annotated_image', 'annotatedImage', 'annotated_image_base64', 'annotatedImageBase64']),
+  );
+  const annotated_image = annotatedImageRaw || undefined;
 
   // Depth from backend (meters)
   const depthValue = pickNumber(['depth']);
@@ -762,6 +815,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     object,
     depth,
     hand_direction: hand_direction || undefined,
+    annotated_image,
     tracking_active,
     reached,
     loopDelay,
@@ -849,4 +903,5 @@ export default {
   shouldPreventInfiniteLoop,
   determineActionMode,
   triggerIOSReaching,
+  sendToSmartGuidance,
 };
