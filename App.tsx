@@ -41,6 +41,7 @@ import {
   resetSessionId,
   determineActionMode,
 } from './src/services/WorkflowService';
+import { sendToKasraGuidance } from './src/services/KasraGuidanceService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import {
   initSounds,
@@ -86,6 +87,7 @@ const PREFETCH_CONFIG = {
 };
 
 const SMART_GUIDANCE_MIN_CYCLE_MS = Math.ceil(2000 / 3);
+const KASRA_FEED_INTERVAL_MS = 500;
 
 // =============================================================================
 // AppInner
@@ -139,6 +141,10 @@ function AppInner(): React.JSX.Element {
     bbox?: any;
     annotatedImage?: string;
   } | null>(null);
+  const kasraFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const kasraLastFrameRef = useRef<string>('');
+  const kasraLastObjectRef = useRef<string>('');
+  const kasraIsSendingRef = useRef(false);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -496,6 +502,35 @@ function AppInner(): React.JSX.Element {
     return undefined;
   };
 
+  const stopKasraFeed = useCallback(() => {
+    if (kasraFeedIntervalRef.current) {
+      clearInterval(kasraFeedIntervalRef.current);
+      kasraFeedIntervalRef.current = null;
+    }
+    kasraIsSendingRef.current = false;
+  }, []);
+
+  const startKasraFeed = useCallback(() => {
+    if (kasraFeedIntervalRef.current) return;
+
+    kasraFeedIntervalRef.current = setInterval(() => {
+      if (!isContinuousModeRunning.current || getCurrentMode() !== 'navigation') return;
+
+      const imageUri = kasraLastFrameRef.current;
+      const objectName = kasraLastObjectRef.current;
+      if (!imageUri || !objectName || kasraIsSendingRef.current) return;
+
+      kasraIsSendingRef.current = true;
+      sendToKasraGuidance({ imageUri, objectName })
+        .catch((err: any) => {
+          console.warn('[Kasra] Guidance send failed:', err?.message || err);
+        })
+        .finally(() => {
+          kasraIsSendingRef.current = false;
+        });
+    }, KASRA_FEED_INTERVAL_MS);
+  }, []);
+
   // ============================================================================
   // iOS Reaching helper — shared by both reaching blocks
   // Accepts the full result + image dims, calls ReachingModule, resets state.
@@ -675,6 +710,7 @@ function AppInner(): React.JSX.Element {
 
       try {
         incrementContinuousMode();
+        const loopMode = getCurrentMode();
 
         // ── Capture ────────────────────────────────────────────────────────
         let photoPath = '';
@@ -684,6 +720,15 @@ function AppInner(): React.JSX.Element {
           console.log('🔄 ✅ Using PRE-FETCHED photo');
         } else {
           photoPath = await reactivateCameraAndCapture();
+        }
+
+        if (loopMode === 'navigation') {
+          if (photoPath) {
+            kasraLastFrameRef.current = photoPath;
+          }
+          startKasraFeed();
+        } else {
+          stopKasraFeed();
         }
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
@@ -697,7 +742,6 @@ function AppInner(): React.JSX.Element {
           playThinkingStarted(); // ← start thinking SFX for this cycle
         }
 
-        const loopMode = getCurrentMode();
         const shouldUseSmartGuidance = loopMode === 'reaching' && smartGuidanceActiveRef.current;
         let usedSmartGuidance = false;
         let result: any;
@@ -793,6 +837,10 @@ function AppInner(): React.JSX.Element {
 
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
+
+        if (loopMode === 'navigation' && result?.object) {
+          kasraLastObjectRef.current = result.object;
+        }
 
         console.log('🔄 Loop result:', {
           text: result.text?.substring(0, 50),
@@ -1061,6 +1109,7 @@ function AppInner(): React.JSX.Element {
     // ── Cleanup ────────────────────────────────────────────────────────────
     console.log('🔄 [ContinuousMode] Loop ended');
     await stopLatencyLoop();
+    stopKasraFeed();
     isContinuousModeRunning.current = false;
     stopContinuousMode('loop ended', false);
     smartGuidanceActiveRef.current = false;
@@ -1073,7 +1122,7 @@ function AppInner(): React.JSX.Element {
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
     AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
-  }, [handleiOSReaching, resolveReachingPipeline]);
+  }, [handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed]);
 
   // ============================================================================
   // Stop helpers
@@ -1081,6 +1130,7 @@ function AppInner(): React.JSX.Element {
   const stopContinuousModeLoop = useCallback(async () => {
     console.log('🛑 Stopping continuous mode');
     continuousModeAbortRef.current = true;
+    stopKasraFeed();
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -1099,10 +1149,11 @@ function AppInner(): React.JSX.Element {
 
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
     AccessibilityInfo.announceForAccessibility('Stopped. Tap to speak.');
-  }, []);
+  }, [stopKasraFeed]);
 
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
+    stopKasraFeed();
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
     await stopLatencyLoop(); // FIX: was missing — latency SFX survived nav interrupt
     await speachesSentenceChunker.stop();
@@ -1114,7 +1165,7 @@ function AppInner(): React.JSX.Element {
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
     AccessibilityInfo.announceForAccessibility('Navigation stopped. Tap to speak.');
-  }, []);
+  }, [stopKasraFeed]);
 
   // ============================================================================
   // Handle Voice Command  ← defined BEFORE handleAutoSubmit so ref is stable
@@ -1174,6 +1225,10 @@ function AppInner(): React.JSX.Element {
       );
 
       if (isEmergencyStopped.current) return;
+
+      if (result?.object) {
+        kasraLastObjectRef.current = result.object;
+      }
 
       await stopLatencyLoop();
       //await playSuccessChime();          // ← plays jbl_success_sae.caf
