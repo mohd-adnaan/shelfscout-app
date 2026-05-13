@@ -74,6 +74,8 @@ const CAMERA_REACTIVATION_DELAY_MS = 800;
 const AUDIO_SESSION_RELEASE_DELAY_MS = 300;
 const TTS_COMPLETION_BUFFER_MS = 500;
 const STARTUP_LOADER_MIN_MS = 1800;
+const VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS = 800;
+const VOICEOVER_LISTENING_GRACE_MS = 600;
 
 // =============================================================================
 // PIPELINE PRE-FETCH CONFIGURATION
@@ -369,9 +371,24 @@ function AppInner(): React.JSX.Element {
     AccessibilityInfo.announceForAccessibility(spoken);
     await speachesSentenceChunker.synthesizeSpeechChunked(spoken);
   };
-  const reactivateCameraAndCapture = async (): Promise<string> => {
+
+  const announceTapToStart = useCallback((prefix: string) => {
+    const suffix = screenReaderEnabledRef.current ? 'Tap to start.' : 'Tap to speak.';
+    const trimmedPrefix = prefix.trim();
+    AccessibilityInfo.announceForAccessibility(
+      trimmedPrefix ? `${trimmedPrefix} ${suffix}` : suffix
+    );
+  }, []);
+  const reactivateCameraAndCapture = async (options?: {
+    enableShutterSound?: boolean;
+  }): Promise<string> => {
     console.log('📷 Reactivating camera for capture...');
     setIsCameraActive(true);
+
+    const useSystemShutterSound =
+      options?.enableShutterSound === true &&
+      Platform.OS === 'ios' &&
+      !settingsRef.current.useWearablesCamera;
 
     if (settingsRef.current.useWearablesCamera) {
       try {
@@ -392,8 +409,21 @@ function AppInner(): React.JSX.Element {
     }
 
     try {
+      if (useSystemShutterSound) {
+        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+        const { ReachingModule } = NativeModules;
+        if (ReachingModule?.playSystemShutter) {
+          try {
+            await ReachingModule.playSystemShutter();
+          } catch (e: any) {
+            console.warn('⚠️ System shutter sound failed:', e?.message || e);
+          }
+        } else {
+          console.warn('⚠️ System shutter unavailable — rebuild iOS app');
+        }
+      }
       const photo = await cameraRef.current.takePhoto({
-        enableShutterSound: false,
+        enableShutterSound: useSystemShutterSound,
         flash: 'off',
       });
       const fixedImage = await fixImageOrientation(photo.path);
@@ -408,8 +438,21 @@ function AppInner(): React.JSX.Element {
       console.error('❌ Photo capture failed, retrying:', error);
       await new Promise(resolve => setTimeout(resolve, 500));
       try {
+        if (useSystemShutterSound) {
+          await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+          const { ReachingModule } = NativeModules;
+          if (ReachingModule?.playSystemShutter) {
+            try {
+              await ReachingModule.playSystemShutter();
+            } catch (e: any) {
+              console.warn('⚠️ System shutter sound failed (retry):', e?.message || e);
+            }
+          } else {
+            console.warn('⚠️ System shutter unavailable (retry) — rebuild iOS app');
+          }
+        }
         const retry = await cameraRef.current.takePhoto({
-          enableShutterSound: false,
+          enableShutterSound: useSystemShutterSound,
         });
         return retry.path;
       } catch (e) {
@@ -583,7 +626,7 @@ function AppInner(): React.JSX.Element {
       // Clean transition to ready (matches the ARKit-success path below)
       setIsCameraActive(true);
       if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-      AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+      announceTapToStart('Ready.');
       return true; // Handled (but without ARKit)
     }
 
@@ -659,9 +702,9 @@ function AppInner(): React.JSX.Element {
     setIsReaching(false);
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-    AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+    announceTapToStart('Ready.');
     return true;
-  }, [resolveReachingPipeline]);
+  }, [announceTapToStart, resolveReachingPipeline]);
 
   // ============================================================================
   // CONTINUOUS LOOP
@@ -719,7 +762,9 @@ function AppInner(): React.JSX.Element {
           prefetchedPhotoRef.current = null;
           console.log('🔄 ✅ Using PRE-FETCHED photo');
         } else {
-          photoPath = await reactivateCameraAndCapture();
+          photoPath = await reactivateCameraAndCapture({
+            enableShutterSound: false,
+          });
         }
 
         if (loopMode === 'navigation') {
@@ -1121,8 +1166,8 @@ function AppInner(): React.JSX.Element {
     setIsSpeaking(false);
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-    AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
-  }, [handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed]);
+    announceTapToStart('Ready.');
+  }, [announceTapToStart, handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed]);
 
   // ============================================================================
   // Stop helpers
@@ -1148,8 +1193,8 @@ function AppInner(): React.JSX.Element {
     setIsCameraActive(true);
 
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
-    AccessibilityInfo.announceForAccessibility('Stopped. Tap to speak.');
-  }, [stopKasraFeed]);
+    announceTapToStart('Stopped.');
+  }, [announceTapToStart, stopKasraFeed]);
 
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
@@ -1164,8 +1209,8 @@ function AppInner(): React.JSX.Element {
     isNavigationLoopRunning.current = false;
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
-    AccessibilityInfo.announceForAccessibility('Navigation stopped. Tap to speak.');
-  }, [stopKasraFeed]);
+    announceTapToStart('Navigation stopped.');
+  }, [announceTapToStart, stopKasraFeed]);
 
   // ============================================================================
   // Handle Voice Command  ← defined BEFORE handleAutoSubmit so ref is stable
@@ -1312,7 +1357,7 @@ function AppInner(): React.JSX.Element {
       // ── Normal (no continuous mode) ────────────────────────────────────
       setIsCameraActive(true);
       if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-      AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+      announceTapToStart('Ready.');
 
     } catch (error: any) {
       // ── Cancelled / aborted requests are silent ──────
@@ -1345,7 +1390,7 @@ function AppInner(): React.JSX.Element {
 
         setIsCameraActive(true);
         if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-        AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+        announceTapToStart('Ready.');
       }
     } finally {
       setIsProcessing(false);
@@ -1359,6 +1404,10 @@ function AppInner(): React.JSX.Element {
   useEffect(() => {
     handleVoiceCommandRef.current = handleVoiceCommand;
   }, [handleVoiceCommand]);
+  const stripVoiceOverListeningPrefix = useCallback((text: string): string => {
+    if (!screenReaderEnabledRef.current) return text;
+    return text.replace(/^\s*listening[\s,.:;!\-]+/i, '').trim();
+  }, []);
 
   // ============================================================================
   // Handle Auto-Submit (silence detection)
@@ -1371,7 +1420,8 @@ function AppInner(): React.JSX.Element {
       return;
     }
 
-    const finalText = (passedTranscript || finalTranscriptRef.current).trim();
+    let finalText = (passedTranscript || finalTranscriptRef.current).trim();
+    finalText = stripVoiceOverListeningPrefix(finalText);
 
     if (!finalText) {
       AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
@@ -1384,6 +1434,14 @@ function AppInner(): React.JSX.Element {
     // Reject transcripts that are clearly VoiceOver UI text, not user speech.
     // Uses ref (not state) because handleAutoSubmit has stable [] deps.
     if (screenReaderEnabledRef.current) {
+      const lower = finalText.toLowerCase().trim();
+      if (
+        lower.length <= 12 &&
+        ['speak', 'tap', 'ready', 'start', 'listen', 'listening', 'button'].includes(lower)
+      ) {
+        console.log('♿ VoiceOver noise rejected (short):', finalText);
+        return;
+      }
       const voPatterns = [
         'speak naturally', 'tap to stop', 'tap to speak', 'tap to interrupt',
         'cybersight is ready', 'cybersight is listening', 'cybersight is speaking',
@@ -1393,7 +1451,6 @@ function AppInner(): React.JSX.Element {
         'button tap', 'ready tap', 'ready to speak',
         'please speak your command', 'please speak your',
       ];
-      const lower = finalText.toLowerCase();
       if (voPatterns.some(p => lower.includes(p))) {
         console.log('♿ VoiceOver noise rejected:', finalText);
         // CRITICAL: Do NOT announce anything here. Any announceForAccessibility
@@ -1422,7 +1479,9 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture();
+        photoPath = await reactivateCameraAndCapture({
+          enableShutterSound: true,
+        });
       } catch (e: any) {
         console.error('❌ Camera error:', e);
 
@@ -1437,7 +1496,7 @@ function AppInner(): React.JSX.Element {
           // Reset to ready state so the next tap starts fresh.
           setIsCameraActive(true);
           if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-          AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+          announceTapToStart('Ready.');
           return;
         }
         // iPhone path: keep existing voice-only fallback.
@@ -1500,15 +1559,12 @@ function AppInner(): React.JSX.Element {
     }
     isStartingRef.current = true;
 
-    // ── Bug 7: immediate "Listening" announcement so the user knows ─────
-    // their tap registered. Without this, VoiceOver users heard nothing
-    // until the STT pipeline was ready (~350ms+ later) — leaving them
-    // unsure whether the tap landed. The announcement fires before any
-    // audio-session juggling so VoiceOver speaks it right away. The
-    // 3500ms grace period in startSTT (below) discards any echo of this
-    // announcement that the mic picks up, and the VoiceOver noise filter
-    // (isVoiceOverNoise / handleAutoSubmit) catches any stragglers.
-    AccessibilityInfo.announceForAccessibility('Listening');
+    const voiceOverEnabled = screenReaderEnabledRef.current;
+    if (voiceOverEnabled) {
+      AccessibilityInfo.announceForAccessibility('Listening');
+      // Let VoiceOver finish before the mic opens to avoid "Listening" bleed-through.
+      await new Promise(resolve => setTimeout(resolve, VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS));
+    }
 
     try {
       if (Platform.OS === 'android') {
@@ -1550,15 +1606,15 @@ function AppInner(): React.JSX.Element {
       }
 
       // Delay to let audio session reconfigure after category switch
-      await new Promise(resolve => setTimeout(resolve, 350));
+      if (!screenReaderEnabled) {
+        await new Promise(resolve => setTimeout(resolve, 350));
+      }
 
-      // ── Start STT immediately with grace period for VoiceOver ─────────
-      // Instead of a long delay (which causes race conditions, stale labels,
-      // and "Speech recognition already started!" errors), we start STT
-      // right away but tell it to DISCARD any results arriving in the first
-      // 2 seconds. VoiceOver reads the button label (~1.5s of speech) and
-      // the mic picks it up — the grace period filters that noise out.
-      const gracePeriodMs = screenReaderEnabled ? 3500 : 0;
+      // ── Start STT with a short VoiceOver grace window ─────────────────
+      // VoiceOver speaks "Listening"; the mic can catch the tail end.
+      // We discard a brief window of early results to avoid the prefix
+      // while keeping the app responsive for the user.
+      const gracePeriodMs = voiceOverEnabled ? VOICEOVER_LISTENING_GRACE_MS : 0;
 
       await startSTT(gracePeriodMs);
       console.log('✅ Voice recognition started');
@@ -1580,7 +1636,8 @@ function AppInner(): React.JSX.Element {
       if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) return;
 
       const finalTranscript = await stopSTT();
-      const finalText = finalTranscript.trim();
+      let finalText = finalTranscript.trim();
+      finalText = stripVoiceOverListeningPrefix(finalText);
       if (!finalText) { /* ... */ return; }
 
       // ── VoiceOver safety net ────────────────────────────────────────────
@@ -1599,7 +1656,9 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture();
+        photoPath = await reactivateCameraAndCapture({
+          enableShutterSound: true,
+        });
       } catch (e: any) {
         console.error('❌ Camera error (manual stop):', e);
         isCapturingPhotoRef.current = false;
@@ -1610,7 +1669,7 @@ function AppInner(): React.JSX.Element {
           isProcessingRef.current = false;
           setIsCameraActive(true);
           if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-          AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+          announceTapToStart('Ready.');
           return;
         }
         // iPhone path: fall through with empty photoPath, voice-only.
@@ -1670,7 +1729,7 @@ function AppInner(): React.JSX.Element {
     if (!screenReaderEnabled) {
       audioFeedback.playEarcon('ready');
     }
-    AccessibilityInfo.announceForAccessibility('Stopped. Tap to speak.');
+    announceTapToStart('Stopped.');
     console.log('✅ Emergency stop complete');
   };
 
@@ -1684,6 +1743,13 @@ function AppInner(): React.JSX.Element {
   // rejects transcripts that match known VoiceOver UI text patterns.
   const isVoiceOverNoise = useCallback((text: string): boolean => {
     if (!screenReaderEnabled) return false;
+    const lower = text.toLowerCase().trim();
+    if (
+      lower.length <= 12 &&
+      ['speak', 'tap', 'ready', 'start', 'listen', 'listening', 'button'].includes(lower)
+    ) {
+      return true;
+    }
     const patterns = [
       // Old labels (might still echo from previous announcement)
       'speak naturally', 'tap to stop', 'tap to speak', 'tap to interrupt',
@@ -1698,7 +1764,6 @@ function AppInner(): React.JSX.Element {
       // Our own rejection announcements (if they leaked)
       'please speak your command', 'please speak your',
     ];
-    const lower = text.toLowerCase();
     return patterns.some(p => lower.includes(p));
   }, [screenReaderEnabled]);
 
@@ -1711,12 +1776,15 @@ function AppInner(): React.JSX.Element {
     if (isSpeaking) return 'Speaking. Tap to stop';
     if (isProcessing) return 'Thinking';
     if (isListening) return 'Listening';
-    return 'Ready. Tap to speak';
+    return screenReaderEnabled ? 'Ready' : 'Ready. Tap to speak';
   };
 
   const getAccessibilityHint = () => {
     // Hints are read AFTER label + role, with a pause.
     // Only use for info NOT in the label.
+    if (screenReaderEnabled && !isListening && !isProcessing && !isSpeaking && !isNavigation) {
+      return 'Double tap to start listening';
+    }
     return '';
   };
 

@@ -3,6 +3,7 @@
 
 import Foundation
 import AVFoundation
+import AudioToolbox
 import UIKit
 
 @objc(ReachingModule)
@@ -217,6 +218,19 @@ class ReachingModule: NSObject {
       NSLog("⚠️ [ReachingModule] configurePlaybackSession error: %@", error.localizedDescription)
       resolver(["success": false, "error": error.localizedDescription])
     }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - System Shutter Sound
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Plays the native iOS camera shutter sound (SystemSoundID 1108).
+  // This matches the default iPhone Camera sound and respects system policies.
+  @objc func playSystemShutter(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    AudioServicesPlaySystemSound(1108)
+    resolver(["success": true])
   }
 
   private func presentReachingVC(
