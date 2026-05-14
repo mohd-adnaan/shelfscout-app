@@ -145,6 +145,40 @@ export const prepareForRecording = (): void => {
 };
 
 /**
+ * Configure the audio session for Bluetooth HFP mic recording.
+ *
+ * Unlike prepareForRecording() (which just sets the category via
+ * react-native-sound), this calls into native code to set:
+ *   .playAndRecord + .allowBluetooth + setActive(true)
+ *
+ * The .allowBluetooth option is what tells iOS to route the microphone
+ * input through the connected HFP Bluetooth device (e.g. Meta Ray-Ban
+ * glasses). Without it, iOS uses the phone's built-in mic.
+ *
+ * Returns the active input port info for logging/debugging.
+ */
+export const configureBluetoothRecordingSession = async (): Promise<{
+  success: boolean;
+  inputPort?: string;
+  inputType?: string;
+}> => {
+  if (Platform.OS !== 'ios' || !ReachingModule?.configureBluetoothRecordingSession) {
+    // Fallback: just set PlayAndRecord without BT options
+    Sound.setCategory('PlayAndRecord', false);
+    return { success: true, inputPort: 'builtin', inputType: 'builtin' };
+  }
+  try {
+    const result = await ReachingModule.configureBluetoothRecordingSession();
+    return result;
+  } catch (e: any) {
+    console.warn('⚠️ [SFX] configureBluetoothRecordingSession failed:', e?.message);
+    // Fallback
+    Sound.setCategory('PlayAndRecord', false);
+    return { success: false };
+  }
+};
+
+/**
  * Play when the app enters THINKING state (photo taken, request sent).
  * Replaces the "Thinking" verbal announcement.
  * Immediately starts the latency loop AFTER the begin tone finishes.

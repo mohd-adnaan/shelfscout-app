@@ -221,6 +221,56 @@ class ReachingModule: NSObject {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Bluetooth Recording Session (Meta Glasses Mic)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Configures the audio session for recording via the Bluetooth HFP
+  // microphone (Meta Ray-Ban glasses). The critical option is .allowBluetooth
+  // which enables the Hands-Free Profile mic input. Without this option,
+  // iOS defaults to the phone's built-in mic.
+  //
+  // Note: .allowBluetooth ≠ .allowBluetoothA2DP:
+  //   .allowBluetooth  → enables HFP (mic input + mono output)
+  //   .allowBluetoothA2DP → enables A2DP (stereo output only, no mic)
+  //
+  // For wake-word listening, we want .allowBluetooth so the speech
+  // recognizer receives audio from the glasses' mic.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  @objc func configureBluetoothRecordingSession(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    do {
+      let session = AVAudioSession.sharedInstance()
+
+      // .playAndRecord allows simultaneous input + output.
+      // .allowBluetooth enables HFP mic from the glasses.
+      // .defaultToSpeaker is NOT set — HFP routes output to the glasses too.
+      try session.setCategory(
+        .playAndRecord,
+        mode: .default,
+        options: [.allowBluetooth]
+      )
+      try session.setActive(true)
+
+      // Log the active input to confirm BT routing
+      let input = session.currentRoute.inputs.first
+      let output = session.currentRoute.outputs.first
+      NSLog("🎤 [ReachingModule] BT Recording → input: %@ (%@), output: %@ (%@)",
+            input?.portName ?? "none", input?.portType.rawValue ?? "?",
+            output?.portName ?? "none", output?.portType.rawValue ?? "?")
+
+      resolver(["success": true,
+                "inputPort": input?.portName ?? "unknown",
+                "inputType": input?.portType.rawValue ?? "unknown"])
+    } catch {
+      NSLog("❌ [ReachingModule] configureBluetoothRecordingSession error: %@", error.localizedDescription)
+      resolver(["success": false, "error": error.localizedDescription])
+    }
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - System Shutter Sound
   // ═══════════════════════════════════════════════════════════════════════════
   // Plays the native iOS camera shutter sound (SystemSoundID 1108).

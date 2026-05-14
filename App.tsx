@@ -26,6 +26,7 @@ import {
 import Video from 'react-native-video';
 import { useTTS } from './src/hooks/useTTS';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
+import { useWakeWordSTT } from './src/hooks/useWakeWordSTT';
 import {
   sendToWorkflow,
   sendToSmartGuidance,
@@ -1167,6 +1168,11 @@ function AppInner(): React.JSX.Element {
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
     announceTapToStart('Ready.');
+
+    // Resume wake word listening if in glasses mode
+    if (settingsRef.current.useWearablesCamera) {
+      wakeWordResumeRef.current?.();
+    }
   }, [announceTapToStart, handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed]);
 
   // ============================================================================
@@ -1359,6 +1365,11 @@ function AppInner(): React.JSX.Element {
       if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
       announceTapToStart('Ready.');
 
+      // Resume wake word listening if in glasses mode
+      if (settingsRef.current.useWearablesCamera) {
+        wakeWordResumeRef.current?.();
+      }
+
     } catch (error: any) {
       // ── Cancelled / aborted requests are silent ──────
       if (
@@ -1391,6 +1402,11 @@ function AppInner(): React.JSX.Element {
         setIsCameraActive(true);
         if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
         announceTapToStart('Ready.');
+
+        // Resume wake word listening if in glasses mode
+        if (settingsRef.current.useWearablesCamera) {
+          wakeWordResumeRef.current?.();
+        }
       }
     } finally {
       setIsProcessing(false);
@@ -1528,7 +1544,7 @@ function AppInner(): React.JSX.Element {
   }, []); // stable — uses refs only
 
   // ============================================================================
-  // STT hook
+  // STT hook (phone mic — used when NOT in glasses mode)
   // ============================================================================
   const {
     startListening: startSTT,
@@ -1541,7 +1557,109 @@ function AppInner(): React.JSX.Element {
     enableAutoSubmit: true,
     silenceThreshold: 1500,
     enableRMSVAD: true,
+    // When glasses mode is on, the wake word hook owns the Voice singleton.
+    // Disable this hook to prevent listener conflicts.
+    disabled: settings.useWearablesCamera,
   });
+
+  // ============================================================================
+  // Wake Word STT hook (glasses mic — used when IN glasses mode)
+  // ============================================================================
+  const wakeWordPauseRef = useRef<(() => Promise<void>) | null>(null);
+  const wakeWordResumeRef = useRef<(() => Promise<void>) | null>(null);
+
+  const handleWakeWordQuery = useCallback(async (query: string) => {
+    console.log('🎤 [WakeWord] Query received:', `"${query}"`);
+
+    // The wake word hook has already paused itself. Run through the same
+    // auto-submit pipeline that the phone-mic flow uses.
+    if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) {
+      console.log('⚠️ [WakeWord] Already in-flight, skipping — resuming wake word');
+      wakeWordResumeRef.current?.();
+      return;
+    }
+
+    console.log('⚡ [WakeWord] Processing:', query);
+    setIsProcessing(true);
+    isCapturingPhotoRef.current = true;
+    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('thinking'); }
+    AccessibilityInfo.announceForAccessibility('Thinking');
+
+    try {
+      // Configure audio for playback before capture/backend call
+      if (!screenReaderEnabledRef.current) {
+        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+      }
+
+      let photoPath = '';
+      try {
+        photoPath = await reactivateCameraAndCapture({ enableShutterSound: false });
+      } catch (e: any) {
+        console.error('❌ [WakeWord] Camera error:', e);
+        if (isWearablesCaptureError(e)) {
+          await stopLatencyLoop();
+          await speakWearablesError(e);
+          setIsProcessing(false);
+          isProcessingRef.current = false;
+          isCapturingPhotoRef.current = false;
+          finalTranscriptRef.current = '';
+          setIsCameraActive(true);
+          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          // Resume wake word listening after error
+          wakeWordResumeRef.current?.();
+          return;
+        }
+      }
+
+      isCapturingPhotoRef.current = false;
+
+      if (isEmergencyStopped.current) {
+        setIsProcessing(false);
+        return;
+      }
+
+      // Process through the standard voice command handler
+      await handleVoiceCommandRef.current(query, photoPath);
+
+    } catch (error: any) {
+      console.error('❌ [WakeWord] Auto-submit error:', error);
+      AccessibilityInfo.announceForAccessibility(`Error: ${error.message || error}`);
+      setIsProcessing(false);
+    } finally {
+      isCapturingPhotoRef.current = false;
+    }
+  }, []);
+
+  const handleWakeWordHeard = useCallback(() => {
+    console.log('🎤 [WakeWord] Wake phrase detected!');
+    if (!screenReaderEnabledRef.current) {
+      audioFeedback.playEarcon('listening');
+    }
+    AccessibilityInfo.announceForAccessibility('Listening');
+  }, []);
+
+  const {
+    isAwaitingWakeWord,
+    isCapturingQuery: isWakeWordCapturing,
+    queryTranscript: wakeWordTranscript,
+    debugStatus: wakeWordDebugStatus,
+    debugRawTranscript: wakeWordDebugRaw,
+    pause: pauseWakeWord,
+    resume: resumeWakeWord,
+    stop: stopWakeWord,
+  } = useWakeWordSTT({
+    onQueryDetected: handleWakeWordQuery,
+    onWakeWordHeard: handleWakeWordHeard,
+    enabled: settings.useWearablesCamera && !showSettings && !showStartupLoader,
+    silenceThreshold: 1500,
+    enableOpenAIVAD: true,
+  });
+
+  // Keep refs in sync so stable callbacks can access pause/resume
+  useEffect(() => {
+    wakeWordPauseRef.current = pauseWakeWord;
+    wakeWordResumeRef.current = resumeWakeWord;
+  }, [pauseWakeWord, resumeWakeWord]);
 
   // ── Re-entry guard for startListening ─────────────────────────────────────
   const isStartingRef = useRef(false);
@@ -1706,6 +1824,8 @@ function AppInner(): React.JSX.Element {
     await stopLatencyLoop(); // FIX: kill thinking SFX immediately on emergency stop
     await speachesSentenceChunker.stop();
     try { await cancelSTT(); } catch { }
+    // Pause wake word listening during emergency stop
+    try { await wakeWordPauseRef.current?.(); } catch { }
 
     await new Promise(resolve => setTimeout(resolve, 300));
 
@@ -1730,6 +1850,12 @@ function AppInner(): React.JSX.Element {
       audioFeedback.playEarcon('ready');
     }
     announceTapToStart('Stopped.');
+
+    // Resume wake word listening after emergency stop
+    if (settingsRef.current.useWearablesCamera) {
+      isEmergencyStopped.current = false; // clear so wake word flow can proceed
+      wakeWordResumeRef.current?.();
+    }
     console.log('✅ Emergency stop complete');
   };
 
@@ -1775,7 +1901,8 @@ function AppInner(): React.JSX.Element {
     if (isNavigation) return 'Navigating. Tap to stop';
     if (isSpeaking) return 'Speaking. Tap to stop';
     if (isProcessing) return 'Thinking';
-    if (isListening) return 'Listening';
+    if (isListening || isWakeWordCapturing) return 'Listening';
+    if (isAwaitingWakeWord) return 'Say Hey ShelfScout to ask a question';
     return screenReaderEnabled ? 'Ready' : 'Ready. Tap to speak';
   };
 
@@ -1798,6 +1925,10 @@ function AppInner(): React.JSX.Element {
       const mode = isNavigation ? 'navigation' : 'reaching';
       AccessibilityInfo.announceForAccessibility(`Stopping ${mode}.`);
       await stopContinuousModeLoop();
+      // Resume wake word after stopping continuous mode
+      if (settingsRef.current.useWearablesCamera) {
+        wakeWordResumeRef.current?.();
+      }
       return;
     }
 
@@ -1810,6 +1941,13 @@ function AppInner(): React.JSX.Element {
     if (isListening) {
       AccessibilityInfo.announceForAccessibility('Thinking.');
       await stopListeningManually();
+      return;
+    }
+
+    // In glasses mode, tap is a no-op when already listening for wake word
+    // (the user should say "hey shelfscout" instead of tapping)
+    if (isAwaitingWakeWord || isWakeWordCapturing) {
+      console.log('👆 [Glasses] Tap during wake word listening — no-op');
       return;
     }
 
@@ -1909,14 +2047,17 @@ function AppInner(): React.JSX.Element {
 
           {/* Voice Visualizer */}
           <VoiceVisualizer
-            isListening={isListening}
+            isListening={isListening || isWakeWordCapturing}
             isProcessing={isProcessing}
             isSpeaking={isSpeaking}
             isNavigation={isNavigation}
             isReaching={isReaching}
-            transcript={transcript}
+            isGlassesListening={isAwaitingWakeWord}
+            transcript={isWakeWordCapturing ? wakeWordTranscript : transcript}
             pulseAnim={pulseAnim}
             opacityAnim={opacityAnim}
+            glassesDebugStatus={wakeWordDebugStatus}
+            glassesDebugRaw={wakeWordDebugRaw}
           />
 
           {/* ── Settings Gear Button (top-right) ── */}
