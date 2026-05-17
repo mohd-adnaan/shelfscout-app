@@ -123,8 +123,8 @@ const WAKE_PHRASES: string[] = [
   'scout',
   'skout',
   'shelfcout',
-  'shelves code'
-
+  'shelves code',
+  'Asian Scout',
 
   // "shelf" → "self" / "shell" / "shelves" substitutions
   'hey self scout',
@@ -133,6 +133,10 @@ const WAKE_PHRASES: string[] = [
   'hey shell scout,',
   'hey shelves scout',
   'hey shelves',
+  'Hey Scout',
+  'Hey Shell',
+  'hey patient',
+
 
   // "hey" mis-merged with following word
   'asian scout',
@@ -152,6 +156,10 @@ const WAKE_PHRASES: string[] = [
   'hey Scott',
   'hey Shall',
   'he Scott',
+  'scotland',
+  'hi scott',
+  'hi scount',
+  'hi scout',
 
 
   // No-"hey" variants (when "hey" gets lost in BT compression)
