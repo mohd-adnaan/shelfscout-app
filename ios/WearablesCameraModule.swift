@@ -1,4 +1,10 @@
-// WearablesCameraModule.swift
+//
+//  WearablesCameraModule.swift
+//  shelfscout
+//
+//  Created by Mohammad Adnaan on 2026-05-17.
+//
+
 // React Native bridge for Meta Wearables Device Access Toolkit (iOS)
 //
 // CRITICAL DESIGN NOTE — photo path vs video-frame fallback:
@@ -19,6 +25,7 @@
 
 import Foundation
 import UIKit
+import AVFoundation
 import MWDATCore
 import MWDATCamera
 
@@ -166,8 +173,78 @@ class WearablesCameraModule: NSObject {
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // MARK: - Permission + Device + Stream
+  // MARK: - BT Radio Arbitration (CRITICAL — root cause of error 11)
   // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Root cause of `ActivityManagerError code 11` ("a session already exists
+  // for this device") that surfaces as "Stream did not reach streaming
+  // state within 8s":
+  //
+  // The Ray-Ban Meta glasses speak two protocols over their single BT
+  // radio:
+  //   1. HFP (Hands-Free Profile) — used by iOS's AVAudioSession when the
+  //      app's audio session category is `.playAndRecord` + `.allowBluetooth`.
+  //      This is what `ReachingModule.configureBluetoothRecordingSession()`
+  //      sets up so the wake-word recognizer can hear the user via the
+  //      glasses' mic.
+  //   2. MWDAT data session — used by the Meta SDK for video stream +
+  //      photo capture. Goes through External Accessory / WARP transport.
+  //
+  // On the glasses side, the ActivityManagerService enforces "ONE app
+  // session at a time" over the BT link. When HFP is active (iOS holding
+  // the AVAudioSession), the glasses see the iPhone as already "in
+  // session" — so when MWDAT tries to add its own data session, the
+  // ActivityManager rejects with error code 11.
+  //
+  // This was masked in earlier builds because MWDAT preWarm ran BEFORE
+  // the wake-word recognizer activated HFP. In the current build, the
+  // wake-word recognizer activates HFP at app launch (immediately when
+  // the wake-word hook is `enabled`), so by the time the user actually
+  // wants to capture a photo, HFP has already claimed the BT link.
+  //
+  // Fix: temporarily deactivate iOS's AVAudioSession before each MWDAT
+  // session start. This releases HFP, freeing the BT radio for MWDAT
+  // exclusively. After capture completes, the wake-word recognizer will
+  // re-acquire HFP on its next session start (the JS-side `resume()`
+  // path already calls `configureBluetoothRecordingSession` before
+  // restarting Voice).
+  //
+  // The audio session must be deactivated with .notifyOthersOnDeactivation
+  // so any active audio output (TTS) is gracefully wound down rather than
+  // killed mid-utterance.
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Release the iOS BT-HFP audio session so MWDAT has exclusive BT radio
+  /// access. Safe to call even if no session is active. Logs result for
+  /// debugging but never throws — a failure here doesn't necessarily
+  /// block MWDAT from trying.
+  private func releaseBTRadioForMWDAT() async {
+    let session = AVAudioSession.sharedInstance()
+    // Log what we're releasing so the BT radio handoff is observable.
+    let beforeInput = session.currentRoute.inputs.first?.portName ?? "none"
+    let beforeOutput = session.currentRoute.outputs.first?.portName ?? "none"
+    NSLog("📻 [Wearables] Releasing BT radio for MWDAT (was: input=%@ output=%@)",
+          beforeInput, beforeOutput)
+    do {
+      // Deactivating with .notifyOthersOnDeactivation lets other audio
+      // clients (TTS via AVSpeechSynthesizer, react-native-sound) get a
+      // clean handoff instead of being killed mid-buffer.
+      try session.setActive(false, options: [.notifyOthersOnDeactivation])
+      NSLog("📻 [Wearables] AVAudioSession deactivated")
+    } catch {
+      // Non-fatal — proceed and let the MWDAT start attempt log its
+      // specific failure if BT is still occupied.
+      NSLog("⚠️ [Wearables] AVAudioSession deactivate warning: %@",
+            (error as NSError).localizedDescription)
+    }
+    // Brief settle period so the glasses' ActivityManager actually
+    // observes HFP teardown before MWDAT issues its session-start.
+    // 250ms is empirically enough on iPhone 16 — shorter values
+    // sometimes still race with the BT controller.
+    try? await Task.sleep(nanoseconds: 250_000_000)
+  }
+
+
 
   private func humanizePermissionError(_ rawValue: Int) -> String {
     // From MWDATCore.PermissionError (Int-backed enum, v0.6):
@@ -572,6 +649,10 @@ class WearablesCameraModule: NSObject {
       do {
         let wearables = try self.ensureConfigured()
         try await self.ensureCameraPermission(wearables)
+        // CRITICAL: Release iOS's hold on the BT radio (HFP audio session)
+        // before MWDAT tries to claim it. Without this, the glasses'
+        // ActivityManagerService rejects MWDAT with error code 11.
+        await self.releaseBTRadioForMWDAT()
         let deviceSession = try await self.ensureDeviceSession(wearables)
         let stream = try await self.ensureStreamSession(deviceSession)
 
@@ -619,6 +700,9 @@ class WearablesCameraModule: NSObject {
       do {
         let wearables = try self.ensureConfigured()
         try await self.ensureCameraPermission(wearables)
+        // CRITICAL: Release BT-HFP before MWDAT claims the radio.
+        // See releaseBTRadioForMWDAT() comment block for full rationale.
+        await self.releaseBTRadioForMWDAT()
         let deviceSession = try await self.ensureDeviceSession(wearables)
         _ = try await self.ensureStreamSession(deviceSession)
         NSLog("✅ [Wearables] preWarm complete — session streaming, video frames flowing")
@@ -647,6 +731,13 @@ class WearablesCameraModule: NSObject {
       self.errorListenerToken = nil
       self.photoListenerToken = nil
       self.videoFrameListenerToken = nil
+      // Properly stop the device session before niling — without this,
+      // the device-side ActivityManager keeps its session alive and the
+      // next reconnect collides with error code 11.
+      if let ds = self.deviceSession, ds.state != .stopped {
+        NSLog("🧹 [Wearables] disconnect — stopping device session (state=%@)", "\(ds.state)")
+        await ds.stop()
+      }
       self.deviceSession = nil
       NSLog("🧹 [Wearables] disconnect complete")
       resolver(["success": true])

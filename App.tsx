@@ -54,6 +54,7 @@ import {
   playErrorSound,
   prepareForRecording,
   configurePlaybackSession,
+  setWearablesMode,
 } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
@@ -114,6 +115,11 @@ function AppInner(): React.JSX.Element {
   const settingsRef = useRef(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
+  // Keep SFX wearables-mode flag in sync with settings
+  useEffect(() => {
+    setWearablesMode(settings.useWearablesCamera);
+  }, [settings.useWearablesCamera]);
+
   // ── Camera / Permissions ───────────────────────────────────────────────────
   const device = useCameraDevice('back');
   const { hasPermission: hasCameraPermission, requestPermission: requestCameraPermission } = useCameraPermission();
@@ -156,6 +162,14 @@ function AppInner(): React.JSX.Element {
   // ── Animation ──────────────────────────────────────────────────────────────
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const opacityAnim = useRef(new Animated.Value(0.3)).current;
+
+  // ── Bug 2 fix: Debounced accessibility label ──────────────────────────────
+  // When VoiceOver is on, rapid state changes (Ready→Listening→Thinking→Speaking)
+  // cause VoiceOver to re-read the label each time, resetting the double-tap
+  // gesture. We debounce label updates so VoiceOver only sees the label AFTER
+  // the state has been stable for 300ms.
+  const [debouncedLabel, setDebouncedLabel] = useState('');
+  const labelTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   // ── Debug native modules on mount ──────────────────────────────────────────
   useEffect(() => {
@@ -214,6 +228,9 @@ function AppInner(): React.JSX.Element {
 
   // ── Sound Check ──────────────────────────────────────────────────────────
   useEffect(() => {
+    // Set wearables mode BEFORE loading sounds so the category isn't set
+    // to Playback when glasses are connected (would corrupt BT-HFP session)
+    setWearablesMode(settings.useWearablesCamera);
     initSounds().then(() => {
       console.log('✅ [App] Sound effects loaded');
     }).catch((err) => {
@@ -372,9 +389,44 @@ function AppInner(): React.JSX.Element {
     AccessibilityInfo.announceForAccessibility(spoken);
     await speachesSentenceChunker.synthesizeSpeechChunked(spoken);
   };
+  // ────────────────────────────────────────────────────────────────────────
+  // VoiceOver-aware announcement helper.
+  //
+  // When VoiceOver is ON, the button's accessibilityLabel is automatically
+  // read aloud on every state change (Ready → Listening → Thinking → ...).
+  // Calling AccessibilityInfo.announceForAccessibility() with text that
+  // duplicates the label produces two simultaneous utterances → user hears
+  // double voice / echo / cut-off.
+  //
+  // More damaging: every redundant announcement also restarts VoiceOver's
+  // announcement queue, which CONSUMES the user's next double-tap gesture
+  // (VoiceOver uses the tap to dismiss the announcement instead of routing
+  // to handleScreenTap). That's why VoiceOver users need many taps to act.
+  //
+  // Use this helper everywhere the announcement duplicates the label.
+  // For genuinely-new info (errors, guidance text) just call the regular
+  // API directly — VoiceOver SHOULD speak those.
+  // ────────────────────────────────────────────────────────────────────────
+  const announceIfNoVoiceOver = useCallback((message: string) => {
+    if (screenReaderEnabledRef.current) {
+      // VoiceOver will read the label change automatically; do nothing.
+      return;
+    }
+    AccessibilityInfo.announceForAccessibility(message);
+  }, []);
 
   const announceTapToStart = useCallback((prefix: string) => {
-    const suffix = screenReaderEnabledRef.current ? 'Tap to start.' : 'Tap to speak.';
+    // ── Bug 1 fix: When VoiceOver is on, do NOT announce here. ───────
+    // VoiceOver will automatically read the button's accessibilityLabel
+    // when focus returns to it. A programmatic announcement creates
+    // overlapping speech: VoiceOver reads the label AND speaks the
+    // announcement simultaneously.
+    if (screenReaderEnabledRef.current) {
+      // Just log — VoiceOver reads the label automatically.
+      console.log('♿ [announceTapToStart] Skipping (VoiceOver reads label)');
+      return;
+    }
+    const suffix = 'Tap to speak.';
     const trimmedPrefix = prefix.trim();
     AccessibilityInfo.announceForAccessibility(
       trimmedPrefix ? `${trimmedPrefix} ${suffix}` : suffix
@@ -730,8 +782,8 @@ function AppInner(): React.JSX.Element {
     let cycleCount = 0;
 
     const currentMode = getCurrentMode();
-    AccessibilityInfo.announceForAccessibility(`${currentMode} started. Tap to stop.`);
-
+    // Label change to "Navigating. Tap to stop" / "Reaching ..." conveys this.
+    announceIfNoVoiceOver(`${currentMode} started. Tap to stop.`);
     while (!continuousModeAbortRef.current && !isEmergencyStopped.current) {
       const intervalMode = getCurrentMode();
       if (intervalMode !== 'reaching' && smartGuidanceActiveRef.current) {
@@ -784,7 +836,8 @@ function AppInner(): React.JSX.Element {
         const abortCtrl = new AbortController();
         abortControllerRef.current = abortCtrl;
 
-        if (!screenReaderEnabledRef.current) {
+        // Skip SFX when VoiceOver is on or in glasses mode (BluetoothHFP audio session conflict)
+        if (!screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera) {
           playThinkingStarted(); // ← start thinking SFX for this cycle
         }
 
@@ -879,6 +932,7 @@ function AppInner(): React.JSX.Element {
         }
 
         await stopLatencyLoop(); // ← stop thinking SFX when result arrives
+        await stopLatencyLoop(); // Bug 3 defense: second stop for audio session race
         setIsProcessing(false);
 
 
@@ -941,11 +995,11 @@ function AppInner(): React.JSX.Element {
                 .then(() => {
                   setIsSpeaking(false);
                   // Bug 4 defense — see continuous-mode .then() above.
-                  stopLatencyLoop().catch(() => {});
+                  stopLatencyLoop().catch(() => { });
                 })
                 .catch((e: any) => {
                   setIsSpeaking(false);
-                  stopLatencyLoop().catch(() => {});
+                  stopLatencyLoop().catch(() => { });
                   if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
                     console.warn('⚠️ [ARKit] Intro TTS error (non-fatal):', e?.message);
                   }
@@ -1051,7 +1105,7 @@ function AppInner(): React.JSX.Element {
           startContinuousMode('reaching', result.loopDelay);
           setIsNavigation(false);
           setIsReaching(true);
-          AccessibilityInfo.announceForAccessibility('Arrived. Switching to object guidance.');
+          announceIfNoVoiceOver('Arrived. Switching to object guidance.');
 
           // Cooldown before next capture (skip null fast-poll path).
           await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN));
@@ -1064,7 +1118,7 @@ function AppInner(): React.JSX.Element {
             await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
             setIsSpeaking(false);
           }
-          AccessibilityInfo.announceForAccessibility('Task complete.');
+          announceIfNoVoiceOver('Task complete.');
           stopContinuousMode('both flags false', true);
           break;
         }
@@ -1072,10 +1126,10 @@ function AppInner(): React.JSX.Element {
         // ── Mode transitions ───────────────────────────────────────────────
         if (navigationActive && !reachingActive && loopMode !== 'navigation') {
           startContinuousMode('navigation', result.loopDelay);
-          AccessibilityInfo.announceForAccessibility('Switching to navigation.');
+          announceIfNoVoiceOver('Switching to navigation.');
         } else if (reachingActive && !navigationActive && loopMode !== 'reaching') {
           startContinuousMode('reaching', result.loopDelay);
-          AccessibilityInfo.announceForAccessibility('Switching to object guidance.');
+          announceIfNoVoiceOver('Switching to object guidance.');
         }
 
         // ── Speak (fire-and-forget) + immediately continue loop ───────────
@@ -1103,13 +1157,13 @@ function AppInner(): React.JSX.Element {
               // loop aborted between fire-and-forget start and now),
               // make sure the latency thinking sound isn't left playing.
               if (!isContinuousModeRunning.current) {
-                stopLatencyLoop().catch(() => {});
+                stopLatencyLoop().catch(() => { });
               }
             })
             .catch((e: any) => {
               setIsSpeaking(false);
               if (!isContinuousModeRunning.current) {
-                stopLatencyLoop().catch(() => {});
+                stopLatencyLoop().catch(() => { });
               }
               if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
                 console.warn('🔄 [ContinuousMode] TTS error (non-fatal):', e?.message);
@@ -1239,8 +1293,13 @@ function AppInner(): React.JSX.Element {
 
       try { await cancelSTT(); } catch { }
 
-      // Skip earcons/SFX when VoiceOver is on — audio session conflicts
-      if (!screenReaderEnabledRef.current) {
+      // Skip earcons/SFX when VoiceOver is on — audio session conflicts.
+      // Also skip in glasses mode — the audio session is locked by BluetoothHFP
+      // for the glasses mic. Playing sounds via react-native-sound calls
+      // Sound.setCategory('Playback') which corrupts the HFP session, leaving
+      // the latency sound in a zombie state that s.stop() can't silence.
+      const shouldPlaySFX = !screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera;
+      if (shouldPlaySFX) {
         // FIX: Restore full-volume audio session after STT's Record+Measurement
         await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
@@ -1282,6 +1341,9 @@ function AppInner(): React.JSX.Element {
       }
 
       await stopLatencyLoop();
+      // Bug 3 defense: second stop catches the race where iOS audio session
+      // switch during the first stop re-queued a play.
+      await stopLatencyLoop();
       //await playSuccessChime();          // ← plays jbl_success_sae.caf
 
       console.log('✅ Response:', {
@@ -1301,17 +1363,25 @@ function AppInner(): React.JSX.Element {
           audioFeedback.playEarcon('speaking');
         }
 
+        // ── Bug 1 fix: When VoiceOver is on, wait for VoiceOver to ─────
+        // finish speaking its 'Thinking' announcement before starting TTS.
+        // Without this, VoiceOver and AVSpeechSynthesizer both speak at
+        // once, creating the double-voice/echo effect.
+        if (screenReaderEnabledRef.current) {
+          await new Promise(resolve => setTimeout(resolve, 600));
+        }
+
         introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
           .then(() => {
             setIsSpeaking(false);
             // Bug 4 defense: kill any latency loop that may have been
             // re-started by a downstream code path (or that survived an
             // earlier stop's iOS audio race) when speech naturally ends.
-            stopLatencyLoop().catch(() => {});
+            stopLatencyLoop().catch(() => { });
           })
           .catch((e: any) => {
             setIsSpeaking(false);
-            stopLatencyLoop().catch(() => {});
+            stopLatencyLoop().catch(() => { });
             if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
               console.warn('⚠️ Intro TTS error (non-fatal):', e?.message);
             }
@@ -1479,8 +1549,16 @@ function AppInner(): React.JSX.Element {
     console.log('⚡ Processing:', finalText);
     setIsProcessing(true);
     isCapturingPhotoRef.current = true;
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('thinking'); }
-    AccessibilityInfo.announceForAccessibility('Thinking');
+    if (!screenReaderEnabledRef.current) {
+      audioFeedback.playEarcon('thinking');
+    }
+    // ── Bug 1 fix: Only announce 'Thinking' when VoiceOver is OFF. ──────
+    // When VoiceOver is ON, the button's accessibilityLabel already changes
+    // to 'Thinking' (via isProcessing state), and VoiceOver reads that
+    // automatically. A manual announcement creates double-speech.
+    if (!screenReaderEnabledRef.current) {
+      AccessibilityInfo.announceForAccessibility('Thinking');
+    }
 
     try {
       try { await cancelSTT(); } catch { }
@@ -1583,11 +1661,16 @@ function AppInner(): React.JSX.Element {
     setIsProcessing(true);
     isCapturingPhotoRef.current = true;
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('thinking'); }
-    AccessibilityInfo.announceForAccessibility('Thinking');
+    // Bug 1 fix: Only announce 'Thinking' when VoiceOver is OFF —
+    // the label change to 'Thinking' is read automatically by VoiceOver.
+    if (!screenReaderEnabledRef.current) {
+      AccessibilityInfo.announceForAccessibility('Thinking');
+    }
 
     try {
-      // Configure audio for playback before capture/backend call
-      if (!screenReaderEnabledRef.current) {
+      // Configure audio for playback before capture/backend call.
+      // Skip in glasses mode — audio session is locked by BluetoothHFP.
+      if (!screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera) {
         await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
       }
 
@@ -1629,14 +1712,14 @@ function AppInner(): React.JSX.Element {
       isCapturingPhotoRef.current = false;
     }
   }, []);
-
   const handleWakeWordHeard = useCallback(() => {
     console.log('🎤 [WakeWord] Wake phrase detected!');
     if (!screenReaderEnabledRef.current) {
       audioFeedback.playEarcon('listening');
     }
-    AccessibilityInfo.announceForAccessibility('Listening');
-  }, []);
+    // VoiceOver reads the label change to "Listening" automatically.
+    announceIfNoVoiceOver('Listening');
+  }, [announceIfNoVoiceOver]);
 
   const {
     isAwaitingWakeWord,
@@ -1679,8 +1762,15 @@ function AppInner(): React.JSX.Element {
 
     const voiceOverEnabled = screenReaderEnabledRef.current;
     if (voiceOverEnabled) {
-      AccessibilityInfo.announceForAccessibility('Listening');
-      // Let VoiceOver finish before the mic opens to avoid "Listening" bleed-through.
+      // INTENTIONAL: do NOT call announceForAccessibility('Listening') here.
+      // The button's accessibilityLabel automatically becomes "Listening"
+      // when isListening flips true — VoiceOver reads that label change on
+      // its own. Adding a manual announcement here produces the double-voice
+      // echo and consumes the user's next double-tap.
+      //
+      // The delay below is still useful: it gives VoiceOver time to finish
+      // reading whatever label change just happened before we open the mic,
+      // so the recogniser doesn't capture VoiceOver's own speech.
       await new Promise(resolve => setTimeout(resolve, VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS));
     }
 
@@ -1767,8 +1857,8 @@ function AppInner(): React.JSX.Element {
 
       isCapturingPhotoRef.current = true;
       if (!screenReaderEnabled) { audioFeedback.playEarcon('thinking'); }
-      AccessibilityInfo.announceForAccessibility('Thinking');
-
+      // Label change to "Thinking" already announces this for VoiceOver users.
+      announceIfNoVoiceOver('Thinking');
       await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
       if (isEmergencyStopped.current) { isCapturingPhotoRef.current = false; return; }
 
@@ -1906,6 +1996,36 @@ function AppInner(): React.JSX.Element {
     return screenReaderEnabled ? 'Ready' : 'Ready. Tap to speak';
   };
 
+  // Debounce the accessibility label to prevent VoiceOver from resetting
+  // its double-tap gesture on rapid state transitions.
+  const rawLabel = getAccessibilityLabel();
+  useEffect(() => {
+    if (!screenReaderEnabled) {
+      // No debouncing needed without VoiceOver
+      setDebouncedLabel(rawLabel);
+      return;
+    }
+    // Clear any pending label update
+    if (labelTimerRef.current) {
+      clearTimeout(labelTimerRef.current);
+    }
+    // Once redundant announcements are removed (see announceIfNoVoiceOver
+    // throughout this file), label cycling is much rarer. 150ms is short
+    // enough to feel responsive but long enough to absorb the Listening→
+    // Thinking transition that fires within ~50ms of releasing the mic.
+    labelTimerRef.current = setTimeout(() => {
+      setDebouncedLabel(rawLabel);
+    }, 150);
+    return () => {
+      if (labelTimerRef.current) {
+        clearTimeout(labelTimerRef.current);
+      }
+    };
+  }, [rawLabel, screenReaderEnabled]);
+
+  // Use debounced label for VoiceOver, raw label for sighted users
+  const effectiveLabel = screenReaderEnabled ? (debouncedLabel || rawLabel) : rawLabel;
+
   const getAccessibilityHint = () => {
     // Hints are read AFTER label + role, with a pause.
     // Only use for info NOT in the label.
@@ -1923,7 +2043,11 @@ function AppInner(): React.JSX.Element {
 
     if (isNavigation || isReaching || isContinuousModeRunning.current) {
       const mode = isNavigation ? 'navigation' : 'reaching';
-      AccessibilityInfo.announceForAccessibility(`Stopping ${mode}.`);
+      // Bug 1/2 fix: Skip announcement when VoiceOver is on to avoid
+      // consuming the next double-tap gesture.
+      if (!screenReaderEnabledRef.current) {
+        AccessibilityInfo.announceForAccessibility(`Stopping ${mode}.`);
+      }
       await stopContinuousModeLoop();
       // Resume wake word after stopping continuous mode
       if (settingsRef.current.useWearablesCamera) {
@@ -1933,13 +2057,21 @@ function AppInner(): React.JSX.Element {
     }
 
     if (isSpeaking || isProcessing) {
-      AccessibilityInfo.announceForAccessibility('Stopping.');
+      // Bug 1/2 fix: Skip the announcement when VoiceOver is on.
+      // VoiceOver reading 'Stopping' consumes the next double-tap gesture,
+      // making the user tap additional times to reach the Ready state.
+      if (!screenReaderEnabledRef.current) {
+        AccessibilityInfo.announceForAccessibility('Stopping.');
+      }
       await emergencyStop();
       return;
     }
 
     if (isListening) {
-      AccessibilityInfo.announceForAccessibility('Thinking.');
+      // Bug 1/2 fix: VoiceOver reads the label change to 'Thinking' automatically.
+      if (!screenReaderEnabledRef.current) {
+        AccessibilityInfo.announceForAccessibility('Thinking.');
+      }
       await stopListeningManually();
       return;
     }
@@ -2013,10 +2145,16 @@ function AppInner(): React.JSX.Element {
       <TouchableWithoutFeedback
         onPress={handleScreenTap}
         accessible={true}
-        accessibilityLabel={getAccessibilityLabel()}
+        accessibilityLabel={effectiveLabel}
         accessibilityHint={getAccessibilityHint()}
         accessibilityRole="button"
         accessibilityState={{ busy: isProcessing || isNavigation, disabled: false }}
+        accessibilityActions={[{ name: 'activate', label: 'Activate' }]}
+        onAccessibilityAction={(event) => {
+          if (event.nativeEvent.actionName === 'activate') {
+            handleScreenTap();
+          }
+        }}
       >
         <View
           ref={containerRef}

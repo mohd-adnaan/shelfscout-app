@@ -1,6 +1,5 @@
 // src/screens/SettingsScreen.tsx
 
-
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View,
@@ -237,57 +236,79 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     [updatePreferAlternativeReaching],
   );
 
-  // ── Meta Ray-Ban camera toggle ──────────────────────────────────────────
+  // Guard: prevent overlapping connect/disconnect operations on the Meta SDK.
+  // Rapid OFF→ON toggling without this creates zombie sessions that cause
+  // ActivityManagerError (error: 11): "A session already exists for this device".
+  const wearablesTransitioningRef = useRef(false);
 
   const handleWearablesToggle = useCallback(
     async (value: boolean) => {
-      await updateUseWearablesCamera(value);
+      // Prevent re-entrant calls while a connect/disconnect is in flight
+      if (wearablesTransitioningRef.current) {
+        console.warn('[Wearables] Toggle ignored — transition in progress');
+        return;
+      }
+      wearablesTransitioningRef.current = true;
 
-      if (value && Platform.OS === 'ios') {
-        try {
-          await wearablesCamera.startRegistration();
-
-          // Pre-warm: grant permission → wait for device → start session/stream.
-          // Without this, the first capturePhoto loses a race against the
-          // permission/device handshake and throws "No eligible device available".
-          //
-          // We DO surface preWarm failures because they are user-actionable
-          // ("open Meta AI app", "grant camera permission", etc).
+      try {
+        // When turning OFF, disconnect FIRST and wait for it to complete
+        // before updating the setting. This ensures the Meta SDK session
+        // is fully torn down before any new session can be created.
+        if (!value && Platform.OS === 'ios') {
           try {
-            await wearablesCamera.preWarm();
-            // Refresh status pill so it flips from "Not connected" to "Connected"
-            await refreshWearablesStatus();
-          } catch (preWarmErr: any) {
-            const msg =
-              preWarmErr?.message ||
-              'Could not start the glasses camera stream.';
-            console.warn('[Wearables] Pre-warm failed:', msg);
-            AccessibilityInfo.announceForAccessibility(msg);
-            Alert.alert('Glasses Camera', msg, [{ text: 'OK', style: 'default' }]);
-            // Don't auto-revert the toggle — capturePhoto will retry on next tap
-            // and the user might fix the issue (open Meta AI, grant perm) in between.
+            await wearablesCamera.disconnect();
+          } catch (disconnectErr: any) {
+            console.warn('[Wearables] Disconnect error (non-fatal):', disconnectErr?.message);
           }
-        } catch (error: any) {
-          console.warn('[Wearables] Registration error:', error);
-          const message =
-            error?.message ||
-            'Unable to start glasses registration. Open the Meta AI app and try again.';
-          AccessibilityInfo.announceForAccessibility(message);
-          Alert.alert('Glasses Registration', message, [{ text: 'OK', style: 'default' }]);
+          // Small cooldown to let the Meta SDK release the device session
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
         }
 
-        await refreshWearablesStatus();
-      }
+        await updateUseWearablesCamera(value);
 
-      if (!value && Platform.OS === 'ios') {
-        await wearablesCamera.disconnect();
-        await refreshWearablesStatus();
-      }
+        if (value && Platform.OS === 'ios') {
+          try {
+            await wearablesCamera.startRegistration();
 
-      const label = value
-        ? 'Meta Ray-Ban camera enabled. Make sure the Meta AI app is open in the background and ShelfScout has camera permission for your glasses.'
-        : 'Phone camera enabled.';
-      AccessibilityInfo.announceForAccessibility(label);
+            // Pre-warm: grant permission → wait for device → start session/stream.
+            // Without this, the first capturePhoto loses a race against the
+            // permission/device handshake and throws "No eligible device available".
+            //
+            // We DO surface preWarm failures because they are user-actionable
+            // ("open Meta AI app", "grant camera permission", etc).
+            try {
+              await wearablesCamera.preWarm();
+              // Refresh status pill so it flips from "Not connected" to "Connected"
+              await refreshWearablesStatus();
+            } catch (preWarmErr: any) {
+              const msg =
+                preWarmErr?.message ||
+                'Could not start the glasses camera stream.';
+              console.warn('[Wearables] Pre-warm failed:', msg);
+              AccessibilityInfo.announceForAccessibility(msg);
+              Alert.alert('Glasses Camera', msg, [{ text: 'OK', style: 'default' }]);
+              // Don't auto-revert the toggle — capturePhoto will retry on next tap
+              // and the user might fix the issue (open Meta AI, grant perm) in between.
+            }
+          } catch (error: any) {
+            console.warn('[Wearables] Registration error:', error);
+            const message =
+              error?.message ||
+              'Unable to start glasses registration. Open the Meta AI app and try again.';
+            AccessibilityInfo.announceForAccessibility(message);
+            Alert.alert('Glasses Registration', message, [{ text: 'OK', style: 'default' }]);
+          }
+
+          await refreshWearablesStatus();
+        }
+
+        const label = value
+          ? 'Meta Ray-Ban camera enabled. Make sure the Meta AI app is open in the background and ShelfScout has camera permission for your glasses.'
+          : 'Phone camera enabled.';
+        AccessibilityInfo.announceForAccessibility(label);
+      } finally {
+        wearablesTransitioningRef.current = false;
+      }
     },
     [updateUseWearablesCamera, refreshWearablesStatus],
   );

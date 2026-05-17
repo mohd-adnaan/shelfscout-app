@@ -44,11 +44,34 @@ export const configurePlaybackSession = async (useSpeaker: boolean = true): Prom
   }
 };
 
+// ── Glasses-mode flag ─────────────────────────────────────────────────────
+// When Meta glasses are connected, the audio session is owned by BluetoothHFP.
+// Calling Sound.setCategory('Playback') corrupts the HFP session, causing:
+//   - ATAudioSessionClientImpl activation failed (status = 561015905)
+//   - recv bitrate: 0 (no video frames from glasses)
+//   - configureBluetoothRecordingSession loop failures
+// This flag is set by App.tsx at startup and prevents ALL setCategory calls.
+let _wearablesMode = false;
+
+/**
+ * Call this from App.tsx before initSounds() when glasses mode is persisted.
+ * Prevents Sound.setCategory('Playback') from fighting with BluetoothHFP.
+ */
+export const setWearablesMode = (enabled: boolean): void => {
+  _wearablesMode = enabled;
+};
+
+/** Safe wrapper: only calls setCategory when NOT in glasses mode. */
+const _safeSetPlaybackCategory = (): void => {
+  if (_wearablesMode) return;
+  Sound.setCategory('Playback', false);
+};
+
 // ── Configure sound to play through the speaker, not earpiece ─────────────
-// MUST be called before any Sound() constructors
-// FIX: mixWithOthers = false → full volume, physical buttons control it.
-// With mixWithOthers = true, iOS treats our audio as secondary and ducks it.
-Sound.setCategory('Playback', false);
+// MUST be called before any Sound() constructors.
+// NOTE: This runs at module import time. In glasses mode the flag isn't set
+// yet, so we defer the actual category set to initSounds() instead.
+// Sound.setCategory('Playback', false); ← REMOVED (caused BT-HFP conflict)
 
 // ── File → bundle key map ──────────────────────────────────────────────────
 // NOTE: "jbl_stopped,IOS_sae.mp3" has been RENAMED to "jbl_stopped_ios_sae.mp3"
@@ -65,12 +88,39 @@ const SOUND_FILES: Record<string, string> = {
 type SoundKey = keyof typeof SOUND_FILES;
 const sounds: Partial<Record<SoundKey, Sound>> = {};
 let latencyLooping = false;
+/**
+ * Generation counter for the latency loop.
+ *
+ * Each call to `_startLatencyLoop()` increments this and captures its own
+ * snapshot. Every subsequent action (the deferred `s.play()` inside the
+ * pre-flight `s.stop()` callback, the play-finish callback, etc.) compares
+ * its captured generation against the current one — if they differ, this
+ * action belongs to a SUPERSEDED generation and bails out silently.
+ *
+ * `stopLatencyLoop()` simply bumps the generation. That single action
+ * invalidates every in-flight callback the previous start may have queued.
+ * This pattern is the same one used by `SpeachesSentenceChunker.sessionId`
+ * and is provably race-free without depending on stop-flag bookkeeping.
+ *
+ * Why the old flag-based guard wasn't enough:
+ *   playThinkingStarted() cleared `latencyStopRequested = false` on every
+ *   fresh start. If `stopLatencyLoop()` set the flag and then a NEW
+ *   `playThinkingStarted()` fired before iOS had finished processing the
+ *   stop, the new start would clear the flag — and any callbacks queued
+ *   by the PREVIOUS start would now no longer be gated, letting the loop
+ *   resurrect itself moments after the user reached the Ready state.
+ *   This bug surfaced as "thinking sound keeps playing after output".
+ */
+let latencyGen = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // init — call once at app startup (e.g. in App.tsx useEffect)
 // ─────────────────────────────────────────────────────────────────────────────
 export const initSounds = (): Promise<void> => {
   return new Promise((resolve) => {
+    // Set playback category ONCE before loading sounds (skip in glasses mode)
+    _safeSetPlaybackCategory();
+
     const keys = Object.keys(SOUND_FILES) as SoundKey[];
     let loaded = 0;
 
@@ -103,11 +153,11 @@ const _playOnce = (key: SoundKey, onFinish?: () => void): void => {
     onFinish?.();
     return;
   }
-  // FIX: Re-assert Playback category before every play.
+  // FIX: Re-assert Playback category before every play (skip in glasses mode).
   // Other modules (e.g. streaming TTS stop, voice recognition) may have
   // switched the category to Ambient/PlayAndRecord — this guarantees our
   // earcons always play at full media volume controlled by physical buttons.
-  Sound.setCategory('Playback', false);
+  _safeSetPlaybackCategory();
   s.setVolume(1.0);
   // Reset to beginning before every play so rapid calls don't skip
   s.setCurrentTime(0);
@@ -184,67 +234,97 @@ export const configureBluetoothRecordingSession = async (): Promise<{
  * Immediately starts the latency loop AFTER the begin tone finishes.
  */
 export const playThinkingStarted = (): void => {
-    // As soon as "begin" finishes, start the latency loop
-    _startLatencyLoop();
+    // Bump the generation so any in-flight callbacks from a previous loop
+    // (e.g. a queued s.play() inside a pre-flight stop callback) are
+    // considered superseded and silently bail out. This is the fundamental
+    // race fix — no flag-clearing means no window for old callbacks to
+    // accidentally proceed under our newly-fresh state.
+    latencyGen++;
+    _startLatencyLoop(latencyGen);
 };
 
 /**
- * Internal — start the latency loop. Called after "begin" sound finishes.
+ * Internal — start the latency loop.
  *
- * Bug 4 hardening: a fast cycle (stopLatencyLoop → next cycle's
- * playThinkingStarted) could call this while iOS was still processing
- * the previous s.stop(), leaving the loop physically playing after a
- * later state transition to Ready. We now call s.stop() defensively
- * before every s.play() so any in-flight loop is guaranteed dead before
- * we restart it. iOS treats stop() on an already-stopped sound as a no-op.
+ * `myGen` is captured at call time. Every async hop inside this function
+ * (the pre-flight `s.stop()` callback, the eventual `s.play()` completion)
+ * checks `latencyGen === myGen` before doing anything observable. If
+ * `stopLatencyLoop()` (or another `_startLatencyLoop()`) has bumped the
+ * generation in the meantime, this generation's callbacks are no-ops.
+ *
+ * Why a generation counter is strictly better than the old `latencyStopRequested`
+ * flag: the flag had to be CLEARED at the start of every fresh play, opening
+ * a window during which callbacks from a previous (now-stopped) generation
+ * could observe a cleared flag and incorrectly proceed. A monotonically
+ * increasing counter has no such window — old generations are forever old.
  */
-const _startLatencyLoop = (): void => {
+const _startLatencyLoop = (myGen: number): void => {
   const s = sounds.latency;
   if (!s) {
     console.warn('⚠️ [SFX] Latency sound not loaded');
     return;
   }
-  if (latencyLooping) return; // already running
+  if (latencyLooping) {
+    // Already running. Either it's still our generation (no-op) or it's
+    // a stale one — in which case the next stopLatencyLoop()/playThinkingStarted()
+    // pair will reset things. Either way, do nothing here.
+    return;
+  }
   latencyLooping = true;
-  // FIX: Re-assert Playback category + full volume before looping audio
-  Sound.setCategory('Playback', false);
+  // Re-assert Playback category + full volume before looping audio (skip in glasses mode)
+  _safeSetPlaybackCategory();
   s.setVolume(1.0);
-  // Defensive: ensure no previous play is still queued/active before
-  // we restart the loop. Prevents Bug 4 (latency surviving a recent stop).
+  // Defensive: ensure no previous play is still queued/active before we
+  // restart. iOS treats stop() on an already-stopped sound as a no-op.
   s.stop(() => {
+    // ── Generation guard: did stopLatencyLoop() fire between our outer
+    //    s.stop() and this callback? If so, abort silently. ─────────────
+    if (latencyGen !== myGen) {
+      console.log(`[SFX] Latency play aborted — superseded (gen ${myGen} → ${latencyGen})`);
+      latencyLooping = false;
+      return;
+    }
     s.setCurrentTime(0);
     s.setNumberOfLoops(-1); // infinite loop
     s.play((success) => {
-      // This callback fires when play() is manually stopped or fails
+      // Fired when play() is manually stopped or fails.
       latencyLooping = false;
       if (!success) {
         console.log('[SFX] Latency loop stopped');
       }
     });
   });
-  console.log('🔁 [SFX] Latency loop started');
+  console.log(`🔁 [SFX] Latency loop started (gen ${myGen})`);
 };
 
 /**
  * Stop the latency loop (call when backend response arrives).
  * Returns a Promise that resolves when the loop has fully stopped.
  *
- * FIX: Always call s.stop() regardless of latencyLooping flag.
- * Previously, if the play callback fired early (e.g. audio session
- * contention) it set latencyLooping = false — then stopLatencyLoop()
- * would short-circuit and never call s.stop(), leaving the sound
- * physically playing on device.
+ * Bumps the generation counter so every in-flight callback from the
+ * previous generation becomes a no-op. Then calls s.stop() to silence
+ * any audio that's currently playing on device.
  */
 export const stopLatencyLoop = (): Promise<void> => {
   return new Promise((resolve) => {
     const s = sounds.latency;
-    latencyLooping = false; // clear flag immediately — always
+    // Bump generation FIRST — invalidates any pending start-callbacks
+    // that might still be racing toward s.play().
+    latencyGen++;
+    latencyLooping = false;
     if (!s) {
       resolve();
       return;
     }
     s.stop(() => {
       console.log('⏹️ [SFX] Latency loop stopped');
+      // Defensive: a second stop 200ms later catches the edge case where
+      // iOS processes a queued play() between our stop() and this callback.
+      // The generation guard inside _startLatencyLoop should already prevent
+      // this, but a belt-and-suspenders stop here is cheap and bullet-proof.
+      setTimeout(() => {
+        s.stop(() => {});
+      }, 200);
       resolve();
     });
   });
