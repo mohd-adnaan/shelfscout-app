@@ -36,6 +36,7 @@ const ACTIVE_BASE = 0.18;
 
 type VisualizerState =
   | 'ready'
+  | 'glassesListening'
   | 'listening'
   | 'thinking'
   | 'speaking'
@@ -57,6 +58,13 @@ const MOTION: Record<VisualizerState, MotionProfile> = {
     pulseAmplitude: 0,
     baseline: 0.16,
     outerGlowOpacity: 0.16,
+  },
+  glassesListening: {
+    speed: 0.6,
+    waveAmplitude: 0.06,
+    pulseAmplitude: 0.03,
+    baseline: 0.2,
+    outerGlowOpacity: 0.22,
   },
   listening: {
     speed: 1.65,
@@ -101,14 +109,20 @@ interface VoiceVisualizerProps {
   isSpeaking: boolean;
   isNavigation?: boolean;
   isReaching?: boolean;
+  isGlassesListening?: boolean;
   transcript: string;
   pulseAnim: Animated.Value;
   opacityAnim: Animated.Value;
   audioLevel?: number;
+  /** Debug status from wake word hook (mic info, errors) */
+  glassesDebugStatus?: string;
+  /** Raw transcript from wake word recognizer */
+  glassesDebugRaw?: string;
 }
 
 const STATUS_TEXT: Record<VisualizerState, string> = {
   ready: 'Ready',
+  glassesListening: 'Say "Hey ShelfScout"',
   listening: 'Listening',
   thinking: 'Thinking',
   speaking: 'Speaking',
@@ -118,6 +132,7 @@ const STATUS_TEXT: Record<VisualizerState, string> = {
 
 const STATUS_INSTRUCTION: Record<VisualizerState, string> = {
   ready: 'Tap to speak',
+  glassesListening: 'Glasses mic active',
   listening: 'Speak naturally, tap to stop',
   thinking: 'Tap to interrupt',
   speaking: 'Tap to interrupt',
@@ -127,6 +142,7 @@ const STATUS_INSTRUCTION: Record<VisualizerState, string> = {
 
 const STATUS_COLOR: Record<VisualizerState, string> = {
   ready: '#8A8F98',
+  glassesListening: '#00BFA5',
   listening: '#2AA4FF',
   thinking: '#FFC24A',
   speaking: '#4CCB6E',
@@ -205,10 +221,13 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   isSpeaking,
   isNavigation = false,
   isReaching = false,
+  isGlassesListening = false,
   transcript,
   pulseAnim,
   opacityAnim: _opacityAnim,
   audioLevel: _audioLevel = 0,
+  glassesDebugStatus,
+  glassesDebugRaw,
 }) => {
   const ringRotateAnim = useRef(new Animated.Value(0)).current;
   
@@ -225,8 +244,9 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     if (isSpeaking) return 'speaking';
     if (isProcessing) return 'thinking';
     if (isListening) return 'listening';
+    if (isGlassesListening) return 'glassesListening';
     return 'ready';
-  }, [isListening, isNavigation, isProcessing, isReaching, isSpeaking]);
+  }, [isGlassesListening, isListening, isNavigation, isProcessing, isReaching, isSpeaking]);
 
   const statusText = STATUS_TEXT[state];
   const instructionText = STATUS_INSTRUCTION[state];
@@ -243,6 +263,8 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
           duration:
             state === 'thinking'
               ? 5400
+              : state === 'glassesListening'
+                ? 12000
               : state === 'navigating' || state === 'reaching'
                 ? 7600
                 : 8400,
@@ -411,10 +433,6 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     [barPositions, statusColor]
   );
 
-  const getAccessibleLabel = () => {
-    return `${statusText}. ${instructionText}`;
-  };
-
   const renderIcon = () => {
     const size = 65;
     if (state === 'reaching') return <ReachingIcon size={size} color={statusColor} />;
@@ -422,15 +440,24 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
     if (isSpeaking) return <Speaker size={size} color="#4CAF50" />;
     if (isProcessing) return <Brain size={size} color="#FFC107" />;
     if (isListening) return <Mic size={size} color="#2196F3" />;
+    if (isGlassesListening) return <Mic size={size} color="#00BFA5" />;
     return <MicOff size={size} color={STATUS_COLOR.ready} />;
   };
 
   return (
     <View
       style={styles.container}
-      accessible={true}
-      accessibilityLabel={getAccessibleLabel()}
-      accessibilityRole="text"
+      // ── Bug 8: do NOT compete with the parent TouchableWithoutFeedback's
+      // accessibility region. Previously this View was `accessible={true}`
+      // with its own `accessibilityRole="text"` — that, combined with the
+      // visible <Text>"Ready"</Text> below using a wide letterSpacing,
+      // caused VoiceOver to spell the word as letters ("R-e-a-d-y" /
+      // "L-I-S-T-E-N-I-N-G") on some iOS versions. We hide the entire
+      // subtree from accessibility; the parent TouchableWithoutFeedback in
+      // App.tsx owns the spoken label ("Ready. Tap to speak").
+      accessible={false}
+      accessibilityElementsHidden={true}
+      importantForAccessibility="no-hide-descendants"
     >
       
       <View style={styles.visualizer} accessible={false} importantForAccessibility="no-hide-descendants">
@@ -459,15 +486,27 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
         <View style={styles.iconContainer}>{renderIcon()}</View>
       </View>
 
-      <Text style={statusTextStyle}>{statusText}</Text>
+      {/* Visible status text — explicitly hidden from accessibility so
+          VoiceOver does not fall back to reading the on-screen letters. */}
+      <Text style={statusTextStyle} accessible={false} importantForAccessibility="no">{statusText}</Text>
 
       {transcript && state === 'listening' && (
-        <View style={transcriptBoxStyle}>
-          <Text style={styles.transcriptText}>{transcript}</Text>
+        <View style={transcriptBoxStyle} accessible={false} importantForAccessibility="no-hide-descendants">
+          <Text style={styles.transcriptText} accessible={false} importantForAccessibility="no">{transcript}</Text>
         </View>
       )}
 
-      <Text style={instructionTextStyle}>{instructionText}</Text>
+      <Text style={instructionTextStyle} accessible={false} importantForAccessibility="no">{instructionText}</Text>
+
+      {/* ── Debug overlay for glasses mode ── */}
+      {(state === 'glassesListening' || isGlassesListening) && glassesDebugStatus ? (
+        <View style={styles.debugBox} accessible={false} importantForAccessibility="no-hide-descendants">
+          <Text style={styles.debugStatusText}>{glassesDebugStatus}</Text>
+          {glassesDebugRaw ? (
+            <Text style={styles.debugRawText}>Raw: "{glassesDebugRaw}"</Text>
+          ) : null}
+        </View>
+      ) : null}
     </View>
   );
 };
@@ -567,6 +606,30 @@ const styles = StyleSheet.create({
     fontSize: 15,
     letterSpacing: 0.28,
     fontWeight: '500',
+  },
+  debugBox: {
+    position: 'absolute',
+    bottom: 65,
+    left: 16,
+    right: 16,
+    backgroundColor: 'rgba(0, 0, 0, 0.85)',
+    borderRadius: 10,
+    borderWidth: 1,
+    borderColor: 'rgba(0, 191, 165, 0.5)',
+    paddingHorizontal: 14,
+    paddingVertical: 10,
+  },
+  debugStatusText: {
+    color: '#00BFA5',
+    fontSize: 13,
+    fontWeight: '600',
+    fontFamily: 'Menlo',
+  },
+  debugRawText: {
+    color: '#AAFFEE',
+    fontSize: 12,
+    fontFamily: 'Menlo',
+    marginTop: 4,
   },
 });
 

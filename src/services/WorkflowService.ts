@@ -7,7 +7,7 @@
 
 import axios, { AxiosError } from 'axios';
 import { Platform, Alert, NativeModules } from 'react-native';
-import { WORKFLOW_URL, CONFIG, NAVIGATION_CONFIG } from '../utils/constants';
+import { WORKFLOW_URL, SMART_GUIDANCE_URL, CONFIG, NAVIGATION_CONFIG } from '../utils/constants';
 import { WorkflowRequest, WorkflowResponse, ContinuousModeState } from '../utils/types';
 import { AccessibilityService } from './AccessibilityService';
 import { debugLogger } from './DebugLogger';
@@ -100,8 +100,16 @@ const generateSessionId = (): string => {
 let SESSION_ID = generateSessionId();
 console.log('📱 [Workflow] Session initialized:', SESSION_ID);
 
+// ─── session_start signal (Melody's tracker reinit) ─────────────────────────
+// True at app launch and after every resetSessionId(). Cleared after the
+// first request that successfully advertises it. Backend reads this on
+// the first request of a new session and reinitializes Melody's tracker
+// so it doesn't stay locked on a stale target from the previous session.
+let isNewSession = true;
+
 export const resetSessionId = (): string => {
   SESSION_ID = generateSessionId();
+  isNewSession = true;
   console.log('🔄 [Workflow] Session RESET:', SESSION_ID);
   return SESSION_ID;
 };
@@ -189,7 +197,7 @@ export const stopContinuousMode = (reason?: string, resetSession: boolean = fals
   }
 };
 
-export const shouldPreventInfiniteLoop = (): boolean => {
+export const shouldPreventInfiniteLoop = (minIntervalMs?: number): boolean => {
   const { iterationCount, lastRequestTime } = continuousModeState;
 
   if (iterationCount >= NAVIGATION_CONFIG.MAX_LOOP_ITERATIONS) {
@@ -198,7 +206,8 @@ export const shouldPreventInfiniteLoop = (): boolean => {
   }
 
   const timeSinceLastRequest = Date.now() - lastRequestTime;
-  if (lastRequestTime > 0 && timeSinceLastRequest < NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS) {
+  const minInterval = minIntervalMs ?? NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS;
+  if (lastRequestTime > 0 && timeSinceLastRequest < minInterval) {
     console.warn('⚠️ Request rate too high');
     return true;
   }
@@ -247,6 +256,22 @@ export const sendToWorkflow = async (
     formData.append('request_id', `mobile-${Date.now()}`);
     formData.append('session_id', SESSION_ID);
     formData.append('continuousMode', isContinuousIteration ? 'true' : 'false');
+
+    // ── session_start signal — fires once per fresh session ─────────────
+    // Coordinated with Melody's backend tracker container: when this is
+    // true, the backend reinitializes the tracker for this session_id
+    // instead of carrying over state from a previous app run.
+    const sessionStartValue = (isNewSession || request.session_start === true)
+      ? 'true'
+      : 'false';
+    formData.append('session_start', sessionStartValue);
+    if (sessionStartValue === 'true') {
+      console.log('🆕 [Workflow] session_start=true (fresh session, tracker reinit)');
+    }
+    // Clear the module-level flag — only the FIRST request after a new
+    // session advertises session_start; subsequent requests in the same
+    // session_id send session_start=false.
+    isNewSession = false;
 
     // Add image if provided
     if (request.imageUri) {
@@ -329,25 +354,35 @@ export const sendToWorkflow = async (
     });
 
     debugLogger.logAPI(
-      `← Parsed: nav=${parsedResponse.navigation} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox}`,
+      `← Parsed: nav=${parsedResponse.navigation} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox} track=${!!parsedResponse.tracking_active} reached=${!!parsedResponse.reached}`,
       `text="${(parsedResponse.text || '').substring(0, 80)}"`,
     );
 
     // ========================================================================
     // Validate response
+    //
+    // Mansi confirmed (chat): when the backend returns null guidance_text
+    // but still has navigation/reaching flags set, the app must stay
+    // silent rather than emitting a hardcoded "Continue". The continuous
+    // loop's TTS block at App.tsx is already guarded by `if (result.text)`,
+    // so leaving text empty is the correct behaviour — TTS just skips
+    // for that iteration and the next backend poll fires.
+    //
+    // We still keep the reaching_ios fallback intro because the ARKit
+    // pipeline relies on a non-empty intro line to drive its parallel
+    // handoff (introSpeechPromise).
     // ========================================================================
     if (!parsedResponse.text || !parsedResponse.text.trim()) {
       if (!isContinuousIteration && !parsedResponse.reaching_ios) {
         const message = 'Server returned empty response. Please try again.';
         AccessibilityService.announceError(message, false);
         throw new Error(message);
-      } else {
-        parsedResponse.text = parsedResponse.navigation || parsedResponse.reaching_flag
-          ? 'Continue'
-          : parsedResponse.reaching_ios
-            ? `Guiding you to ${parsedResponse.object || 'the object'}`
-            : 'Task complete';
+      } else if (parsedResponse.reaching_ios) {
+        parsedResponse.text = `Guiding you to ${parsedResponse.object || 'the object'}`;
       }
+      // else: continuous-mode iteration with empty guidance → leave text
+      //       empty, downstream TTS guard skips speak. NO "Continue"
+      //       fallback (Mansi-confirmed).
     }
 
     return parsedResponse;
@@ -387,6 +422,76 @@ export const sendToWorkflow = async (
 
     throw new Error(userMessage);
   }
+};
+
+// =============================================================================
+// SMART GUIDANCE (tracker-driven reaching)
+// =============================================================================
+
+export interface SmartGuidanceRequest {
+  object: string;
+  bbox: string;
+  image: string;
+  annotated_image: string;
+  success: boolean;
+  session_id?: string;
+}
+
+export interface SmartGuidanceResponse {
+  guidance?: string;
+  hand_direction?: string | null;
+  tracking_active?: boolean;
+  reaching_completed?: boolean;
+  bbox?: { x: number; y: number; width: number; height: number } | string | [number, number, number, number];
+  class_name?: string;
+  confidence?: number;
+  depth_estimate?: number;
+}
+
+export const sendToSmartGuidance = async (
+  payload: SmartGuidanceRequest,
+  signal?: AbortSignal
+): Promise<SmartGuidanceResponse> => {
+  const requestStartTime = Date.now();
+
+  debugLogger.logAPI(
+    `→ POST ${SMART_GUIDANCE_URL.replace('https://cybersight.cim.mcgill.ca', '')}`,
+    `object=${payload.object} bbox=${payload.bbox}`,
+  );
+
+  const response = await axios.post<any>(
+    SMART_GUIDANCE_URL,
+    {
+      session: {
+        object: payload.object,
+        bbox: payload.bbox,
+        image: payload.image,
+        annotated_image: payload.annotated_image,
+        success: payload.success,
+        ...(payload.session_id ? { session_id: payload.session_id } : {}),
+      },
+    },
+    {
+      headers: {
+        'Content-Type': 'application/json',
+        'Accept': 'application/json',
+      },
+      timeout: CONFIG.REQUEST_TIMEOUT,
+      signal,
+    }
+  );
+
+  const elapsed = Date.now() - requestStartTime;
+  debugLogger.logAPI(
+    `← ${response.status} OK (${elapsed}ms)`,
+  );
+
+  const data = response.data;
+  const payloadData = Array.isArray(data) ? data[0] : data;
+  if (payloadData && typeof payloadData === 'object' && payloadData.json) {
+    return payloadData.json as SmartGuidanceResponse;
+  }
+  return payloadData as SmartGuidanceResponse;
 };
 
 // =============================================================================
@@ -602,30 +707,8 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     return s;
   };
 
-  // Extract text per Mansi's contract:
-  //   • backend always returns the long guidance in `text` (= session.response)
-  //   • backend additionally returns `hand_direction` (short, e.g. "top left")
-  //     ONLY when a hand is detected in the standard reaching pipeline
-  //   • when hand_direction is non-null, speak that instead of the long text
-  // We also include `reaching` as a final fallback because the standard
-  // reaching pipeline writes its per-iteration guidance to session.reaching,
-  // and we do NOT want an empty-text error if session.response wasn't
-  // refreshed for that iteration.
-  const hand_direction = normalizeBackendString(
-    pickString(['hand_direction', 'handDirection']),
-  );
-
-  let text = '';
-  if (hand_direction) {
-    text = hand_direction;
-  } else {
-    text = normalizeBackendString(
-      pickString(['text', 'response', 'message', 'reaching']),
-    );
-  }
-
   // =========================================================================
-  // THREE-FLAG EXTRACTION
+  // FLAG EXTRACTION
   // =========================================================================
 
   // Navigation flag
@@ -641,13 +724,45 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     parseBoolean(payload.reaching) === true
   );
 
-  // =========================================================================
   // reaching_ios flag (iOS native ARKit) - HIGHEST PRIORITY
-  // =========================================================================
   const reaching_ios = normalizedPayloads.some((payload) =>
     parseBoolean(payload.reaching_ios) === true ||
     parseBoolean(payload.reachingIos) === true
   );
+
+  // tracking_active flag — Melody's tracker is locked on the target.
+  const tracking_active = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.tracking_active) === true ||
+    parseBoolean(payload.trackingActive) === true
+  );
+
+  // reached flag — RTAB navigation completion (Kasra).
+  const reached = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.reached) === true ||
+    parseBoolean(payload.navigation_completed) === true
+  );
+
+  // Extract guidance text with hand-direction precedence.
+  const hand_direction = normalizeBackendString(
+    pickString(['hand_direction', 'handDirection']),
+  );
+
+  const reachingText = normalizeBackendString(
+    pickString(['reaching', 'guidance']),
+  );
+
+  const nonReachingText = normalizeBackendString(
+    pickString(['text', 'message', 'response']),
+  );
+
+  let text = '';
+  if (hand_direction) {
+    text = hand_direction;
+  } else if (reaching_flag || tracking_active) {
+    text = reachingText || normalizeBackendString(pickString(['text', 'message']));
+  } else {
+    text = nonReachingText || reachingText;
+  }
 
   // =========================================================================
   // BBOX extraction (when reaching_ios is true)
@@ -658,6 +773,11 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   // Object name extraction
   // =========================================================================
   const object = pickString(['object', 'objectName']) || undefined;
+
+  const annotatedImageRaw = normalizeBackendString(
+    pickString(['annotated_image', 'annotatedImage', 'annotated_image_base64', 'annotatedImageBase64']),
+  );
+  const annotated_image = annotatedImageRaw || undefined;
 
   // Depth from backend (meters)
   const depthValue = pickNumber(['depth']);
@@ -682,6 +802,8 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
     object,
     depth,
+    tracking_active,
+    reached,
   });
 
   return {
@@ -693,6 +815,9 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     object,
     depth,
     hand_direction: hand_direction || undefined,
+    annotated_image,
+    tracking_active,
+    reached,
     loopDelay,
     session_id,
   };
@@ -778,4 +903,5 @@ export default {
   shouldPreventInfiniteLoop,
   determineActionMode,
   triggerIOSReaching,
+  sendToSmartGuidance,
 };

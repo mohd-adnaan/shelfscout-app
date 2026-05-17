@@ -554,6 +554,12 @@ class WearablesCameraModule: NSObject {
     if let stream = streamSession, stream.state == .streaming {
       resolver("connected"); return
     }
+    if let session = deviceSession, session.state == .started {
+      resolver("connected"); return
+    }
+    if !availableDevices.isEmpty {
+      resolver("paired"); return
+    }
     resolver("disconnected")
   }
 

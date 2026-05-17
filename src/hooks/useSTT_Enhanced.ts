@@ -39,6 +39,12 @@ interface UseSTTOptions {
   enableOpenAIVAD?: boolean;
   /** Minimum confidence required from OpenAI VAD (default: 0.55) */
   openAIVADMinConfidence?: number;
+  /**
+   * When true, the hook will NOT register Voice listeners or call
+   * Voice.destroy(). Use this when another hook (e.g. useWakeWordSTT)
+   * owns the Voice singleton.
+   */
+  disabled?: boolean;
 }
 
 interface UseSTTReturn {
@@ -69,6 +75,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     silenceThreshold = DEFAULT_SILENCE_THRESHOLD,
     enableOpenAIVAD = true,
     openAIVADMinConfidence = 0.55,
+    disabled = false,
   } = options;
 
   // State
@@ -82,6 +89,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
   const lastSpeechTimeRef = useRef<number>(Date.now());
   const isManualStopRef = useRef(false);
   const openAIVadRequestSeqRef = useRef(0);
+  const hasHeardSpeechRef = useRef(false);
   
   // ✅ FIX: Track if we've already auto-submitted for this utterance
   const hasAutoSubmittedRef = useRef(false);
@@ -285,6 +293,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       transcriptRef.current = finalResult;
       setTranscript(finalResult);
       lastSpeechTimeRef.current = Date.now();
+      hasHeardSpeechRef.current = true;
       
       console.log("'📝 Final:'", `'${finalResult}'`);
       
@@ -310,6 +319,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       transcriptRef.current = partialResult;
       setTranscript(partialResult);
       lastSpeechTimeRef.current = Date.now();
+      hasHeardSpeechRef.current = true;
       
       console.log("'📝 Partial:'", `'${partialResult}'`);
 
@@ -350,6 +360,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     clearSilenceTimer();
     openAIVadRequestSeqRef.current += 1;
     setIsListening(false);
+    hasHeardSpeechRef.current = false;
   }, [clearSilenceTimer]);
 
   // ============================================================================
@@ -357,6 +368,13 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
   // ============================================================================
 
   useEffect(() => {
+    // When disabled (e.g. glasses mode active), do NOT register listeners.
+    // Another hook (useWakeWordSTT) owns the Voice singleton.
+    if (disabled) {
+      console.log('ℹ️ [STT] Disabled — skipping Voice listener registration');
+      return;
+    }
+
     Voice.onSpeechStart = onSpeechStart;
     Voice.onSpeechEnd = onSpeechEnd;
     Voice.onSpeechResults = onSpeechResults;
@@ -364,10 +382,12 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     Voice.onSpeechError = onSpeechError;
 
     return () => {
-      Voice.destroy().then(Voice.removeAllListeners);
+      if (!disabled) {
+        Voice.destroy().then(Voice.removeAllListeners);
+      }
       clearSilenceTimer();
     };
-  }, [onSpeechStart, onSpeechEnd, onSpeechResults, onSpeechPartialResults, onSpeechError, clearSilenceTimer]);
+  }, [disabled, onSpeechStart, onSpeechEnd, onSpeechResults, onSpeechPartialResults, onSpeechError, clearSilenceTimer]);
 
   // ============================================================================
   // Public Methods
@@ -383,6 +403,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       // ✅ FIX: Reset auto-submit flag for new listening session
       hasAutoSubmittedRef.current = false;
       isAutoSubmittingRef.current = false;
+      hasHeardSpeechRef.current = false;
 
       // ✅ VOICEOVER FIX: Set grace period for discarding early results
       gracePeriodMsRef.current = gracePeriodMs;
@@ -427,7 +448,6 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
         console.log(`♿ Grace period active: ${gracePeriodMs}ms (discarding VoiceOver noise)`);
       }
 
-      startSilenceTimer();
     } catch (err: any) {
       console.error('❌ Failed to start voice:', err);
       setError(err.message || 'Failed to start voice recognition');

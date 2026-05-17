@@ -10,7 +10,12 @@
 
 import { NativeModules, Platform } from 'react-native';
 
-export type WearablesCameraStatus = 'unknown' | 'connected' | 'disconnected' | 'unsupported';
+export type WearablesCameraStatus =
+  | 'unknown'
+  | 'connected'
+  | 'paired'
+  | 'disconnected'
+  | 'unsupported';
 
 const { WearablesCameraModule } = NativeModules;
 
@@ -33,7 +38,12 @@ export const wearablesCamera = {
 
     try {
       const status = await WearablesCameraModule.getStatus();
-      if (status === 'connected' || status === 'disconnected' || status === 'unknown') {
+      if (
+        status === 'connected' ||
+        status === 'paired' ||
+        status === 'disconnected' ||
+        status === 'unknown'
+      ) {
         return status;
       }
       return 'unknown';

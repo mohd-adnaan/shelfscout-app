@@ -36,7 +36,7 @@
 	<key>MWDAT</key>
 	<dict>
 		<key>AppLinkURLScheme</key>
-		<string></string>
+		<string>shelfscout://</string>
 		<key>ClientToken</key>
 		<string>AR|990815883436347|877995328d6315812e7e1d79390dbf69</string>
 		<key>MetaAppID</key>

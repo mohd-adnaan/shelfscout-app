@@ -484,19 +484,23 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 styles.statusDot,
                 wearablesStatus === 'connected'
                   ? styles.statusDotConnected
-                  : wearablesStatus === 'disconnected'
-                    ? styles.statusDotDisconnected
-                    : styles.statusDotUnknown,
+                  : wearablesStatus === 'paired'
+                    ? styles.statusDotPaired
+                    : wearablesStatus === 'disconnected'
+                      ? styles.statusDotDisconnected
+                      : styles.statusDotUnknown,
               ]}
             />
             <Text style={styles.statusText}>
               {wearablesStatus === 'connected'
                 ? 'Connected'
-                : wearablesStatus === 'disconnected'
-                  ? 'Not connected'
-                  : wearablesStatus === 'unsupported'
-                    ? 'Unsupported'
-                    : 'Status unknown'}
+                : wearablesStatus === 'paired'
+                  ? 'Paired'
+                  : wearablesStatus === 'disconnected'
+                    ? 'Not connected'
+                    : wearablesStatus === 'unsupported'
+                      ? 'Unsupported'
+                      : 'Status unknown'}
             </Text>
           </View>
         </Section>
@@ -871,6 +875,9 @@ const styles = StyleSheet.create({
   },
   statusDotConnected: {
     backgroundColor: C.success,
+  },
+  statusDotPaired: {
+    backgroundColor: C.primary,
   },
   statusDotDisconnected: {
     backgroundColor: C.warning,

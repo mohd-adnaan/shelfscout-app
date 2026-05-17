@@ -26,8 +26,10 @@ import {
 import Video from 'react-native-video';
 import { useTTS } from './src/hooks/useTTS';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
+import { useWakeWordSTT } from './src/hooks/useWakeWordSTT';
 import {
   sendToWorkflow,
+  sendToSmartGuidance,
   isContinuousModeActive,
   getCurrentMode,
   startContinuousMode,
@@ -40,6 +42,7 @@ import {
   resetSessionId,
   determineActionMode,
 } from './src/services/WorkflowService';
+import { sendToKasraGuidance } from './src/services/KasraGuidanceService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import {
   initSounds,
@@ -61,6 +64,7 @@ import SettingsScreen from './src/screens/SettingsScreen';
 import { debugLogger } from './src/services/DebugLogger';
 import { DebugOverlay } from './src/components/DebugOverlay';
 import { wearablesCamera } from './src/services/WearablesCamera';
+import RNFS from 'react-native-fs';
 
 const { width, height } = Dimensions.get('window');
 
@@ -71,6 +75,8 @@ const CAMERA_REACTIVATION_DELAY_MS = 800;
 const AUDIO_SESSION_RELEASE_DELAY_MS = 300;
 const TTS_COMPLETION_BUFFER_MS = 500;
 const STARTUP_LOADER_MIN_MS = 1800;
+const VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS = 800;
+const VOICEOVER_LISTENING_GRACE_MS = 600;
 
 // =============================================================================
 // PIPELINE PRE-FETCH CONFIGURATION
@@ -82,6 +88,9 @@ const PREFETCH_CONFIG = {
   PROGRESS_POLL_INTERVAL: 500,
   MIN_CYCLE_COOLDOWN: 300,
 };
+
+const SMART_GUIDANCE_MIN_CYCLE_MS = Math.ceil(2000 / 3);
+const KASRA_FEED_INTERVAL_MS = 500;
 
 // =============================================================================
 // AppInner
@@ -128,6 +137,17 @@ function AppInner(): React.JSX.Element {
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
   const prefetchedPhotoRef = useRef<string | null>(null);
   const wearablesPrewarmAttemptedRef = useRef(false);
+  const smartGuidanceActiveRef = useRef(false);
+  const smartGuidanceResumeMainRef = useRef(false);
+  const smartGuidanceCacheRef = useRef<{
+    object?: string;
+    bbox?: any;
+    annotatedImage?: string;
+  } | null>(null);
+  const kasraFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const kasraLastFrameRef = useRef<string>('');
+  const kasraLastObjectRef = useRef<string>('');
+  const kasraIsSendingRef = useRef(false);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -352,9 +372,24 @@ function AppInner(): React.JSX.Element {
     AccessibilityInfo.announceForAccessibility(spoken);
     await speachesSentenceChunker.synthesizeSpeechChunked(spoken);
   };
-  const reactivateCameraAndCapture = async (): Promise<string> => {
+
+  const announceTapToStart = useCallback((prefix: string) => {
+    const suffix = screenReaderEnabledRef.current ? 'Tap to start.' : 'Tap to speak.';
+    const trimmedPrefix = prefix.trim();
+    AccessibilityInfo.announceForAccessibility(
+      trimmedPrefix ? `${trimmedPrefix} ${suffix}` : suffix
+    );
+  }, []);
+  const reactivateCameraAndCapture = async (options?: {
+    enableShutterSound?: boolean;
+  }): Promise<string> => {
     console.log('📷 Reactivating camera for capture...');
     setIsCameraActive(true);
+
+    const useSystemShutterSound =
+      options?.enableShutterSound === true &&
+      Platform.OS === 'ios' &&
+      !settingsRef.current.useWearablesCamera;
 
     if (settingsRef.current.useWearablesCamera) {
       try {
@@ -375,8 +410,21 @@ function AppInner(): React.JSX.Element {
     }
 
     try {
+      if (useSystemShutterSound) {
+        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+        const { ReachingModule } = NativeModules;
+        if (ReachingModule?.playSystemShutter) {
+          try {
+            await ReachingModule.playSystemShutter();
+          } catch (e: any) {
+            console.warn('⚠️ System shutter sound failed:', e?.message || e);
+          }
+        } else {
+          console.warn('⚠️ System shutter unavailable — rebuild iOS app');
+        }
+      }
       const photo = await cameraRef.current.takePhoto({
-        enableShutterSound: false,
+        enableShutterSound: useSystemShutterSound,
         flash: 'off',
       });
       const fixedImage = await fixImageOrientation(photo.path);
@@ -391,8 +439,21 @@ function AppInner(): React.JSX.Element {
       console.error('❌ Photo capture failed, retrying:', error);
       await new Promise(resolve => setTimeout(resolve, 500));
       try {
+        if (useSystemShutterSound) {
+          await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+          const { ReachingModule } = NativeModules;
+          if (ReachingModule?.playSystemShutter) {
+            try {
+              await ReachingModule.playSystemShutter();
+            } catch (e: any) {
+              console.warn('⚠️ System shutter sound failed (retry):', e?.message || e);
+            }
+          } else {
+            console.warn('⚠️ System shutter unavailable (retry) — rebuild iOS app');
+          }
+        }
         const retry = await cameraRef.current.takePhoto({
-          enableShutterSound: false,
+          enableShutterSound: useSystemShutterSound,
         });
         return retry.path;
       } catch (e) {
@@ -401,6 +462,118 @@ function AppInner(): React.JSX.Element {
       }
     }
   };
+
+  const toDataUrl = (value: string): string => {
+    if (!value) return '';
+    return value.startsWith('data:') ? value : `data:image/jpeg;base64,${value}`;
+  };
+
+  const readImageAsDataUrl = async (uri: string): Promise<string | null> => {
+    if (!uri) return null;
+    const path = uri.startsWith('file://') ? uri.replace('file://', '') : uri;
+    try {
+      const base64 = await RNFS.readFile(path, 'base64');
+      return toDataUrl(base64);
+    } catch (e) {
+      console.warn('⚠️ Failed to read image for smart guidance:', e);
+      return null;
+    }
+  };
+
+  const normalizeTextValue = (value?: string | null): string => {
+    if (!value) return '';
+    let s = String(value).trim();
+    if (s.length >= 2 && s.startsWith('"') && s.endsWith('"')) {
+      s = s.slice(1, -1).trim();
+    }
+    const lower = s.toLowerCase();
+    if (lower === 'null' || lower === 'undefined' || lower === 'none' || lower === '') {
+      return '';
+    }
+    return s;
+  };
+
+  const bboxToString = (bbox: any): string => {
+    if (!bbox) return '';
+    if (typeof bbox === 'string') {
+      const trimmed = bbox.trim();
+      const lower = trimmed.toLowerCase();
+      if (lower === 'none' || lower === 'null' || lower === 'undefined') return '';
+      return trimmed;
+    }
+    if (Array.isArray(bbox) && bbox.length === 4) {
+      const parsed = bbox.map((v) => Number(v));
+      if (parsed.some(Number.isNaN)) return '';
+      return `[${parsed.join(',')}]`;
+    }
+    if (typeof bbox === 'object') {
+      const x = Number(bbox.x);
+      const y = Number(bbox.y);
+      const w = Number(bbox.width);
+      const h = Number(bbox.height);
+      if (![x, y, w, h].some(Number.isNaN)) {
+        return `[${x},${y},${x + w},${y + h}]`;
+      }
+    }
+    return '';
+  };
+
+  const bboxToArray = (bbox: any): [number, number, number, number] | undefined => {
+    if (!bbox) return undefined;
+    if (Array.isArray(bbox) && bbox.length === 4) {
+      const parsed = bbox.map((v) => Number(v));
+      if (parsed.some(Number.isNaN)) return undefined;
+      return parsed as [number, number, number, number];
+    }
+    if (typeof bbox === 'string') {
+      const lower = bbox.trim().toLowerCase();
+      if (lower === 'none' || lower === 'null' || lower === 'undefined') return undefined;
+      const cleaned = bbox.replace(/[\[\]]/g, '');
+      const parts = cleaned.split(',').map((v) => Number(v.trim()));
+      if (parts.length === 4 && !parts.some(Number.isNaN)) {
+        return parts as [number, number, number, number];
+      }
+    }
+    if (typeof bbox === 'object') {
+      const x = Number(bbox.x);
+      const y = Number(bbox.y);
+      const w = Number(bbox.width);
+      const h = Number(bbox.height);
+      if (![x, y, w, h].some(Number.isNaN)) {
+        return [x, y, x + w, y + h];
+      }
+    }
+    return undefined;
+  };
+
+  const stopKasraFeed = useCallback(() => {
+    if (kasraFeedIntervalRef.current) {
+      clearInterval(kasraFeedIntervalRef.current);
+      kasraFeedIntervalRef.current = null;
+    }
+    kasraIsSendingRef.current = false;
+  }, []);
+
+  const startKasraFeed = useCallback(() => {
+    if (kasraFeedIntervalRef.current) return;
+
+    kasraFeedIntervalRef.current = setInterval(() => {
+      if (!isContinuousModeRunning.current || getCurrentMode() !== 'navigation') return;
+
+      const imageUri = kasraLastFrameRef.current;
+      const objectName = kasraLastObjectRef.current;
+      if (!imageUri || !objectName || kasraIsSendingRef.current) return;
+
+      kasraIsSendingRef.current = true;
+      sendToKasraGuidance({ imageUri, objectName })
+        .catch((err: any) => {
+          console.warn('[Kasra] Guidance send failed:', err?.message || err);
+        })
+        .finally(() => {
+          kasraIsSendingRef.current = false;
+        });
+    }, KASRA_FEED_INTERVAL_MS);
+  }, []);
 
   // ============================================================================
   // iOS Reaching helper — shared by both reaching blocks
@@ -454,7 +627,7 @@ function AppInner(): React.JSX.Element {
       // Clean transition to ready (matches the ARKit-success path below)
       setIsCameraActive(true);
       if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-      AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+      announceTapToStart('Ready.');
       return true; // Handled (but without ARKit)
     }
 
@@ -530,9 +703,9 @@ function AppInner(): React.JSX.Element {
     setIsReaching(false);
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-    AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+    announceTapToStart('Ready.');
     return true;
-  }, [resolveReachingPipeline]);
+  }, [announceTapToStart, resolveReachingPipeline]);
 
   // ============================================================================
   // CONTINUOUS LOOP
@@ -560,7 +733,17 @@ function AppInner(): React.JSX.Element {
     AccessibilityInfo.announceForAccessibility(`${currentMode} started. Tap to stop.`);
 
     while (!continuousModeAbortRef.current && !isEmergencyStopped.current) {
-      if (shouldPreventInfiniteLoop()) {
+      const intervalMode = getCurrentMode();
+      if (intervalMode !== 'reaching' && smartGuidanceActiveRef.current) {
+        smartGuidanceActiveRef.current = false;
+        smartGuidanceResumeMainRef.current = false;
+        smartGuidanceCacheRef.current = null;
+      }
+
+      const minIntervalOverride = smartGuidanceActiveRef.current
+        ? SMART_GUIDANCE_MIN_CYCLE_MS
+        : undefined;
+      if (shouldPreventInfiniteLoop(minIntervalOverride)) {
         AccessibilityInfo.announceForAccessibility('Stopped due to time limit.');
         break;
       }
@@ -571,6 +754,7 @@ function AppInner(): React.JSX.Element {
 
       try {
         incrementContinuousMode();
+        const loopMode = getCurrentMode();
 
         // ── Capture ────────────────────────────────────────────────────────
         let photoPath = '';
@@ -579,7 +763,18 @@ function AppInner(): React.JSX.Element {
           prefetchedPhotoRef.current = null;
           console.log('🔄 ✅ Using PRE-FETCHED photo');
         } else {
-          photoPath = await reactivateCameraAndCapture();
+          photoPath = await reactivateCameraAndCapture({
+            enableShutterSound: false,
+          });
+        }
+
+        if (loopMode === 'navigation') {
+          if (photoPath) {
+            kasraLastFrameRef.current = photoPath;
+          }
+          startKasraFeed();
+        } else {
+          stopKasraFeed();
         }
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
@@ -593,18 +788,95 @@ function AppInner(): React.JSX.Element {
           playThinkingStarted(); // ← start thinking SFX for this cycle
         }
 
-        const loopMode = getCurrentMode();
-        const result = await sendToWorkflow(
-          {
-            text: '',
-            imageUri: photoPath || '',
-            imageWidth: lastImageDimensions.current.width,
-            imageHeight: lastImageDimensions.current.height,
-            navigation: loopMode === 'navigation',
-            reaching_flag: loopMode === 'reaching',
-          },
-          abortCtrl.signal
-        );
+        const shouldUseSmartGuidance = loopMode === 'reaching' && smartGuidanceActiveRef.current;
+        let usedSmartGuidance = false;
+        let result: any;
+
+        if (shouldUseSmartGuidance) {
+          const cached = smartGuidanceCacheRef.current;
+          const imageDataUrl = await readImageAsDataUrl(photoPath || '');
+          const bboxString = bboxToString(cached?.bbox);
+          const objectName = cached?.object || 'object';
+          const annotatedImage = cached?.annotatedImage
+            ? toDataUrl(cached.annotatedImage)
+            : (imageDataUrl || '');
+
+          if (!imageDataUrl || !bboxString) {
+            console.warn('⚠️ [SmartGuidance] Missing payload, resuming main workflow');
+            smartGuidanceActiveRef.current = false;
+            smartGuidanceResumeMainRef.current = true;
+          } else {
+            usedSmartGuidance = true;
+            const smartResponse = await sendToSmartGuidance(
+              {
+                object: objectName,
+                bbox: bboxString,
+                image: imageDataUrl,
+                annotated_image: annotatedImage,
+                success: true,
+                session_id: getSessionId(),
+              },
+              abortCtrl.signal
+            );
+
+            const handDirection = normalizeTextValue(smartResponse?.hand_direction);
+            const guidance = normalizeTextValue(smartResponse?.guidance);
+            const trackingActive = smartResponse?.tracking_active === true;
+            const reachingCompleted = smartResponse?.reaching_completed === true;
+            const responseBbox = bboxToArray(smartResponse?.bbox) || bboxToArray(cached?.bbox);
+
+            result = {
+              text: handDirection || guidance,
+              navigation: false,
+              reaching_flag: false,
+              reaching_ios: false,
+              tracking_active: trackingActive,
+              reaching_completed: reachingCompleted,
+              bbox: responseBbox,
+              object: smartResponse?.class_name || objectName,
+              hand_direction: handDirection || undefined,
+              loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
+            };
+
+            smartGuidanceCacheRef.current = {
+              object: smartResponse?.class_name || objectName,
+              bbox: smartResponse?.bbox || cached?.bbox,
+              annotatedImage: cached?.annotatedImage || annotatedImage,
+            };
+
+            if (smartResponse?.tracking_active === false) {
+              smartGuidanceActiveRef.current = false;
+              smartGuidanceResumeMainRef.current = true;
+            }
+          }
+        }
+
+        if (!usedSmartGuidance) {
+          result = await sendToWorkflow(
+            {
+              text: '',
+              imageUri: photoPath || '',
+              imageWidth: lastImageDimensions.current.width,
+              imageHeight: lastImageDimensions.current.height,
+              navigation: loopMode === 'navigation',
+              reaching_flag: loopMode === 'reaching',
+            },
+            abortCtrl.signal
+          );
+
+          if (smartGuidanceResumeMainRef.current) {
+            smartGuidanceResumeMainRef.current = false;
+          }
+
+          if (loopMode === 'reaching' && result?.tracking_active === true && result?.bbox && result?.object) {
+            smartGuidanceActiveRef.current = true;
+            smartGuidanceCacheRef.current = {
+              object: result?.object || smartGuidanceCacheRef.current?.object,
+              bbox: result?.bbox || smartGuidanceCacheRef.current?.bbox,
+              annotatedImage: result?.annotated_image || smartGuidanceCacheRef.current?.annotatedImage,
+            };
+          }
+        }
 
         await stopLatencyLoop(); // ← stop thinking SFX when result arrives
         setIsProcessing(false);
@@ -612,16 +884,21 @@ function AppInner(): React.JSX.Element {
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
 
-        console.log('🔄 Backend result:', {
+        if (loopMode === 'navigation' && result?.object) {
+          kasraLastObjectRef.current = result.object;
+        }
+
+        console.log('🔄 Loop result:', {
           text: result.text?.substring(0, 50),
           navigation: result.navigation,
           reaching_flag: result.reaching_flag,
           reaching_ios: result.reaching_ios,
           bbox: result.bbox,
           loopDelay: result.loopDelay,
+          smart_guidance: usedSmartGuidance,
         });
 
-        if (result.loopDelay) updateLoopDelay(result.loopDelay);
+        if (!usedSmartGuidance && result.loopDelay) updateLoopDelay(result.loopDelay);
 
         // ── "Null" response detection ──────────────────────────────────────
         // The n8n synthesizer returns the literal string "Null" when Redis
@@ -640,7 +917,7 @@ function AppInner(): React.JSX.Element {
         const cycleElapsed = Date.now() - cycleStart;
         debugLogger.logAPI(
           `🔄 Cycle #${cycleCount} | ${isNullResponse ? '⏭️ NULL' : '🔊 SPEAK'} | ${cycleElapsed}ms`,
-          `mode=${loopMode} nav=${result.navigation} reach=${result.reaching_flag} ios=${result.reaching_ios} text="${(rawText || '').substring(0, 80)}"`,
+          `mode=${loopMode} nav=${result.navigation} reach=${result.reaching_flag} ios=${result.reaching_ios} smart=${usedSmartGuidance} text="${(rawText || '').substring(0, 80)}"`,
         );
 
         if (isNullResponse) {
@@ -663,9 +940,12 @@ function AppInner(): React.JSX.Element {
               introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
                 .then(() => {
                   setIsSpeaking(false);
+                  // Bug 4 defense — see continuous-mode .then() above.
+                  stopLatencyLoop().catch(() => {});
                 })
                 .catch((e: any) => {
                   setIsSpeaking(false);
+                  stopLatencyLoop().catch(() => {});
                   if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
                     console.warn('⚠️ [ARKit] Intro TTS error (non-fatal):', e?.message);
                   }
@@ -708,13 +988,75 @@ function AppInner(): React.JSX.Element {
           }
         }
 
+        if (smartGuidanceActiveRef.current && result.reaching_completed === true) {
+          if (result.text) {
+            setIsSpeaking(true);
+            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+            setIsSpeaking(false);
+          }
+          console.log('✅ [SmartGuidance] reaching_completed=true — resetting session');
+          smartGuidanceActiveRef.current = false;
+          smartGuidanceResumeMainRef.current = false;
+          resetSessionId();
+          stopContinuousMode('smart guidance complete', true);
+          break;
+        }
+
         // ── Flag check ─────────────────────────────────────────────────────
         const navigationActive = result.navigation === true;
-        const reachingActive = result.reaching_flag === true;
+        const smartGuidanceActive = smartGuidanceActiveRef.current;
+        const reachingActive = result.reaching_flag === true || smartGuidanceActive || smartGuidanceResumeMainRef.current;
         const bothInactive = !navigationActive && !reachingActive;
 
         setIsNavigation(navigationActive);
         setIsReaching(reachingActive);
+
+        // ── RTAB → Reaching auto-handoff (Kasra) ──────────────────────────
+        //
+        // When the navigation pipeline returns reached=true (text "You have
+        // arrived"), force a transition into reaching mode regardless of how
+        // the backend toggled navigation/reaching_flag in the same response.
+        // This makes the handoff resilient to backend flag-routing glitches
+        // that previously left the loop stuck or exited it via bothInactive.
+        //
+        // We:
+        //   1. speak the arrival message (await — short and important),
+        //   2. flip loopMode to 'reaching' so the next iteration polls the
+        //      reaching pipeline,
+        //   3. `continue` to the next iteration.
+        //
+        // Only triggers from navigation mode. If we're already in reaching
+        // (e.g. a stale `reached=true` echoes), fall through to existing
+        // logic so reaching_completed/bothInactive can finish the session.
+        if (result.reached === true && loopMode === 'navigation') {
+          console.log('🎯 [RTAB→Reaching] reached=true in navigation mode — handoff');
+          debugLogger.logAPI('🎯 RTAB→Reaching handoff', `text="${(result.text || '').substring(0, 60)}"`);
+
+          if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
+            setIsSpeaking(true);
+            try {
+              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+            } catch (e: any) {
+              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+                console.warn('⚠️ [RTAB→Reaching] arrival TTS error (non-fatal):', e?.message);
+              }
+            }
+            setIsSpeaking(false);
+          }
+
+          if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
+
+          // Flip the loop mode so the next iteration sends reaching_flag=true
+          // even if the current response did not have it set.
+          startContinuousMode('reaching', result.loopDelay);
+          setIsNavigation(false);
+          setIsReaching(true);
+          AccessibilityInfo.announceForAccessibility('Arrived. Switching to object guidance.');
+
+          // Cooldown before next capture (skip null fast-poll path).
+          await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN));
+          continue; // ★ next iteration runs with loopMode='reaching'
+        }
 
         if (bothInactive) {
           if (result.text) {
@@ -755,24 +1097,45 @@ function AppInner(): React.JSX.Element {
           setIsSpeaking(true);
           // Fire TTS — do NOT await. Loop proceeds to next capture immediately.
           speachesSentenceChunker.synthesizeSpeechChunked(result.text)
-            .then(() => { setIsSpeaking(false); })
+            .then(() => {
+              setIsSpeaking(false);
+              // Bug 4 defense: if no next cycle is running yet (e.g. the
+              // loop aborted between fire-and-forget start and now),
+              // make sure the latency thinking sound isn't left playing.
+              if (!isContinuousModeRunning.current) {
+                stopLatencyLoop().catch(() => {});
+              }
+            })
             .catch((e: any) => {
               setIsSpeaking(false);
+              if (!isContinuousModeRunning.current) {
+                stopLatencyLoop().catch(() => {});
+              }
               if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
                 console.warn('🔄 [ContinuousMode] TTS error (non-fatal):', e?.message);
               }
             });
         } else if (isNullResponse) {
           // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
-          console.log(`🔄 ⏭️ Null fast-poll — waiting 500ms before next cycle`);
-          await new Promise(resolve => setTimeout(resolve, 500));
+          const nullCooldown = smartGuidanceActiveRef.current
+            ? SMART_GUIDANCE_MIN_CYCLE_MS
+            : 500;
+          console.log(`🔄 ⏭️ Null fast-poll — waiting ${nullCooldown}ms before next cycle`);
+          await new Promise(resolve => setTimeout(resolve, nullCooldown));
         }
 
         // Brief cooldown before next capture — gives JS thread a breath and
         // prevents hammering the backend faster than it can handle.
         // TTS is already playing in background; this does NOT wait for it.
         if (!isNullResponse && !continuousModeAbortRef.current) {
-          await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN));
+          const minCycleMs = smartGuidanceActiveRef.current
+            ? SMART_GUIDANCE_MIN_CYCLE_MS
+            : PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN;
+          const elapsed = Date.now() - cycleStart;
+          const cooldown = Math.max(0, minCycleMs - elapsed);
+          if (cooldown > 0) {
+            await new Promise(r => setTimeout(r, cooldown));
+          }
         }
 
         const cycleMs = Date.now() - cycleStart;
@@ -792,16 +1155,25 @@ function AppInner(): React.JSX.Element {
     // ── Cleanup ────────────────────────────────────────────────────────────
     console.log('🔄 [ContinuousMode] Loop ended');
     await stopLatencyLoop();
+    stopKasraFeed();
     isContinuousModeRunning.current = false;
     stopContinuousMode('loop ended', false);
+    smartGuidanceActiveRef.current = false;
+    smartGuidanceResumeMainRef.current = false;
+    smartGuidanceCacheRef.current = null;
     setIsNavigation(false);
     setIsReaching(false);
     setIsProcessing(false);
     setIsSpeaking(false);
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-    AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
-  }, [handleiOSReaching, resolveReachingPipeline]);
+    announceTapToStart('Ready.');
+
+    // Resume wake word listening if in glasses mode
+    if (settingsRef.current.useWearablesCamera) {
+      wakeWordResumeRef.current?.();
+    }
+  }, [announceTapToStart, handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed]);
 
   // ============================================================================
   // Stop helpers
@@ -809,6 +1181,7 @@ function AppInner(): React.JSX.Element {
   const stopContinuousModeLoop = useCallback(async () => {
     console.log('🛑 Stopping continuous mode');
     continuousModeAbortRef.current = true;
+    stopKasraFeed();
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -826,11 +1199,12 @@ function AppInner(): React.JSX.Element {
     setIsCameraActive(true);
 
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
-    AccessibilityInfo.announceForAccessibility('Stopped. Tap to speak.');
-  }, []);
+    announceTapToStart('Stopped.');
+  }, [announceTapToStart, stopKasraFeed]);
 
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
+    stopKasraFeed();
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
     await stopLatencyLoop(); // FIX: was missing — latency SFX survived nav interrupt
     await speachesSentenceChunker.stop();
@@ -841,8 +1215,8 @@ function AppInner(): React.JSX.Element {
     isNavigationLoopRunning.current = false;
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
-    AccessibilityInfo.announceForAccessibility('Navigation stopped. Tap to speak.');
-  }, []);
+    announceTapToStart('Navigation stopped.');
+  }, [announceTapToStart, stopKasraFeed]);
 
   // ============================================================================
   // Handle Voice Command  ← defined BEFORE handleAutoSubmit so ref is stable
@@ -903,6 +1277,10 @@ function AppInner(): React.JSX.Element {
 
       if (isEmergencyStopped.current) return;
 
+      if (result?.object) {
+        kasraLastObjectRef.current = result.object;
+      }
+
       await stopLatencyLoop();
       //await playSuccessChime();          // ← plays jbl_success_sae.caf
 
@@ -926,9 +1304,14 @@ function AppInner(): React.JSX.Element {
         introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
           .then(() => {
             setIsSpeaking(false);
+            // Bug 4 defense: kill any latency loop that may have been
+            // re-started by a downstream code path (or that survived an
+            // earlier stop's iOS audio race) when speech naturally ends.
+            stopLatencyLoop().catch(() => {});
           })
           .catch((e: any) => {
             setIsSpeaking(false);
+            stopLatencyLoop().catch(() => {});
             if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
               console.warn('⚠️ Intro TTS error (non-fatal):', e?.message);
             }
@@ -980,7 +1363,12 @@ function AppInner(): React.JSX.Element {
       // ── Normal (no continuous mode) ────────────────────────────────────
       setIsCameraActive(true);
       if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-      AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+      announceTapToStart('Ready.');
+
+      // Resume wake word listening if in glasses mode
+      if (settingsRef.current.useWearablesCamera) {
+        wakeWordResumeRef.current?.();
+      }
 
     } catch (error: any) {
       // ── Cancelled / aborted requests are silent ──────
@@ -1013,7 +1401,12 @@ function AppInner(): React.JSX.Element {
 
         setIsCameraActive(true);
         if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-        AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+        announceTapToStart('Ready.');
+
+        // Resume wake word listening if in glasses mode
+        if (settingsRef.current.useWearablesCamera) {
+          wakeWordResumeRef.current?.();
+        }
       }
     } finally {
       setIsProcessing(false);
@@ -1027,6 +1420,10 @@ function AppInner(): React.JSX.Element {
   useEffect(() => {
     handleVoiceCommandRef.current = handleVoiceCommand;
   }, [handleVoiceCommand]);
+  const stripVoiceOverListeningPrefix = useCallback((text: string): string => {
+    if (!screenReaderEnabledRef.current) return text;
+    return text.replace(/^\s*listening[\s,.:;!\-]+/i, '').trim();
+  }, []);
 
   // ============================================================================
   // Handle Auto-Submit (silence detection)
@@ -1039,7 +1436,8 @@ function AppInner(): React.JSX.Element {
       return;
     }
 
-    const finalText = (passedTranscript || finalTranscriptRef.current).trim();
+    let finalText = (passedTranscript || finalTranscriptRef.current).trim();
+    finalText = stripVoiceOverListeningPrefix(finalText);
 
     if (!finalText) {
       AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
@@ -1052,6 +1450,14 @@ function AppInner(): React.JSX.Element {
     // Reject transcripts that are clearly VoiceOver UI text, not user speech.
     // Uses ref (not state) because handleAutoSubmit has stable [] deps.
     if (screenReaderEnabledRef.current) {
+      const lower = finalText.toLowerCase().trim();
+      if (
+        lower.length <= 12 &&
+        ['speak', 'tap', 'ready', 'start', 'listen', 'listening', 'button'].includes(lower)
+      ) {
+        console.log('♿ VoiceOver noise rejected (short):', finalText);
+        return;
+      }
       const voPatterns = [
         'speak naturally', 'tap to stop', 'tap to speak', 'tap to interrupt',
         'cybersight is ready', 'cybersight is listening', 'cybersight is speaking',
@@ -1061,7 +1467,6 @@ function AppInner(): React.JSX.Element {
         'button tap', 'ready tap', 'ready to speak',
         'please speak your command', 'please speak your',
       ];
-      const lower = finalText.toLowerCase();
       if (voPatterns.some(p => lower.includes(p))) {
         console.log('♿ VoiceOver noise rejected:', finalText);
         // CRITICAL: Do NOT announce anything here. Any announceForAccessibility
@@ -1090,7 +1495,9 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture();
+        photoPath = await reactivateCameraAndCapture({
+          enableShutterSound: true,
+        });
       } catch (e: any) {
         console.error('❌ Camera error:', e);
 
@@ -1105,7 +1512,7 @@ function AppInner(): React.JSX.Element {
           // Reset to ready state so the next tap starts fresh.
           setIsCameraActive(true);
           if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-          AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+          announceTapToStart('Ready.');
           return;
         }
         // iPhone path: keep existing voice-only fallback.
@@ -1137,7 +1544,7 @@ function AppInner(): React.JSX.Element {
   }, []); // stable — uses refs only
 
   // ============================================================================
-  // STT hook
+  // STT hook (phone mic — used when NOT in glasses mode)
   // ============================================================================
   const {
     startListening: startSTT,
@@ -1150,7 +1557,109 @@ function AppInner(): React.JSX.Element {
     enableAutoSubmit: true,
     silenceThreshold: 1500,
     enableRMSVAD: true,
+    // When glasses mode is on, the wake word hook owns the Voice singleton.
+    // Disable this hook to prevent listener conflicts.
+    disabled: settings.useWearablesCamera,
   });
+
+  // ============================================================================
+  // Wake Word STT hook (glasses mic — used when IN glasses mode)
+  // ============================================================================
+  const wakeWordPauseRef = useRef<(() => Promise<void>) | null>(null);
+  const wakeWordResumeRef = useRef<(() => Promise<void>) | null>(null);
+
+  const handleWakeWordQuery = useCallback(async (query: string) => {
+    console.log('🎤 [WakeWord] Query received:', `"${query}"`);
+
+    // The wake word hook has already paused itself. Run through the same
+    // auto-submit pipeline that the phone-mic flow uses.
+    if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) {
+      console.log('⚠️ [WakeWord] Already in-flight, skipping — resuming wake word');
+      wakeWordResumeRef.current?.();
+      return;
+    }
+
+    console.log('⚡ [WakeWord] Processing:', query);
+    setIsProcessing(true);
+    isCapturingPhotoRef.current = true;
+    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('thinking'); }
+    AccessibilityInfo.announceForAccessibility('Thinking');
+
+    try {
+      // Configure audio for playback before capture/backend call
+      if (!screenReaderEnabledRef.current) {
+        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+      }
+
+      let photoPath = '';
+      try {
+        photoPath = await reactivateCameraAndCapture({ enableShutterSound: false });
+      } catch (e: any) {
+        console.error('❌ [WakeWord] Camera error:', e);
+        if (isWearablesCaptureError(e)) {
+          await stopLatencyLoop();
+          await speakWearablesError(e);
+          setIsProcessing(false);
+          isProcessingRef.current = false;
+          isCapturingPhotoRef.current = false;
+          finalTranscriptRef.current = '';
+          setIsCameraActive(true);
+          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          // Resume wake word listening after error
+          wakeWordResumeRef.current?.();
+          return;
+        }
+      }
+
+      isCapturingPhotoRef.current = false;
+
+      if (isEmergencyStopped.current) {
+        setIsProcessing(false);
+        return;
+      }
+
+      // Process through the standard voice command handler
+      await handleVoiceCommandRef.current(query, photoPath);
+
+    } catch (error: any) {
+      console.error('❌ [WakeWord] Auto-submit error:', error);
+      AccessibilityInfo.announceForAccessibility(`Error: ${error.message || error}`);
+      setIsProcessing(false);
+    } finally {
+      isCapturingPhotoRef.current = false;
+    }
+  }, []);
+
+  const handleWakeWordHeard = useCallback(() => {
+    console.log('🎤 [WakeWord] Wake phrase detected!');
+    if (!screenReaderEnabledRef.current) {
+      audioFeedback.playEarcon('listening');
+    }
+    AccessibilityInfo.announceForAccessibility('Listening');
+  }, []);
+
+  const {
+    isAwaitingWakeWord,
+    isCapturingQuery: isWakeWordCapturing,
+    queryTranscript: wakeWordTranscript,
+    debugStatus: wakeWordDebugStatus,
+    debugRawTranscript: wakeWordDebugRaw,
+    pause: pauseWakeWord,
+    resume: resumeWakeWord,
+    stop: stopWakeWord,
+  } = useWakeWordSTT({
+    onQueryDetected: handleWakeWordQuery,
+    onWakeWordHeard: handleWakeWordHeard,
+    enabled: settings.useWearablesCamera && !showSettings && !showStartupLoader,
+    silenceThreshold: 1500,
+    enableOpenAIVAD: true,
+  });
+
+  // Keep refs in sync so stable callbacks can access pause/resume
+  useEffect(() => {
+    wakeWordPauseRef.current = pauseWakeWord;
+    wakeWordResumeRef.current = resumeWakeWord;
+  }, [pauseWakeWord, resumeWakeWord]);
 
   // ── Re-entry guard for startListening ─────────────────────────────────────
   const isStartingRef = useRef(false);
@@ -1167,6 +1676,13 @@ function AppInner(): React.JSX.Element {
       return;
     }
     isStartingRef.current = true;
+
+    const voiceOverEnabled = screenReaderEnabledRef.current;
+    if (voiceOverEnabled) {
+      AccessibilityInfo.announceForAccessibility('Listening');
+      // Let VoiceOver finish before the mic opens to avoid "Listening" bleed-through.
+      await new Promise(resolve => setTimeout(resolve, VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS));
+    }
 
     try {
       if (Platform.OS === 'android') {
@@ -1208,15 +1724,15 @@ function AppInner(): React.JSX.Element {
       }
 
       // Delay to let audio session reconfigure after category switch
-      await new Promise(resolve => setTimeout(resolve, 350));
+      if (!screenReaderEnabled) {
+        await new Promise(resolve => setTimeout(resolve, 350));
+      }
 
-      // ── Start STT immediately with grace period for VoiceOver ─────────
-      // Instead of a long delay (which causes race conditions, stale labels,
-      // and "Speech recognition already started!" errors), we start STT
-      // right away but tell it to DISCARD any results arriving in the first
-      // 2 seconds. VoiceOver reads the button label (~1.5s of speech) and
-      // the mic picks it up — the grace period filters that noise out.
-      const gracePeriodMs = screenReaderEnabled ? 3500 : 0;
+      // ── Start STT with a short VoiceOver grace window ─────────────────
+      // VoiceOver speaks "Listening"; the mic can catch the tail end.
+      // We discard a brief window of early results to avoid the prefix
+      // while keeping the app responsive for the user.
+      const gracePeriodMs = voiceOverEnabled ? VOICEOVER_LISTENING_GRACE_MS : 0;
 
       await startSTT(gracePeriodMs);
       console.log('✅ Voice recognition started');
@@ -1238,7 +1754,8 @@ function AppInner(): React.JSX.Element {
       if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) return;
 
       const finalTranscript = await stopSTT();
-      const finalText = finalTranscript.trim();
+      let finalText = finalTranscript.trim();
+      finalText = stripVoiceOverListeningPrefix(finalText);
       if (!finalText) { /* ... */ return; }
 
       // ── VoiceOver safety net ────────────────────────────────────────────
@@ -1257,7 +1774,9 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture();
+        photoPath = await reactivateCameraAndCapture({
+          enableShutterSound: true,
+        });
       } catch (e: any) {
         console.error('❌ Camera error (manual stop):', e);
         isCapturingPhotoRef.current = false;
@@ -1268,7 +1787,7 @@ function AppInner(): React.JSX.Element {
           isProcessingRef.current = false;
           setIsCameraActive(true);
           if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
-          AccessibilityInfo.announceForAccessibility('Ready. Tap to speak.');
+          announceTapToStart('Ready.');
           return;
         }
         // iPhone path: fall through with empty photoPath, voice-only.
@@ -1305,6 +1824,8 @@ function AppInner(): React.JSX.Element {
     await stopLatencyLoop(); // FIX: kill thinking SFX immediately on emergency stop
     await speachesSentenceChunker.stop();
     try { await cancelSTT(); } catch { }
+    // Pause wake word listening during emergency stop
+    try { await wakeWordPauseRef.current?.(); } catch { }
 
     await new Promise(resolve => setTimeout(resolve, 300));
 
@@ -1328,7 +1849,13 @@ function AppInner(): React.JSX.Element {
     if (!screenReaderEnabled) {
       audioFeedback.playEarcon('ready');
     }
-    AccessibilityInfo.announceForAccessibility('Stopped. Tap to speak.');
+    announceTapToStart('Stopped.');
+
+    // Resume wake word listening after emergency stop
+    if (settingsRef.current.useWearablesCamera) {
+      isEmergencyStopped.current = false; // clear so wake word flow can proceed
+      wakeWordResumeRef.current?.();
+    }
     console.log('✅ Emergency stop complete');
   };
 
@@ -1342,6 +1869,13 @@ function AppInner(): React.JSX.Element {
   // rejects transcripts that match known VoiceOver UI text patterns.
   const isVoiceOverNoise = useCallback((text: string): boolean => {
     if (!screenReaderEnabled) return false;
+    const lower = text.toLowerCase().trim();
+    if (
+      lower.length <= 12 &&
+      ['speak', 'tap', 'ready', 'start', 'listen', 'listening', 'button'].includes(lower)
+    ) {
+      return true;
+    }
     const patterns = [
       // Old labels (might still echo from previous announcement)
       'speak naturally', 'tap to stop', 'tap to speak', 'tap to interrupt',
@@ -1356,7 +1890,6 @@ function AppInner(): React.JSX.Element {
       // Our own rejection announcements (if they leaked)
       'please speak your command', 'please speak your',
     ];
-    const lower = text.toLowerCase();
     return patterns.some(p => lower.includes(p));
   }, [screenReaderEnabled]);
 
@@ -1368,13 +1901,17 @@ function AppInner(): React.JSX.Element {
     if (isNavigation) return 'Navigating. Tap to stop';
     if (isSpeaking) return 'Speaking. Tap to stop';
     if (isProcessing) return 'Thinking';
-    if (isListening) return 'Listening';
-    return 'Ready. Tap to speak';
+    if (isListening || isWakeWordCapturing) return 'Listening';
+    if (isAwaitingWakeWord) return 'Say Hey ShelfScout to ask a question';
+    return screenReaderEnabled ? 'Ready' : 'Ready. Tap to speak';
   };
 
   const getAccessibilityHint = () => {
     // Hints are read AFTER label + role, with a pause.
     // Only use for info NOT in the label.
+    if (screenReaderEnabled && !isListening && !isProcessing && !isSpeaking && !isNavigation) {
+      return 'Double tap to start listening';
+    }
     return '';
   };
 
@@ -1388,6 +1925,10 @@ function AppInner(): React.JSX.Element {
       const mode = isNavigation ? 'navigation' : 'reaching';
       AccessibilityInfo.announceForAccessibility(`Stopping ${mode}.`);
       await stopContinuousModeLoop();
+      // Resume wake word after stopping continuous mode
+      if (settingsRef.current.useWearablesCamera) {
+        wakeWordResumeRef.current?.();
+      }
       return;
     }
 
@@ -1400,6 +1941,13 @@ function AppInner(): React.JSX.Element {
     if (isListening) {
       AccessibilityInfo.announceForAccessibility('Thinking.');
       await stopListeningManually();
+      return;
+    }
+
+    // In glasses mode, tap is a no-op when already listening for wake word
+    // (the user should say "hey shelfscout" instead of tapping)
+    if (isAwaitingWakeWord || isWakeWordCapturing) {
+      console.log('👆 [Glasses] Tap during wake word listening — no-op');
       return;
     }
 
@@ -1499,14 +2047,17 @@ function AppInner(): React.JSX.Element {
 
           {/* Voice Visualizer */}
           <VoiceVisualizer
-            isListening={isListening}
+            isListening={isListening || isWakeWordCapturing}
             isProcessing={isProcessing}
             isSpeaking={isSpeaking}
             isNavigation={isNavigation}
             isReaching={isReaching}
-            transcript={transcript}
+            isGlassesListening={isAwaitingWakeWord}
+            transcript={isWakeWordCapturing ? wakeWordTranscript : transcript}
             pulseAnim={pulseAnim}
             opacityAnim={opacityAnim}
+            glassesDebugStatus={wakeWordDebugStatus}
+            glassesDebugRaw={wakeWordDebugRaw}
           />
 
           {/* ── Settings Gear Button (top-right) ── */}

@@ -112,6 +112,12 @@ export const COLORS = {
 // Mansi's workflow
 export const WORKFLOW_URL = 'https://cybersight.cim.mcgill.ca/api/webhook/29ee1345-f789-4738-997f-ffdae65bba74';
 
+// Melody's standard reaching guidance endpoint (tracker-driven)
+export const SMART_GUIDANCE_URL = 'https://cybersight.cim.mcgill.ca/reaching/smartguidance';
+
+// Kasra's RTAB guidance endpoint (navigation pipeline)
+export const KASRA_GUIDANCE_URL = 'https://cybersight.cim.mcgill.ca/rtabmap/guidance';
+
 // Vision pipeline detection endpoint for progressive re-detection during reaching.
 // This is the external URL for the Docker vision-pipeline service (internal: cybersight-vision-pipeline-1:5000/detect).
 // Update this if the Traefik route differs.
@@ -195,6 +201,8 @@ export default {
   CONFIG,
   COLORS,
   WORKFLOW_URL,
+  SMART_GUIDANCE_URL,
+  KASRA_GUIDANCE_URL,
   DETECTION_URL,
   ACQUISITION_URL,
   SPEACHES_CONFIG,
