@@ -91,20 +91,55 @@ const MAX_RESTART_FAILURES = 5;
 
 /**
  * Wake phrase variants the speech recognizer might produce.
- * iOS speech recognition normalises case to lowercase sentence-case but
- * we compare on lower-cased text. We also include common mis-hearings.
+ *
+ * REAL-WORLD CALIBRATION (from device logs, BT mic via Ray-Ban Meta):
+ * Apple's on-device speech recogniser frequently mis-hears "shelfscout":
+ *   - "shelfscout" is not a dictionary word, so the recogniser substitutes
+ *     phonetically similar tokens. Observed substitutions include:
+ *       "shelf scout", "shell scout", "shelves", "shelves scout",
+ *       "hey scout"  (← `shelf` gets dropped entirely; most common),
+ *       "asian scout", "patient scout", "shell scout scott", "scout watson",
+ *       "she scout", "shelf scott", "shell scott", "scout".
+ *   - Sometimes the leading "hey" survives ("hey scout") and sometimes the
+ *     "hey" gets merged with the next word ("asian", "patient").
+ *
+ * Strategy: list every commonly-observed variant. Matching is now
+ * SUBSTRING (not prefix) to handle the case where the iOS recogniser
+ * concatenates multiple utterances into one ever-growing FINAL transcript.
  */
 const WAKE_PHRASES: string[] = [
+  // Canonical forms
   'hey shelfscout',
   'hey shelf scout',
-  'a shelfscout',
-  'a shelf scout',
+  'hey shelfscout,',
+  'hey shelf scout,',
+
+  // "shelf" → "self" / "shell" / "shelves" substitutions
   'hey self scout',
   'hey self scout,',
-  'hey shelf scout,',
-  'hey shelfscout,',
-  'hey shelf',       // partial — may expand to "hey shelf scout ..."
-  'hey shelfscout ',
+  'hey shell scout',
+  'hey shell scout,',
+  'hey shelves scout',
+  'hey shelves',
+
+  // "hey" mis-merged with following word
+  'asian scout',
+  'patient scout',
+  'a shelfscout',
+  'a shelf scout',
+
+  // "shelf" entirely dropped — most common mis-hearing in BT-mic logs
+  'hey scout',
+  'hey scott',
+  'hey shell scott',
+  'hey shell scott,',
+
+  // No-"hey" variants (when "hey" gets lost in BT compression)
+  'shelfscout',
+  'shelf scout',
+  'shell scout',
+  'shell scott',
+  'shelves scout',
 ];
 
 /**
@@ -114,24 +149,71 @@ const WAKE_PHRASES: string[] = [
  */
 const MIN_QUERY_LENGTH = 2;
 
+/**
+ * If the accumulated transcript exceeds this without a wake-word match, we
+ * force-restart the recogniser. iOS sometimes keeps appending to a single
+ * FINAL transcript across multiple utterances (observed in production logs:
+ * one transcript grew past 200 chars over ~90 seconds of attempted wakes).
+ * Force-restart clears the buffer so the next "hey shelfscout" actually
+ * lands at position 0 of a fresh transcript.
+ */
+const MAX_NO_MATCH_TRANSCRIPT_LEN = 80;
+
 // ============================================================================
 // Helpers
 // ============================================================================
 
 /**
- * Try to match and strip a wake phrase from the beginning of `text`.
- * Returns the remaining query string, or null if no wake phrase was found.
+ * Search `text` for any wake phrase variant and return the substring that
+ * follows the LAST occurrence (i.e. the user's query). Returns null if no
+ * wake phrase variant is present anywhere in the transcript.
+ *
+ * Why "last occurrence" and not "first"?
+ *   iOS STT accumulates a long transcript over time. If the user says the
+ *   wake phrase twice (a retry), we want the query that follows the most
+ *   recent wake — not stale text after the first one.
+ *
+ * Word-boundary aware: a phrase is only considered matched if it sits on
+ * word boundaries, so "shelf" doesn't accidentally match inside "shelves".
  */
 function stripWakePhrase(text: string): string | null {
   const lower = text.toLowerCase().trim();
+  if (!lower) return null;
+
+  let bestEndIndex = -1;     // position immediately AFTER the matched phrase
+  let bestPhrase = '';
+
   for (const phrase of WAKE_PHRASES) {
-    if (lower.startsWith(phrase)) {
-      // Strip the wake phrase and any trailing comma/space
-      let rest = text.substring(phrase.length).replace(/^[,\s]+/, '').trim();
-      return rest;
+    // Find the LAST occurrence of this phrase in the lower-cased transcript
+    let idx = lower.lastIndexOf(phrase);
+    while (idx !== -1) {
+      // Word-boundary check: char before must not be alphanumeric, char
+      // after must not be alphanumeric (or end-of-string).
+      const charBefore = idx === 0 ? ' ' : lower[idx - 1];
+      const charAfter = lower[idx + phrase.length] ?? ' ';
+      const isWordBoundaryBefore = !/[a-z0-9]/.test(charBefore);
+      const isWordBoundaryAfter = !/[a-z0-9]/.test(charAfter);
+
+      if (isWordBoundaryBefore && isWordBoundaryAfter) {
+        const endIdx = idx + phrase.length;
+        if (endIdx > bestEndIndex) {
+          bestEndIndex = endIdx;
+          bestPhrase = phrase;
+        }
+        break; // we already have the LAST occurrence of THIS phrase
+      }
+      // Not a word boundary, look earlier in the string for another match
+      idx = lower.lastIndexOf(phrase, idx - 1);
     }
   }
-  return null;
+
+  if (bestEndIndex === -1) return null;
+
+  // Extract whatever comes after the matched wake phrase as the query.
+  // Use the original-case `text` so user words keep their casing.
+  let rest = text.substring(bestEndIndex).replace(/^[,\s.!?]+/, '').trim();
+  console.log(`🎯 [WakeWord] Matched phrase "${bestPhrase}" → query: "${rest}"`);
+  return rest;
 }
 
 /**
@@ -407,6 +489,23 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
         // No wake phrase found — show what was heard on screen
         setDebugStatus(`Heard: "${text.substring(0, 40)}" (no wake match)`);
         console.log(`🎤 [WakeWord] No wake match in: "${text.toLowerCase().trim()}"`);
+
+        // ── Anti-bloat: force-restart on runaway transcript ──────────────
+        // iOS sometimes keeps appending to a single FINAL transcript across
+        // multiple utterances. Once it grows large with no match, future
+        // "hey shelfscout" attempts are buried in the middle and never make
+        // it to the start of a fresh recognition session. Cancel now so
+        // handleSpeechEnd fires and triggers a clean restart with an empty
+        // buffer.
+        if (text.length >= MAX_NO_MATCH_TRANSCRIPT_LEN) {
+          console.log(
+            `🔄 [WakeWord] Transcript too long (${text.length} chars) without match — force-restarting recogniser`
+          );
+          setDebugStatus('Resetting recogniser…');
+          Voice.cancel().catch(() => {});
+          isActiveRef.current = false;
+          // handleSpeechEnd will auto-restart via its RESTART_DELAY_MS timer
+        }
       }
     } else {
       // ── Capturing query (wake word already detected) ─────────────────
@@ -448,6 +547,17 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
         setQueryTranscript(query);
         onWakeWordHeardRef.current?.();
         startSilenceTimer();
+      } else if (text.length >= MAX_NO_MATCH_TRANSCRIPT_LEN) {
+        // ── Anti-bloat: same runaway-transcript guard for partials ───────
+        // If we keep seeing huge partials with no match, force a clean
+        // restart. Without this, FINAL might never fire and partials grow
+        // unbounded.
+        console.log(
+          `🔄 [WakeWord] Partial transcript too long (${text.length} chars) without match — force-restarting`
+        );
+        setDebugStatus('Resetting recogniser…');
+        Voice.cancel().catch(() => {});
+        isActiveRef.current = false;
       }
     } else {
       // Update query text from partial
