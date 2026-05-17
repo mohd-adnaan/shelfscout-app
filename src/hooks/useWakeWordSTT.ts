@@ -113,6 +113,18 @@ const WAKE_PHRASES: string[] = [
   'hey shelf scout',
   'hey shelfscout,',
   'hey shelf scout,',
+  'hey shellscout',
+  'hi shelfscout',
+  'hishelf scout',
+  'hi shelfscout',
+  'hi shelf scout',
+  'hey she',
+  'he she',
+  'scout',
+  'skout',
+  'shelfcout',
+  'shelves code'
+
 
   // "shelf" → "self" / "shell" / "shelves" substitutions
   'hey self scout',
@@ -133,6 +145,14 @@ const WAKE_PHRASES: string[] = [
   'hey scott',
   'hey shell scott',
   'hey shell scott,',
+  'he shall scout',
+  'he shall scouts',
+  'he shall scout Hazel Shell',
+  'hey Shell',
+  'hey Scott',
+  'hey Shall',
+  'he Scott',
+
 
   // No-"hey" variants (when "hey" gets lost in BT compression)
   'shelfscout',
@@ -140,6 +160,8 @@ const WAKE_PHRASES: string[] = [
   'shell scout',
   'shell scott',
   'shelves scout',
+  'Haitian scout',
+  'haitian',
 ];
 
 /**

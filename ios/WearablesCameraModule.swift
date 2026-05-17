@@ -647,6 +647,25 @@ class WearablesCameraModule: NSObject {
       self.errorListenerToken = nil
       self.photoListenerToken = nil
       self.videoFrameListenerToken = nil
+      // ── CRITICAL FIX (ActivityManagerError code 11) ───────────────────
+      // Previously this method only set deviceSession = nil, which leaves
+      // the DEVICE-SIDE ActivityManager session alive on the glasses.
+      // The next createSession() call collides with that stale device-side
+      // state and the device replies with ActivityManagerError code 11
+      // ("a session already exists for this device") ~5s into the next
+      // stream's start handshake — the exact symptom we see in production:
+      //   📡 deviceSession state → started
+      //   ...
+      //   MediaStreamSession - connect complete: 11
+      //   📡 Stream state: stopped
+      //   ⚠️ capturePhoto failed: Stream did not reach streaming state
+      //
+      // Awaiting deviceSession.stop() forces a clean device-side teardown
+      // so the next session start always begins from a clean slate.
+      if let ds = self.deviceSession, ds.state != .stopped {
+        NSLog("🧹 [Wearables] disconnect — stopping device session (state=%@)", "\(ds.state)")
+        await ds.stop()
+      }
       self.deviceSession = nil
       NSLog("🧹 [Wearables] disconnect complete")
       resolver(["success": true])
