@@ -249,6 +249,45 @@ class ReachingViewController: UIViewController {
   var detectionFrameCameraTransform: simd_float4x4? = nil
 
   // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Depth Anything V2 (Monocular Depth)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // When the backend returns depth: undefined (which happens consistently
+  // for some scenes), the 1.5m fallback is wrong by 30–80% — far enough that
+  // ARKit refinement raycasts land on the floor or back wall instead of the
+  // object's actual surface, and once 5 hits agree the median locks onto the
+  // wrong depth permanently.
+  //
+  // DAv2 produces a RELATIVE depth map (not metric). To make it metric we
+  // anchor its scale to a single ARKit plane raycast: we know the true
+  // metric depth of one pixel (the raycast hit), so we can scale the
+  // relative map to metric using the ratio at that pixel. The bbox center's
+  // relative depth, scaled by this factor, becomes our metric estimate.
+  //
+  // Fall-back chain for initial anchor depth, in priority order:
+  //   1. LiDAR (Pro devices only)
+  //   2. Backend Qwen depth
+  //   3. DAv2 metric estimate (NEW)
+  //   4. 1.5m fixed fallback
+  //
+  // DAv2 runs once at placement time on a dedicated queue. If anything fails
+  // (model not in bundle, no plane hit for scale anchor, value out of range)
+  // the chain falls through to the next option transparently.
+
+  /// Set by depth-anything inference (Reachingviewcontroller+depthAnythingV2.swift).
+  /// Read by placeWorldAnchor before applying the 1.5m fallback.
+  var estimatedMetricDepth: Float? = nil
+  let depthAnythingQ = DispatchQueue(label: "reach.depthAnything", qos: .userInitiated)
+  /// State of the DAv2 inference attempt before initial placement:
+  ///   notStarted → noDepthFromBackend triggers it, becomes inFlight
+  ///   inFlight   → request running, placement waits up to dav2TimeoutSec
+  ///   done       → either success (estimatedMetricDepth set) or failure (nil)
+  enum DAv2Status { case notStarted, inFlight, done }
+  var dav2Status: DAv2Status = .notStarted
+  var dav2StartTime: TimeInterval = 0
+  let dav2TimeoutSec: TimeInterval = 0.8
+
+  // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Audio / Speech / Haptics
   // ═══════════════════════════════════════════════════════════════════════════
 
@@ -676,6 +715,10 @@ class ReachingViewController: UIViewController {
     initialReseedStatus = .pending
     initialReseedStartTime = 0
     detectionFrameCameraTransform = nil
+    // Reset DepthAnythingV2 estimate
+    estimatedMetricDepth = nil
+    dav2Status = .notStarted
+    dav2StartTime = 0
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

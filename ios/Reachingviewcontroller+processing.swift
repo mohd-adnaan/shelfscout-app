@@ -54,7 +54,47 @@ extension ReachingViewController {
         }
         return
       case .succeeded, .failed, .skipped:
-        break  // fall through to placement gate below
+        break  // fall through
+      }
+
+      // ── DEPTH ANYTHING V2 GATE ───────────────────────────────────────────
+      // Fires when:
+      //   - Initial reseed succeeded (so bbox is in correct AR coords)
+      //   - Backend depth is nil (the failure mode this is meant to address)
+      //   - No LiDAR (Pro devices already have ground-truth metric depth)
+      //   - DAv2 hasn't been started yet
+      // Skipped entirely if backend gave depth or we're on a LiDAR device.
+      let needsDAv2 = (initialReseedStatus == .succeeded)
+                   && (backendDepth == nil)
+                   && !hasLiDAR
+      if needsDAv2 {
+        switch dav2Status {
+        case .notStarted:
+          dav2Status = .inFlight
+          dav2StartTime = ProcessInfo.processInfo.systemUptime
+          NSLog("🌊 [DAv2] firing inference (backend depth was nil)")
+          estimateMetricDepth(frame: frame, bboxARNormalized: bboxNormalized) { [weak self] estimate in
+            guard let self = self else { return }
+            self.estimatedMetricDepth = estimate
+            self.dav2Status = .done
+            if let e = estimate {
+              NSLog("🌊 [DAv2] estimate ready: %.2fm — placement will use this instead of 1.5m fallback", e)
+            } else {
+              NSLog("🌊 [DAv2] no estimate available — placement will use 1.5m fallback")
+            }
+          }
+          return
+        case .inFlight:
+          let elapsedDAv2 = ProcessInfo.processInfo.systemUptime - dav2StartTime
+          if elapsedDAv2 > dav2TimeoutSec {
+            NSLog("🌊 [DAv2] timed out after %.2fs — placement will use 1.5m fallback", elapsedDAv2)
+            dav2Status = .done
+            estimatedMetricDepth = nil
+          }
+          return
+        case .done:
+          break
+        }
       }
 
       if arFrameCount >= anchorWaitFrames {
