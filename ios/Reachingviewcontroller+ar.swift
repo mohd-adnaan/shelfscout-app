@@ -47,6 +47,7 @@ extension ReachingViewController {
     }
 
     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
+    sessionStartTime = ProcessInfo.processInfo.systemUptime
     startBeepLoop()
     startRedetectionLoop()
     NSLog("📷 [ReachingVC] AR session started — mode=%@ hasLiDAR=%@",
@@ -190,6 +191,29 @@ extension ReachingViewController {
     anchorRefinementFrames = 1
     NSLog("🎯 [ReachingVC] ✅ Anchor SEEDED at (%.3f, %.3f, %.3f) depth=%.2fm pose=%@ (refining with ARKit...)",
           worldPos.x, worldPos.y, worldPos.z, depth, poseSource)
+
+    // ── POST-PLACEMENT SELF-CHECK ─────────────────────────────────────────
+    // Project the placed anchor back to portrait screen using Apple's own
+    // projectPoint API, and compare against the bbox center we INTENDED to
+    // place it at. If they match (within a few pixels), our unprojection
+    // math is correct. If they diverge, we have a rotation/coord bug —
+    // log it loudly so we know.
+    //
+    // Note: this check is most meaningful when poseSource is "live frame"
+    // (the unprojection and reprojection use the same camera pose). When
+    // we used the saved detection-time pose, the live camera has drifted
+    // a bit, so a small projection error is expected (a few pixels per
+    // few cm of drift). A LARGE error (>50px) indicates a real math bug.
+    let viewSize = CGSize(width: cachedSW, height: cachedSH)
+    let portraitX = arNormX * cachedSW
+    let portraitY = arNormY * cachedSH
+    let projectedBack = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
+    let pxErr = sqrt(pow(projectedBack.x - portraitX, 2) + pow(projectedBack.y - portraitY, 2))
+    NSLog("🎯 [SelfCheck] intended portrait pixel (%.1f, %.1f); placed point projects to (%.1f, %.1f); error %.1f px (screen %.0fx%.0f, pose=%@)",
+          portraitX, portraitY, projectedBack.x, projectedBack.y, pxErr, cachedSW, cachedSH, poseSource)
+    if pxErr > 50 {
+      NSLog("🎯 [SelfCheck] ⚠️ LARGE PIXEL ERROR — unprojection math may have a rotation/coord bug, or camera drifted significantly between detection-frame and placement")
+    }
 
     // Saved transform's job is done — clear it so any subsequent reseeds
     // (tracker drift recovery) operate from the live transform as intended.

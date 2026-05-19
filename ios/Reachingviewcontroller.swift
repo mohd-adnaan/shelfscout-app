@@ -157,6 +157,9 @@ class ReachingViewController: UIViewController {
   var sceneView: ARSCNView!
   var arFrameCount = 0
   let anchorWaitFrames = 15
+  /// Absolute time the AR session began (set when ARSession is run); used by DAv2
+  /// to decide when to give up waiting for ARKit planes to form.
+  var sessionStartTime: TimeInterval = 0
   var meshReconstructionEnabled = false
   var lastFrameProcessedAt: TimeInterval = 0
   let frameProcessInterval: TimeInterval = 0.05

@@ -1,8 +1,6 @@
 //
-//  Reachingviewcontroller+depthanythingv2.swift
+//  Reachingviewcontroller+depthAnythingV2.swift
 //  shelfscout
-//
-//  Created by Mohammad Adnaan on 2026-05-18.
 //
 //  DepthAnythingV2 inference for monocular metric-depth estimation,
 //  scale-anchored to a single ARKit plane raycast.
@@ -138,31 +136,78 @@ extension ReachingViewController {
     let worldRay = simd_normalize(simd_make_float3(camTransform * simd_float4(rayCam, 0)))
     let camPos = simd_make_float3(camTransform.columns.3)
 
-    // ── Scale anchor: ARKit raycast for ONE metric depth reading ──
-    // We MUST get the raycast on the main/AR thread because session.raycast
-    // is not thread-safe relative to ARFrame lifetime. Doing it synchronously
-    // here from the visionQ caller is acceptable; session.raycast is a quick
-    // CPU lookup against existing planes.
+    // ── Scale anchor: try multiple sample points to maximize hit success ──
+    //
+    // PROBLEM with original single-point approach: when this fires at the
+    // start of an AR session, ARKit has typically not built any planes yet,
+    // so a raycast through the bbox center returns nothing. The whole
+    // DAv2 path then aborts and we fall back to 1.5m every single time —
+    // exactly what the logs from 18 May show.
+    //
+    // FIX: try a grid of 9 sample points (bbox center + bbox corners + a
+    // few floor-direction samples). As long as ANY raycast hits a plane
+    // anywhere in the visible scene, we have a scale anchor.
+    //
+    // The scale anchor's actual SURFACE doesn't matter — DAv2 gives us
+    // relative depth at any pixel, so we can scale-anchor against any
+    // known-metric pixel. We just sample DAv2 at the SAME pixel where
+    // we got a metric hit, then propagate the scale factor to the bbox center.
+    let sampleCandidates: [(CGFloat, CGFloat, String)] = [
+      (cx, cy, "bbox center"),
+      (cx, cy + 0.10, "below bbox"),
+      (cx - 0.10, cy + 0.10, "below-left"),
+      (cx + 0.10, cy + 0.10, "below-right"),
+      (cx, 0.85, "lower screen"),
+      (0.30, 0.85, "lower-left screen"),
+      (0.70, 0.85, "lower-right screen"),
+      (cx, cy - 0.10, "above bbox"),
+      (cx, 0.50, "screen center"),
+    ]
+
     var scaleAnchorMetricDepth: Float? = nil
-    let scaleQuery = ARRaycastQuery(origin: camPos, direction: worldRay,
-                                    allowing: .estimatedPlane, alignment: .any)
-    if let hit = sceneView.session.raycast(scaleQuery).first {
-      let hp = simd_make_float3(hit.worldTransform.columns.3)
-      let dist = simd_length(hp - camPos)
-      if dist > 0.3 && dist < 8.0 {
-        scaleAnchorMetricDepth = dist
-      } else {
-        NSLog("🌊 [DAv2] Scale anchor raycast hit out of range: %.2fm", dist)
+    var scaleAnchorPixelX: CGFloat = cx  // for sampling DAv2 at this pixel later
+    var scaleAnchorPixelY: CGFloat = cy
+    var scaleAnchorLabel: String = "none"
+
+    for (sx, sy, label) in sampleCandidates {
+      // Clamp to valid normalized range
+      let ssx = max(0.05, min(0.95, sx))
+      let ssy = max(0.05, min(0.95, sy))
+      // Convert sample point to landscape pixel + world ray
+      let sArPxX = ssy * arW
+      let sArPxY = (1.0 - ssx) * arH
+      let sRX = Float((sArPxX - cxi) / fx)
+      let sRY = Float((sArPxY - cyi) / fy)
+      let sRayCam = simd_normalize(simd_float3(sRX, -sRY, -1.0))
+      let sWorldRay = simd_normalize(simd_make_float3(camTransform * simd_float4(sRayCam, 0)))
+      let q = ARRaycastQuery(origin: camPos, direction: sWorldRay,
+                             allowing: .estimatedPlane, alignment: .any)
+      if let hit = sceneView.session.raycast(q).first {
+        let hp = simd_make_float3(hit.worldTransform.columns.3)
+        let dist = simd_length(hp - camPos)
+        if dist > 0.3 && dist < 8.0 {
+          scaleAnchorMetricDepth = dist
+          scaleAnchorPixelX = ssx
+          scaleAnchorPixelY = ssy
+          scaleAnchorLabel = label
+          NSLog("🌊 [DAv2] Scale anchor found at '%@' (%.2f, %.2f) → %.2fm", label, ssx, ssy, dist)
+          break
+        }
       }
-    } else {
-      NSLog("🌊 [DAv2] No raycast hit available for scale anchor — DAv2 cannot produce metric depth")
     }
 
     guard let metricAnchor = scaleAnchorMetricDepth else {
+      NSLog("🌊 [DAv2] No raycast hit available at any of %d sample points — DAv2 cannot produce metric depth", sampleCandidates.count)
       // No way to convert relative→metric without a scale reference.
       completion(nil)
       return
     }
+    _ = worldRay  // suppress unused warning; we no longer use it directly
+    _ = scaleAnchorLabel  // suppress unused warning; only useful for logging
+    // Const-copy for closure capture; these will be read on a background queue
+    // after the guard above succeeds.
+    let anchorPixelX: CGFloat = scaleAnchorPixelX
+    let anchorPixelY: CGFloat = scaleAnchorPixelY
 
     // Run DAv2 on a dedicated queue so we don't stall the AR/vision thread.
     depthAnythingQ.async { [weak self] in
@@ -209,40 +254,32 @@ extension ReachingViewController {
           return
         }
 
-        // Sample at object center and at scale-anchor hit projected back to image pixel.
-        // Both points share the same pixel because our ARKit raycast went THROUGH
-        // the bbox center — so d_rel_anchor IS d_rel_obj at the same pixel.
-        // That makes the scale ratio = metricAnchor / d_rel_at_that_pixel.
+        // Sample DAv2 at two pixels:
+        //   d_rel_obj    — at the bbox center (the object pixel)
+        //   d_rel_anchor — at the scale-anchor pixel where ARKit gave us
+        //                  a confirmed metric distance
         //
-        // But the bbox center is the OBJECT pixel, while the raycast hit is on a
-        // PLANE behind/under the object. If they shared the same pixel and the
-        // object were transparent, depth-anything would have given two different
-        // relative depths — one for object foreground, one for background plane.
-        // In practice, depth-anything returns the depth of the NEAREST surface
-        // visible at that pixel, which is the object. So d_rel at the bbox center
-        // is the object's relative depth, NOT the plane behind it.
-        //
-        // To scale-anchor, we sample a DIFFERENT pixel where we expect the
-        // raycast to have hit the plane (typically below/around the object).
-        // Approach: sample relative depth at a point slightly above (toward screen
-        // top in portrait, which is "farther from camera" in 2D layout) and on a
-        // visible floor/table area. We use a point HALFWAY BETWEEN bbox bottom
-        // and screen bottom edge as a proxy for the nearby plane.
+        // The scale-anchor pixel is wherever ARKit's raycast actually hit a
+        // plane. We pass that pixel through scaleAnchorPixelX/Y captured
+        // when the raycast succeeded. This is much more reliable than
+        // guessing "5% below bbox bottom" because:
+        //  - The pixel ACTUALLY has a known metric depth (raycast hit)
+        //  - Whatever surface it's on (floor, table, wall), DAv2 sees
+        //    it too — the ratio between obj-pixel and anchor-pixel
+        //    relative depths gives us the depth ratio
         let dW = depthArr.shape[depthArr.shape.count - 1].intValue
         let dH = depthArr.shape[depthArr.shape.count - 2].intValue
 
         // Image is portrait-oriented (rotated .right from landscape AR pixel buffer).
-        // bbox is in AR-portrait normalized, so (cx,cy) maps directly to depth map.
+        // bbox/scale-anchor are in AR-portrait normalized, map directly to depth map.
         let objX = max(0, min(dW - 1, Int(CGFloat(dW) * cx)))
         let objY = max(0, min(dH - 1, Int(CGFloat(dH) * cy)))
         let dRelObj = self.sampleMultiArray(depthArr, x: objX, y: objY)
 
-        // Anchor sample: pixel below the bbox, on the supporting surface.
-        // bbox bottom is at cy + (bboxBottom - cy); we want JUST below that.
-        let bboxBottomY = bboxARNormalized[3]
-        let anchorYNorm = min(0.98, bboxBottomY + 0.05)  // 5% below bbox bottom
-        let anchorY = max(0, min(dH - 1, Int(CGFloat(dH) * anchorYNorm)))
-        let dRelAnchor = self.sampleMultiArray(depthArr, x: objX, y: anchorY)
+        // Anchor sample: pixel where ARKit raycast confirmed a metric distance
+        let anchorX = max(0, min(dW - 1, Int(CGFloat(dW) * anchorPixelX)))
+        let anchorY = max(0, min(dH - 1, Int(CGFloat(dH) * anchorPixelY)))
+        let dRelAnchor = self.sampleMultiArray(depthArr, x: anchorX, y: anchorY)
 
         guard dRelObj > 0.001, dRelAnchor > 0.001 else {
           NSLog("🌊 [DAv2] Degenerate samples — obj=%.4f anchor=%.4f", dRelObj, dRelAnchor)

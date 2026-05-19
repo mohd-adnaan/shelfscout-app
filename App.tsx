@@ -90,7 +90,7 @@ const PREFETCH_CONFIG = {
   MIN_CYCLE_COOLDOWN: 300,
 };
 
-const SMART_GUIDANCE_MIN_CYCLE_MS = Math.ceil(2000 / 3);
+const SMART_GUIDANCE_MIN_CYCLE_MS = 250; // 4fps
 const KASRA_FEED_INTERVAL_MS = 500;
 
 // =============================================================================

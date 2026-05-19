@@ -63,6 +63,12 @@ extension ReachingViewController {
       //   - Backend depth is nil (the failure mode this is meant to address)
       //   - No LiDAR (Pro devices already have ground-truth metric depth)
       //   - DAv2 hasn't been started yet
+      //   - AND: at least one ARKit plane has been detected, OR plane-wait
+      //     timeout has expired. This is the fix for the 18 May log issue
+      //     where DAv2 fired at frame 2 with zero planes available, the
+      //     scale-anchor raycast missed every time, and the fallback path
+      //     was used unconditionally. Planes typically form within 1-3s
+      //     of session start in well-lit indoor scenes; we wait up to 2.5s.
       // Skipped entirely if backend gave depth or we're on a LiDAR device.
       let needsDAv2 = (initialReseedStatus == .succeeded)
                    && (backendDepth == nil)
@@ -70,9 +76,27 @@ extension ReachingViewController {
       if needsDAv2 {
         switch dav2Status {
         case .notStarted:
+          // Check if a plane exists or if we've waited long enough
+          let planeCount = sceneView.session.currentFrame?.anchors.filter { $0 is ARPlaneAnchor }.count ?? 0
+          let timeSinceStart = ProcessInfo.processInfo.systemUptime - sessionStartTime
+          let planeWaitTimeoutSec: TimeInterval = 2.5
+          if planeCount == 0 && timeSinceStart < planeWaitTimeoutSec {
+            // Still waiting for planes to form. Stall placement.
+            if Int(arFrameCount) % 60 == 0 {
+              NSLog("🌊 [DAv2] waiting for ARKit planes (count=%d, elapsed=%.1fs of %.1fs)",
+                    planeCount, timeSinceStart, planeWaitTimeoutSec)
+            }
+            return
+          }
+          if planeCount == 0 {
+            NSLog("🌊 [DAv2] no planes after %.1fs — skipping DAv2, will use 1.5m fallback", timeSinceStart)
+            dav2Status = .done
+            estimatedMetricDepth = nil
+            break  // fall through to placement
+          }
           dav2Status = .inFlight
           dav2StartTime = ProcessInfo.processInfo.systemUptime
-          NSLog("🌊 [DAv2] firing inference (backend depth was nil)")
+          NSLog("🌊 [DAv2] firing inference (backend depth nil, %d plane(s) available)", planeCount)
           estimateMetricDepth(frame: frame, bboxARNormalized: bboxNormalized) { [weak self] estimate in
             guard let self = self else { return }
             self.estimatedMetricDepth = estimate

@@ -752,7 +752,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   );
 
   const nonReachingText = normalizeBackendString(
-    pickString(['text', 'message', 'response']),
+    pickString(['response', 'text', 'message']),
   );
 
   let text = '';

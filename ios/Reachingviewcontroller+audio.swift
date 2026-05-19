@@ -192,11 +192,15 @@ extension ReachingViewController {
     }
 
     if now - lastBeep >= iv {
-      if let p = playerNode, let b = beepBuf {
-        p.pan = pan
-        p.volume = vol
-        p.scheduleBuffer(b, at: nil, options: .interrupts)
-        if !p.isPlaying { p.play() }
+      if let p = playerNode, let b = beepBuf, b.frameLength > 0 {
+        if audioEngine?.isRunning == true {
+          p.pan = pan.isNaN ? 0 : pan
+          p.volume = vol.isNaN ? 0 : vol
+          p.scheduleBuffer(b, at: nil, options: .interrupts)
+          if !p.isPlaying { p.play() }
+        } else {
+          try? audioEngine?.start()
+        }
       }
       lastBeep = now
     }
@@ -236,10 +240,16 @@ extension ReachingViewController {
       d[i] = Float(sin(2 * .pi * freq * t) * vol * env)
     }
 
-    player.pan = 0
-    player.volume = 1.0  // volume is baked into the buffer
-    player.scheduleBuffer(buf, at: nil, options: .interrupts)
-    if !player.isPlaying { player.play() }
+    if buf.frameLength > 0 {
+      if audioEngine?.isRunning == true {
+        player.pan = 0
+        player.volume = 1.0  // volume is baked into the buffer
+        player.scheduleBuffer(buf, at: nil, options: .interrupts)
+        if !player.isPlaying { player.play() }
+      } else {
+        try? audioEngine?.start()
+      }
+    }
     lastBeep = now
   }
 
@@ -257,8 +267,14 @@ extension ReachingViewController {
       let t = Double(i)/sr; let f = 523.25 * pow(2, t/dur)
       d[i] = Float(sin(2 * .pi * f * t) * 0.6 * min(t/0.01, 1) * min((dur-t)/0.08, 1))
     }
-    player.pan = 0; player.scheduleBuffer(buf, at: nil, options: .interrupts)
-    if !player.isPlaying { player.play() }
+    if buf.frameLength > 0 {
+      if audioEngine?.isRunning == true {
+        player.pan = 0; player.scheduleBuffer(buf, at: nil, options: .interrupts)
+        if !player.isPlaying { player.play() }
+      } else {
+        try? audioEngine?.start()
+      }
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
