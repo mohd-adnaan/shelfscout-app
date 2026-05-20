@@ -145,6 +145,16 @@ class ReachingViewController: UIViewController {
   var anchorPlaced = false
   var anchorDepth: Float = 0.5
   var liveDistanceToObject: Float = 0.5
+
+  // ── PROTOTYPE: place-and-hold (Reality-Composer style) ───────────────────
+  // When true, the reaching pipeline is replaced by: raycast once against
+  // ARKit geometry, place an anchor, then NEVER touch it. No tracker, no
+  // re-detection, no refinement, no DAv2. Flip to false to restore the old
+  // pipeline unchanged. See Reachingviewcontroller+placeAndHold.swift.
+  var placeAndHoldPrototype = true
+  // Absolute time the AR session started (set in startARSession). Used by
+  // the prototype's placement deadline.
+  var sessionStartTime: TimeInterval = 0
   var handIsCloseEnoughInDepth = false
   /// Hand-free: lock anchor after first ARKit refinement converges.
   /// Re-detection still runs (for logging) but CANNOT move the anchor.
@@ -157,9 +167,6 @@ class ReachingViewController: UIViewController {
   var sceneView: ARSCNView!
   var arFrameCount = 0
   let anchorWaitFrames = 15
-  /// Absolute time the AR session began (set when ARSession is run); used by DAv2
-  /// to decide when to give up waiting for ARKit planes to form.
-  var sessionStartTime: TimeInterval = 0
   var meshReconstructionEnabled = false
   var lastFrameProcessedAt: TimeInterval = 0
   let frameProcessInterval: TimeInterval = 0.05
@@ -184,6 +191,7 @@ class ReachingViewController: UIViewController {
 
   let handReq = VNDetectHumanHandPoseRequest()
   let visionQ = DispatchQueue(label: "reach.vision", qos: .userInitiated)
+  let depthAnythingQ = DispatchQueue(label: "reach.depth", qos: .userInitiated)
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Visual Tracking (VNTrackObjectRequest)
@@ -250,45 +258,6 @@ class ReachingViewController: UIViewController {
   /// that produced the bbox. Cleared after successful placement and on
   /// any failure path so the live frame's transform is used as fallback.
   var detectionFrameCameraTransform: simd_float4x4? = nil
-
-  // ═══════════════════════════════════════════════════════════════════════════
-  // MARK: - Depth Anything V2 (Monocular Depth)
-  // ═══════════════════════════════════════════════════════════════════════════
-  //
-  // When the backend returns depth: undefined (which happens consistently
-  // for some scenes), the 1.5m fallback is wrong by 30–80% — far enough that
-  // ARKit refinement raycasts land on the floor or back wall instead of the
-  // object's actual surface, and once 5 hits agree the median locks onto the
-  // wrong depth permanently.
-  //
-  // DAv2 produces a RELATIVE depth map (not metric). To make it metric we
-  // anchor its scale to a single ARKit plane raycast: we know the true
-  // metric depth of one pixel (the raycast hit), so we can scale the
-  // relative map to metric using the ratio at that pixel. The bbox center's
-  // relative depth, scaled by this factor, becomes our metric estimate.
-  //
-  // Fall-back chain for initial anchor depth, in priority order:
-  //   1. LiDAR (Pro devices only)
-  //   2. Backend Qwen depth
-  //   3. DAv2 metric estimate (NEW)
-  //   4. 1.5m fixed fallback
-  //
-  // DAv2 runs once at placement time on a dedicated queue. If anything fails
-  // (model not in bundle, no plane hit for scale anchor, value out of range)
-  // the chain falls through to the next option transparently.
-
-  /// Set by depth-anything inference (Reachingviewcontroller+depthAnythingV2.swift).
-  /// Read by placeWorldAnchor before applying the 1.5m fallback.
-  var estimatedMetricDepth: Float? = nil
-  let depthAnythingQ = DispatchQueue(label: "reach.depthAnything", qos: .userInitiated)
-  /// State of the DAv2 inference attempt before initial placement:
-  ///   notStarted → noDepthFromBackend triggers it, becomes inFlight
-  ///   inFlight   → request running, placement waits up to dav2TimeoutSec
-  ///   done       → either success (estimatedMetricDepth set) or failure (nil)
-  enum DAv2Status { case notStarted, inFlight, done }
-  var dav2Status: DAv2Status = .notStarted
-  var dav2StartTime: TimeInterval = 0
-  let dav2TimeoutSec: TimeInterval = 0.8
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Audio / Speech / Haptics
@@ -718,10 +687,6 @@ class ReachingViewController: UIViewController {
     initialReseedStatus = .pending
     initialReseedStartTime = 0
     detectionFrameCameraTransform = nil
-    // Reset DepthAnythingV2 estimate
-    estimatedMetricDepth = nil
-    dav2Status = .notStarted
-    dav2StartTime = 0
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

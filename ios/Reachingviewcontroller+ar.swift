@@ -118,23 +118,15 @@ extension ReachingViewController {
       depth = anchorDepth
       NSLog("🎯 [ReachingVC] Using re-detection depth: %.2fm", depth)
     } else {
-      // FALLBACK CHAIN (no LiDAR, no backend depth):
-      //   1. DepthAnythingV2 metric estimate (scale-anchored monocular depth)
-      //   2. 1.5m fixed fallback (last resort)
-      //
-      // The 1.5m fallback alone is wrong 30–80% of the time, and a wrong
-      // initial depth makes ARKit refinement raycasts land on floor/wall
-      // surfaces past the actual object — see Reachingviewcontroller+depthAnythingV2.swift.
-      if let estimated = estimatedMetricDepth {
-        depth = estimated
-        anchorDepth = estimated
-        NSLog("🎯 [ReachingVC] Using DepthAnythingV2 estimate: %.2fm", depth)
-      } else {
-        depth = backendDepth ?? 1.5
-        anchorDepth = depth
-        NSLog("🎯 [ReachingVC] Using %@ depth: %.2fm",
-              hasLiDAR ? "backend (LiDAR miss)" : (backendDepth != nil ? "Qwen/backend" : "fallback (nil backend, no DAv2)"), depth)
-      }
+      // BAND-AID: when backend depth is missing (Qwen returned undefined),
+      // 1.5m is a far better default than 0.5m for shelf-reaching scenarios.
+      // Most targets are 0.5–3m away; 1.5m sits at the median, so the worst-
+      // case error in either direction is bounded. 0.5m put us at the close
+      // end and made the divergence gate inactive against the all-nil path.
+      depth = backendDepth ?? 1.5
+      anchorDepth = depth
+      NSLog("🎯 [ReachingVC] Using %@ depth: %.2fm",
+            hasLiDAR ? "backend (LiDAR miss)" : (backendDepth != nil ? "Qwen/backend" : "fallback (nil backend)"), depth)
     }
 
     let fx = CGFloat(intrinsics[0][0]), fy = CGFloat(intrinsics[1][1])
@@ -191,29 +183,6 @@ extension ReachingViewController {
     anchorRefinementFrames = 1
     NSLog("🎯 [ReachingVC] ✅ Anchor SEEDED at (%.3f, %.3f, %.3f) depth=%.2fm pose=%@ (refining with ARKit...)",
           worldPos.x, worldPos.y, worldPos.z, depth, poseSource)
-
-    // ── POST-PLACEMENT SELF-CHECK ─────────────────────────────────────────
-    // Project the placed anchor back to portrait screen using Apple's own
-    // projectPoint API, and compare against the bbox center we INTENDED to
-    // place it at. If they match (within a few pixels), our unprojection
-    // math is correct. If they diverge, we have a rotation/coord bug —
-    // log it loudly so we know.
-    //
-    // Note: this check is most meaningful when poseSource is "live frame"
-    // (the unprojection and reprojection use the same camera pose). When
-    // we used the saved detection-time pose, the live camera has drifted
-    // a bit, so a small projection error is expected (a few pixels per
-    // few cm of drift). A LARGE error (>50px) indicates a real math bug.
-    let viewSize = CGSize(width: cachedSW, height: cachedSH)
-    let portraitX = arNormX * cachedSW
-    let portraitY = arNormY * cachedSH
-    let projectedBack = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
-    let pxErr = sqrt(pow(projectedBack.x - portraitX, 2) + pow(projectedBack.y - portraitY, 2))
-    NSLog("🎯 [SelfCheck] intended portrait pixel (%.1f, %.1f); placed point projects to (%.1f, %.1f); error %.1f px (screen %.0fx%.0f, pose=%@)",
-          portraitX, portraitY, projectedBack.x, projectedBack.y, pxErr, cachedSW, cachedSH, poseSource)
-    if pxErr > 50 {
-      NSLog("🎯 [SelfCheck] ⚠️ LARGE PIXEL ERROR — unprojection math may have a rotation/coord bug, or camera drifted significantly between detection-frame and placement")
-    }
 
     // Saved transform's job is done — clear it so any subsequent reseeds
     // (tracker drift recovery) operate from the live transform as intended.
@@ -488,31 +457,7 @@ extension ReachingViewController {
     }
 
     let prevDepth = simd_length(currentPos - camPos)
-
-    // ── CRITICAL: only adjust DEPTH along the original anchor direction ──
-    //
-    // PREVIOUS BUG: newWorldPos = camPos + worldDir * median uses the CURRENT
-    // camera position and CURRENT ray direction. As the user walks laterally,
-    // worldDir rotates to keep pointing at the (now off-axis) object, and
-    // camPos translates. The recomputed world point then translates WITH the
-    // user — the anchor "follows the device" instead of staying on the object.
-    // This is the Professor's "bbox moves as device moves" observation.
-    //
-    // FIX: keep the anchor's WORLD POSITION on its original line-of-sight from
-    // wherever it was first placed. We translate the existing anchor along the
-    // vector (currentPos - originalCamPos) so its distance to the current
-    // camera equals the new median. We do NOT use worldDir or camPos from
-    // the current frame to define the position — those are for the raycast
-    // only, which provides a depth READING, not a position.
-    //
-    // For our case "object in world doesn't move", anchor.position is
-    // ESSENTIALLY immutable after first lock — refinement only refines depth
-    // when the camera reads a closer/farther plane along the same world ray.
-    // We update the anchor's position only by moving it along the
-    // CAMERA-TO-ANCHOR line so the distance equals the new median; the
-    // angular position from the original placement remains preserved.
-    let anchorDir = simd_normalize(currentPos - camPos)
-    let newWorldPos = camPos + anchorDir * median
+    let newWorldPos = camPos + worldDir * median
     objectWorldPosition = newWorldPos
 
     let camT = camera.transform
