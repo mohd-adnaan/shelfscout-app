@@ -37,9 +37,6 @@ extension ReachingViewController {
     let photoCenterX = 1.0 - rawCenterX   // ← THE FIX
     let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
 
-    NSLog("🔍 [FlipCheck] bbox X raw=%.2f flipped=%.2f | object should be on %@",
-          rawCenterX, photoCenterX, photoCenterX < 0.5 ? "LEFT" : "RIGHT")
-
     // ── FOV crop correction ─────────────────────────────────────────────
     let imgRes = camera.imageResolution  // 1920×1440 landscape
     let arW = imgRes.width, arH = imgRes.height
@@ -137,34 +134,38 @@ extension ReachingViewController {
   }
 
   private func finalizePlacement(worldPos: simd_float3, depth: Float,
-                                 camera: ARCamera, horizScale: CGFloat,
-                                 source: String) {
-    objectWorldPosition = worldPos
-    anchorDepth = depth
-    liveDistanceToObject = depth
+                                   camera: ARCamera, horizScale: CGFloat,
+                                   source: String) {
+      objectWorldPosition = worldPos
+      anchorDepth = depth
+      liveDistanceToObject = depth
 
-    let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
-    let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-    objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.15)
-    objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.20)
+      // Box size from the REAL detected bbox — no cap, so the overlay
+      // wraps the actual object instead of a fixed narrow pill.
+      // Loose safety rail (depth * 0.45) only catches a runaway full-screen
+      // VLM detection; real object boxes stay well under it.
+      let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
+      let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
+      objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.45)
+      objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.45)
 
-    let camT = camera.transform
-    let right = -simd_normalize(simd_make_float3(camT.columns.1))
-    let up    =  simd_normalize(simd_make_float3(camT.columns.0))
-    objectWorldCornerTR = worldPos + right * objectWorldHalfW + up * objectWorldHalfH
-    objectWorldCornerBL = worldPos - right * objectWorldHalfW - up * objectWorldHalfH
-    anchorPlaced = true
+      let camT = camera.transform
+      let right = -simd_normalize(simd_make_float3(camT.columns.1))
+      let up    =  simd_normalize(simd_make_float3(camT.columns.0))
+      objectWorldCornerTR = worldPos + right * objectWorldHalfW + up * objectWorldHalfH
+      objectWorldCornerBL = worldPos - right * objectWorldHalfW - up * objectWorldHalfH
+      anchorPlaced = true
 
-    NSLog("🅿️ [PlaceHold] ✅ ANCHOR at (%.3f,%.3f,%.3f) depth=%.2fm via %@",
-          worldPos.x, worldPos.y, worldPos.z, depth, source)
+      NSLog("🅿️ [PlaceHold] ✅ ANCHOR at (%.3f,%.3f,%.3f) depth=%.2fm halfW=%.3f halfH=%.3f via %@",
+            worldPos.x, worldPos.y, worldPos.z, depth, objectWorldHalfW, objectWorldHalfH, source)
 
-    let viewSize = CGSize(width: cachedSW, height: cachedSH)
-    let back = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
-    NSLog("🅿️ [PlaceHold] SelfCheck → screen (%.0f,%.0f)", back.x, back.y)
+      let viewSize = CGSize(width: cachedSW, height: cachedSH)
+      let back = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
+      NSLog("🅿️ [PlaceHold] SelfCheck → screen (%.0f,%.0f)", back.x, back.y)
 
-    DispatchQueue.main.async { [weak self] in
-      self?.distanceLabel.text = "\(Int(depth * 100)) cm"
+      DispatchQueue.main.async { [weak self] in
+        self?.distanceLabel.text = "\(Int(depth * 100)) cm"
+      }
+      say("Target locked.")
     }
-    say("Target locked.")
-  }
 }
