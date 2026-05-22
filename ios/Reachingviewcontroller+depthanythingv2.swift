@@ -93,6 +93,120 @@ private final class DepthAnythingV2Loader {
   }
 }
 
+// MARK: - Startup Validation (call once to confirm model is bundled & loadable)
+
+/// Eagerly loads and validates the DepthAnythingV2 model, logging detailed
+/// diagnostics. Call from viewDidLoad() so you get immediate confirmation
+/// in the console that the model is present and functional — no AR session needed.
+func validateDepthAnythingModel() {
+  let t0 = ProcessInfo.processInfo.systemUptime
+
+  NSLog("🌊 [DAv2-Validate] ═══════════════════════════════════════════════════")
+  NSLog("🌊 [DAv2-Validate] Starting DepthAnythingV2 model validation...")
+  NSLog("🌊 [DAv2-Validate] ═══════════════════════════════════════════════════")
+
+  // 1. Check if the compiled model is in the app bundle
+  let bundledNames = ["DepthAnythingV2SmallF16", "DepthAnythingV2MetricSmallInt8"]
+  var foundUrl: URL? = nil
+  var foundName: String? = nil
+  for name in bundledNames {
+    if let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc") {
+      foundUrl = url
+      foundName = name
+      NSLog("🌊 [DAv2-Validate] ✅ Found compiled model in bundle: %@ (.mlmodelc)", name)
+      break
+    } else if let url = Bundle.main.url(forResource: name, withExtension: "mlpackage") {
+      foundUrl = url
+      foundName = name
+      NSLog("🌊 [DAv2-Validate] ✅ Found model package in bundle: %@ (.mlpackage)", name)
+      break
+    } else {
+      NSLog("🌊 [DAv2-Validate] ⏭️  '%@' not found in bundle (tried .mlmodelc and .mlpackage)", name)
+    }
+  }
+
+  guard let modelUrl = foundUrl, let modelName = foundName else {
+    NSLog("🌊 [DAv2-Validate] ❌ NO DepthAnythingV2 model found in app bundle!")
+    NSLog("🌊 [DAv2-Validate]    Make sure the .mlpackage is added to the Xcode target.")
+    NSLog("🌊 [DAv2-Validate] ═══════════════════════════════════════════════════")
+    return
+  }
+
+  NSLog("🌊 [DAv2-Validate] 📁 Model URL: %@", modelUrl.path)
+
+  // 2. Try loading the MLModel
+  let config = MLModelConfiguration()
+  config.computeUnits = .all
+  do {
+    let mlModel = try MLModel(contentsOf: modelUrl, configuration: config)
+    let loadMs = (ProcessInfo.processInfo.systemUptime - t0) * 1000
+    NSLog("🌊 [DAv2-Validate] ✅ MLModel loaded successfully in %.0fms", loadMs)
+
+    // 3. Log model metadata
+    let desc = mlModel.modelDescription
+    NSLog("🌊 [DAv2-Validate] 📋 Model: %@", modelName)
+
+    // Input details
+    NSLog("🌊 [DAv2-Validate] 📥 Inputs (%d):", desc.inputDescriptionsByName.count)
+    for (name, input) in desc.inputDescriptionsByName {
+      if let imageConstraint = input.imageConstraint {
+        NSLog("🌊 [DAv2-Validate]    • '%@': Image %dx%d (type: %d)",
+              name,
+              imageConstraint.pixelsWide,
+              imageConstraint.pixelsHigh,
+              imageConstraint.pixelFormatType)
+      } else if let multiArrayConstraint = input.multiArrayConstraint {
+        NSLog("🌊 [DAv2-Validate]    • '%@': MultiArray shape=%@ dtype=%d",
+              name,
+              multiArrayConstraint.shape,
+              multiArrayConstraint.dataType.rawValue)
+      } else {
+        NSLog("🌊 [DAv2-Validate]    • '%@': %@", name, input.type.rawValue as CVarArg)
+      }
+    }
+
+    // Output details
+    NSLog("🌊 [DAv2-Validate] 📤 Outputs (%d):", desc.outputDescriptionsByName.count)
+    for (name, output) in desc.outputDescriptionsByName {
+      if let imageConstraint = output.imageConstraint {
+        NSLog("🌊 [DAv2-Validate]    • '%@': Image %dx%d (type: %d)",
+              name,
+              imageConstraint.pixelsWide,
+              imageConstraint.pixelsHigh,
+              imageConstraint.pixelFormatType)
+      } else if let multiArrayConstraint = output.multiArrayConstraint {
+        NSLog("🌊 [DAv2-Validate]    • '%@': MultiArray shape=%@ dtype=%d",
+              name,
+              multiArrayConstraint.shape,
+              multiArrayConstraint.dataType.rawValue)
+      } else {
+        NSLog("🌊 [DAv2-Validate]    • '%@': type=%d", name, output.type.rawValue)
+      }
+    }
+
+    // 4. Try wrapping in VNCoreMLModel (same as runtime path)
+    let visionModel = try VNCoreMLModel(for: mlModel)
+    NSLog("🌊 [DAv2-Validate] ✅ VNCoreMLModel wrapper created successfully")
+    _ = visionModel  // suppress unused warning
+
+    // 5. Pre-warm the lazy singleton so first real inference is faster
+    _ = DepthAnythingV2Loader.shared.model()
+
+    let totalMs = (ProcessInfo.processInfo.systemUptime - t0) * 1000
+    NSLog("🌊 [DAv2-Validate] ═══════════════════════════════════════════════════")
+    NSLog("🌊 [DAv2-Validate] ✅ ALL CHECKS PASSED — model is ready (total: %.0fms)", totalMs)
+    NSLog("🌊 [DAv2-Validate]    Name:    %@", modelName)
+    NSLog("🌊 [DAv2-Validate]    Compute: .all (Neural Engine + GPU + CPU)")
+    NSLog("🌊 [DAv2-Validate]    Status:  OPERATIONAL ✅")
+    NSLog("🌊 [DAv2-Validate] ═══════════════════════════════════════════════════")
+
+  } catch {
+    let failMs = (ProcessInfo.processInfo.systemUptime - t0) * 1000
+    NSLog("🌊 [DAv2-Validate] ❌ MODEL LOAD FAILED after %.0fms: %@", failMs, error.localizedDescription)
+    NSLog("🌊 [DAv2-Validate] ═══════════════════════════════════════════════════")
+  }
+}
+
 extension ReachingViewController {
 
   // ═══════════════════════════════════════════════════════════════════════════

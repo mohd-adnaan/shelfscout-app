@@ -463,6 +463,11 @@ class ReachingViewController: UIViewController {
     setupAudio()
     setupHaptics()
     setupTapToDismiss()
+
+    // Eagerly validate DepthAnythingV2 model on startup — logs detailed diagnostics
+    DispatchQueue.global(qos: .userInitiated).async {
+      validateDepthAnythingModel()
+    }
   }
 
   override func viewDidAppear(_ animated: Bool) {
