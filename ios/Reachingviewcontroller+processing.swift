@@ -28,6 +28,12 @@ extension ReachingViewController {
     guard running else { return }
     arFrameCount += 1
 
+    // ── PROTOTYPE intercept ──────────────────────────────────────────────
+    // When the place-and-hold prototype is on, it fully owns the frame:
+    // place once via raycast, then hold + draw + guide. The entire old
+    // pipeline below (reseed, tracker, refinement, mode routing) is skipped.
+    if handlePlaceAndHoldFrame(frame) { return }
+
     if !anchorPlaced {
       // ── INITIAL BBOX REFRESH GATE ─────────────────────────────────────
       // The bbox passed in came from a VisionCamera photo seconds ago.

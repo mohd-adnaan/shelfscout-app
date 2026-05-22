@@ -145,6 +145,16 @@ class ReachingViewController: UIViewController {
   var anchorPlaced = false
   var anchorDepth: Float = 0.5
   var liveDistanceToObject: Float = 0.5
+
+  // ── PROTOTYPE: place-and-hold (Reality-Composer style) ───────────────────
+  // When true, the reaching pipeline is replaced by: raycast once against
+  // ARKit geometry, place an anchor, then NEVER touch it. No tracker, no
+  // re-detection, no refinement, no DAv2. Flip to false to restore the old
+  // pipeline unchanged. See Reachingviewcontroller+placeAndHold.swift.
+  var placeAndHoldPrototype = true
+  // Absolute time the AR session started (set in startARSession). Used by
+  // the prototype's placement deadline.
+  var sessionStartTime: TimeInterval = 0
   var handIsCloseEnoughInDepth = false
   /// Hand-free: lock anchor after first ARKit refinement converges.
   /// Re-detection still runs (for logging) but CANNOT move the anchor.
@@ -181,6 +191,7 @@ class ReachingViewController: UIViewController {
 
   let handReq = VNDetectHumanHandPoseRequest()
   let visionQ = DispatchQueue(label: "reach.vision", qos: .userInitiated)
+  let depthAnythingQ = DispatchQueue(label: "reach.depth", qos: .userInitiated)
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Visual Tracking (VNTrackObjectRequest)
@@ -452,6 +463,11 @@ class ReachingViewController: UIViewController {
     setupAudio()
     setupHaptics()
     setupTapToDismiss()
+
+    // Eagerly validate DepthAnythingV2 model on startup — logs detailed diagnostics
+    DispatchQueue.global(qos: .userInitiated).async {
+      validateDepthAnythingModel()
+    }
   }
 
   override func viewDidAppear(_ animated: Bool) {
