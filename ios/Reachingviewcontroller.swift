@@ -160,6 +160,24 @@ class ReachingViewController: UIViewController {
   /// Re-detection still runs (for logging) but CANNOT move the anchor.
   var anchorLockedForHandFree = false
 
+  // ── DAv2-primary placement state (place-and-hold path) ───────────────────
+  // The prototype now seeds depth from DepthAnythingV2 (metric, scale-anchored)
+  // instead of a raw raycast / fixed fallback. DAv2 inference is async, so we
+  // kick it off ONCE and gate placement on its result.
+  //   .idle      → not started
+  //   .inFlight  → estimateMetricDepth running; hold placement
+  //   .done      → result in dav2MetricDepth (nil = DAv2 unavailable, use fallback ladder)
+  enum DAv2PlacementState { case idle, inFlight, done }
+  var dav2PlacementState: DAv2PlacementState = .idle
+  var dav2MetricDepth: Float? = nil
+  /// Wall-clock when DAv2 was kicked off — used to bound the wait before the
+  /// fallback ladder is allowed to take over.
+  var dav2KickoffTime: TimeInterval = 0
+  /// Max time to hold placement waiting for DAv2 before falling through to
+  /// the raycast/backend/fixed ladder. Inference is ~80ms but the SCALE-ANCHOR
+  /// raycast needs planes to exist, so we allow a couple seconds of plane warmup.
+  let dav2MaxWaitSec: TimeInterval = 3.0
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - ARKit
   // ═══════════════════════════════════════════════════════════════════════════

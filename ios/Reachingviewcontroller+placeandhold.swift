@@ -76,7 +76,93 @@ extension ReachingViewController {
       speakInitialDirection(photoCenterX: photoCenterX, photoCenterY: photoCenterY)
     }
 
-    // ── Try ARKit raycast along the bbox ray ─────────────────────────────
+    // ═══════════════════════════════════════════════════════════════════════
+    // DEPTH SOURCE — DAv2 metric depth is PRIMARY.
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // The old ladder (raw raycast → backend-relative → fixed 1.0m) was the
+    // root cause of every mis-placed box: on a non-LiDAR device the first
+    // raycast at frame 5 lands on the floor/back-wall (or nothing), and the
+    // fixed fallback slammed the anchor down the ray onto whatever was behind
+    // the object. The bearing was right; the DISTANCE was garbage.
+    //
+    // DepthAnythingV2 gives a learned metric depth at the bbox center,
+    // scale-anchored to ONE raycast (the raycast is now just a metre
+    // reference for DAv2 — we never *place* from it directly). We kick it
+    // off once, hold placement until it returns, then place at the DAv2
+    // depth down the SAME bbox ray. Only if DAv2 is genuinely unavailable
+    // (model missing, or no plane anywhere yet for the scale anchor) do we
+    // fall through to the legacy ladder.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    // AR-portrait normalized bbox for DAv2 (it re-derives the landscape pixel
+    // mapping internally; pass the crop-corrected X so DAv2 samples the same
+    // pixel column the placement ray points through).
+    let arBboxNormalized: [CGFloat] = [
+      bboxNormalized[0] * horizScale + horizOffset, bboxNormalized[1],
+      bboxNormalized[2] * horizScale + horizOffset, bboxNormalized[3]
+    ]
+
+    switch dav2PlacementState {
+    case .idle:
+      dav2PlacementState = .inFlight
+      // Set the deadline clock only on the FIRST kickoff. Synchronous "no
+      // plane yet" nils bounce us back to .idle and re-enter here each frame;
+      // if we reset the clock every time, the dav2MaxWaitSec deadline would
+      // never accumulate and we'd retry forever. dav2KickoffTime == 0 means
+      // "never started".
+      if dav2KickoffTime == 0 {
+        dav2KickoffTime = ProcessInfo.processInfo.systemUptime
+        NSLog("🅿️ [PlaceHold] 🌊 Kicking off DAv2 metric depth estimate…")
+      }
+      estimateMetricDepth(frame: frame, bboxARNormalized: arBboxNormalized) { [weak self] metric in
+        guard let self = self else { return }
+        if let m = metric {
+          // Success — DAv2 produced a metric depth. Place on the next frame.
+          self.dav2MetricDepth = m
+          self.dav2PlacementState = .done
+          NSLog("🅿️ [PlaceHold] 🌊 DAv2 returned %.2fm", m)
+        } else {
+          // nil = either the model is missing, OR (the common early case) no
+          // ARKit plane exists yet to scale-anchor against. The latter is
+          // TRANSIENT: planes form over the next 1–2s. We must NOT lock to
+          // .done here — that would permanently skip DAv2 on the very first
+          // frame, before any plane exists, which is precisely the failure we
+          // are fixing. Reset to .idle so the next frame retries; the
+          // dav2MaxWaitSec deadline (checked in .inFlight) bounds the retries.
+          self.dav2PlacementState = .idle
+          NSLog("🅿️ [PlaceHold] 🌊 DAv2 nil (no scale anchor yet or model missing) — will retry until %.1fs deadline", self.dav2MaxWaitSec)
+        }
+      }
+      return  // hold this frame; placement happens once .done
+
+    case .inFlight:
+      // Either DAv2 inference is genuinely in flight, OR a synchronous nil
+      // bounced us back to .idle and we're between retries. Bound total wait
+      // from the FIRST kickoff so repeated "no plane yet" nils can't stall
+      // placement forever — after dav2MaxWaitSec, give up on DAv2 and let the
+      // fallback ladder take over.
+      let waited = ProcessInfo.processInfo.systemUptime - dav2KickoffTime
+      if waited > dav2MaxWaitSec {
+        NSLog("🅿️ [PlaceHold] 🌊 DAv2 wait exceeded %.1fs — proceeding to fallback ladder", dav2MaxWaitSec)
+        dav2MetricDepth = nil
+        dav2PlacementState = .done
+      }
+      return
+
+    case .done:
+      if let metric = dav2MetricDepth {
+        let worldPos = camPos + worldRayDir * metric
+        NSLog("🅿️ [PlaceHold] ✅ Placing at DAv2 metric depth %.2fm", metric)
+        finalizePlacement(worldPos: worldPos, depth: metric, camera: camera,
+                          horizScale: horizScale, source: "dav2-metric")
+        return
+      }
+      // DAv2 unavailable after deadline — fall through to the legacy ladder below.
+    }
+
+    // ── FALLBACK LADDER (only reached when DAv2 returned nil) ────────────
+    // Try ARKit raycast along the bbox ray.
     let targets: [(ARRaycastQuery.Target, ARRaycastQuery.TargetAlignment, String)] = [
       (.existingPlaneGeometry, .any, "existingGeometry"),
       (.estimatedPlane,        .any, "estimatedPlane"),
@@ -89,7 +175,7 @@ extension ReachingViewController {
         let hitPos = simd_make_float3(hit.worldTransform.columns.3)
         let d = simd_length(hitPos - camPos)
         if d >= 0.15 && d <= 5.0 {
-          NSLog("🅿️ [PlaceHold] ✅ ARKit HIT at %.2fm via %@", d, label)
+          NSLog("🅿️ [PlaceHold] ✅ (fallback) ARKit HIT at %.2fm via %@", d, label)
           finalizePlacement(worldPos: hitPos, depth: d, camera: camera,
                             horizScale: horizScale, source: "raycast:\(label)")
           return
@@ -100,7 +186,7 @@ extension ReachingViewController {
     // ── No hit — use backend depth if available ─────────────────────────
     if let bd = backendDepth, bd >= 0.1, bd <= 10.0 {
       let worldPos = camPos + worldRayDir * bd
-      NSLog("🅿️ [PlaceHold] No raycast hit — placing at backend depth %.2fm", bd)
+      NSLog("🅿️ [PlaceHold] (fallback) No raycast hit — placing at backend depth %.2fm", bd)
       finalizePlacement(worldPos: worldPos, depth: bd, camera: camera,
                         horizScale: horizScale, source: "backend-depth")
       return
@@ -110,7 +196,7 @@ extension ReachingViewController {
     let elapsed = ProcessInfo.processInfo.systemUptime - sessionStartTime
     if elapsed < 10.0 {
       if framesSinceStart % 30 == 0 {
-        NSLog("🅿️ [PlaceHold] no hit, no backend depth (%.1fs) — waiting", elapsed)
+        NSLog("🅿️ [PlaceHold] (fallback) no hit, no backend depth (%.1fs) — waiting", elapsed)
       }
       return
     }
