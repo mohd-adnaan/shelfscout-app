@@ -90,7 +90,7 @@ const PREFETCH_CONFIG = {
   MIN_CYCLE_COOLDOWN: 300,
 };
 
-const SMART_GUIDANCE_MIN_CYCLE_MS = 250; // 4fps
+const SMART_GUIDANCE_MIN_CYCLE_MS = 200; // 5fps
 const KASRA_FEED_INTERVAL_MS = 500;
 
 // =============================================================================
@@ -150,6 +150,14 @@ function AppInner(): React.JSX.Element {
     bbox?: any;
     annotatedImage?: string;
   } | null>(null);
+  // Issue 5: the Qwen seed bbox is handed to the tracker container ONLY on the
+  // first smart-guidance call after the tracker locks. While tracking is
+  // active the container owns the box, so subsequent calls send no bbox.
+  const smartGuidanceSeededRef = useRef(false);
+  // Issue 4: true while tracking has been lost and the loop is re-requesting
+  // Qwen detection to reacquire the target. Keeps the loop alive instead of
+  // exiting on bothInactive.
+  const reacquiringRef = useRef(false);
   const kasraFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const kasraLastFrameRef = useRef<string>('');
   const kasraLastObjectRef = useRef<string>('');
@@ -779,6 +787,8 @@ function AppInner(): React.JSX.Element {
     isContinuousModeRunning.current = true;
     continuousModeAbortRef.current = false;
     prefetchedPhotoRef.current = null;
+    smartGuidanceSeededRef.current = false;
+    reacquiringRef.current = false;
     let cycleCount = 0;
 
     const currentMode = getCurrentMode();
@@ -790,6 +800,8 @@ function AppInner(): React.JSX.Element {
         smartGuidanceActiveRef.current = false;
         smartGuidanceResumeMainRef.current = false;
         smartGuidanceCacheRef.current = null;
+        smartGuidanceSeededRef.current = false;
+        reacquiringRef.current = false;
       }
 
       const minIntervalOverride = smartGuidanceActiveRef.current
@@ -829,6 +841,21 @@ function AppInner(): React.JSX.Element {
           stopKasraFeed();
         }
 
+        // Issue 3: never POST a reaching request without an image. A failed
+        // capture right after the navigation→reaching switch left Melody's
+        // tracker container with no image (and no usable session) to
+        // initialize from. Retry once, then skip the cycle rather than
+        // sending an imageless request.
+        if (!photoPath && loopMode === 'reaching') {
+          console.warn('🔄 [Reaching] Empty capture — retrying once before send');
+          photoPath = await reactivateCameraAndCapture({ enableShutterSound: false });
+          if (!photoPath) {
+            console.warn('🔄 [Reaching] Still no image — skipping cycle, will retry');
+            await new Promise(r => setTimeout(r, SMART_GUIDANCE_MIN_CYCLE_MS));
+            continue;
+          }
+        }
+
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
 
         // ── Send to backend ────────────────────────────────────────────────
@@ -848,22 +875,35 @@ function AppInner(): React.JSX.Element {
         if (shouldUseSmartGuidance) {
           const cached = smartGuidanceCacheRef.current;
           const imageDataUrl = await readImageAsDataUrl(photoPath || '');
-          const bboxString = bboxToString(cached?.bbox);
+          const seedBbox = bboxToString(cached?.bbox);
           const objectName = cached?.object || 'object';
           const annotatedImage = cached?.annotatedImage
             ? toDataUrl(cached.annotatedImage)
             : (imageDataUrl || '');
 
-          if (!imageDataUrl || !bboxString) {
+          // Issue 5: hand the Qwen seed bbox to the tracker container ONLY on
+          // the first call after the tracker locks. While tracking is active
+          // the container's tracker owns the box — echoing it back (or the
+          // tracker's own normalized output) makes the container think Qwen
+          // is still detecting.
+          const needsSeed = !smartGuidanceSeededRef.current;
+          const bboxToSend = needsSeed ? seedBbox : '';
+
+          if (!imageDataUrl || (needsSeed && !seedBbox)) {
+            // Issue 3: incomplete payload — don't send a partial request to
+            // the container. Resume the main workflow; reacquiringRef keeps
+            // the loop alive so Qwen detection retries.
             console.warn('⚠️ [SmartGuidance] Missing payload, resuming main workflow');
             smartGuidanceActiveRef.current = false;
             smartGuidanceResumeMainRef.current = true;
+            smartGuidanceSeededRef.current = false;
+            reacquiringRef.current = true;
           } else {
             usedSmartGuidance = true;
             const smartResponse = await sendToSmartGuidance(
               {
                 object: objectName,
-                bbox: bboxString,
+                bbox: bboxToSend,
                 image: imageDataUrl,
                 annotated_image: annotatedImage,
                 success: true,
@@ -871,6 +911,11 @@ function AppInner(): React.JSX.Element {
               },
               abortCtrl.signal
             );
+            // Seed has now gone out — every later call sends an empty bbox.
+            if (needsSeed) {
+              smartGuidanceSeededRef.current = true;
+              console.log('🎯 [SmartGuidance] Seed bbox sent — tracker owns the box now');
+            }
 
             const handDirection = normalizeTextValue(smartResponse?.hand_direction);
             const guidance = normalizeTextValue(smartResponse?.guidance);
@@ -891,15 +936,24 @@ function AppInner(): React.JSX.Element {
               loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
             };
 
+            // Keep the ORIGINAL Qwen seed bbox in the cache — never overwrite
+            // it with the tracker's normalized output. If tracking is lost the
+            // cache is refreshed from a fresh Qwen detection (see below).
             smartGuidanceCacheRef.current = {
               object: smartResponse?.class_name || objectName,
-              bbox: smartResponse?.bbox || cached?.bbox,
+              bbox: cached?.bbox,
               annotatedImage: cached?.annotatedImage || annotatedImage,
             };
 
             if (smartResponse?.tracking_active === false) {
+              // Issue 4: tracking lost — resume the main workflow so the
+              // backend re-runs Qwen detection to reacquire the target.
+              // reacquiringRef keeps the loop alive instead of exiting.
+              console.log('🔄 [SmartGuidance] tracking lost — reacquiring via Qwen detection');
               smartGuidanceActiveRef.current = false;
               smartGuidanceResumeMainRef.current = true;
+              smartGuidanceSeededRef.current = false;
+              reacquiringRef.current = true;
             }
           }
         }
@@ -923,6 +977,10 @@ function AppInner(): React.JSX.Element {
 
           if (loopMode === 'reaching' && result?.tracking_active === true && result?.bbox && result?.object) {
             smartGuidanceActiveRef.current = true;
+            // Fresh Qwen detection → fresh seed bbox to hand the tracker, and
+            // reacquisition (if any was in progress) is now complete.
+            smartGuidanceSeededRef.current = false;
+            reacquiringRef.current = false;
             smartGuidanceCacheRef.current = {
               object: result?.object || smartGuidanceCacheRef.current?.object,
               bbox: result?.bbox || smartGuidanceCacheRef.current?.bbox,
@@ -1056,10 +1114,35 @@ function AppInner(): React.JSX.Element {
           break;
         }
 
+        // ── Reacquisition completion guard ─────────────────────────────────
+        // Issue 4: while reacquiring, the loop is kept alive (reachingActive
+        // is forced true below) so the backend keeps re-running Qwen
+        // detection. The ONLY clean ways out are an explicit completion
+        // signal or the user stopping — never transiently-dropped flags.
+        if (reacquiringRef.current && result.reaching_completed === true) {
+          if (result.text) {
+            setIsSpeaking(true);
+            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+            setIsSpeaking(false);
+          }
+          console.log('✅ [Reaching] reaching_completed during reacquisition — done');
+          reacquiringRef.current = false;
+          resetSessionId();
+          stopContinuousMode('reaching complete', true);
+          break;
+        }
+
+        // A genuine navigation handoff ends any in-progress reacquisition.
+        if (result.navigation === true) reacquiringRef.current = false;
+
         // ── Flag check ─────────────────────────────────────────────────────
         const navigationActive = result.navigation === true;
         const smartGuidanceActive = smartGuidanceActiveRef.current;
-        const reachingActive = result.reaching_flag === true || smartGuidanceActive || smartGuidanceResumeMainRef.current;
+        // Issue 4: reacquiringRef keeps reaching active across the transient
+        // window where tracking is lost and the backend has not yet re-set
+        // reaching_flag — otherwise bothInactive would exit the pipeline.
+        const reachingActive = result.reaching_flag === true || smartGuidanceActive
+          || smartGuidanceResumeMainRef.current || reacquiringRef.current;
         const bothInactive = !navigationActive && !reachingActive;
 
         setIsNavigation(navigationActive);
@@ -1215,6 +1298,8 @@ function AppInner(): React.JSX.Element {
     smartGuidanceActiveRef.current = false;
     smartGuidanceResumeMainRef.current = false;
     smartGuidanceCacheRef.current = null;
+    smartGuidanceSeededRef.current = false;
+    reacquiringRef.current = false;
     setIsNavigation(false);
     setIsReaching(false);
     setIsProcessing(false);

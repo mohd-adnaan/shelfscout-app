@@ -342,7 +342,9 @@ export const sendToWorkflow = async (
     // ========================================================================
     // Parse response with THREE-FLAG support (including reaching_ios)
     // ========================================================================
-    const parsedResponse = parseWorkflowResponse(response.data);
+    const parsedResponse = parseWorkflowResponse(response.data, {
+      reachingRequest: request.reaching_flag === true,
+    });
 
     console.log('📄 Response:', {
       textLength: parsedResponse.text?.length || 0,
@@ -468,7 +470,10 @@ export const sendToSmartGuidance = async (
         image: payload.image,
         annotated_image: payload.annotated_image,
         success: payload.success,
-        ...(payload.session_id ? { session_id: payload.session_id } : {}),
+        // Always include session_id — the tracker container keys its
+        // per-session state on it. Fall back to the current session id
+        // rather than dropping the field entirely.
+        session_id: payload.session_id || getSessionId(),
       },
     },
     {
@@ -498,7 +503,10 @@ export const sendToSmartGuidance = async (
 // RESPONSE PARSER (with reaching_ios support)
 // =============================================================================
 
-function parseWorkflowResponse(data: any): WorkflowResponse {
+function parseWorkflowResponse(
+  data: any,
+  opts: { reachingRequest?: boolean } = {},
+): WorkflowResponse {
   const defaultResponse: WorkflowResponse = {
     text: '',
     navigation: false,
@@ -742,6 +750,13 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     parseBoolean(payload.navigation_completed) === true
   );
 
+  // reaching_completed flag — standard/Melody reaching pipeline says the
+  // object has been reached. Used to end a reacquisition loop cleanly.
+  const reaching_completed = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.reaching_completed) === true ||
+    parseBoolean(payload.reachingCompleted) === true
+  );
+
   // Extract guidance text with hand-direction precedence.
   const hand_direction = normalizeBackendString(
     pickString(['hand_direction', 'handDirection']),
@@ -758,8 +773,13 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   let text = '';
   if (hand_direction) {
     text = hand_direction;
-  } else if (reaching_flag || tracking_active) {
-    text = reachingText || normalizeBackendString(pickString(['text', 'message']));
+  } else if (reaching_flag || tracking_active || opts.reachingRequest === true) {
+    // Reaching context — guidance text lives in the `reaching` field.
+    // On the FIRST reaching cycle the response's own reaching_flag is often
+    // still false (the backend sets it on the NEXT response), so without
+    // opts.reachingRequest this fell through to the `else` branch and read
+    // the `response` field instead of `reaching`.
+    text = reachingText || normalizeBackendString(pickString(['text', 'message', 'response']));
   } else {
     text = nonReachingText || reachingText;
   }
@@ -817,6 +837,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     hand_direction: hand_direction || undefined,
     annotated_image,
     tracking_active,
+    reaching_completed,
     reached,
     loopDelay,
     session_id,
