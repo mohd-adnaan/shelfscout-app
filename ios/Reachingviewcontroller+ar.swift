@@ -86,7 +86,7 @@ extension ReachingViewController {
     }
 
     // Bbox center in photo-normalized coords
-    let photoCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
+    let photoCenterX = 1.0 - (bboxNormalized[0] + bboxNormalized[2]) / 2
     let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
 
     // Convert to AR-camera-normalized portrait coords
@@ -166,11 +166,13 @@ extension ReachingViewController {
 
     objectWorldPosition = worldPos
 
-    // Bbox size in world space — correct width for photo→AR crop
+    // Bbox size in world space — correct width for photo→AR crop.
+    // Cap to reasonable maximums: a 48%×77% bbox (VLM detecting the whole
+    // dresser) produces a box covering the entire screen — unusable.
     let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
     let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-    objectWorldHalfW = depth * Float(bboxNormW * horizScale) * 0.5  // crop-corrected width
-    objectWorldHalfH = depth * Float(bboxNormH) * 0.8               // vertical: no correction
+    objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.15)
+    objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.20)
 
     // Billboard corners use the SAME transform we unprojected through, so
     // the rectangle sits in the plane perpendicular to the detection ray.
@@ -859,7 +861,7 @@ extension ReachingViewController {
           ? photoPortraitAspect / arPortraitAspect : 1.0
         let horizOffset: CGFloat = (1.0 - horizScale) / 2.0
 
-        let photoCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
+        let photoCenterX = 1.0 - (bboxNormalized[0] + bboxNormalized[2]) / 2
         let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
         let arNormX = photoCenterX * horizScale + horizOffset
         let arNormY = photoCenterY
@@ -895,8 +897,8 @@ extension ReachingViewController {
         let billboardUp = simd_normalize(simd_make_float3(camT.columns.0))
         let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
         let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-        objectWorldHalfW = anchorDepth * Float(bboxNormW * horizScale) * 0.5
-        objectWorldHalfH = anchorDepth * Float(bboxNormH) * 0.8
+        objectWorldHalfW = min(anchorDepth * Float(bboxNormW * horizScale) * 0.5, anchorDepth * 0.15)
+        objectWorldHalfH = min(anchorDepth * Float(bboxNormH) * 0.5, anchorDepth * 0.20)
         if let pos = objectWorldPosition {
           objectWorldCornerTR = pos + billboardRight * objectWorldHalfW + billboardUp * objectWorldHalfH
           objectWorldCornerBL = pos - billboardRight * objectWorldHalfW - billboardUp * objectWorldHalfH
