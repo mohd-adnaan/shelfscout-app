@@ -2,13 +2,14 @@
 //  Reachingviewcontroller+placeAndHold.swift
 //  shelfscout
 //
-//  PLACE-AND-HOLD v7 — X-mirror fix + clean placement.
+//  PLACE-AND-HOLD v8 — no X-mirror. Clean placement.
 //
-//  THE BUG: VisionCamera's OrientationFix produces a photo that is
-//  horizontally mirrored relative to what ARKit's capturedImage shows.
-//  Photo X must be flipped (X → 1-X) before computing the placement ray.
-//  Objects near center-X worked because X ≈ 1-X; off-center objects
-//  were placed on the mirror-image side every time.
+//  The corrected photo and ARKit's capturedImage are BOTH true,
+//  un-mirrored views of the same scene (the OrientationFixer only does
+//  an EXIF rotation, which preserves handedness; the back camera is not
+//  mirrored). The portrait→landscape mapping below is already a pure
+//  rotation, so no X flip is applied — flipping would turn it into a
+//  reflection and place every off-center object on the wrong side.
 
 import ARKit
 
@@ -32,9 +33,8 @@ extension ReachingViewController {
     let sw = cachedSW, sh = cachedSH
     let viewSize = CGSize(width: sw, height: sh)
 
-    // ── Bbox center — FLIP X to fix the mirror ──────────────────────────
-    let rawCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
-    let photoCenterX = 1.0 - rawCenterX   // ← THE FIX
+    // ── Bbox center — photo coords map directly, no mirror ──────────────
+    let photoCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
     let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
 
     // ── FOV crop correction ─────────────────────────────────────────────

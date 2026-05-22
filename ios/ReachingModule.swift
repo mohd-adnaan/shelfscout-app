@@ -61,7 +61,7 @@ class ReachingModule: NSObject {
         if v >= 0.1 && v <= 10.0 { backendDepth = v }
       }
     }
-    NSLog("🎯 [ReachingModule] depth from backend: %@", backendDepth.map { "\($0)m" } ?? "nil")
+    NSLog("🎯 [ReachingModule] depth from backend (RELATIVE, not used for metric placement): %@", backendDepth.map { "\($0)" } ?? "nil")
 
     var imgW: CGFloat = 0, imgH: CGFloat = 0
     if let w = params["imageWidth"] as? NSNumber  { imgW = CGFloat(w.doubleValue) }

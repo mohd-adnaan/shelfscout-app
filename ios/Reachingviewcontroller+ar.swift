@@ -47,7 +47,6 @@ extension ReachingViewController {
     }
 
     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
-    sessionStartTime = ProcessInfo.processInfo.systemUptime
     startBeepLoop()
     startRedetectionLoop()
     NSLog("📷 [ReachingVC] AR session started — mode=%@ hasLiDAR=%@",
@@ -86,12 +85,30 @@ extension ReachingViewController {
     }
 
     // Bbox center in photo-normalized coords
-    let photoCenterX = 1.0 - (bboxNormalized[0] + bboxNormalized[2]) / 2
+    let rawCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
     let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
+
+    // ── X-MIRROR HANDLING ────────────────────────────────────────────────
+    // The corrected photo (EXIF-normalized) can be horizontally mirrored
+    // relative to ARKit's capturedImage, depending on capture path. When
+    // mirrored, an object on the LEFT of the scene is reported by the backend
+    // with a HIGH X (right side of the photo). We flip in RAW photo space
+    // FIRST, then apply the crop correction so the crop math stays in the
+    // space it was written for.
+    //
+    // Toggle `flipPhotoX` to test: if the box lands on the WRONG side,
+    // change this one constant and rebuild. The FlipCheck log below tells
+    // you which side the code thinks the object is on — compare it to reality.
+    let flipPhotoX = true
+    let photoCenterX = flipPhotoX ? (1.0 - rawCenterX) : rawCenterX
 
     // Convert to AR-camera-normalized portrait coords
     let arNormX = photoCenterX * horizScale + horizOffset  // horizontal crop correction
     let arNormY = photoCenterY                              // vertical: same FOV, no correction
+
+    NSLog("🔍 [FlipCheck] bbox X raw=%.2f flipped=%.2f (flip=%@) → object should appear on %@",
+          rawCenterX, photoCenterX, flipPhotoX ? "ON" : "OFF",
+          arNormX < 0.5 ? "LEFT half" : "RIGHT half")
 
     // Convert AR portrait-normalized → AR landscape pixels
     // Portrait (X,Y) → Landscape: pxX = Y * arW, pxY = (1-X) * arH
@@ -106,28 +123,23 @@ extension ReachingViewController {
     let sw = cachedSW, sh = cachedSH
     let screenCenter = CGPoint(x: arNormX * sw, y: arNormY * sh)
 
-    // ── Depth source selection ───────────────────────────────────────────
-    let depth: Float
+    // ── LiDAR fast-path (Pro devices only) ───────────────────────────────
+    // Non-LiDAR depth is resolved AFTER the placement ray is built (below),
+    // so we can raycast ARKit planes along the exact ray. Here we only take
+    // the LiDAR seed when available; otherwise `depth` stays nil and is
+    // filled in after the ray exists.
+    var depth: Float = -1
     if hasLiDAR, let lidarDepth = sampleLiDARDepth(frame: frame, screenCenter: screenCenter) {
       depth = lidarDepth
       anchorDepth = lidarDepth
       lidarDepthSeeded = true
-      NSLog("🎯 [ReachingVC] ✅ LiDAR depth seed: %.2fm (backend was %.2fm)",
-            depth, backendDepth ?? -1)
+      NSLog("🎯 [ReachingVC] ✅ LiDAR depth seed: %.2fm", depth)
     } else if bboxUpdateCount > 0, anchorDepth > 0.05 {
       depth = anchorDepth
       NSLog("🎯 [ReachingVC] Using re-detection depth: %.2fm", depth)
-    } else {
-      // BAND-AID: when backend depth is missing (Qwen returned undefined),
-      // 1.5m is a far better default than 0.5m for shelf-reaching scenarios.
-      // Most targets are 0.5–3m away; 1.5m sits at the median, so the worst-
-      // case error in either direction is bounded. 0.5m put us at the close
-      // end and made the divergence gate inactive against the all-nil path.
-      depth = backendDepth ?? 1.5
-      anchorDepth = depth
-      NSLog("🎯 [ReachingVC] Using %@ depth: %.2fm",
-            hasLiDAR ? "backend (LiDAR miss)" : (backendDepth != nil ? "Qwen/backend" : "fallback (nil backend)"), depth)
     }
+    // NOTE: backend (Qwen) depth is RELATIVE, not metric — values like "2"
+    // are NOT 2 metres. We deliberately do NOT seed metric depth from it.
 
     let fx = CGFloat(intrinsics[0][0]), fy = CGFloat(intrinsics[1][1])
     let cx = CGFloat(intrinsics[2][0]), cy = CGFloat(intrinsics[2][1])
@@ -162,17 +174,50 @@ extension ReachingViewController {
     let rayCam   = simd_normalize(simd_float3(rX, -rY, -1.0))
     let worldRay = simd_normalize(simd_make_float3(camT * simd_float4(rayCam, 0)))
     let camPos   = simd_make_float3(camT.columns.3)
+
+    // ── Non-LiDAR depth: raycast ARKit planes along the EXACT placement ray ─
+    // This is ARKit doing the work it's good at. We cast through the same ray
+    // we just built and take the nearest plausible plane hit. Only if ARKit
+    // gives us nothing do we fall back — and the fallback is a NEAR reach
+    // distance (0.6m), not a far one. A near default keeps the anchor in
+    // front of the user at arm's-reach scale instead of pinned to the back
+    // wall, which is the failure mode in the demo screenshots.
+    if depth < 0 {
+      let liveCamPos = simd_make_float3(camera.transform.columns.3)
+      var bestHit: Float? = nil
+      for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
+        let q = ARRaycastQuery(origin: liveCamPos, direction: worldRay,
+                               allowing: target, alignment: .any)
+        for hit in sceneView.session.raycast(q) {
+          let hp = simd_make_float3(hit.worldTransform.columns.3)
+          let d = simd_length(hp - liveCamPos)
+          // Plausible reach/shelf range only — reject floor-far and too-near.
+          if d >= 0.25 && d <= 2.5 {
+            if bestHit == nil || d < bestHit! { bestHit = d }
+          }
+        }
+        if bestHit != nil { break }  // prefer existing-geometry hits
+      }
+      if let h = bestHit {
+        depth = h
+        NSLog("🎯 [ReachingVC] ✅ ARKit raycast depth: %.2fm (real plane hit)", depth)
+      } else {
+        depth = 0.6  // NEAR reach fallback — never the far wall
+        NSLog("🎯 [ReachingVC] ⚠️ No plane hit — NEAR fallback %.2fm (was relative backend=%@)",
+              depth, backendDepth.map { String(format: "%.1f", $0) } ?? "nil")
+      }
+      anchorDepth = depth
+    }
+
     let worldPos = camPos + worldRay * depth
 
     objectWorldPosition = worldPos
 
-    // Bbox size in world space — correct width for photo→AR crop.
-    // Cap to reasonable maximums: a 48%×77% bbox (VLM detecting the whole
-    // dresser) produces a box covering the entire screen — unusable.
+    // Bbox size in world space — correct width for photo→AR crop
     let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
     let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-    objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.15)
-    objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.20)
+    objectWorldHalfW = depth * Float(bboxNormW * horizScale) * 0.5  // crop-corrected width
+    objectWorldHalfH = depth * Float(bboxNormH) * 0.5               // true half-height (was 0.8 → box 60% too tall)
 
     // Billboard corners use the SAME transform we unprojected through, so
     // the rectangle sits in the plane perpendicular to the detection ray.
@@ -861,7 +906,7 @@ extension ReachingViewController {
           ? photoPortraitAspect / arPortraitAspect : 1.0
         let horizOffset: CGFloat = (1.0 - horizScale) / 2.0
 
-        let photoCenterX = 1.0 - (bboxNormalized[0] + bboxNormalized[2]) / 2
+        let photoCenterX = (bboxNormalized[0] + bboxNormalized[2]) / 2
         let photoCenterY = (bboxNormalized[1] + bboxNormalized[3]) / 2
         let arNormX = photoCenterX * horizScale + horizOffset
         let arNormY = photoCenterY
@@ -897,8 +942,8 @@ extension ReachingViewController {
         let billboardUp = simd_normalize(simd_make_float3(camT.columns.0))
         let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
         let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-        objectWorldHalfW = min(anchorDepth * Float(bboxNormW * horizScale) * 0.5, anchorDepth * 0.15)
-        objectWorldHalfH = min(anchorDepth * Float(bboxNormH) * 0.5, anchorDepth * 0.20)
+        objectWorldHalfW = anchorDepth * Float(bboxNormW * horizScale) * 0.5
+        objectWorldHalfH = anchorDepth * Float(bboxNormH) * 0.8
         if let pos = objectWorldPosition {
           objectWorldCornerTR = pos + billboardRight * objectWorldHalfW + billboardUp * objectWorldHalfH
           objectWorldCornerBL = pos - billboardRight * objectWorldHalfW - billboardUp * objectWorldHalfH
