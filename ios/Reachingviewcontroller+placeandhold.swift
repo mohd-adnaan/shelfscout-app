@@ -21,6 +21,7 @@ extension ReachingViewController {
       attemptPlaceAndHold(frame)
       return true
     }
+    tryDav2Refine(frame)        // parallel, non-blocking DAv2 depth correction
     processARFrameHandFree(frame)
     return true
   }
@@ -77,134 +78,138 @@ extension ReachingViewController {
     }
 
     // ═══════════════════════════════════════════════════════════════════════
-    // DEPTH SOURCE — DAv2 metric depth is PRIMARY.
+    // PLACE IMMEDIATELY — never block on DAv2.
     // ═══════════════════════════════════════════════════════════════════════
     //
-    // The old ladder (raw raycast → backend-relative → fixed 1.0m) was the
-    // root cause of every mis-placed box: on a non-LiDAR device the first
-    // raycast at frame 5 lands on the floor/back-wall (or nothing), and the
-    // fixed fallback slammed the anchor down the ray onto whatever was behind
-    // the object. The bearing was right; the DISTANCE was garbage.
+    // Blocking placement on DAv2 was the "box shows up a minute later" bug:
+    // DAv2 needs an ARKit scale anchor, and on a non-LiDAR device that anchor
+    // doesn't exist until the user has walked around long enough for planes to
+    // form. The old state machine held EVERY frame until then.
     //
-    // DepthAnythingV2 gives a learned metric depth at the bbox center,
-    // scale-anchored to ONE raycast (the raycast is now just a metre
-    // reference for DAv2 — we never *place* from it directly). We kick it
-    // off once, hold placement until it returns, then place at the DAv2
-    // depth down the SAME bbox ray. Only if DAv2 is genuinely unavailable
-    // (model missing, or no plane anywhere yet for the scale anchor) do we
-    // fall through to the legacy ladder.
+    // Now we place NOW from the best depth available this frame (raycast →
+    // backend → near default) and arm DAv2 to run IN PARALLEL. tryDav2Refine()
+    // snaps the anchor to the DAv2 metric depth a frame or two later, the
+    // moment DAv2 succeeds — without ever freezing the box.
     // ═══════════════════════════════════════════════════════════════════════
 
-    // AR-portrait normalized bbox for DAv2 (it re-derives the landscape pixel
-    // mapping internally; pass the crop-corrected X so DAv2 samples the same
-    // pixel column the placement ray points through).
-    let arBboxNormalized: [CGFloat] = [
-      bboxNormalized[0] * horizScale + horizOffset, bboxNormalized[1],
-      bboxNormalized[2] * horizScale + horizOffset, bboxNormalized[3]
+    var placedDepth: Float? = nil
+    var placedSource = ""
+
+    // 1. ARKit raycast along the bbox ray — best immediate depth IF a plane
+    //    already exists. Usually nothing this early; that's expected.
+    let targets: [(ARRaycastQuery.Target, String)] = [
+      (.existingPlaneGeometry, "existingGeometry"),
+      (.estimatedPlane,        "estimatedPlane"),
     ]
-
-    switch dav2PlacementState {
-    case .idle:
-      dav2PlacementState = .inFlight
-      // Set the deadline clock only on the FIRST kickoff. Synchronous "no
-      // plane yet" nils bounce us back to .idle and re-enter here each frame;
-      // if we reset the clock every time, the dav2MaxWaitSec deadline would
-      // never accumulate and we'd retry forever. dav2KickoffTime == 0 means
-      // "never started".
-      if dav2KickoffTime == 0 {
-        dav2KickoffTime = ProcessInfo.processInfo.systemUptime
-        NSLog("🅿️ [PlaceHold] 🌊 Kicking off DAv2 metric depth estimate…")
-      }
-      estimateMetricDepth(frame: frame, bboxARNormalized: arBboxNormalized) { [weak self] metric in
-        guard let self = self else { return }
-        if let m = metric {
-          // Success — DAv2 produced a metric depth. Place on the next frame.
-          self.dav2MetricDepth = m
-          self.dav2PlacementState = .done
-          NSLog("🅿️ [PlaceHold] 🌊 DAv2 returned %.2fm", m)
-        } else {
-          // nil = either the model is missing, OR (the common early case) no
-          // ARKit plane exists yet to scale-anchor against. The latter is
-          // TRANSIENT: planes form over the next 1–2s. We must NOT lock to
-          // .done here — that would permanently skip DAv2 on the very first
-          // frame, before any plane exists, which is precisely the failure we
-          // are fixing. Reset to .idle so the next frame retries; the
-          // dav2MaxWaitSec deadline (checked in .inFlight) bounds the retries.
-          self.dav2PlacementState = .idle
-          NSLog("🅿️ [PlaceHold] 🌊 DAv2 nil (no scale anchor yet or model missing) — will retry until %.1fs deadline", self.dav2MaxWaitSec)
-        }
-      }
-      return  // hold this frame; placement happens once .done
-
-    case .inFlight:
-      // Either DAv2 inference is genuinely in flight, OR a synchronous nil
-      // bounced us back to .idle and we're between retries. Bound total wait
-      // from the FIRST kickoff so repeated "no plane yet" nils can't stall
-      // placement forever — after dav2MaxWaitSec, give up on DAv2 and let the
-      // fallback ladder take over.
-      let waited = ProcessInfo.processInfo.systemUptime - dav2KickoffTime
-      if waited > dav2MaxWaitSec {
-        NSLog("🅿️ [PlaceHold] 🌊 DAv2 wait exceeded %.1fs — proceeding to fallback ladder", dav2MaxWaitSec)
-        dav2MetricDepth = nil
-        dav2PlacementState = .done
-      }
-      return
-
-    case .done:
-      if let metric = dav2MetricDepth {
-        let worldPos = camPos + worldRayDir * metric
-        NSLog("🅿️ [PlaceHold] ✅ Placing at DAv2 metric depth %.2fm", metric)
-        finalizePlacement(worldPos: worldPos, depth: metric, camera: camera,
-                          horizScale: horizScale, source: "dav2-metric")
-        return
-      }
-      // DAv2 unavailable after deadline — fall through to the legacy ladder below.
-    }
-
-    // ── FALLBACK LADDER (only reached when DAv2 returned nil) ────────────
-    // Try ARKit raycast along the bbox ray.
-    let targets: [(ARRaycastQuery.Target, ARRaycastQuery.TargetAlignment, String)] = [
-      (.existingPlaneGeometry, .any, "existingGeometry"),
-      (.estimatedPlane,        .any, "estimatedPlane"),
-    ]
-    for (target, alignment, label) in targets {
+    for (target, label) in targets {
       let query = ARRaycastQuery(origin: camPos, direction: worldRayDir,
-                                 allowing: target, alignment: alignment)
-      let results = sceneView.session.raycast(query)
-      if let hit = results.first {
+                                 allowing: target, alignment: .any)
+      if let hit = sceneView.session.raycast(query).first {
         let hitPos = simd_make_float3(hit.worldTransform.columns.3)
         let d = simd_length(hitPos - camPos)
         if d >= 0.15 && d <= 5.0 {
-          NSLog("🅿️ [PlaceHold] ✅ (fallback) ARKit HIT at %.2fm via %@", d, label)
-          finalizePlacement(worldPos: hitPos, depth: d, camera: camera,
-                            horizScale: horizScale, source: "raycast:\(label)")
-          return
+          placedDepth = d; placedSource = "raycast:\(label)"; break
         }
       }
     }
 
-    // ── No hit — use backend depth if available ─────────────────────────
-    if let bd = backendDepth, bd >= 0.1, bd <= 10.0 {
-      let worldPos = camPos + worldRayDir * bd
-      NSLog("🅿️ [PlaceHold] (fallback) No raycast hit — placing at backend depth %.2fm", bd)
-      finalizePlacement(worldPos: worldPos, depth: bd, camera: camera,
-                        horizScale: horizScale, source: "backend-depth")
+    // 2. Backend depth, if the vision pipeline returned a usable metric value.
+    if placedDepth == nil, let bd = backendDepth, bd >= 0.1, bd <= 10.0 {
+      placedDepth = bd; placedSource = "backend-depth"
+    }
+
+    // 3. Near default — arm's-reach so the box never parks on the back wall.
+    //    DAv2 corrects this within ~1-2s via tryDav2Refine().
+    let depth = placedDepth ?? 0.8
+    if placedDepth == nil { placedSource = "near-default(0.8m, DAv2 pending)" }
+
+    let worldPos = camPos + worldRayDir * depth
+
+    // Stash the ray so a late DAv2 result can re-place along the same bearing.
+    placementRayOrigin = camPos
+    placementRayDir = worldRayDir
+    placementHorizScale = horizScale
+
+    finalizePlacement(worldPos: worldPos, depth: depth, camera: camera,
+                      horizScale: horizScale, source: placedSource)
+
+    // Arm parallel DAv2 refinement — handled by tryDav2Refine() on later frames.
+    dav2RefineState = .pending
+    dav2RequestInFlight = false
+    dav2RefineDeadline = ProcessInfo.processInfo.systemUptime + dav2RefineWindowSec
+    NSLog("🅿️ [PlaceHold] 🌊 DAv2 refinement armed (%.0fs window) — placement NOT blocked", dav2RefineWindowSec)
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Parallel DAv2 Depth Refinement
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Runs DAv2 metric-depth estimation IN PARALLEL with the live guidance loop,
+  // after the anchor is already placed. Non-blocking: at most one inference is
+  // in flight at a time, and the whole thing self-disables after the first
+  // success or once the refine window expires. The box is already on screen
+  // and guiding the user the entire time this runs.
+
+  func tryDav2Refine(_ frame: ARFrame) {
+    guard dav2RefineState == .pending, !dav2RequestInFlight else { return }
+
+    if ProcessInfo.processInfo.systemUptime > dav2RefineDeadline {
+      dav2RefineState = .done
+      NSLog("🅿️ [PlaceHold] 🌊 DAv2 refine window expired — keeping fallback depth %.2fm", anchorDepth)
       return
     }
 
-    // ── No depth — wait for geometry ────────────────────────────────────
-    let elapsed = ProcessInfo.processInfo.systemUptime - sessionStartTime
-    if elapsed < 10.0 {
-      if framesSinceStart % 30 == 0 {
-        NSLog("🅿️ [PlaceHold] (fallback) no hit, no backend depth (%.1fs) — waiting", elapsed)
+    // AR-portrait normalized bbox for DAv2 (crop-corrected X, same column the
+    // placement ray points through).
+    let hs = placementHorizScale
+    let ho = (1.0 - hs) / 2.0
+    let arBboxNormalized: [CGFloat] = [
+      bboxNormalized[0] * hs + ho, bboxNormalized[1],
+      bboxNormalized[2] * hs + ho, bboxNormalized[3]
+    ]
+
+    dav2RequestInFlight = true
+    estimateMetricDepth(frame: frame, bboxARNormalized: arBboxNormalized) { [weak self] metric in
+      guard let self = self else { return }
+      self.dav2RequestInFlight = false
+      guard self.dav2RefineState == .pending else { return }
+      if let m = metric {
+        self.dav2RefineState = .done
+        self.applyDav2Depth(m)
       }
-      return
+      // nil → still .pending; the next frame retries until the deadline.
+    }
+  }
+
+  /// Snap the already-placed anchor to a DAv2 metric depth along the stored
+  /// placement ray. Runs on visionQ (estimateMetricDepth's completion queue),
+  /// the same queue as frame processing — no locking needed.
+  private func applyDav2Depth(_ metric: Float) {
+    guard anchorPlaced else { return }
+    let oldDepth = anchorDepth
+    let worldPos = placementRayOrigin + placementRayDir * metric
+    objectWorldPosition  = worldPos
+    anchorDepth          = metric
+    liveDistanceToObject = metric
+
+    let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
+    let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
+    objectWorldHalfW = min(metric * Float(bboxNormW * placementHorizScale) * 0.5, metric * 0.45)
+    objectWorldHalfH = min(metric * Float(bboxNormH) * 0.5, metric * 0.45)
+
+    // Re-billboard from the most recent camera so the corners stay upright.
+    if let camT = lastARFrame?.camera.transform {
+      let right = -simd_normalize(simd_make_float3(camT.columns.1))
+      let up    =  simd_normalize(simd_make_float3(camT.columns.0))
+      objectWorldCornerTR = worldPos + right * objectWorldHalfW + up * objectWorldHalfH
+      objectWorldCornerBL = worldPos - right * objectWorldHalfW - up * objectWorldHalfH
     }
 
-    NSLog("🅿️ [PlaceHold] ⚠️ FALLBACK 1.0m")
-    let worldPos = camPos + worldRayDir * Float(1.0)
-    finalizePlacement(worldPos: worldPos, depth: 1.0, camera: camera,
-                      horizScale: horizScale, source: "fixed-fallback")
+    NSLog("🅿️ [PlaceHold] 🌊 ✅ DAv2 refined depth %.2fm → %.2fm (Δ%.0fcm)",
+          oldDepth, metric, abs(metric - oldDepth) * 100)
+    DispatchQueue.main.async { [weak self] in
+      self?.distanceLabel.text = "\(Int(metric * 100)) cm"
+    }
   }
 
   private func speakInitialDirection(photoCenterX: CGFloat, photoCenterY: CGFloat) {

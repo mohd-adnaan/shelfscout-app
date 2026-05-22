@@ -310,13 +310,45 @@ extension ReachingViewController {
       }
     }
 
+    // ── Feature-point fallback scale anchor ────────────────────────────────
+    //
+    // Raycasts need ARKit PLANES, which on a non-LiDAR device only form after
+    // the user walks around for several seconds — that is the cold-start
+    // failure that left DAv2 unable to produce depth at all.
+    //
+    // Raw feature points appear within ~1s from the natural hand-shake of
+    // holding a phone — no walking required. We take the feature points whose
+    // bearing falls inside the bbox cone and use their median camera distance
+    // as the metric anchor. Because these points sit ON/near the target, the
+    // anchor pixel is the bbox center itself: DAv2's relative ratio is ~1 and
+    // the returned metric depth is essentially the feature-point median — a
+    // correct, motion-free depth estimate.
+    if scaleAnchorMetricDepth == nil, let cloud = frame.rawFeaturePoints {
+      var dists: [Float] = []
+      for p in cloud.points {
+        let toP = p - camPos
+        let d = simd_length(toP)
+        guard d > 0.3 && d < 8.0 else { continue }
+        // Within ~18° of the bbox-center ray (cos 18° ≈ 0.951).
+        if simd_dot(toP / d, worldRay) > 0.951 { dists.append(d) }
+      }
+      if dists.count >= 3 {
+        dists.sort()
+        let med = dists[dists.count / 2]
+        scaleAnchorMetricDepth = med
+        scaleAnchorPixelX = cx
+        scaleAnchorPixelY = cy
+        scaleAnchorLabel = "featurePoints(\(dists.count))"
+        NSLog("🌊 [DAv2] Scale anchor from %d feature points in bbox cone → %.2fm", dists.count, med)
+      }
+    }
+
     guard let metricAnchor = scaleAnchorMetricDepth else {
-      NSLog("🌊 [DAv2] No raycast hit available at any of %d sample points — DAv2 cannot produce metric depth", sampleCandidates.count)
+      NSLog("🌊 [DAv2] No scale anchor (no plane raycast hit, no feature points in bbox cone) — retrying next frame")
       // No way to convert relative→metric without a scale reference.
       completion(nil)
       return
     }
-    _ = worldRay  // suppress unused warning; we no longer use it directly
     _ = scaleAnchorLabel  // suppress unused warning; only useful for logging
     // Const-copy for closure capture; these will be read on a background queue
     // after the guard above succeeds.

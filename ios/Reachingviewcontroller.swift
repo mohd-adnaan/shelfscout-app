@@ -160,23 +160,29 @@ class ReachingViewController: UIViewController {
   /// Re-detection still runs (for logging) but CANNOT move the anchor.
   var anchorLockedForHandFree = false
 
-  // ── DAv2-primary placement state (place-and-hold path) ───────────────────
-  // The prototype now seeds depth from DepthAnythingV2 (metric, scale-anchored)
-  // instead of a raw raycast / fixed fallback. DAv2 inference is async, so we
-  // kick it off ONCE and gate placement on its result.
-  //   .idle      → not started
-  //   .inFlight  → estimateMetricDepth running; hold placement
-  //   .done      → result in dav2MetricDepth (nil = DAv2 unavailable, use fallback ladder)
-  enum DAv2PlacementState { case idle, inFlight, done }
-  var dav2PlacementState: DAv2PlacementState = .idle
-  var dav2MetricDepth: Float? = nil
-  /// Wall-clock when DAv2 was kicked off — used to bound the wait before the
-  /// fallback ladder is allowed to take over.
-  var dav2KickoffTime: TimeInterval = 0
-  /// Max time to hold placement waiting for DAv2 before falling through to
-  /// the raycast/backend/fixed ladder. Inference is ~80ms but the SCALE-ANCHOR
-  /// raycast needs planes to exist, so we allow a couple seconds of plane warmup.
-  let dav2MaxWaitSec: TimeInterval = 3.0
+  // ── DAv2 parallel depth refinement (place-and-hold path) ─────────────────
+  // Placement NO LONGER waits for DAv2. The anchor is placed IMMEDIATELY from
+  // the fallback ladder (raycast → backend → near default) so the box appears
+  // the instant detection lands. DAv2 then runs IN PARALLEL; when it returns a
+  // metric depth, the anchor is snapped to it along the original bbox ray.
+  //
+  // This is the fix for the "box appears a minute later" freeze: the old state
+  // machine held EVERY frame until DAv2 got a scale anchor, and on a non-LiDAR
+  // device that needs the user to walk around until ARKit builds planes.
+  enum DAv2RefineState { case pending, done }
+  var dav2RefineState: DAv2RefineState = .pending
+  /// True while a DAv2 inference is in flight — prevents stacking requests.
+  var dav2RequestInFlight = false
+  /// Wall-clock deadline; after this we stop retrying DAv2 and keep the
+  /// fallback-ladder depth. Set at placement time.
+  var dav2RefineDeadline: TimeInterval = 0
+  /// How long after placement to keep retrying DAv2 before giving up.
+  let dav2RefineWindowSec: TimeInterval = 10.0
+  /// Placement ray captured at anchor time so a late DAv2 result can re-place
+  /// the anchor at the corrected depth along the exact same bearing.
+  var placementRayOrigin: simd_float3 = .zero
+  var placementRayDir: simd_float3 = .zero
+  var placementHorizScale: CGFloat = 1.0
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - ARKit
