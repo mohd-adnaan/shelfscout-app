@@ -1036,6 +1036,53 @@ function AppInner(): React.JSX.Element {
           console.log(`🔄 ⏭️ Cycle #${cycleCount} — "Null" response, skipping TTS, fast-polling…`);
         }
 
+        // ── RTAB → Reaching auto-handoff (Kasra) ──────────────────────────
+        //
+        // When the navigation pipeline returns reached=true (text "You have
+        // arrived"), force a transition into reaching mode regardless of how
+        // the backend toggled navigation/reaching_flag in the same response.
+        // This makes the handoff resilient to backend flag-routing glitches
+        // that previously left the loop stuck or exited it via bothInactive.
+        //
+        // We:
+        //   1. speak the arrival message (await — short and important),
+        //   2. flip loopMode to 'reaching' so the next iteration polls the
+        //      reaching pipeline,
+        //   3. `continue` to the next iteration.
+        //
+        // Only triggers from navigation mode. If we're already in reaching
+        // (e.g. a stale `reached=true` echoes), fall through to existing
+        // logic so reaching_completed/bothInactive can finish the session.
+        if (result.reached === true && loopMode === 'navigation') {
+          console.log('🎯 [RTAB→Reaching] reached=true in navigation mode — handoff');
+          debugLogger.logAPI('🎯 RTAB→Reaching handoff', `text="${(result.text || '').substring(0, 60)}"`);
+
+          if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
+            setIsSpeaking(true);
+            try {
+              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
+            } catch (e: any) {
+              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+                console.warn('⚠️ [RTAB→Reaching] arrival TTS error (non-fatal):', e?.message);
+              }
+            }
+            setIsSpeaking(false);
+          }
+
+          if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
+
+          // Flip the loop mode so the next iteration sends reaching_flag=true
+          // even if the current response did not have it set.
+          startContinuousMode('reaching', result.loopDelay);
+          setIsNavigation(false);
+          setIsReaching(true);
+          announceIfNoVoiceOver('Arrived. Switching to object guidance.');
+
+          // Cooldown before next capture (give user a moment to stabilize camera after arrival).
+          await new Promise(r => setTimeout(r, Math.max(1200, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN)));
+          continue; // ★ next iteration runs with loopMode='reaching'
+        }
+
         // ── iOS ARKit reaching check (respects user preference) ───────────
         if (Platform.OS === 'ios' && result.reaching_ios === true) {
           // Check pipeline FIRST — determines whether to kill the loop or continue it
@@ -1148,53 +1195,6 @@ function AppInner(): React.JSX.Element {
         setIsNavigation(navigationActive);
         setIsReaching(reachingActive);
 
-        // ── RTAB → Reaching auto-handoff (Kasra) ──────────────────────────
-        //
-        // When the navigation pipeline returns reached=true (text "You have
-        // arrived"), force a transition into reaching mode regardless of how
-        // the backend toggled navigation/reaching_flag in the same response.
-        // This makes the handoff resilient to backend flag-routing glitches
-        // that previously left the loop stuck or exited it via bothInactive.
-        //
-        // We:
-        //   1. speak the arrival message (await — short and important),
-        //   2. flip loopMode to 'reaching' so the next iteration polls the
-        //      reaching pipeline,
-        //   3. `continue` to the next iteration.
-        //
-        // Only triggers from navigation mode. If we're already in reaching
-        // (e.g. a stale `reached=true` echoes), fall through to existing
-        // logic so reaching_completed/bothInactive can finish the session.
-        if (result.reached === true && loopMode === 'navigation') {
-          console.log('🎯 [RTAB→Reaching] reached=true in navigation mode — handoff');
-          debugLogger.logAPI('🎯 RTAB→Reaching handoff', `text="${(result.text || '').substring(0, 60)}"`);
-
-          if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
-            setIsSpeaking(true);
-            try {
-              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            } catch (e: any) {
-              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
-                console.warn('⚠️ [RTAB→Reaching] arrival TTS error (non-fatal):', e?.message);
-              }
-            }
-            setIsSpeaking(false);
-          }
-
-          if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
-
-          // Flip the loop mode so the next iteration sends reaching_flag=true
-          // even if the current response did not have it set.
-          startContinuousMode('reaching', result.loopDelay);
-          setIsNavigation(false);
-          setIsReaching(true);
-          announceIfNoVoiceOver('Arrived. Switching to object guidance.');
-
-          // Cooldown before next capture (skip null fast-poll path).
-          await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN));
-          continue; // ★ next iteration runs with loopMode='reaching'
-        }
-
         if (bothInactive) {
           if (result.text) {
             setIsSpeaking(true);
@@ -1210,9 +1210,11 @@ function AppInner(): React.JSX.Element {
         if (navigationActive && !reachingActive && loopMode !== 'navigation') {
           startContinuousMode('navigation', result.loopDelay);
           announceIfNoVoiceOver('Switching to navigation.');
+          result.text = ''; // Prevent downstream TTS from overlapping with transition speech
         } else if (reachingActive && !navigationActive && loopMode !== 'reaching') {
           startContinuousMode('reaching', result.loopDelay);
           announceIfNoVoiceOver('Switching to object guidance.');
+          result.text = ''; // Prevent downstream TTS from overlapping with transition speech
         }
 
         // ── Speak (fire-and-forget) + immediately continue loop ───────────
