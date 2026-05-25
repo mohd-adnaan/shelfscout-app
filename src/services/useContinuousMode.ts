@@ -35,6 +35,7 @@ import { AccessibilityInfo } from 'react-native';
 import { sendToWorkflow } from '../services/WorkflowService';
 import { speachesSentenceChunker } from '../services/SpeachesSentenceChunker';
 import { audioFeedback } from '../services/AudioFeedbackService';
+import { useDeviceOrientation } from '../hooks/useDeviceOrientation';
 
 // ============================================================================
 // Configuration
@@ -111,8 +112,11 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     photosCaputred: 0,
   });
 
+  const { isStraightRef } = useDeviceOrientation();
+
   // ---- Refs ----
   const isNavigatingRef = useRef(false);
+  const lastOrientationWarningTimeRef = useRef(0);
 
   /**
    * isProcessingFrameRef — mirrors the same flag in Swift reaching acquisition.
@@ -207,6 +211,25 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     if (!isNavigatingRef.current) return;
     if (isProcessingFrameRef.current) {
       log('⏭️ Frame skipped — previous request still in-flight');
+      return;
+    }
+
+    if (!isStraightRef.current) {
+      log('⚠️ Phone orientation incorrect. Skipping capture cycle.');
+      
+      const now = Date.now();
+      if (now - lastOrientationWarningTimeRef.current > 5000) {
+        ttsQueueRef.current.push('Please hold your phone straight up, with the camera facing forward.');
+        drainTTSQueue();
+        lastOrientationWarningTimeRef.current = now;
+      }
+      
+      if (isNavigatingRef.current) {
+        nextCaptureTimeoutRef.current = setTimeout(
+          captureAndSend,
+          NAV_CONFIG.MIN_DELAY_AFTER_RESPONSE
+        );
+      }
       return;
     }
 

@@ -19,6 +19,7 @@ import {
   useCameraPermission 
 } from 'react-native-vision-camera';
 import { AccessibilityService } from '../services/AccessibilityService';
+import { useDeviceOrientation } from './useDeviceOrientation';
 
 /**
  * Camera Hook with WCAG-compliant error handling
@@ -29,6 +30,7 @@ export const useCamera = () => {
   const device = useCameraDevice('back');
   const { hasPermission, requestPermission } = useCameraPermission();
   const cameraRef = useRef<Camera>(null);
+  const { isStraightRef } = useDeviceOrientation();
 
   /**
    * Capture photo with comprehensive error handling
@@ -109,6 +111,20 @@ export const useCamera = () => {
         }
         
         console.log('[Camera] ✅ Permission granted');
+      }
+
+      // WCAG 3.3.2: Verify Device Orientation
+      if (!isStraightRef.current) {
+        const message = 'Please hold the phone straight up, with the camera facing forward.';
+        console.warn('[Camera] ⚠️ Phone orientation is flat. Prompting user.');
+        
+        AccessibilityService.announceError(message, false);
+        Alert.alert(
+          'Hold Phone Straight',
+          message,
+          [{ text: 'OK', style: 'default' }]
+        );
+        throw new Error('Phone orientation incorrect');
       }
 
       // Capture photo

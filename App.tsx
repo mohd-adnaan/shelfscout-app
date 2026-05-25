@@ -27,6 +27,8 @@ import Video from 'react-native-video';
 import { useTTS } from './src/hooks/useTTS';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
 import { useWakeWordSTT } from './src/hooks/useWakeWordSTT';
+import { useDeviceOrientation } from './src/hooks/useDeviceOrientation';
+import { useProximitySensor } from './src/hooks/useProximitySensor';
 import {
   sendToWorkflow,
   sendToSmartGuidance,
@@ -78,6 +80,9 @@ const TTS_COMPLETION_BUFFER_MS = 500;
 const STARTUP_LOADER_MIN_MS = 1800;
 const VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS = 800;
 const VOICEOVER_LISTENING_GRACE_MS = 600;
+const POSTURE_WARNING_COOLDOWN_MS = 6000;
+const POSTURE_MAX_WAIT_MS = 6500;
+const POSTURE_POLL_INTERVAL_MS = 250;
 
 // =============================================================================
 // PIPELINE PRE-FETCH CONFIGURATION
@@ -114,6 +119,13 @@ function AppInner(): React.JSX.Element {
   // Ref always holds the latest settings — avoids stale closure in useCallback
   const settingsRef = useRef(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
+
+  // ── Posture sensing (orientation + proximity) ───────────────────────────
+  const { isStraightRef, isAvailableRef: orientationAvailableRef } = useDeviceOrientation();
+  const { isNearRef, isAvailableRef: proximityAvailableRef } = useProximitySensor(
+    Platform.OS === 'ios' && !settings.useWearablesCamera
+  );
+  const lastPostureWarningRef = useRef(0);
 
   // Keep SFX wearables-mode flag in sync with settings
   useEffect(() => {
@@ -440,6 +452,99 @@ function AppInner(): React.JSX.Element {
       trimmedPrefix ? `${trimmedPrefix} ${suffix}` : suffix
     );
   }, []);
+
+  // ────────────────────────────────────────────────────────────────────────
+  // Posture gating (orientation + proximity)
+  // ────────────────────────────────────────────────────────────────────────
+  const getPostureStatus = useCallback(() => {
+    if (settingsRef.current.useWearablesCamera) {
+      return { ok: true, isNear: false, isStraight: true, hasSignal: false };
+    }
+
+    const hasOrientation = orientationAvailableRef.current;
+    const hasProximity = proximityAvailableRef.current;
+
+    if (!hasOrientation && !hasProximity) {
+      return { ok: true, isNear: false, isStraight: true, hasSignal: false };
+    }
+
+    const isNear = hasProximity ? isNearRef.current : false;
+    const isStraight = hasOrientation ? isStraightRef.current : true;
+    const ok = !isNear && isStraight;
+
+    return { ok, isNear, isStraight, hasSignal: true };
+  }, []);
+
+  const buildPostureMessage = useCallback((status: {
+    isNear: boolean;
+    isStraight: boolean;
+  }): string => {
+    if (status.isNear && !status.isStraight) {
+      return 'Move the phone away from your face and hold it straight with the camera facing forward.';
+    }
+    if (status.isNear) {
+      return 'Move the phone away from your face and hold it straight with the camera facing forward.';
+    }
+    if (!status.isStraight) {
+      return 'Hold the phone straight with the camera facing forward.';
+    }
+    return '';
+  }, []);
+
+  const maybeAnnouncePosture = useCallback(async (_context: 'capture' | 'continuous') => {
+    const status = getPostureStatus();
+    if (status.ok) return false;
+
+    const now = Date.now();
+    if (now - lastPostureWarningRef.current < POSTURE_WARNING_COOLDOWN_MS) return false;
+
+    const message = buildPostureMessage(status);
+    if (!message) return false;
+
+    lastPostureWarningRef.current = now;
+
+    if (!screenReaderEnabledRef.current) {
+      audioFeedback.playEarcon('error');
+    }
+    AccessibilityInfo.announceForAccessibility(message);
+
+    if (!screenReaderEnabledRef.current) {
+      try {
+        await speachesSentenceChunker.synthesizeSpeechChunked(message);
+      } catch (e: any) {
+        if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+          console.warn('⚠️ Posture TTS error (non-fatal):', e?.message || e);
+        }
+      }
+    }
+
+    return true;
+  }, [buildPostureMessage, getPostureStatus]);
+
+  const waitForGoodPosture = useCallback(async (context: 'capture' | 'continuous'): Promise<boolean> => {
+    const status = getPostureStatus();
+    if (status.ok) return true;
+
+    await maybeAnnouncePosture(context);
+
+    if (context === 'continuous') {
+      return false;
+    }
+
+    const start = Date.now();
+    while (Date.now() - start < POSTURE_MAX_WAIT_MS) {
+      await new Promise(resolve => setTimeout(resolve, POSTURE_POLL_INTERVAL_MS));
+      if (getPostureStatus().ok) return true;
+    }
+
+    return getPostureStatus().ok;
+  }, [getPostureStatus, maybeAnnouncePosture]);
+
+  // Keep a stable ref for callbacks that are intentionally []-memoized.
+  const waitForGoodPostureRef = useRef(waitForGoodPosture);
+  useEffect(() => {
+    waitForGoodPostureRef.current = waitForGoodPosture;
+  }, [waitForGoodPosture]);
   const reactivateCameraAndCapture = async (options?: {
     enableShutterSound?: boolean;
   }): Promise<string> => {
@@ -819,6 +924,15 @@ function AppInner(): React.JSX.Element {
       try {
         incrementContinuousMode();
         const loopMode = getCurrentMode();
+
+        // ── Posture gate (skip cycles when phone is near face / tilted) ──
+        if (!settingsRef.current.useWearablesCamera) {
+          const postureOk = await waitForGoodPosture('continuous');
+          if (!postureOk) {
+            await new Promise(r => setTimeout(r, Math.max(300, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN)));
+            continue;
+          }
+        }
 
         // ── Capture ────────────────────────────────────────────────────────
         let photoPath = '';
@@ -1314,7 +1428,7 @@ function AppInner(): React.JSX.Element {
     if (settingsRef.current.useWearablesCamera) {
       wakeWordResumeRef.current?.();
     }
-  }, [announceTapToStart, handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed]);
+  }, [announceTapToStart, handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed, waitForGoodPosture]);
 
   // ============================================================================
   // Stop helpers
@@ -1634,6 +1748,16 @@ function AppInner(): React.JSX.Element {
     }
 
     console.log('⚡ Processing:', finalText);
+
+    const postureOk = await waitForGoodPostureRef.current('capture');
+    if (!postureOk) {
+      setIsProcessing(false);
+      isCapturingPhotoRef.current = false;
+      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      announceTapToStart('Ready.');
+      return;
+    }
+
     setIsProcessing(true);
     isCapturingPhotoRef.current = true;
     if (!screenReaderEnabledRef.current) {
@@ -1745,6 +1869,15 @@ function AppInner(): React.JSX.Element {
     }
 
     console.log('⚡ [WakeWord] Processing:', query);
+
+    const postureOk = await waitForGoodPostureRef.current('capture');
+    if (!postureOk) {
+      setIsProcessing(false);
+      isCapturingPhotoRef.current = false;
+      wakeWordResumeRef.current?.();
+      return;
+    }
+
     setIsProcessing(true);
     isCapturingPhotoRef.current = true;
     if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('thinking'); }
@@ -1862,6 +1995,7 @@ function AppInner(): React.JSX.Element {
     }
 
     try {
+      await stopLatencyLoop(); // ensure no stale thinking loop continues into listening
       if (Platform.OS === 'android') {
         const granted = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.RECORD_AUDIO
@@ -1939,6 +2073,13 @@ function AppInner(): React.JSX.Element {
       if (isVoiceOverNoise(finalText)) {
         console.log('♿ VoiceOver noise rejected (manual stop):', finalText);
         // Silent discard — no announcement (would feed back into mic)
+        return;
+      }
+
+      const postureOk = await waitForGoodPosture('capture');
+      if (!postureOk) {
+        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        announceTapToStart('Ready.');
         return;
       }
 
