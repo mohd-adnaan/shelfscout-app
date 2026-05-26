@@ -29,4 +29,7 @@ RCT_EXTERN_METHOD(configureBluetoothRecordingSession:(RCTPromiseResolveBlock)res
 RCT_EXTERN_METHOD(playSystemShutter:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 
+RCT_EXTERN_METHOD(prewarmDAv2:(RCTPromiseResolveBlock)resolver
+                  rejecter:(RCTPromiseRejectBlock)rejecter)
+
 @end

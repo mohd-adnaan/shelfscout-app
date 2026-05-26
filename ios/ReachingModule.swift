@@ -283,6 +283,16 @@ class ReachingModule: NSObject {
     resolver(["success": true])
   }
 
+  @objc func prewarmDAv2(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      prewarmDepthAnythingV2Model()
+      resolver(["success": true])
+    }
+  }
+
   private func presentReachingVC(
     bbox: [CGFloat], objectName: String, depth: Float?,
     imageW: CGFloat, imageH: CGFloat,

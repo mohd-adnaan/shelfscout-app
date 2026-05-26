@@ -107,13 +107,20 @@ extension ReachingViewController {
     visY = max(0.0, min(visY, 1.0 - visH))
 
     let visionBbox = CGRect(x: visX, y: visY, width: visW, height: visH)
-    let observation = VNDetectedObjectObservation(boundingBox: visionBbox)
+    let safeObs = VNDetectedObjectObservation(boundingBox: visionBbox)
+
+    // Free existing tracking resources before creating a new sequence handler
+    cancelTracker()
 
     // Fresh sequence handler — track state must restart cleanly
     trackerSequenceHandler = VNSequenceRequestHandler()
-    lastTrackedObservation = observation
+    lastTrackedObservation = safeObs
+    let request = VNTrackObjectRequest(detectedObjectObservation: safeObs)
+    request.trackingLevel = .accurate
+    activeTrackerRequest = request
     consecutiveLowConfFrames = 0
     trackingActive = true
+    lastTrackedConfidence = 1.0
     lastTrackerReseedTime = ProcessInfo.processInfo.systemUptime
 
     // Reseed shifts the ray direction — stale depths in the median buffer
@@ -137,9 +144,27 @@ extension ReachingViewController {
   @discardableResult
   func updateTracker(frame: ARFrame) -> VNDetectedObjectObservation? {
     guard trackerEnabled, trackingActive,
-          let lastObs = lastTrackedObservation else { return nil }
+          let request = activeTrackerRequest else { return nil }
 
-    var safeBox = lastObs.boundingBox
+    // DO NOT modify request.inputObservation here. VNSequenceRequestHandler updates it automatically.
+    // Modifying it manually causes the tracker to restart internally and leak memory/trackers.
+
+    do {
+      try trackerSequenceHandler.perform([request], on: frame.capturedImage, orientation: .right)
+    } catch {
+      NSLog("🎯 [Tracker] perform() failed: %@", error.localizedDescription)
+      consecutiveLowConfFrames += 1
+      return nil
+    }
+
+    guard let result = request.results?.first as? VNDetectedObjectObservation else {
+      consecutiveLowConfFrames += 1
+      return nil
+    }
+    lastTrackedConfidence = result.confidence
+
+    // Apply minimum size limits to the output observation without touching the internal tracker state
+    var safeBox = result.boundingBox
     let minSize: CGFloat = 0.05
     if safeBox.width < minSize {
       let diff = minSize - safeBox.width
@@ -157,25 +182,13 @@ extension ReachingViewController {
     safeBox.origin.y = max(0.0, min(safeBox.origin.y, 1.0 - safeBox.height))
     
     let safeObs = VNDetectedObjectObservation(boundingBox: safeBox)
-    let request = VNTrackObjectRequest(detectedObjectObservation: safeObs)
-    request.trackingLevel = .accurate
-    // isLastFrame = false — we're streaming. Apple's tracker uses this to free
-    // tracking state when the sequence ends; we never end mid-session.
+    // Manually copy over the confidence since we created a new VNDetectedObjectObservation
+    let finalObs = VNDetectedObjectObservation(boundingBox: safeBox)
+    // Wait, VNDetectedObjectObservation does not have a public initializer that sets confidence.
+    // However, we only need it for boundingBox in the rest of the code. We'll store it as is,
+    // and rely on `result.confidence` for the check below.
 
-    do {
-      try trackerSequenceHandler.perform([request], on: frame.capturedImage, orientation: .right)
-    } catch {
-      NSLog("🎯 [Tracker] perform() failed: %@", error.localizedDescription)
-      consecutiveLowConfFrames += 1
-      return nil
-    }
-
-    guard let result = request.results?.first as? VNDetectedObjectObservation else {
-      consecutiveLowConfFrames += 1
-      return nil
-    }
-
-    lastTrackedObservation = result
+    lastTrackedObservation = safeObs
 
     if result.confidence < trackerLowConfThreshold {
       consecutiveLowConfFrames += 1
@@ -183,7 +196,7 @@ extension ReachingViewController {
       consecutiveLowConfFrames = 0
     }
 
-    return result
+    return safeObs
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -628,5 +641,20 @@ extension ReachingViewController {
               newCx, newCy, newW, newH, imgW, imgH, elapsed)
       }
     }.resume()
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Cleanup
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  func cancelTracker() {
+    guard trackingActive, let request = activeTrackerRequest, let frame = lastARFrame else { return }
+    request.isLastFrame = true
+    do {
+      try trackerSequenceHandler.perform([request], on: frame.capturedImage, orientation: .right)
+    } catch {
+      // Ignored during cancellation
+    }
+    activeTrackerRequest = nil
   }
 }

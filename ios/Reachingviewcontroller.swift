@@ -162,7 +162,7 @@ class ReachingViewController: UIViewController {
 
   // ── DAv2 parallel depth refinement (place-and-hold path) ─────────────────
   // Placement NO LONGER waits for DAv2. The anchor is placed IMMEDIATELY from
-  // the fallback ladder (raycast → backend → near default) so the box appears
+  // the fallback ladder (raycast → feature points → near default) so the box appears
   // the instant detection lands. DAv2 then runs IN PARALLEL; when it returns a
   // metric depth, the anchor is snapped to it along the original bbox ray.
   //
@@ -179,12 +179,15 @@ class ReachingViewController: UIViewController {
   /// fallback-ladder depth. Set at placement time.
   var dav2RefineDeadline: TimeInterval = 0
   /// How long after placement to keep retrying DAv2 before giving up.
-  let dav2RefineWindowSec: TimeInterval = 10.0
+  let dav2RefineWindowSec: TimeInterval = 45.0
   /// Placement ray captured at anchor time so a late DAv2 result can re-place
   /// the anchor at the corrected depth along the exact same bearing.
   var placementRayOrigin: simd_float3 = .zero
   var placementRayDir: simd_float3 = .zero
   var placementHorizScale: CGFloat = 1.0
+  /// Place-and-hold: once DAv2 produces a trusted metric depth, stop ARKit
+  /// refinement so the anchor stays locked in world space.
+  var placeAndHoldDepthLocked = false
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - ARKit
@@ -224,10 +227,12 @@ class ReachingViewController: UIViewController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   // Master feature flag. false → original behavior, true → tracker drives refinement.
-  let trackerEnabled: Bool = true
+  var trackerEnabled: Bool { return !placeAndHoldPrototype }
 
   var trackerSequenceHandler = VNSequenceRequestHandler()
+  var activeTrackerRequest: VNTrackObjectRequest?
   var lastTrackedObservation: VNDetectedObjectObservation?
+  var lastTrackedConfidence: VNConfidence = 0
   var trackingActive: Bool = false
   var consecutiveLowConfFrames: Int = 0
   let trackerLowConfThreshold: Float = 0.40
@@ -614,8 +619,29 @@ class ReachingViewController: UIViewController {
     }
 
     bboxNormalized = bboxNormalized.map { min(max($0, 0), 1) }
-    let bw = bboxNormalized[2] - bboxNormalized[0]
-    let bh = bboxNormalized[3] - bboxNormalized[1]
+    var bw = bboxNormalized[2] - bboxNormalized[0]
+    var bh = bboxNormalized[3] - bboxNormalized[1]
+    if bw > 0, bh > 0 {
+      let minW: CGFloat = 0.05, minH: CGFloat = 0.05
+      let maxW: CGFloat = 0.20, maxH: CGFloat = 0.28
+      var scale: CGFloat = 1.0
+      if bw < minW || bh < minH {
+        scale = max(minW / bw, minH / bh)
+      } else if bw > maxW || bh > maxH {
+        scale = min(maxW / bw, maxH / bh)
+      }
+      if abs(scale - 1.0) > 0.001 {
+        let cx = (bboxNormalized[0] + bboxNormalized[2]) * 0.5
+        let cy = (bboxNormalized[1] + bboxNormalized[3]) * 0.5
+        let newW = bw * scale
+        let newH = bh * scale
+        bboxNormalized = [cx - newW * 0.5, cy - newH * 0.5, cx + newW * 0.5, cy + newH * 0.5]
+        bboxNormalized = bboxNormalized.map { min(max($0, 0), 1) }
+        bw = bboxNormalized[2] - bboxNormalized[0]
+        bh = bboxNormalized[3] - bboxNormalized[1]
+        NSLog("⚖️ [ReachingVC] Bbox size clamped to %.3f×%.3f (scale=%.2f)", bw, bh, scale)
+      }
+    }
     if bw < 0.01 || bh < 0.01 {
       bboxNormalized = [0.35, 0.35, 0.65, 0.65]
       NSLog("⚠️ [ReachingVC] Bbox degenerate (%.3f×%.3f) — using center fallback", bw, bh)
@@ -709,7 +735,9 @@ class ReachingViewController: UIViewController {
     handGuidanceActive = false
     handGuidanceAnnounced = false
     // Reset tracker state — fresh handler on next session
+    cancelTracker()
     trackingActive = false
+    activeTrackerRequest = nil
     lastTrackedObservation = nil
     consecutiveLowConfFrames = 0
     isTrackerReseeding = false

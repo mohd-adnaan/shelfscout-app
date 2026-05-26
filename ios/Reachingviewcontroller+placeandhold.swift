@@ -24,12 +24,8 @@ extension ReachingViewController {
     tryDav2Refine(frame)        // parallel, non-blocking DAv2 depth correction
 
     // ── Visual Tracker ──────────────────────────────────────────────────
-    // Keep the tracker locked onto the object's 2D pixels in the live feed.
-    if trackerEnabled && trackingActive {
-      _ = updateTracker(frame: frame)
-      // Note: we intentionally skip `reseedTrackerFromBackend` here for
-      // the prototype to avoid stalling the experience.
-    }
+    // Disabled for place-and-hold to prevent lateral drift from noisy 2D
+    // tracking while the anchor should stay locked in world space.
 
     // ── Continuous ARKit depth refinement ──────────────────────────────
     // Critical fix: without this, the anchor depth is FROZEN after
@@ -134,15 +130,36 @@ extension ReachingViewController {
       }
     }
 
-    // 2. Backend depth, if the vision pipeline returned a usable metric value.
-    if placedDepth == nil, let bd = backendDepth, bd >= 0.1, bd <= 10.0 {
-      placedDepth = bd; placedSource = "backend-depth"
+    // 2. Feature-point cone depth (no planes needed). Use the median distance
+    //    of points near the bbox ray to avoid far-wall hits.
+    if placedDepth == nil, let cloud = frame.rawFeaturePoints {
+      var dists: [Float] = []
+      dists.reserveCapacity(min(cloud.points.count, 64))
+      let coneCos: Float = 0.94  // ~20 deg
+      for p in cloud.points {
+        let toP = p - camPos
+        let d = simd_length(toP)
+        guard d > 0.25 && d < 4.0 else { continue }
+        let dot = simd_dot(toP / d, worldRayDir)
+        if dot > coneCos { dists.append(d) }
+      }
+      if dists.count >= 6 {
+        dists.sort()
+        let n = dists.count
+        let median = n % 2 == 0 ? (dists[n/2-1] + dists[n/2]) / 2.0 : dists[n/2]
+        let q1 = dists[n/4], q3 = dists[3*n/4]
+        let iqr = q3 - q1
+        if iqr < 0.25 {
+          placedDepth = median
+          placedSource = "featurePoints"
+        }
+      }
     }
 
-    // 3. Scene-distance default — 1.5m is typical desk/shelf range.
+    // 3. Scene-distance default — 0.9m is typical desk reach.
     //    ARKit continuous refinement + DAv2 correct this as planes form.
-    let depth = placedDepth ?? 1.5
-    if placedDepth == nil { placedSource = "default(1.5m, refinement pending)" }
+    let depth = placedDepth ?? 0.9
+    if placedDepth == nil { placedSource = "default(0.9m, refinement pending)" }
 
     let worldPos = camPos + worldRayDir * depth
 
@@ -229,6 +246,7 @@ extension ReachingViewController {
 
     NSLog("🅿️ [PlaceHold] 🌊 ✅ DAv2 refined depth %.2fm → %.2fm (Δ%.0fcm)",
           oldDepth, metric, abs(metric - oldDepth) * 100)
+    placeAndHoldDepthLocked = true
     DispatchQueue.main.async { [weak self] in
       self?.distanceLabel.text = "\(Int(metric * 100)) cm"
     }
@@ -252,6 +270,7 @@ extension ReachingViewController {
         objectWorldPosition = worldPos
         anchorDepth = depth
         liveDistanceToObject = depth
+        placeAndHoldDepthLocked = false
 
         // Box size from the REAL detected bbox — no cap, so the overlay
         // wraps the actual object instead of a fixed narrow pill.

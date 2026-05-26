@@ -312,6 +312,12 @@ export const sendToWorkflow = async (
       throw new Error('Request cancelled');
     }
 
+    // Pre-warm the DAv2 model on iOS while the network request is in flight
+    if (reachingIOSValue === 'true' && CybsGuidanceModule?.prewarmDAv2) {
+      console.log('🔥 [Workflow] Pre-warming DAv2 model in background...');
+      CybsGuidanceModule.prewarmDAv2().catch(() => {});
+    }
+
     // ========================================================================
     // Make request
     // ========================================================================

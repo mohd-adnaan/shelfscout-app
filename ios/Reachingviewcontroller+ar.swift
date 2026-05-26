@@ -277,7 +277,7 @@ extension ReachingViewController {
     var raySource: String
 
     let trackerHealthy = trackerEnabled && trackingActive &&
-                         (lastTrackedObservation?.confidence ?? 0) >= trackerLowConfThreshold * 0.5
+               lastTrackedConfidence >= trackerLowConfThreshold * 0.5
 
     if trackerHealthy, let obs = lastTrackedObservation {
       worldDir = trackerWorldRay(observation: obs, camera: camera)
@@ -304,8 +304,17 @@ extension ReachingViewController {
     // shelf-scenario-reasonable default of 1.5m. Tracking whether the baseline
     // is "real" lets the gates apply tighter tolerance when we trust the
     // baseline and looser tolerance when we're guessing.
-    let effectiveBaseline: Float = backendDepth ?? 1.5
-    let hasRealBackendDepth = (backendDepth != nil) && ((backendDepth ?? 0) > 0.05)
+    let effectiveBaseline: Float
+    let hasRealBackendDepth: Bool
+    if mode == .handFree {
+      // Hand-free: backend depth is relative and unreliable. Use the current
+      // anchor depth as a soft baseline instead.
+      effectiveBaseline = anchorDepth > 0.05 ? anchorDepth : 1.0
+      hasRealBackendDepth = false
+    } else {
+      effectiveBaseline = backendDepth ?? 1.5
+      hasRealBackendDepth = (backendDepth != nil) && ((backendDepth ?? 0) > 0.05)
+    }
 
     // ── Raycast with chosen direction ────────────────────────────────────────
     //
@@ -322,50 +331,81 @@ extension ReachingViewController {
     // is the most common false hit when the object is on a table in front
     // of it — a 1.5m baseline + a 3m+ wall hit is the bicycle-and-back-wall
     // failure mode we saw in the field test.
-    var hitPos: simd_float3? = nil
+    var hitDepth: Float? = nil
     var hitSource = ""
+
+    // Feature-point cone fallback (hand-free) — no plane required.
+    if mode == .handFree, let cloud = frame.rawFeaturePoints {
+      let coneCos: Float = 0.95  // ~18 deg
+      var dists: [Float] = []
+      dists.reserveCapacity(min(cloud.points.count, 64))
+      for p in cloud.points {
+        let toP = p - camPos
+        let d = simd_length(toP)
+        guard d > 0.25 && d < 4.0 else { continue }
+        let dot = simd_dot(toP / d, worldDir)
+        if dot > coneCos { dists.append(d) }
+      }
+      if dists.count >= 6 {
+        dists.sort()
+        let n = dists.count
+        let median = n % 2 == 0 ? (dists[n/2-1] + dists[n/2]) / 2.0 : dists[n/2]
+        let q1 = dists[n/4], q3 = dists[3*n/4]
+        let iqr = q3 - q1
+        if iqr < 0.20 {
+          hitDepth = median
+          hitSource = "featurePoints"
+        }
+      }
+    }
+
+    var hitPos: simd_float3? = nil
     let camWorldY = camera.transform.columns.3.y
     let floorRejectMargin: Float = 1.0  // 1m below camera = likely floor
 
-    for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
-      let query = ARRaycastQuery(origin: camPos, direction: worldDir,
-                                 allowing: target, alignment: .any)
-      for hit in sceneView.session.raycast(query) {
-        if mode == .handFree && hit.targetAlignment == .horizontal {
-          let hitWorldY = hit.worldTransform.columns.3.y
-          let depthBelowCam = camWorldY - hitWorldY
-          if depthBelowCam > floorRejectMargin {
-            NSLog("🎯 [Refine] Skipped floor candidate: %.2fm below cam, target=%@",
-                  depthBelowCam, target == .existingPlaneGeometry ? "existing" : "estimated")
-            continue
+    if hitDepth == nil {
+      for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
+        let query = ARRaycastQuery(origin: camPos, direction: worldDir,
+                                   allowing: target, alignment: .any)
+        for hit in sceneView.session.raycast(query) {
+          if mode == .handFree && hit.targetAlignment == .horizontal {
+            let hitWorldY = hit.worldTransform.columns.3.y
+            let depthBelowCam = camWorldY - hitWorldY
+            if depthBelowCam > floorRejectMargin {
+              NSLog("🎯 [Refine] Skipped floor candidate: %.2fm below cam, target=%@",
+                    depthBelowCam, target == .existingPlaneGeometry ? "existing" : "estimated")
+              continue
+            }
           }
-        }
-        // BAND-AID: pre-convergence vertical-plane back-wall filter
-        if mode == .handFree && lastRefinementAppliedDepth == 0
-           && hit.targetAlignment == .vertical {
-          let hitDistVal = simd_length(simd_make_float3(hit.worldTransform.columns.3) - camPos)
-          if hitDistVal > effectiveBaseline * 2.0 {
-            NSLog("🎯 [Refine] Skipped back-wall hit: %.2fm > 2× baseline %.2fm (vertical)",
-                  hitDistVal, effectiveBaseline)
-            continue
+          // BAND-AID: pre-convergence vertical-plane back-wall filter
+          if mode == .handFree && lastRefinementAppliedDepth == 0
+             && hit.targetAlignment == .vertical {
+            let hitDistVal = simd_length(simd_make_float3(hit.worldTransform.columns.3) - camPos)
+            if hitDistVal > effectiveBaseline * 2.0 {
+              NSLog("🎯 [Refine] Skipped back-wall hit: %.2fm > 2× baseline %.2fm (vertical)",
+                    hitDistVal, effectiveBaseline)
+              continue
+            }
           }
+          hitPos = simd_make_float3(hit.worldTransform.columns.3)
+          hitSource = target == .existingPlaneGeometry ? "existingPlane" : "estimatedPlane"
+          break
         }
-        hitPos = simd_make_float3(hit.worldTransform.columns.3)
-        hitSource = target == .existingPlaneGeometry ? "existingPlane" : "estimatedPlane"
-        break
+        if hitPos != nil { break }
       }
-      if hitPos != nil { break }
     }
 
-    guard let hp = hitPos else {
+    if hitDepth == nil, let hp = hitPos {
+      hitDepth = simd_length(hp - camPos)
+    }
+
+    guard let hitDepth = hitDepth else {
       if anchorRefinementFrames % 60 == 0 {
-        NSLog("🎯 [Refine] No plane hit yet (frame %d, %d hits buffered) — planes still forming",
+        NSLog("🎯 [Refine] No plane or feature hit yet (frame %d, %d hits buffered) — still forming",
               anchorRefinementFrames, refinementHits.count)
       }
       return
     }
-
-    let hitDepth = simd_length(hp - camPos)
 
     guard hitDepth > 0.15 && hitDepth < 4.0 else {
       NSLog("🎯 [Refine] Rejected hit at %.2fm (out of range)", hitDepth)
