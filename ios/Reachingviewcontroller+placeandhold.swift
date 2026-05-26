@@ -22,6 +22,27 @@ extension ReachingViewController {
       return true
     }
     tryDav2Refine(frame)        // parallel, non-blocking DAv2 depth correction
+
+    // ── Visual Tracker ──────────────────────────────────────────────────
+    // Keep the tracker locked onto the object's 2D pixels in the live feed.
+    if trackerEnabled && trackingActive {
+      _ = updateTracker(frame: frame)
+      // Note: we intentionally skip `reseedTrackerFromBackend` here for
+      // the prototype to avoid stalling the experience.
+    }
+
+    // ── Continuous ARKit depth refinement ──────────────────────────────
+    // Critical fix: without this, the anchor depth is FROZEN after
+    // DAv2's one-shot estimate. As the user walks and ARKit detects
+    // planes, raycast refinement corrects the depth continuously.
+    // This is the same refinement loop the non-prototype path runs.
+    if anchorRefinementFrames == 0 { anchorRefinementFrames = 1 }
+    anchorRefinementFrames += 1
+    if anchorRefinementFrames >= anchorRefinementLimit {
+      anchorRefinementFrames = 1  // keep refining forever
+    }
+    tryRefineAnchorDepth(frame: frame)
+
     processARFrameHandFree(frame)
     return true
   }
@@ -118,10 +139,10 @@ extension ReachingViewController {
       placedDepth = bd; placedSource = "backend-depth"
     }
 
-    // 3. Near default — arm's-reach so the box never parks on the back wall.
-    //    DAv2 corrects this within ~1-2s via tryDav2Refine().
-    let depth = placedDepth ?? 0.8
-    if placedDepth == nil { placedSource = "near-default(0.8m, DAv2 pending)" }
+    // 3. Scene-distance default — 1.5m is typical desk/shelf range.
+    //    ARKit continuous refinement + DAv2 correct this as planes form.
+    let depth = placedDepth ?? 1.5
+    if placedDepth == nil { placedSource = "default(1.5m, refinement pending)" }
 
     let worldPos = camPos + worldRayDir * depth
 
@@ -131,11 +152,12 @@ extension ReachingViewController {
     placementHorizScale = horizScale
 
     finalizePlacement(worldPos: worldPos, depth: depth, camera: camera,
-                      horizScale: horizScale, source: placedSource)
+                      horizScale: horizScale, source: placedSource, frame: frame)
 
     // Arm parallel DAv2 refinement — handled by tryDav2Refine() on later frames.
     dav2RefineState = .pending
     dav2RequestInFlight = false
+    dav2NoAnchorLogCount = 0
     dav2RefineDeadline = ProcessInfo.processInfo.systemUptime + dav2RefineWindowSec
     NSLog("🅿️ [PlaceHold] 🌊 DAv2 refinement armed (%.0fs window) — placement NOT blocked", dav2RefineWindowSec)
   }
@@ -224,39 +246,44 @@ extension ReachingViewController {
     if guidanceAudioEnabled { say(msg) }
   }
 
-  private func finalizePlacement(worldPos: simd_float3, depth: Float,
-                                   camera: ARCamera, horizScale: CGFloat,
-                                   source: String) {
-      objectWorldPosition = worldPos
-      anchorDepth = depth
-      liveDistanceToObject = depth
+    private func finalizePlacement(worldPos: simd_float3, depth: Float,
+                                     camera: ARCamera, horizScale: CGFloat,
+                                     source: String, frame: ARFrame) {
+        objectWorldPosition = worldPos
+        anchorDepth = depth
+        liveDistanceToObject = depth
 
-      // Box size from the REAL detected bbox — no cap, so the overlay
-      // wraps the actual object instead of a fixed narrow pill.
-      // Loose safety rail (depth * 0.45) only catches a runaway full-screen
-      // VLM detection; real object boxes stay well under it.
-      let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
-      let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-      objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.45)
-      objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.45)
+        // Box size from the REAL detected bbox — no cap, so the overlay
+        // wraps the actual object instead of a fixed narrow pill.
+        // Loose safety rail (depth * 0.45) only catches a runaway full-screen
+        // VLM detection; real object boxes stay well under it.
+        let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
+        let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
+        objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.45)
+        objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.45)
 
-      let camT = camera.transform
-      let right = -simd_normalize(simd_make_float3(camT.columns.1))
-      let up    =  simd_normalize(simd_make_float3(camT.columns.0))
-      objectWorldCornerTR = worldPos + right * objectWorldHalfW + up * objectWorldHalfH
-      objectWorldCornerBL = worldPos - right * objectWorldHalfW - up * objectWorldHalfH
-      anchorPlaced = true
+        let camT = camera.transform
+        let right = -simd_normalize(simd_make_float3(camT.columns.1))
+        let up    =  simd_normalize(simd_make_float3(camT.columns.0))
+        objectWorldCornerTR = worldPos + right * objectWorldHalfW + up * objectWorldHalfH
+        objectWorldCornerBL = worldPos - right * objectWorldHalfW - up * objectWorldHalfH
+        anchorPlaced = true
 
-      NSLog("🅿️ [PlaceHold] ✅ ANCHOR at (%.3f,%.3f,%.3f) depth=%.2fm halfW=%.3f halfH=%.3f via %@",
-            worldPos.x, worldPos.y, worldPos.z, depth, objectWorldHalfW, objectWorldHalfH, source)
+        NSLog("🅿️ [PlaceHold] ✅ ANCHOR at (%.3f,%.3f,%.3f) depth=%.2fm halfW=%.3f halfH=%.3f via %@",
+              worldPos.x, worldPos.y, worldPos.z, depth, objectWorldHalfW, objectWorldHalfH, source)
 
-      let viewSize = CGSize(width: cachedSW, height: cachedSH)
-      let back = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
-      NSLog("🅿️ [PlaceHold] SelfCheck → screen (%.0f,%.0f)", back.x, back.y)
+        let viewSize = CGSize(width: cachedSW, height: cachedSH)
+        let back = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
+        NSLog("🅿️ [PlaceHold] SelfCheck → screen (%.0f,%.0f)", back.x, back.y)
 
-      DispatchQueue.main.async { [weak self] in
-        self?.distanceLabel.text = "\(Int(depth * 100)) cm"
+        // ── Seed visual tracker so subsequent refinement uses fresh 2D pixel target ──
+        if trackerEnabled {
+          seedTracker(initialBboxPhotoNorm: bboxNormalized, frame: frame)
+        }
+
+        DispatchQueue.main.async { [weak self] in
+          self?.distanceLabel.text = "\(Int(depth * 100)) cm"
+        }
+        say("Target locked.")
       }
-      say("Target locked.")
-    }
 }

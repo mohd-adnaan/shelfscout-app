@@ -78,10 +78,33 @@ extension ReachingViewController {
     // ── AR-portrait (top-left origin) → Vision-normalized (bottom-left origin) ─
     // We pass orientation: .right to Vision, so Vision sees the buffer rotated
     // to portrait. Y is bottom-up in Vision, so we flip from our top-down convention.
-    let visX = arPx1
-    let visY = 1.0 - arPy2     // top-down maxY → bottom-up minY
-    let visW = arPx2 - arPx1
-    let visH = arPy2 - arPy1
+    var visX = arPx1
+    var visY = 1.0 - arPy2     // top-down maxY → bottom-up minY
+    var visW = arPx2 - arPx1
+    var visH = arPy2 - arPy1
+
+    // ── Vision Framework Minimum Size Enforcement ────────────────────────────
+    // VNTrackObjectRequest will throw "Internal error: unexpected tracked object
+    // bounding box size" if the box is too small (e.g., < ~5% of the frame).
+    // The Rubik's cube at a distance can easily be 3%x2%.
+    // We symmetrically inflate the box to a minimum of 0.05 to satisfy Vision.
+    // Since tryRefineAnchorDepth only uses the CENTER of the tracker bbox to
+    // cast its ray, inflating symmetrically has ZERO effect on the ray's accuracy.
+    let minSize: CGFloat = 0.05
+    if visW < minSize {
+      let diff = minSize - visW
+      visX -= diff / 2.0
+      visW = minSize
+    }
+    if visH < minSize {
+      let diff = minSize - visH
+      visY -= diff / 2.0
+      visH = minSize
+    }
+
+    // Clamp to valid normalized rect [0..1]
+    visX = max(0.0, min(visX, 1.0 - visW))
+    visY = max(0.0, min(visY, 1.0 - visH))
 
     let visionBbox = CGRect(x: visX, y: visY, width: visW, height: visH)
     let observation = VNDetectedObjectObservation(boundingBox: visionBbox)
@@ -116,7 +139,25 @@ extension ReachingViewController {
     guard trackerEnabled, trackingActive,
           let lastObs = lastTrackedObservation else { return nil }
 
-    let request = VNTrackObjectRequest(detectedObjectObservation: lastObs)
+    var safeBox = lastObs.boundingBox
+    let minSize: CGFloat = 0.05
+    if safeBox.width < minSize {
+      let diff = minSize - safeBox.width
+      safeBox.origin.x -= diff / 2.0
+      safeBox.size.width = minSize
+    }
+    if safeBox.height < minSize {
+      let diff = minSize - safeBox.height
+      safeBox.origin.y -= diff / 2.0
+      safeBox.size.height = minSize
+    }
+    
+    // Clamp to valid [0..1]
+    safeBox.origin.x = max(0.0, min(safeBox.origin.x, 1.0 - safeBox.width))
+    safeBox.origin.y = max(0.0, min(safeBox.origin.y, 1.0 - safeBox.height))
+    
+    let safeObs = VNDetectedObjectObservation(boundingBox: safeBox)
+    let request = VNTrackObjectRequest(detectedObjectObservation: safeObs)
     request.trackingLevel = .accurate
     // isLastFrame = false — we're streaming. Apple's tracker uses this to free
     // tracking state when the sequence ends; we never end mid-session.

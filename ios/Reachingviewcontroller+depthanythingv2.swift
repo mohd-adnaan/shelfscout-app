@@ -333,22 +333,24 @@ extension ReachingViewController {
         let d = simd_length(toP)
         guard d > 0.3 && d < 8.0 else { continue }
         let dot = simd_dot(toP / d, worldRay)
-        // Within ~18 deg of the bbox-center ray (cos 18 deg ~= 0.951).
-        if dot > 0.951 { dists.append(d) }
+        // Within ~35 deg of the bbox-center ray (cos 35 deg ~= 0.819).
+        // Widened from 18° to catch more desk-edge/surface feature points
+        // near smooth objects like water bottles.
+        if dot > 0.819 { dists.append(d) }
         if dot > bestDot {
           bestDot = dot
           bestPoint = p
           bestDepth = d
         }
       }
-      if dists.count >= 3 {
+      if dists.count >= 2 {
         dists.sort()
         let med = dists[dists.count / 2]
         scaleAnchorMetricDepth = med
         scaleAnchorPixelX = cx
         scaleAnchorPixelY = cy
-        scaleAnchorLabel = "featurePoints(\(dists.count))"
-        NSLog("🌊 [DAv2] Scale anchor from %d feature points in bbox cone → %.2fm", dists.count, med)
+        scaleAnchorLabel = "featurePoints(\(dists.count),cone35)"
+        NSLog("🌊 [DAv2] Scale anchor from %d feature points in bbox cone (35°) → %.2fm", dists.count, med)
       } else if let point = bestPoint, bestDot > 0 {
         // Fallback: use the closest feature point in angular space and project it.
         let viewportSize = CGSize(width: arH, height: arW)
@@ -366,8 +368,60 @@ extension ReachingViewController {
       }
     }
 
+    // ── Scene-wide feature-point fallback ──────────────────────────────────
+    //
+    // When both the bbox-cone and single-closest-point fallbacks fail, try
+    // ANY visible feature point in front of the camera. The key insight:
+    // DAv2 produces a relative depth map for the ENTIRE image. The scale
+    // anchor pixel does NOT need to be near the object — we can anchor at
+    // a desk corner 40° away and transfer the scale factor to the bbox
+    // center pixel via the relative depth ratio.
+    //
+    // ARKit produces feature points within ~0.5s from natural hand-shake,
+    // even before any planes form. This tier should succeed almost
+    // immediately on session start.
+    if scaleAnchorMetricDepth == nil, let cloud = frame.rawFeaturePoints {
+      let camFwd = -simd_normalize(simd_make_float3(camTransform.columns.2))
+      var bestCandidate: (depth: Float, normX: CGFloat, normY: CGFloat)?
+
+      for p in cloud.points {
+        let toP = p - camPos
+        let d = simd_length(toP)
+        guard d > 0.3 && d < 6.0 else { continue }
+        // Must be in front of camera (within ~60° of forward)
+        let fwdDot = simd_dot(toP / d, camFwd)
+        guard fwdDot > 0.5 else { continue }
+        // Project to portrait-normalized coords
+        let viewportSize = CGSize(width: arH, height: arW)
+        let projected = camera.projectPoint(p, orientation: .portrait, viewportSize: viewportSize)
+        let normX = projected.x / viewportSize.width
+        let normY = projected.y / viewportSize.height
+        // Must project within valid image bounds (with small margin)
+        guard normX >= 0.02 && normX <= 0.98 && normY >= 0.02 && normY <= 0.98 else { continue }
+        // Prefer the nearest valid feature point — closer points have
+        // more reliable ARKit position estimates.
+        if bestCandidate == nil || d < bestCandidate!.depth {
+          bestCandidate = (d, normX, normY)
+        }
+      }
+
+      if let best = bestCandidate {
+        scaleAnchorMetricDepth = best.depth
+        scaleAnchorPixelX = best.normX
+        scaleAnchorPixelY = best.normY
+        scaleAnchorLabel = "anyFeaturePoint"
+        NSLog("🌊 [DAv2] Scale anchor from scene feature point → %.2fm at (%.2f, %.2f)",
+              best.depth, best.normX, best.normY)
+      }
+    }
+
     guard let metricAnchor = scaleAnchorMetricDepth else {
-      NSLog("🌊 [DAv2] No scale anchor (no plane raycast hit, no feature points in bbox cone) — retrying next frame")
+      // Throttle log: only emit once per ~60 frames (~1/sec at 60fps)
+      self.dav2NoAnchorLogCount += 1
+      if self.dav2NoAnchorLogCount == 1 || self.dav2NoAnchorLogCount % 60 == 0 {
+        NSLog("🌊 [DAv2] No scale anchor (no planes, no feature points) — attempt #%d, retrying...",
+              self.dav2NoAnchorLogCount)
+      }
       // No way to convert relative→metric without a scale reference.
       completion(nil)
       return

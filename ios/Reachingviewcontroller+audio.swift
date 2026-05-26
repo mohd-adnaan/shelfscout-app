@@ -205,7 +205,6 @@ extension ReachingViewController {
       lastBeep = now
     }
   }
-
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Parking Sensor Tone (Hand-Free, Close + Aligned)
   // ═══════════════════════════════════════════════════════════════════════════

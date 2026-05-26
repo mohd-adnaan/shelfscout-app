@@ -173,6 +173,8 @@ class ReachingViewController: UIViewController {
   var dav2RefineState: DAv2RefineState = .pending
   /// True while a DAv2 inference is in flight — prevents stacking requests.
   var dav2RequestInFlight = false
+  /// Counter for throttling DAv2 "no scale anchor" log messages
+  var dav2NoAnchorLogCount: Int = 0
   /// Wall-clock deadline; after this we stop retrying DAv2 and keep the
   /// fallback-ladder depth. Set at placement time.
   var dav2RefineDeadline: TimeInterval = 0
