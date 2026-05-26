@@ -809,6 +809,9 @@ function AppInner(): React.JSX.Element {
     try {
       const { ReachingModule } = NativeModules;
       if (ReachingModule?.startReaching) {
+        const acquisitionUrl = settingsRef.current.enableAcquisitionAutoExit
+          ? ACQUISITION_URL
+          : undefined;
         const reachingPromise = ReachingModule.startReaching({
           bbox,
           object: result.object || 'object',
@@ -817,7 +820,7 @@ function AppInner(): React.JSX.Element {
           imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
           detectionUrl: DETECTION_URL,
-          acquisitionUrl: ACQUISITION_URL,
+          ...(acquisitionUrl ? { acquisitionUrl } : {}),
           mode: settingsRef.current.reachingMode,
           startupSilent: options?.startupSilent === true,
           ttsRate: settingsRef.current.ttsRate,

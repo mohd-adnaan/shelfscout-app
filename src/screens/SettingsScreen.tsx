@@ -219,6 +219,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     updateDeveloperMode,
     updateReachingMode,
     updateDistanceUnit,
+    updateEnableAcquisitionAutoExit,
   } =
     useSettings();
 
@@ -250,6 +251,17 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       }
       wearablesTransitioningRef.current = true;
 
+
+    const handleAcquisitionToggle = useCallback(
+      async (value: boolean) => {
+        await updateEnableAcquisitionAutoExit(value);
+        const label = value
+          ? 'Auto-exit enabled.'
+          : 'Auto-exit disabled. Manual exit only.';
+        AccessibilityInfo.announceForAccessibility(label);
+      },
+      [updateEnableAcquisitionAutoExit],
+    );
       try {
         // When turning OFF, disconnect FIRST and wait for it to complete
         // before updating the setting. This ensures the Meta SDK session
@@ -586,6 +598,37 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                   <View style={[styles.activeDot, { backgroundColor: C.warning }]} />
                 )}
               </TouchableOpacity>
+            </View>
+
+            <View style={styles.settingRow}>
+              <View style={styles.settingLabelBlock}>
+                <Text style={styles.settingLabel}>Auto-exit on reach</Text>
+                <Text style={styles.settingSubLabel}>
+                  {settings.enableAcquisitionAutoExit
+                    ? 'Enabled (uses backend validation)'
+                    : 'Manual exit only'}
+                </Text>
+              </View>
+              <Switch
+                value={settings.enableAcquisitionAutoExit}
+                onValueChange={handleAcquisitionToggle}
+                trackColor={{ false: C.border, true: C.success }}
+                thumbColor={settings.enableAcquisitionAutoExit ? C.success : C.sliderThumb}
+                ios_backgroundColor={C.border}
+                accessible={true}
+                accessibilityRole="switch"
+                accessibilityLabel="Auto-exit when the object is reached"
+                accessibilityHint={
+                  settings.enableAcquisitionAutoExit
+                    ? 'Double tap to require manual confirmation.'
+                    : 'Double tap to enable automatic exit.'
+                }
+                accessibilityValue={{
+                  text: settings.enableAcquisitionAutoExit
+                    ? 'Auto-exit enabled'
+                    : 'Manual exit only',
+                }}
+              />
             </View>
           </Section>
         )}

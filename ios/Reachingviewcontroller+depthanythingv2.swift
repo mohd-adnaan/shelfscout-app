@@ -325,12 +325,21 @@ extension ReachingViewController {
     // correct, motion-free depth estimate.
     if scaleAnchorMetricDepth == nil, let cloud = frame.rawFeaturePoints {
       var dists: [Float] = []
+      var bestDot: Float = -1
+      var bestPoint: simd_float3? = nil
+      var bestDepth: Float = 0
       for p in cloud.points {
         let toP = p - camPos
         let d = simd_length(toP)
         guard d > 0.3 && d < 8.0 else { continue }
-        // Within ~18° of the bbox-center ray (cos 18° ≈ 0.951).
-        if simd_dot(toP / d, worldRay) > 0.951 { dists.append(d) }
+        let dot = simd_dot(toP / d, worldRay)
+        // Within ~18 deg of the bbox-center ray (cos 18 deg ~= 0.951).
+        if dot > 0.951 { dists.append(d) }
+        if dot > bestDot {
+          bestDot = dot
+          bestPoint = p
+          bestDepth = d
+        }
       }
       if dists.count >= 3 {
         dists.sort()
@@ -340,6 +349,20 @@ extension ReachingViewController {
         scaleAnchorPixelY = cy
         scaleAnchorLabel = "featurePoints(\(dists.count))"
         NSLog("🌊 [DAv2] Scale anchor from %d feature points in bbox cone → %.2fm", dists.count, med)
+      } else if let point = bestPoint, bestDot > 0 {
+        // Fallback: use the closest feature point in angular space and project it.
+        let viewportSize = CGSize(width: arH, height: arW)
+        let projected = camera.projectPoint(point, orientation: .portrait, viewportSize: viewportSize)
+        let normX = projected.x / viewportSize.width
+        let normY = projected.y / viewportSize.height
+        if normX >= 0 && normX <= 1 && normY >= 0 && normY <= 1 {
+          scaleAnchorMetricDepth = bestDepth
+          scaleAnchorPixelX = normX
+          scaleAnchorPixelY = normY
+          scaleAnchorLabel = String(format: "featurePointFallback(dot=%.2f)", bestDot)
+          NSLog("🌊 [DAv2] Scale anchor fallback at dot=%.2f px=(%.2f, %.2f) → %.2fm",
+                bestDot, normX, normY, bestDepth)
+        }
       }
     }
 

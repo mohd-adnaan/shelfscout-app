@@ -30,6 +30,8 @@ export interface AppSettings {
   reachingMode: 'handFree' | 'withHand';
   /** Distance unit for reaching guidance: 'steps' (default) or 'cm' */
   distanceUnit: 'steps' | 'cm';
+  /** When true, allow ARKit auto-exit via acquisition validation */
+  enableAcquisitionAutoExit: boolean;
 }
 
 interface SettingsContextValue {
@@ -41,6 +43,7 @@ interface SettingsContextValue {
   updateDeveloperMode: (value: boolean) => Promise<void>;
   updateReachingMode: (mode: 'handFree' | 'withHand') => Promise<void>;
   updateDistanceUnit: (unit: 'steps' | 'cm') => Promise<void>;
+  updateEnableAcquisitionAutoExit: (value: boolean) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
    * Returns 'arkit' | 'standard' | 'none'.
@@ -62,6 +65,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   developerMode: false,
   reachingMode: 'handFree',
   distanceUnit: 'steps',
+  enableAcquisitionAutoExit: false,
 };
 
 const STORAGE_KEY = '@cybersight_settings_v1';
@@ -179,6 +183,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateEnableAcquisitionAutoExit = useCallback(
+    async (value: boolean) => {
+      const next = { ...settings, enableAcquisitionAutoExit: value };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Reaching auto-exit → ${value ? 'ON' : 'OFF'}`);
+    },
+    [settings, persist],
+  );
+
   // ── Pipeline resolver ─────────────────────────────────────────────────────
 
   const resolveReachingPipeline = useCallback(
@@ -213,6 +227,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateDeveloperMode,
     updateReachingMode,
     updateDistanceUnit,
+    updateEnableAcquisitionAutoExit,
     resolveReachingPipeline,
   };
 
