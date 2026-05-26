@@ -137,6 +137,7 @@ function AppInner(): React.JSX.Element {
   const { hasPermission: hasCameraPermission, requestPermission: requestCameraPermission } = useCameraPermission();
   const { hasPermission: hasMicPermission, requestPermission: requestMicPermission } = useMicrophonePermission();
   const cameraRef = useRef<Camera>(null);
+  const isCapturingRef = useRef(false);
   const containerRef = useRef<View>(null);
 
   // ── Audio / Speech ─────────────────────────────────────────────────────────
@@ -548,8 +549,14 @@ function AppInner(): React.JSX.Element {
   const reactivateCameraAndCapture = async (options?: {
     enableShutterSound?: boolean;
   }): Promise<string> => {
-    console.log('📷 Reactivating camera for capture...');
-    setIsCameraActive(true);
+    if (isCapturingRef.current) {
+      console.log('📷 Capture already in progress, returning last known frame...');
+      return kasraLastFrameRef.current || '';
+    }
+    isCapturingRef.current = true;
+    try {
+      console.log('📷 Reactivating camera for capture...');
+      setIsCameraActive(true);
 
     const useSystemShutterSound =
       options?.enableShutterSound === true &&
@@ -625,6 +632,9 @@ function AppInner(): React.JSX.Element {
         console.error('❌ Retry also failed:', e);
         return '';
       }
+    }
+    } finally {
+      isCapturingRef.current = false;
     }
   };
 
@@ -722,23 +732,29 @@ function AppInner(): React.JSX.Element {
   const startKasraFeed = useCallback(() => {
     if (kasraFeedIntervalRef.current) return;
 
-    kasraFeedIntervalRef.current = setInterval(() => {
+    kasraFeedIntervalRef.current = setInterval(async () => {
       if (!isContinuousModeRunning.current || getCurrentMode() !== 'navigation') return;
+      if (kasraIsSendingRef.current) return;
 
-      const imageUri = kasraLastFrameRef.current;
       const objectName = kasraLastObjectRef.current;
-      if (!imageUri || !objectName || kasraIsSendingRef.current) return;
+      if (!objectName) return;
 
       kasraIsSendingRef.current = true;
-      sendToKasraGuidance({ imageUri, objectName })
-        .catch((err: any) => {
-          console.warn('[Kasra] Guidance send failed:', err?.message || err);
-        })
-        .finally(() => {
-          kasraIsSendingRef.current = false;
-        });
+      try {
+        // Capture a NEW frame here so RTAB gets a fresh image every interval,
+        // rather than sending the exact same image multiple times.
+        const photoPath = await reactivateCameraAndCapture({ enableShutterSound: false });
+        if (photoPath) {
+          kasraLastFrameRef.current = photoPath;
+          await sendToKasraGuidance({ imageUri: photoPath, objectName });
+        }
+      } catch (err: any) {
+        console.warn('[Kasra] Guidance send failed:', err?.message || err);
+      } finally {
+        kasraIsSendingRef.current = false;
+      }
     }, KASRA_FEED_INTERVAL_MS);
-  }, []);
+  }, [reactivateCameraAndCapture]);
 
   // ============================================================================
   // iOS Reaching helper — shared by both reaching blocks
@@ -943,6 +959,11 @@ function AppInner(): React.JSX.Element {
           photoPath = prefetchedPhotoRef.current;
           prefetchedPhotoRef.current = null;
           console.log('🔄 ✅ Using PRE-FETCHED photo');
+        } else if (loopMode === 'navigation' && kasraFeedIntervalRef.current && kasraLastFrameRef.current) {
+          // If Kasra feed is already capturing at a high frame rate, reuse its latest frame
+          // to avoid concurrent hardware camera locks and maintain the fast loop speed.
+          console.log('🔄 ✅ Using Kasra feed photo for backend');
+          photoPath = kasraLastFrameRef.current;
         } else {
           photoPath = await reactivateCameraAndCapture({
             enableShutterSound: false,
