@@ -57,6 +57,7 @@ import {
   prepareForRecording,
   configurePlaybackSession,
   setWearablesMode,
+  playStopReachingSound,
 } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
@@ -1127,8 +1128,10 @@ function AppInner(): React.JSX.Element {
           }
         }
 
-        await stopLatencyLoop(); // ← stop thinking SFX when result arrives
-        await stopLatencyLoop(); // Bug 3 defense: second stop for audio session race
+        if (loopMode !== 'navigation') {
+          await stopLatencyLoop(); // ← stop thinking SFX when result arrives
+          await stopLatencyLoop(); // Bug 3 defense: second stop for audio session race
+        }
         setIsProcessing(false);
 
 
@@ -1477,7 +1480,10 @@ function AppInner(): React.JSX.Element {
     isContinuousModeRunning.current = false;
     setIsCameraActive(true);
 
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
+    if (!screenReaderEnabledRef.current) { 
+      audioFeedback.playEarcon('cancel'); 
+      playStopReachingSound();
+    }
     announceTapToStart('Stopped.');
   }, [announceTapToStart, stopKasraFeed]);
 
@@ -1493,7 +1499,10 @@ function AppInner(): React.JSX.Element {
     setIsSpeaking(false);
     isNavigationLoopRunning.current = false;
     setIsCameraActive(true);
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
+    if (!screenReaderEnabledRef.current) { 
+      audioFeedback.playEarcon('cancel'); 
+      playStopReachingSound();
+    }
     announceTapToStart('Navigation stopped.');
   }, [announceTapToStart, stopKasraFeed]);
 

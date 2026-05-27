@@ -185,9 +185,19 @@ class ReachingViewController: UIViewController {
   var placementRayOrigin: simd_float3 = .zero
   var placementRayDir: simd_float3 = .zero
   var placementHorizScale: CGFloat = 1.0
-  /// Place-and-hold: once DAv2 produces a trusted metric depth, stop ARKit
-  /// refinement so the anchor stays locked in world space.
+  /// Place-and-hold: true after ARKit has approved a stable depth along the
+  /// original placement ray. DAv2 can seed depth, but does not get to move the
+  /// anchor laterally or permanently lock the target by itself.
   var placeAndHoldDepthLocked = false
+  /// Place-and-hold depth refinement buffer. Unlike the legacy refinement
+  /// buffer, these samples are measured only on the original placement ray,
+  /// so they cannot drag the target toward the live phone reticle.
+  var placeAndHoldRefinementHits: [Float] = []
+  let placeAndHoldRefinementMinHits = 7
+  let placeAndHoldRefinementMaxHits = 12
+  let placeAndHoldRefinementIQR: Float = 0.08
+  let placeAndHoldRefinementHardJump: Float = 1.25
+  var placeAndHoldLastDepthSource = "none"
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - ARKit

@@ -77,11 +77,12 @@ const _safeSetPlaybackCategory = (): void => {
 // NOTE: "jbl_stopped,IOS_sae.mp3" has been RENAMED to "jbl_stopped_ios_sae.mp3"
 // on disk. Do that rename before building.
 const SOUND_FILES: Record<string, string> = {
-  listen:   'siri-begin-improved.caf',
+  listen:   'soundshelfstudio-ui-notification-listening-start.mp3', // ← replaced siri-begin-improved.caf
   begin:    'jbl_begin_sae.caf',
   latency:  'jbl_latency_sae.caf',
   success:  'jbl_success_sae.caf',
-  stopped:  'jbl_stopped_ios_sae.mp3',  // ← renamed from "jbl_stopped,IOS_sae.mp3"
+  stopped:  'jbl_stopped_ios_sae.mp3',
+  stop_reaching: 'soundshelfstudio-ui-notification-stop-reaching.wav', // ← new sound
 };
 
 // ── Sound instances ────────────────────────────────────────────────────────
@@ -180,6 +181,13 @@ const _playOnce = (key: SoundKey, onFinish?: () => void): void => {
  */
 export const playListenSound = (): void => {
   _playOnce('listen');
+};
+
+/**
+ * Play when the user stops reaching manually or when it goes back to default.
+ */
+export const playStopReachingSound = (): Promise<void> => {
+  return new Promise((resolve) => _playOnce('stop_reaching', resolve));
 };
 
 /**
