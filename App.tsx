@@ -99,6 +99,29 @@ const PREFETCH_CONFIG = {
 const SMART_GUIDANCE_MIN_CYCLE_MS = 200; // 5fps
 const KASRA_FEED_INTERVAL_MS = 500;
 
+let dav2PrewarmStarted = false;
+
+const looksLikeReachingCommand = (text: string): boolean => {
+  const normalized = text.toLowerCase();
+  return /\b(take|guide|lead|walk|navigate|bring)\s+(me\s+)?to\b/.test(normalized)
+    || /\b(reach|grab|get)\b/.test(normalized);
+};
+
+const prewarmDAv2InBackground = (reason: string) => {
+  if (Platform.OS !== 'ios' || dav2PrewarmStarted) return;
+  const { ReachingModule } = NativeModules;
+  if (!ReachingModule?.prewarmDAv2) return;
+
+  dav2PrewarmStarted = true;
+  console.log(`🔥 [DAv2] Pre-warming model (${reason})`);
+  ReachingModule.prewarmDAv2()
+    .then(() => console.log('✅ [DAv2] Prewarm complete'))
+    .catch((e: any) => {
+      dav2PrewarmStarted = false;
+      console.warn('⚠️ [DAv2] Prewarm failed:', e?.message || e);
+    });
+};
+
 // =============================================================================
 // AppInner
 // =============================================================================
@@ -814,6 +837,7 @@ function AppInner(): React.JSX.Element {
     }
 
     console.log('🎯 [ARKit] Launching native reaching for:', result.object, 'bbox:', bbox);
+    prewarmDAv2InBackground('reaching_ios response');
 
     AccessibilityInfo.announceForAccessibility(
       `Guiding you to ${result.object || 'object'}. Follow the audio beeps. Tap anywhere when you have it.`
@@ -1522,6 +1546,9 @@ function AppInner(): React.JSX.Element {
 
     try {
       console.log('⚡ Processing:', command);
+      if (looksLikeReachingCommand(command)) {
+        prewarmDAv2InBackground('voice command');
+      }
       isProcessingRef.current = true;
       setIsProcessing(true);
 
@@ -1781,6 +1808,9 @@ function AppInner(): React.JSX.Element {
     }
 
     console.log('⚡ Processing:', finalText);
+    if (looksLikeReachingCommand(finalText)) {
+      prewarmDAv2InBackground('voice command');
+    }
 
     const postureOk = await waitForGoodPostureRef.current('capture');
     if (!postureOk) {
@@ -1902,6 +1932,9 @@ function AppInner(): React.JSX.Element {
     }
 
     console.log('⚡ [WakeWord] Processing:', query);
+    if (looksLikeReachingCommand(query)) {
+      prewarmDAv2InBackground('wake word command');
+    }
 
     const postureOk = await waitForGoodPostureRef.current('capture');
     if (!postureOk) {

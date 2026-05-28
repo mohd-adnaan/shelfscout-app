@@ -242,6 +242,17 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
   // ActivityManagerError (error: 11): "A session already exists for this device".
   const wearablesTransitioningRef = useRef(false);
 
+  const handleAcquisitionToggle = useCallback(
+    async (value: boolean) => {
+      await updateEnableAcquisitionAutoExit(value);
+      const label = value
+        ? 'Auto-exit enabled.'
+        : 'Auto-exit disabled. Manual exit only.';
+      AccessibilityInfo.announceForAccessibility(label);
+    },
+    [updateEnableAcquisitionAutoExit],
+  );
+
   const handleWearablesToggle = useCallback(
     async (value: boolean) => {
       // Prevent re-entrant calls while a connect/disconnect is in flight
@@ -251,17 +262,6 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       }
       wearablesTransitioningRef.current = true;
 
-
-    const handleAcquisitionToggle = useCallback(
-      async (value: boolean) => {
-        await updateEnableAcquisitionAutoExit(value);
-        const label = value
-          ? 'Auto-exit enabled.'
-          : 'Auto-exit disabled. Manual exit only.';
-        AccessibilityInfo.announceForAccessibility(label);
-      },
-      [updateEnableAcquisitionAutoExit],
-    );
       try {
         // When turning OFF, disconnect FIRST and wait for it to complete
         // before updating the setting. This ensures the Meta SDK session

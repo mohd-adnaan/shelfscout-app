@@ -19,6 +19,26 @@ import { debugLogger } from './DebugLogger';
 // This will be the bridge to Swift ViewController
 const { ReachingModule: CybsGuidanceModule } = NativeModules;
 
+let dav2PrewarmStarted = false;
+
+const looksLikeReachingRequest = (text?: string): boolean => {
+  const normalized = (text || '').toLowerCase();
+  return /\b(take|guide|lead|walk|navigate|bring)\s+(me\s+)?to\b/.test(normalized)
+    || /\b(reach|grab|get)\b/.test(normalized);
+};
+
+const prewarmDAv2InBackground = (reason: string) => {
+  if (Platform.OS !== 'ios' || dav2PrewarmStarted || !CybsGuidanceModule?.prewarmDAv2) return;
+
+  dav2PrewarmStarted = true;
+  console.log(`🔥 [Workflow] Pre-warming DAv2 model (${reason})`);
+  CybsGuidanceModule.prewarmDAv2()
+    .catch((e: any) => {
+      dav2PrewarmStarted = false;
+      console.warn('⚠️ [Workflow] DAv2 prewarm failed:', e?.message || e);
+    });
+};
+
 /**
  * Trigger iOS ARKit reaching with bounding box data
  * 
@@ -312,10 +332,13 @@ export const sendToWorkflow = async (
       throw new Error('Request cancelled');
     }
 
-    // Pre-warm the DAv2 model on iOS while the network request is in flight
-    if (reachingIOSValue === 'true' && CybsGuidanceModule?.prewarmDAv2) {
-      console.log('🔥 [Workflow] Pre-warming DAv2 model in background...');
-      CybsGuidanceModule.prewarmDAv2().catch(() => {});
+    // Pre-warm DAv2 while the backend request is in flight. On the first user
+    // request reaching_ios is still false because the backend has not replied,
+    // so use the transcript intent too.
+    if (reachingIOSValue === 'true' || looksLikeReachingRequest(request.text)) {
+      prewarmDAv2InBackground(
+        reachingIOSValue === 'true' ? 'reaching_ios request' : 'likely reaching transcript'
+      );
     }
 
     // ========================================================================
@@ -351,6 +374,10 @@ export const sendToWorkflow = async (
     const parsedResponse = parseWorkflowResponse(response.data, {
       reachingRequest: request.reaching_flag === true,
     });
+
+    if (parsedResponse.reaching_ios === true) {
+      prewarmDAv2InBackground('reaching_ios response');
+    }
 
     console.log('📄 Response:', {
       textLength: parsedResponse.text?.length || 0,

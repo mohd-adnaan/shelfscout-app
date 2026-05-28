@@ -17,6 +17,8 @@ import CoreHaptics
 
 class ReachingViewController: UIViewController {
 
+  private static var dav2PrewarmRequested = false
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Enums
   // ═══════════════════════════════════════════════════════════════════════════
@@ -193,10 +195,20 @@ class ReachingViewController: UIViewController {
   /// buffer, these samples are measured only on the original placement ray,
   /// so they cannot drag the target toward the live phone reticle.
   var placeAndHoldRefinementHits: [Float] = []
+  /// Default scene-distance seed when ARKit has not formed geometry yet.
+  /// 1.5m is a safer non-LiDAR cold-start prior than desk-reach 0.9m because
+  /// it lets the locked-ray consensus accept real mid-room evidence.
+  let placeAndHoldDefaultDepth: Float = 1.5
+  /// Large-jump candidates are not trusted individually, but a stable cluster
+  /// means the current seed is wrong and the anchor should be rebased.
+  var placeAndHoldAlternateDepthHits: [Float] = []
   let placeAndHoldRefinementMinHits = 7
   let placeAndHoldRefinementMaxHits = 12
   let placeAndHoldRefinementIQR: Float = 0.08
   let placeAndHoldRefinementHardJump: Float = 1.25
+  let placeAndHoldAlternateDepthMinHits = 6
+  let placeAndHoldAlternateDepthMaxHits = 14
+  let placeAndHoldAlternateDepthIQR: Float = 0.18
   var placeAndHoldLastDepthSource = "none"
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -505,9 +517,14 @@ class ReachingViewController: UIViewController {
     setupHaptics()
     setupTapToDismiss()
 
-    // Eagerly validate DepthAnythingV2 model on startup — logs detailed diagnostics
-    DispatchQueue.global(qos: .userInitiated).async {
-      validateDepthAnythingModel()
+    // Keep this lightweight: the JS/native bridge prewarms DAv2 as soon as a
+    // reaching-like command is heard. This is only a last-chance warmup if the
+    // bridge did not get there first.
+    if !Self.dav2PrewarmRequested {
+      Self.dav2PrewarmRequested = true
+      DispatchQueue.global(qos: .userInitiated).async {
+        prewarmDepthAnythingV2Model()
+      }
     }
   }
 

@@ -169,10 +169,12 @@ extension ReachingViewController {
       }
     }
 
-    // 3. Scene-distance default — 0.9m is typical desk reach.
+    // 3. Scene-distance default.
     //    ARKit continuous refinement + DAv2 correct this as planes form.
-    let depth = placedDepth ?? 0.9
-    if placedDepth == nil { placedSource = "default(0.9m, refinement pending)" }
+    let depth = placedDepth ?? placeAndHoldDefaultDepth
+    if placedDepth == nil {
+      placedSource = String(format: "default(%.1fm, refinement pending)", placeAndHoldDefaultDepth)
+    }
 
     let worldPos = camPos + worldRayDir * depth
 
@@ -222,13 +224,12 @@ extension ReachingViewController {
     ]
 
     dav2RequestInFlight = true
-    estimateMetricDepth(frame: frame, bboxARNormalized: arBboxNormalized) { [weak self] metric in
+    estimateMetricDepth(frame: frame, bboxARNormalized: arBboxNormalized) { [weak self] estimate in
       guard let self = self else { return }
       self.dav2RequestInFlight = false
       guard self.dav2RefineState == .pending else { return }
-      if let m = metric {
+      if let estimate = estimate, self.applyDav2Depth(estimate) {
         self.dav2RefineState = .done
-        self.applyDav2Depth(m)
       }
       // nil → still .pending; the next frame retries until the deadline.
     }
@@ -237,19 +238,38 @@ extension ReachingViewController {
   /// Snap the already-placed anchor to a DAv2 metric depth along the stored
   /// placement ray. Runs on visionQ (estimateMetricDepth's completion queue),
   /// the same queue as frame processing — no locking needed.
-  private func applyDav2Depth(_ metric: Float) {
-    guard anchorPlaced else { return }
+  @discardableResult
+  private func applyDav2Depth(_ estimate: DAv2MetricDepthEstimate) -> Bool {
+    guard anchorPlaced else { return false }
+    let metric = estimate.depth
     let oldDepth = anchorDepth
     guard metric > 0.20 && metric < 5.0 else {
       NSLog("🅿️ [PlaceHold] 🌊 Rejected DAv2 depth %.2fm (out of range)", metric)
-      return
+      return false
+    }
+
+    let delta = abs(metric - oldDepth)
+    let offBboxScaleAnchor = estimate.anchorLabel != "bbox center"
+      && !estimate.anchorLabel.hasPrefix("featurePoints")
+    if offBboxScaleAnchor && delta > 0.25 {
+      if metric < oldDepth && estimate.ratio < 0.75 {
+        NSLog("🅿️ [PlaceHold] 🌊 Holding DAv2 %.2fm from %@ (anchor=%.2fm ratio=%.3f) — off-bbox shrink from %.2fm needs ARKit vote",
+              metric, estimate.anchorLabel, estimate.anchorDepth, estimate.ratio, oldDepth)
+        return false
+      }
+      if metric > oldDepth && estimate.ratio > 1.45 {
+        NSLog("🅿️ [PlaceHold] 🌊 Holding DAv2 %.2fm from %@ (anchor=%.2fm ratio=%.3f) — off-bbox expansion from %.2fm needs ARKit vote",
+              metric, estimate.anchorLabel, estimate.anchorDepth, estimate.ratio, oldDepth)
+        return false
+      }
     }
 
     applyPlaceAndHoldDepth(metric, source: "DAv2")
     placeAndHoldRefinementHits.removeAll()
 
-    NSLog("🅿️ [PlaceHold] 🌊 ✅ DAv2 refined depth %.2fm → %.2fm (Δ%.0fcm)",
-          oldDepth, metric, abs(metric - oldDepth) * 100)
+    NSLog("🅿️ [PlaceHold] 🌊 ✅ DAv2 refined depth %.2fm → %.2fm (Δ%.0fcm, source=%@, ratio=%.3f)",
+          oldDepth, metric, delta * 100, estimate.anchorLabel, estimate.ratio)
+    return true
   }
 
   private func tryPlaceAndHoldLockedRayDepthRefine(frame: ARFrame) {
@@ -325,10 +345,17 @@ extension ReachingViewController {
 
     let jump = abs(depth - anchorDepth)
     if jump > placeAndHoldRefinementHardJump {
-      NSLog("🅿️ [PlaceHoldRefine] Rejected %.2fm from %@ — jump %.0fcm from current %.2fm",
-            depth, candidateSource, jump * 100, anchorDepth)
-      placeAndHoldRefinementHits.removeAll()
+      _ = recordPlaceAndHoldAlternateDepth(depth, source: candidateSource)
       return
+    }
+
+    let softRebaseJump = max(anchorDepth * 0.35, 0.55)
+    if jump > softRebaseJump,
+       recordPlaceAndHoldAlternateDepth(depth, source: candidateSource) {
+      return
+    }
+    if jump < 0.30 {
+      placeAndHoldAlternateDepthHits.removeAll()
     }
 
     placeAndHoldRefinementHits.append(depth)
@@ -368,6 +395,50 @@ extension ReachingViewController {
 
     NSLog("🅿️ [PlaceHoldRefine] ✅ DEPTH LOCKED %.2fm → %.2fm (IQR %.2fm, Δ%.0fcm)",
           old, median, iqr, abs(old - median) * 100)
+  }
+
+  @discardableResult
+  private func recordPlaceAndHoldAlternateDepth(_ depth: Float, source: String) -> Bool {
+    placeAndHoldAlternateDepthHits.append(depth)
+    if placeAndHoldAlternateDepthHits.count > placeAndHoldAlternateDepthMaxHits {
+      placeAndHoldAlternateDepthHits.removeFirst()
+    }
+
+    let count = placeAndHoldAlternateDepthHits.count
+    if count <= 3 || count % 3 == 0 {
+      NSLog("🅿️ [PlaceHoldRefine] Correction candidate %.2fm via %@ — collecting alternate evidence (%d/%d)",
+            depth, source, count, placeAndHoldAlternateDepthMinHits)
+    }
+
+    guard count >= placeAndHoldAlternateDepthMinHits else { return false }
+
+    let sorted = placeAndHoldAlternateDepthHits.sorted()
+    let n = sorted.count
+    let median = n % 2 == 0 ? (sorted[n/2-1] + sorted[n/2]) / 2.0 : sorted[n/2]
+    let q1 = sorted[n/4], q3 = sorted[3*n/4]
+    let iqr = q3 - q1
+
+    guard iqr <= placeAndHoldAlternateDepthIQR else {
+      NSLog("🅿️ [PlaceHoldRefine] Alternate cluster IQR %.2fm too wide (need %.2fm)",
+            iqr, placeAndHoldAlternateDepthIQR)
+      return false
+    }
+
+    let old = anchorDepth
+    applyPlaceAndHoldDepth(median, source: "ARKit locked ray rebase")
+    placeAndHoldAlternateDepthHits.removeAll()
+    placeAndHoldRefinementHits.removeAll()
+
+    if iqr <= placeAndHoldRefinementIQR {
+      placeAndHoldDepthLocked = true
+      dav2RefineState = .done
+      NSLog("🅿️ [PlaceHoldRefine] ✅ DEPTH LOCKED %.2fm → %.2fm via alternate cluster (IQR %.2fm, Δ%.0fcm)",
+            old, median, iqr, abs(old - median) * 100)
+    } else {
+      NSLog("🅿️ [PlaceHoldRefine] ✅ REBASED %.2fm → %.2fm via alternate cluster (IQR %.2fm, Δ%.0fcm) — continuing refinement",
+            old, median, iqr, abs(old - median) * 100)
+    }
+    return true
   }
 
   private func applyPlaceAndHoldDepth(_ depth: Float, source: String) {
@@ -414,6 +485,7 @@ extension ReachingViewController {
         liveDistanceToObject = depth
         placeAndHoldDepthLocked = false
         placeAndHoldRefinementHits.removeAll()
+        placeAndHoldAlternateDepthHits.removeAll()
         placeAndHoldLastDepthSource = source
 
         // Box size from the REAL detected bbox — no cap, so the overlay
