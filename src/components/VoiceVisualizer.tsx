@@ -223,7 +223,7 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
   isReaching = false,
   isGlassesListening = false,
   transcript,
-  pulseAnim,
+  pulseAnim: _pulseAnim,
   opacityAnim: _opacityAnim,
   audioLevel: _audioLevel = 0,
   glassesDebugStatus,
@@ -391,10 +391,9 @@ export const VoiceVisualizer: React.FC<VoiceVisualizerProps> = ({
       {
         borderColor: statusColor,
         opacity: motion.outerGlowOpacity,
-        transform: [{ scale: pulseAnim }],
       },
     ],
-    [motion.outerGlowOpacity, pulseAnim, statusColor]
+    [motion.outerGlowOpacity, statusColor]
   );
 
   const ringBarsRotationStyle = useMemo(

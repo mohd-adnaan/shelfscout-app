@@ -170,6 +170,15 @@ export const getCurrentLoopDelay = (): number => {
   return continuousModeState.currentLoopDelay;
 };
 
+export const getContinuousModeRateLimitDelay = (minIntervalMs?: number): number => {
+  const { lastRequestTime } = continuousModeState;
+  if (lastRequestTime <= 0) return 0;
+
+  const minInterval = minIntervalMs ?? NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS;
+  const timeSinceLastRequest = Date.now() - lastRequestTime;
+  return Math.max(0, minInterval - timeSinceLastRequest);
+};
+
 export const startContinuousMode = (
   mode: 'navigation' | 'reaching',
   loopDelay?: number
@@ -217,18 +226,11 @@ export const stopContinuousMode = (reason?: string, resetSession: boolean = fals
   }
 };
 
-export const shouldPreventInfiniteLoop = (minIntervalMs?: number): boolean => {
-  const { iterationCount, lastRequestTime } = continuousModeState;
+export const shouldPreventInfiniteLoop = (_minIntervalMs?: number): boolean => {
+  const { iterationCount } = continuousModeState;
 
   if (iterationCount >= NAVIGATION_CONFIG.MAX_LOOP_ITERATIONS) {
     console.warn('⚠️ Max iterations reached');
-    return true;
-  }
-
-  const timeSinceLastRequest = Date.now() - lastRequestTime;
-  const minInterval = minIntervalMs ?? NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS;
-  if (lastRequestTime > 0 && timeSinceLastRequest < minInterval) {
-    console.warn('⚠️ Request rate too high');
     return true;
   }
 
@@ -688,6 +690,18 @@ function parseWorkflowResponse(
     return '';
   };
 
+  const pickStringByKeyPriority = (keys: string[]): string => {
+    for (const key of keys) {
+      for (const payload of orderedPayloads) {
+        const value = payload[key];
+        if (typeof value === 'string' && value.trim()) {
+          return value.trim();
+        }
+      }
+    }
+    return '';
+  };
+
   const pickNumber = (keys: string[]): number | undefined => {
     for (const payload of orderedPayloads) {
       for (const key of keys) {
@@ -800,19 +814,15 @@ function parseWorkflowResponse(
   );
 
   const nonReachingText = normalizeBackendString(
-    pickString(['response', 'text', 'message']),
+    pickStringByKeyPriority(['response', 'text', 'message']),
   );
 
   let text = '';
-  if (hand_direction) {
-    text = hand_direction;
-  } else if (reaching_flag || tracking_active || opts.reachingRequest === true) {
-    // Reaching context — guidance text lives in the `reaching` field.
-    // On the FIRST reaching cycle the response's own reaching_flag is often
-    // still false (the backend sets it on the NEXT response), so without
-    // opts.reachingRequest this fell through to the `else` branch and read
-    // the `response` field instead of `reaching`.
-    text = reachingText || normalizeBackendString(pickString(['text', 'message', 'response']));
+  if (opts.reachingRequest === true) {
+    // Outgoing reaching loops speak reaching-only guidance. The backend can
+    // also set reaching/tracking flags on the initial scene-description
+    // response, so those response flags must not decide the spoken field.
+    text = hand_direction || reachingText || normalizeBackendString(pickString(['text', 'message', 'response']));
   } else {
     text = nonReachingText || reachingText;
   }
@@ -837,7 +847,7 @@ function parseWorkflowResponse(
   const depth = depthValue !== undefined ? String(depthValue) : undefined;
 
   // Loop delay
-  let loopDelay = NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS;
+  let loopDelay: number = NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS;
   const loopDelayValue = pickNumber(['loopDelay']);
   if (loopDelayValue && loopDelayValue > 0) {
     loopDelay = loopDelayValue;
@@ -950,6 +960,7 @@ export default {
   getCurrentMode,
   getContinuousModeIteration,
   getCurrentLoopDelay,
+  getContinuousModeRateLimitDelay,
   startContinuousMode,
   stopContinuousMode,
   incrementContinuousMode,

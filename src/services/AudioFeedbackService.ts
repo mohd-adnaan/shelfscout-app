@@ -56,7 +56,7 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
       }
 
       Vibration.vibrate(pattern);
-      console.log(`🔊 Earcon: ${state}`);
+      console.log(`📳 Haptic: ${state}`);
       
     } catch (error: any) {
       // WCAG 3.3.1: Don't crash on vibration errors

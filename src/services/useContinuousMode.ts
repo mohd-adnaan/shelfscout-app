@@ -367,8 +367,6 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
 
     setIsNavigating(true);
     updateCycleState('capturing');
-    audioFeedback.playEarcon('listening');
-
     // Brief settle delay (camera/audio)
     await new Promise(r => setTimeout(r, 500));
 

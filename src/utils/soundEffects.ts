@@ -2,13 +2,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // CyberSight — iOS Sound Effects
 //
-// Five physical audio files replace verbal state announcements:
+// App state audio cues:
 //
-//   siri-begin-improved.caf    → Listening started  (Siri-style chime)
-//   jbl_begin_sae.caf          → Thinking started   (replaces "Thinking" TTS)
-//   jbl_latency_sae.caf        → Loops while waiting for backend response
-//   jbl_success_sae.caf        → Right before speaking the result
-//   jbl_stopped_ios_sae.mp3    → Error returned from backend
+//   soundshelfstudio-ui-notification-listening-start.mp3 → Interaction/listening started
+//   jbl_latency_sae.caf                                  → Loops while waiting for backend/RTAB
+//   jbl_success_sae.caf                                  → Right before speaking the result
+//   jbl_stopped_ios_sae.mp3                              → Error returned from backend
+//   soundshelfstudio-ui-notification-stop-reaching.wav   → Manual reaching stop
 //
 // FILE PLACEMENT (see SOUND_SETUP_GUIDE.md):
 //   iOS  → ios/<ProjectName>/sounds/<filename>  (added to Xcode bundle)
@@ -74,15 +74,13 @@ const _safeSetPlaybackCategory = (): void => {
 // Sound.setCategory('Playback', false); ← REMOVED (caused BT-HFP conflict)
 
 // ── File → bundle key map ──────────────────────────────────────────────────
-// NOTE: "jbl_stopped,IOS_sae.mp3" has been RENAMED to "jbl_stopped_ios_sae.mp3"
-// on disk. Do that rename before building.
 const SOUND_FILES: Record<string, string> = {
-  listen:   'soundshelfstudio-ui-notification-listening-start.mp3', // ← replaced siri-begin-improved.caf
+  listen:   'soundshelfstudio-ui-notification-listening-start.mp3',
   begin:    'jbl_begin_sae.caf',
   latency:  'jbl_latency_sae.caf',
   success:  'jbl_success_sae.caf',
   stopped:  'jbl_stopped_ios_sae.mp3',
-  stop_reaching: 'soundshelfstudio-ui-notification-stop-reaching.wav', // ← new sound
+  stop_reaching: 'soundshelfstudio-ui-notification-stop-reaching.wav',
 };
 
 // ── Sound instances ────────────────────────────────────────────────────────
@@ -177,10 +175,21 @@ const _playOnce = (key: SoundKey, onFinish?: () => void): void => {
 
 /**
  * Play when the app enters LISTENING state.
- * Replaces the "Listening" verbal announcement.
+ * Resolves when the cue finishes so recording can start after the full sound.
  */
-export const playListenSound = (): void => {
-  _playOnce('listen');
+export const playListenSound = (): Promise<void> => {
+  return new Promise((resolve) => _playOnce('listen', resolve));
+};
+
+export const stopListenSound = (): Promise<void> => {
+  return new Promise((resolve) => {
+    const s = sounds.listen;
+    if (!s) {
+      resolve();
+      return;
+    }
+    s.stop(() => resolve());
+  });
 };
 
 /**
@@ -237,11 +246,10 @@ export const configureBluetoothRecordingSession = async (): Promise<{
 };
 
 /**
- * Play when the app enters THINKING state (photo taken, request sent).
- * Replaces the "Thinking" verbal announcement.
- * Immediately starts the latency loop AFTER the begin tone finishes.
+ * Start the only thinking sound: the latency loop while waiting for backend/RTAB.
  */
 export const playThinkingStarted = (): void => {
+    sounds.listen?.stop(() => {});
     // Bump the generation so any in-flight callbacks from a previous loop
     // (e.g. a queued s.play() inside a pre-flight stop callback) are
     // considered superseded and silently bail out. This is the fundamental

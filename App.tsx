@@ -38,6 +38,7 @@ import {
   stopContinuousMode,
   incrementContinuousMode,
   getCurrentLoopDelay,
+  getContinuousModeRateLimitDelay,
   shouldPreventInfiniteLoop,
   updateLoopDelay,
   getSessionId,
@@ -50,6 +51,7 @@ import {
   initSounds,
   releaseSounds,
   playListenSound,
+  stopListenSound,
   playThinkingStarted,
   stopLatencyLoop,
   playSuccessChime,
@@ -177,8 +179,12 @@ function AppInner(): React.JSX.Element {
   const navigationLoopAbortRef = useRef(false);
   const isContinuousModeRunning = useRef(false);
   const continuousModeAbortRef = useRef(false);
+  const continuousBackendInFlightRef = useRef(false);
+  const continuousTtsSpeakingRef = useRef(false);
+  const continuousTtsGenerationRef = useRef(0);
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
   const prefetchedPhotoRef = useRef<string | null>(null);
+  const activeCapturePromiseRef = useRef<Promise<string> | null>(null);
   const wearablesPrewarmAttemptedRef = useRef(false);
   const smartGuidanceActiveRef = useRef(false);
   const smartGuidanceResumeMainRef = useRef(false);
@@ -197,8 +203,10 @@ function AppInner(): React.JSX.Element {
   const reacquiringRef = useRef(false);
   const kasraFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const kasraLastFrameRef = useRef<string>('');
+  const kasraLastSentFrameRef = useRef<string>('');
   const kasraLastObjectRef = useRef<string>('');
   const kasraIsSendingRef = useRef(false);
+  const kasraFrameSeqRef = useRef(0);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -570,97 +578,119 @@ function AppInner(): React.JSX.Element {
   useEffect(() => {
     waitForGoodPostureRef.current = waitForGoodPosture;
   }, [waitForGoodPosture]);
-  const reactivateCameraAndCapture = async (options?: {
+  const reactivateCameraAndCapture = useCallback(async (options?: {
     enableShutterSound?: boolean;
+    busyStrategy?: 'wait' | 'skip';
   }): Promise<string> => {
     if (isCapturingRef.current) {
-      console.log('📷 Capture already in progress, returning last known frame...');
-      return kasraLastFrameRef.current || '';
-    }
-    isCapturingRef.current = true;
-    try {
-      console.log('📷 Reactivating camera for capture...');
-      setIsCameraActive(true);
-
-    const useSystemShutterSound =
-      options?.enableShutterSound === true &&
-      Platform.OS === 'ios' &&
-      !settingsRef.current.useWearablesCamera;
-
-    if (settingsRef.current.useWearablesCamera) {
-      try {
-        const wearablesPhoto = await wearablesCamera.capturePhoto();
-        lastImageDimensions.current = { width: 0, height: 0 };
-        return wearablesPhoto;
-      } catch (error) {
-        console.error('❌ Wearables capture failed:', error);
-        throw error;
-      }
-    }
-
-    await new Promise(resolve => setTimeout(resolve, CAMERA_REACTIVATION_DELAY_MS));
-
-    if (!cameraRef.current) {
-      console.error('❌ Camera ref not available after reactivation');
-      return '';
-    }
-
-    try {
-      if (useSystemShutterSound) {
-        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
-        const { ReachingModule } = NativeModules;
-        if (ReachingModule?.playSystemShutter) {
-          try {
-            await ReachingModule.playSystemShutter();
-          } catch (e: any) {
-            console.warn('⚠️ System shutter sound failed:', e?.message || e);
-          }
-        } else {
-          console.warn('⚠️ System shutter unavailable — rebuild iOS app');
-        }
-      }
-      const photo = await cameraRef.current.takePhoto({
-        enableShutterSound: useSystemShutterSound,
-        flash: 'off',
-      });
-      const fixedImage = await fixImageOrientation(photo.path);
-      lastImageDimensions.current = {
-        width: fixedImage.width || 0,
-        height: fixedImage.height || 0,
-      };
-      console.log('✅ Photo captured & fixed:', fixedImage.uri,
-        `(${fixedImage.width}×${fixedImage.height})`);
-      return fixedImage.uri;
-    } catch (error) {
-      console.error('❌ Photo capture failed, retrying:', error);
-      await new Promise(resolve => setTimeout(resolve, 500));
-      try {
-        if (useSystemShutterSound) {
-          await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
-          const { ReachingModule } = NativeModules;
-          if (ReachingModule?.playSystemShutter) {
-            try {
-              await ReachingModule.playSystemShutter();
-            } catch (e: any) {
-              console.warn('⚠️ System shutter sound failed (retry):', e?.message || e);
-            }
-          } else {
-            console.warn('⚠️ System shutter unavailable (retry) — rebuild iOS app');
-          }
-        }
-        const retry = await cameraRef.current.takePhoto({
-          enableShutterSound: useSystemShutterSound,
-        });
-        return retry.path;
-      } catch (e) {
-        console.error('❌ Retry also failed:', e);
+      if (options?.busyStrategy === 'skip') {
+        console.log('📷 Capture already in progress, skipping fresh-frame request...');
         return '';
       }
+
+      if (activeCapturePromiseRef.current) {
+        console.log('📷 Capture already in progress, waiting for fresh frame...');
+        return activeCapturePromiseRef.current;
+      }
+
+      console.log('📷 Capture already in progress, no active promise to await.');
+      return '';
     }
-    } finally {
-      isCapturingRef.current = false;
-    }
-  };
+    isCapturingRef.current = true;
+
+    const capturePromise = (async (): Promise<string> => {
+      try {
+        console.log('📷 Reactivating camera for capture...');
+        setIsCameraActive(true);
+
+        const useSystemShutterSound =
+          options?.enableShutterSound === true &&
+          Platform.OS === 'ios' &&
+          !settingsRef.current.useWearablesCamera;
+
+        if (settingsRef.current.useWearablesCamera) {
+          try {
+            const wearablesPhoto = await wearablesCamera.capturePhoto();
+            lastImageDimensions.current = { width: 0, height: 0 };
+            return wearablesPhoto;
+          } catch (error) {
+            console.error('❌ Wearables capture failed:', error);
+            throw error;
+          }
+        }
+
+        await new Promise(resolve => setTimeout(resolve, CAMERA_REACTIVATION_DELAY_MS));
+
+        if (!cameraRef.current) {
+          console.error('❌ Camera ref not available after reactivation');
+          return '';
+        }
+
+        try {
+          if (useSystemShutterSound) {
+            await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+            const { ReachingModule } = NativeModules;
+            if (ReachingModule?.playSystemShutter) {
+              try {
+                await ReachingModule.playSystemShutter();
+              } catch (e: any) {
+                console.warn('⚠️ System shutter sound failed:', e?.message || e);
+              }
+            } else {
+              console.warn('⚠️ System shutter unavailable — rebuild iOS app');
+            }
+          }
+          const photo = await cameraRef.current.takePhoto({
+            enableShutterSound: useSystemShutterSound,
+            flash: 'off',
+          });
+          const fixedImage = await fixImageOrientation(photo.path);
+          lastImageDimensions.current = {
+            width: fixedImage.width || 0,
+            height: fixedImage.height || 0,
+          };
+          console.log('✅ Photo captured & fixed:', fixedImage.uri,
+            `(${fixedImage.width}×${fixedImage.height})`);
+          return fixedImage.uri;
+        } catch (error) {
+          console.error('❌ Photo capture failed, retrying:', error);
+          await new Promise(resolve => setTimeout(resolve, 500));
+          try {
+            if (useSystemShutterSound) {
+              await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+              const { ReachingModule } = NativeModules;
+              if (ReachingModule?.playSystemShutter) {
+                try {
+                  await ReachingModule.playSystemShutter();
+                } catch (e: any) {
+                  console.warn('⚠️ System shutter sound failed (retry):', e?.message || e);
+                }
+              } else {
+                console.warn('⚠️ System shutter unavailable (retry) — rebuild iOS app');
+              }
+            }
+            const retry = await cameraRef.current.takePhoto({
+              enableShutterSound: useSystemShutterSound,
+            });
+            return retry.path;
+          } catch (e) {
+            console.error('❌ Retry also failed:', e);
+            return '';
+          }
+        }
+      } finally {
+        isCapturingRef.current = false;
+        activeCapturePromiseRef.current = null;
+      }
+    })();
+
+    activeCapturePromiseRef.current = capturePromise;
+    return capturePromise;
+  }, []);
+  const reactivateCameraAndCaptureRef = useRef(reactivateCameraAndCapture);
+  useEffect(() => {
+    reactivateCameraAndCaptureRef.current = reactivateCameraAndCapture;
+  }, [reactivateCameraAndCapture]);
 
   const toDataUrl = (value: string): string => {
     if (!value) return '';
@@ -751,6 +781,8 @@ function AppInner(): React.JSX.Element {
       kasraFeedIntervalRef.current = null;
     }
     kasraIsSendingRef.current = false;
+    kasraLastSentFrameRef.current = '';
+    kasraFrameSeqRef.current = 0;
   }, []);
 
   const startKasraFeed = useCallback(() => {
@@ -767,10 +799,26 @@ function AppInner(): React.JSX.Element {
       try {
         // Capture a NEW frame here so RTAB gets a fresh image every interval,
         // rather than sending the exact same image multiple times.
-        const photoPath = await reactivateCameraAndCapture({ enableShutterSound: false });
+        const photoPath = await reactivateCameraAndCapture({
+          enableShutterSound: false,
+          busyStrategy: 'skip',
+        });
         if (photoPath) {
+          if (photoPath === kasraLastSentFrameRef.current) {
+            console.warn('[Kasra] Skipping duplicate frame URI:', photoPath);
+            return;
+          }
+
+          const capturedAtMs = Date.now();
+          const frameId = `rtab-${capturedAtMs}-${++kasraFrameSeqRef.current}`;
           kasraLastFrameRef.current = photoPath;
-          await sendToKasraGuidance({ imageUri: photoPath, objectName });
+          kasraLastSentFrameRef.current = photoPath;
+          await sendToKasraGuidance({
+            imageUri: photoPath,
+            objectName,
+            frameId,
+            capturedAtMs,
+          });
         }
       } catch (err: any) {
         console.warn('[Kasra] Guidance send failed:', err?.message || err);
@@ -890,6 +938,13 @@ function AppInner(): React.JSX.Element {
 
         console.log('✅ [ARKit] Native result:', reachingResult);
 
+        if (
+          (reachingResult?.reason === 'user_confirmed' || reachingResult?.reason === 'user_cancelled') &&
+          !screenReaderEnabledRef.current
+        ) {
+          await playStopReachingSound();
+        }
+
         // Manual exit: reason will be "user_confirmed" or "ar_error"
         const msg = reachingResult?.reason === 'user_confirmed'
           ? 'Reaching complete.'
@@ -935,6 +990,9 @@ function AppInner(): React.JSX.Element {
 
     isContinuousModeRunning.current = true;
     continuousModeAbortRef.current = false;
+    continuousBackendInFlightRef.current = false;
+    continuousTtsSpeakingRef.current = false;
+    continuousTtsGenerationRef.current++;
     prefetchedPhotoRef.current = null;
     smartGuidanceSeededRef.current = false;
     reacquiringRef.current = false;
@@ -953,10 +1011,22 @@ function AppInner(): React.JSX.Element {
         reacquiringRef.current = false;
       }
 
-      const minIntervalOverride = smartGuidanceActiveRef.current
+      const fastReachingCycle =
+        smartGuidanceActiveRef.current ||
+        smartGuidanceResumeMainRef.current ||
+        reacquiringRef.current;
+
+      const minIntervalOverride = fastReachingCycle
         ? SMART_GUIDANCE_MIN_CYCLE_MS
-        : undefined;
-      if (shouldPreventInfiniteLoop(minIntervalOverride)) {
+        : Math.max(NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS, getCurrentLoopDelay());
+      const rateLimitDelay = getContinuousModeRateLimitDelay(minIntervalOverride);
+      if (rateLimitDelay > 0) {
+        console.log(`🔄 [ContinuousMode] Rate-limit cooldown: ${rateLimitDelay}ms`);
+        await new Promise<void>(resolve => setTimeout(resolve, rateLimitDelay));
+        if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
+      }
+
+      if (shouldPreventInfiniteLoop()) {
         AccessibilityInfo.announceForAccessibility('Stopped due to time limit.');
         break;
       }
@@ -990,7 +1060,7 @@ function AppInner(): React.JSX.Element {
           console.log('🔄 ✅ Using Kasra feed photo for backend');
           photoPath = kasraLastFrameRef.current;
         } else {
-          photoPath = await reactivateCameraAndCapture({
+          photoPath = await reactivateCameraAndCaptureRef.current({
             enableShutterSound: false,
           });
         }
@@ -1011,7 +1081,7 @@ function AppInner(): React.JSX.Element {
         // sending an imageless request.
         if (!photoPath && loopMode === 'reaching') {
           console.warn('🔄 [Reaching] Empty capture — retrying once before send');
-          photoPath = await reactivateCameraAndCapture({ enableShutterSound: false });
+          photoPath = await reactivateCameraAndCaptureRef.current({ enableShutterSound: false });
           if (!photoPath) {
             console.warn('🔄 [Reaching] Still no image — skipping cycle, will retry');
             await new Promise(r => setTimeout(r, SMART_GUIDANCE_MIN_CYCLE_MS));
@@ -1026,8 +1096,14 @@ function AppInner(): React.JSX.Element {
         const abortCtrl = new AbortController();
         abortControllerRef.current = abortCtrl;
 
-        // Skip SFX when VoiceOver is on or in glasses mode (BluetoothHFP audio session conflict)
-        if (!screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera) {
+        continuousBackendInFlightRef.current = true;
+        // Skip SFX when VoiceOver is on or in glasses mode (BluetoothHFP audio session conflict).
+        // During navigation/RTAB, this fills the otherwise-silent wait between spoken responses.
+        if (
+          !continuousTtsSpeakingRef.current &&
+          !screenReaderEnabledRef.current &&
+          !settingsRef.current.useWearablesCamera
+        ) {
           playThinkingStarted(); // ← start thinking SFX for this cycle
         }
 
@@ -1152,10 +1228,9 @@ function AppInner(): React.JSX.Element {
           }
         }
 
-        if (loopMode !== 'navigation') {
-          await stopLatencyLoop(); // ← stop thinking SFX when result arrives
-          await stopLatencyLoop(); // Bug 3 defense: second stop for audio session race
-        }
+        continuousBackendInFlightRef.current = false;
+        await stopLatencyLoop(); // ← stop thinking SFX when result arrives
+        await stopLatencyLoop(); // Bug 3 defense: second stop for audio session race
         setIsProcessing(false);
 
 
@@ -1398,11 +1473,25 @@ function AppInner(): React.JSX.Element {
         // This is correct behaviour — the user has moved since the old guidance.
         //
         if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
+          const ttsGeneration = ++continuousTtsGenerationRef.current;
+          continuousTtsSpeakingRef.current = true;
           setIsSpeaking(true);
           // Fire TTS — do NOT await. Loop proceeds to next capture immediately.
           speachesSentenceChunker.synthesizeSpeechChunked(result.text)
             .then(() => {
+              if (continuousTtsGenerationRef.current !== ttsGeneration) return;
+              continuousTtsSpeakingRef.current = false;
               setIsSpeaking(false);
+              if (
+                continuousBackendInFlightRef.current &&
+                isContinuousModeRunning.current &&
+                !continuousModeAbortRef.current &&
+                !isEmergencyStopped.current &&
+                !screenReaderEnabledRef.current &&
+                !settingsRef.current.useWearablesCamera
+              ) {
+                playThinkingStarted();
+              }
               // Bug 4 defense: if no next cycle is running yet (e.g. the
               // loop aborted between fire-and-forget start and now),
               // make sure the latency thinking sound isn't left playing.
@@ -1411,7 +1500,19 @@ function AppInner(): React.JSX.Element {
               }
             })
             .catch((e: any) => {
+              if (continuousTtsGenerationRef.current !== ttsGeneration) return;
+              continuousTtsSpeakingRef.current = false;
               setIsSpeaking(false);
+              if (
+                continuousBackendInFlightRef.current &&
+                isContinuousModeRunning.current &&
+                !continuousModeAbortRef.current &&
+                !isEmergencyStopped.current &&
+                !screenReaderEnabledRef.current &&
+                !settingsRef.current.useWearablesCamera
+              ) {
+                playThinkingStarted();
+              }
               if (!isContinuousModeRunning.current) {
                 stopLatencyLoop().catch(() => { });
               }
@@ -1421,7 +1522,7 @@ function AppInner(): React.JSX.Element {
             });
         } else if (isNullResponse) {
           // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
-          const nullCooldown = smartGuidanceActiveRef.current
+          const nullCooldown = fastReachingCycle
             ? SMART_GUIDANCE_MIN_CYCLE_MS
             : 500;
           console.log(`🔄 ⏭️ Null fast-poll — waiting ${nullCooldown}ms before next cycle`);
@@ -1432,9 +1533,9 @@ function AppInner(): React.JSX.Element {
         // prevents hammering the backend faster than it can handle.
         // TTS is already playing in background; this does NOT wait for it.
         if (!isNullResponse && !continuousModeAbortRef.current) {
-          const minCycleMs = smartGuidanceActiveRef.current
+          const minCycleMs = fastReachingCycle
             ? SMART_GUIDANCE_MIN_CYCLE_MS
-            : PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN;
+            : Math.max(PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN, getCurrentLoopDelay());
           const elapsed = Date.now() - cycleStart;
           const cooldown = Math.max(0, minCycleMs - elapsed);
           if (cooldown > 0) {
@@ -1451,6 +1552,14 @@ function AppInner(): React.JSX.Element {
       } catch (error: any) {
         console.error('🔄 [ContinuousMode] Error:', error);
         if (error.message?.includes('cancel')) break;
+        continuousBackendInFlightRef.current = false;
+        continuousTtsSpeakingRef.current = false;
+        continuousTtsGenerationRef.current++;
+        await stopLatencyLoop();
+        if (!screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera) {
+          audioFeedback.playEarcon('cancel');
+          await playErrorSound();
+        }
         AccessibilityInfo.announceForAccessibility(`Error: ${error.message}`);
         break;
       }
@@ -1461,6 +1570,9 @@ function AppInner(): React.JSX.Element {
     await stopLatencyLoop();
     stopKasraFeed();
     isContinuousModeRunning.current = false;
+    continuousBackendInFlightRef.current = false;
+    continuousTtsSpeakingRef.current = false;
+    continuousTtsGenerationRef.current++;
     stopContinuousMode('loop ended', false);
     smartGuidanceActiveRef.current = false;
     smartGuidanceResumeMainRef.current = false;
@@ -1486,6 +1598,15 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   const stopContinuousModeLoop = useCallback(async () => {
     console.log('🛑 Stopping continuous mode');
+    const wasContinuous =
+      isNavigation ||
+      isContinuousModeRunning.current ||
+      isReaching ||
+      getCurrentMode() === 'navigation' ||
+      getCurrentMode() === 'reaching' ||
+      smartGuidanceActiveRef.current ||
+      smartGuidanceResumeMainRef.current ||
+      reacquiringRef.current;
     continuousModeAbortRef.current = true;
     stopKasraFeed();
 
@@ -1506,10 +1627,12 @@ function AppInner(): React.JSX.Element {
 
     if (!screenReaderEnabledRef.current) { 
       audioFeedback.playEarcon('cancel'); 
-      playStopReachingSound();
+      if (wasContinuous) {
+        await playStopReachingSound();
+      }
     }
     announceTapToStart('Stopped.');
-  }, [announceTapToStart, stopKasraFeed]);
+  }, [announceTapToStart, isNavigation, isReaching, stopKasraFeed]);
 
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
@@ -1525,7 +1648,7 @@ function AppInner(): React.JSX.Element {
     setIsCameraActive(true);
     if (!screenReaderEnabledRef.current) { 
       audioFeedback.playEarcon('cancel'); 
-      playStopReachingSound();
+      await playStopReachingSound();
     }
     announceTapToStart('Navigation stopped.');
   }, [announceTapToStart, stopKasraFeed]);
@@ -1564,7 +1687,7 @@ function AppInner(): React.JSX.Element {
         // FIX: Restore full-volume audio session after STT's Record+Measurement
         await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
-        audioFeedback.playEarcon('thinking');
+        await stopListenSound();
         playThinkingStarted();
       }
 
@@ -1812,6 +1935,8 @@ function AppInner(): React.JSX.Element {
       prewarmDAv2InBackground('voice command');
     }
 
+    await stopListenSound();
+
     const postureOk = await waitForGoodPostureRef.current('capture');
     if (!postureOk) {
       setIsProcessing(false);
@@ -1823,17 +1948,6 @@ function AppInner(): React.JSX.Element {
 
     setIsProcessing(true);
     isCapturingPhotoRef.current = true;
-    if (!screenReaderEnabledRef.current) {
-      audioFeedback.playEarcon('thinking');
-    }
-    // ── Bug 1 fix: Only announce 'Thinking' when VoiceOver is OFF. ──────
-    // When VoiceOver is ON, the button's accessibilityLabel already changes
-    // to 'Thinking' (via isProcessing state), and VoiceOver reads that
-    // automatically. A manual announcement creates double-speech.
-    if (!screenReaderEnabledRef.current) {
-      AccessibilityInfo.announceForAccessibility('Thinking');
-    }
-
     try {
       try { await cancelSTT(); } catch { }
 
@@ -1847,8 +1961,8 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture({
-          enableShutterSound: true,
+        photoPath = await reactivateCameraAndCaptureRef.current({
+          enableShutterSound: false,
         });
       } catch (e: any) {
         console.error('❌ Camera error:', e);
@@ -1946,13 +2060,6 @@ function AppInner(): React.JSX.Element {
 
     setIsProcessing(true);
     isCapturingPhotoRef.current = true;
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('thinking'); }
-    // Bug 1 fix: Only announce 'Thinking' when VoiceOver is OFF —
-    // the label change to 'Thinking' is read automatically by VoiceOver.
-    if (!screenReaderEnabledRef.current) {
-      AccessibilityInfo.announceForAccessibility('Thinking');
-    }
-
     try {
       // Configure audio for playback before capture/backend call.
       // Skip in glasses mode — audio session is locked by BluetoothHFP.
@@ -1962,7 +2069,7 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture({ enableShutterSound: false });
+        photoPath = await reactivateCameraAndCaptureRef.current({ enableShutterSound: false });
       } catch (e: any) {
         console.error('❌ [WakeWord] Camera error:', e);
         if (isWearablesCaptureError(e)) {
@@ -2000,12 +2107,7 @@ function AppInner(): React.JSX.Element {
   }, []);
   const handleWakeWordHeard = useCallback(() => {
     console.log('🎤 [WakeWord] Wake phrase detected!');
-    if (!screenReaderEnabledRef.current) {
-      audioFeedback.playEarcon('listening');
-    }
-    // VoiceOver reads the label change to "Listening" automatically.
-    announceIfNoVoiceOver('Listening');
-  }, [announceIfNoVoiceOver]);
+  }, []);
 
   const {
     isAwaitingWakeWord,
@@ -2089,14 +2191,9 @@ function AppInner(): React.JSX.Element {
         // route — matching the reaching pipeline's audio config.
         await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
-        audioFeedback.playEarcon('listening');
-        playListenSound();
+        await playListenSound();
 
-        // ✅ FIX: The earcon sets Sound.setCategory('Playback', false) which
-        // locks the audio session in exclusive-playback mode. Voice.start()
-        // needs PlayAndRecord. Reset the category BEFORE starting STT so the
-        // mic can be acquired. PlayAndRecord allows the earcon to keep playing
-        // while recording begins simultaneously.
+        // The listening cue is finished now; switch to recording for STT.
         prepareForRecording();
       }
 
@@ -2150,15 +2247,12 @@ function AppInner(): React.JSX.Element {
       }
 
       isCapturingPhotoRef.current = true;
-      if (!screenReaderEnabled) { audioFeedback.playEarcon('thinking'); }
-      // Label change to "Thinking" already announces this for VoiceOver users.
-      announceIfNoVoiceOver('Thinking');
       await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
       if (isEmergencyStopped.current) { isCapturingPhotoRef.current = false; return; }
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture({
+        photoPath = await reactivateCameraAndCaptureRef.current({
           enableShutterSound: true,
         });
       } catch (e: any) {
