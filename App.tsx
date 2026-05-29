@@ -202,11 +202,12 @@ function AppInner(): React.JSX.Element {
   // exiting on bothInactive.
   const reacquiringRef = useRef(false);
   const kasraFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const kasraLastFrameRef = useRef<string>('');
   const kasraLastSentFrameRef = useRef<string>('');
   const kasraLastObjectRef = useRef<string>('');
   const kasraIsSendingRef = useRef(false);
   const kasraFrameSeqRef = useRef(0);
+  const rtabSubmittedFrameUrisRef = useRef<Set<string>>(new Set());
+  const rtabSubmittedFrameQueueRef = useRef<string[]>([]);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -580,7 +581,7 @@ function AppInner(): React.JSX.Element {
   }, [waitForGoodPosture]);
   const reactivateCameraAndCapture = useCallback(async (options?: {
     enableShutterSound?: boolean;
-    busyStrategy?: 'wait' | 'skip';
+    busyStrategy?: 'wait' | 'skip' | 'wait-new';
   }): Promise<string> => {
     if (isCapturingRef.current) {
       if (options?.busyStrategy === 'skip') {
@@ -588,13 +589,31 @@ function AppInner(): React.JSX.Element {
         return '';
       }
 
-      if (activeCapturePromiseRef.current) {
+      if (options?.busyStrategy === 'wait-new') {
+        if (activeCapturePromiseRef.current) {
+          console.log('📷 Capture already in progress, waiting before fresh-frame request...');
+          try {
+            await activeCapturePromiseRef.current;
+          } catch {
+            // The follow-up capture below is the one the caller will use.
+          }
+        } else {
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
+        }
+
+        if (isCapturingRef.current) {
+          console.log('📷 Capture still in progress after wait; skipping fresh-frame request...');
+          return '';
+        }
+      } else if (activeCapturePromiseRef.current) {
         console.log('📷 Capture already in progress, waiting for fresh frame...');
         return activeCapturePromiseRef.current;
       }
 
-      console.log('📷 Capture already in progress, no active promise to await.');
-      return '';
+      if (isCapturingRef.current) {
+        console.log('📷 Capture already in progress, no active promise to await.');
+        return '';
+      }
     }
     isCapturingRef.current = true;
 
@@ -775,6 +794,24 @@ function AppInner(): React.JSX.Element {
     return undefined;
   };
 
+  const rememberRtabSubmittedFrame = useCallback((photoPath: string) => {
+    if (!photoPath || rtabSubmittedFrameUrisRef.current.has(photoPath)) return;
+
+    rtabSubmittedFrameUrisRef.current.add(photoPath);
+    rtabSubmittedFrameQueueRef.current.push(photoPath);
+
+    while (rtabSubmittedFrameQueueRef.current.length > 120) {
+      const oldest = rtabSubmittedFrameQueueRef.current.shift();
+      if (oldest) {
+        rtabSubmittedFrameUrisRef.current.delete(oldest);
+      }
+    }
+  }, []);
+
+  const hasSubmittedRtabFrame = useCallback((photoPath: string) => {
+    return !!photoPath && rtabSubmittedFrameUrisRef.current.has(photoPath);
+  }, []);
+
   const stopKasraFeed = useCallback(() => {
     if (kasraFeedIntervalRef.current) {
       clearInterval(kasraFeedIntervalRef.current);
@@ -804,6 +841,11 @@ function AppInner(): React.JSX.Element {
           busyStrategy: 'skip',
         });
         if (photoPath) {
+          if (hasSubmittedRtabFrame(photoPath)) {
+            console.warn('[Kasra] Skipping frame already submitted to RTAB:', photoPath);
+            return;
+          }
+
           if (photoPath === kasraLastSentFrameRef.current) {
             console.warn('[Kasra] Skipping duplicate frame URI:', photoPath);
             return;
@@ -811,8 +853,8 @@ function AppInner(): React.JSX.Element {
 
           const capturedAtMs = Date.now();
           const frameId = `rtab-${capturedAtMs}-${++kasraFrameSeqRef.current}`;
-          kasraLastFrameRef.current = photoPath;
           kasraLastSentFrameRef.current = photoPath;
+          rememberRtabSubmittedFrame(photoPath);
           await sendToKasraGuidance({
             imageUri: photoPath,
             objectName,
@@ -826,7 +868,7 @@ function AppInner(): React.JSX.Element {
         kasraIsSendingRef.current = false;
       }
     }, KASRA_FEED_INTERVAL_MS);
-  }, [reactivateCameraAndCapture]);
+  }, [hasSubmittedRtabFrame, reactivateCameraAndCapture, rememberRtabSubmittedFrame]);
 
   // ============================================================================
   // iOS Reaching helper — shared by both reaching blocks
@@ -994,6 +1036,9 @@ function AppInner(): React.JSX.Element {
     continuousTtsSpeakingRef.current = false;
     continuousTtsGenerationRef.current++;
     prefetchedPhotoRef.current = null;
+    kasraLastSentFrameRef.current = '';
+    rtabSubmittedFrameUrisRef.current.clear();
+    rtabSubmittedFrameQueueRef.current = [];
     smartGuidanceSeededRef.current = false;
     reacquiringRef.current = false;
     let cycleCount = 0;
@@ -1054,24 +1099,44 @@ function AppInner(): React.JSX.Element {
           photoPath = prefetchedPhotoRef.current;
           prefetchedPhotoRef.current = null;
           console.log('🔄 ✅ Using PRE-FETCHED photo');
-        } else if (loopMode === 'navigation' && kasraFeedIntervalRef.current && kasraLastFrameRef.current) {
-          // If Kasra feed is already capturing at a high frame rate, reuse its latest frame
-          // to avoid concurrent hardware camera locks and maintain the fast loop speed.
-          console.log('🔄 ✅ Using Kasra feed photo for backend');
-          photoPath = kasraLastFrameRef.current;
         } else {
           photoPath = await reactivateCameraAndCaptureRef.current({
             enableShutterSound: false,
+            // Navigation workflow and the direct Kasra feed both end up at RTAB.
+            // Wait for an in-flight Kasra capture, then take our own frame so
+            // the same local JPEG is never posted through both routes.
+            busyStrategy: loopMode === 'navigation' ? 'wait-new' : 'wait',
           });
         }
 
         if (loopMode === 'navigation') {
+          if (photoPath && hasSubmittedRtabFrame(photoPath)) {
+            console.warn('🔄 [Navigation] Captured frame was already submitted to RTAB — recapturing once');
+            photoPath = await reactivateCameraAndCaptureRef.current({
+              enableShutterSound: false,
+              busyStrategy: 'wait-new',
+            });
+          }
+
+          if (photoPath && hasSubmittedRtabFrame(photoPath)) {
+            console.warn('🔄 [Navigation] Recapture still matched an RTAB-submitted frame — skipping cycle');
+            photoPath = '';
+          }
+
           if (photoPath) {
-            kasraLastFrameRef.current = photoPath;
+            rememberRtabSubmittedFrame(photoPath);
           }
           startKasraFeed();
         } else {
           stopKasraFeed();
+        }
+
+        if (!photoPath && loopMode === 'navigation') {
+          console.warn('🔄 [Navigation] Empty capture — skipping cycle, will retry');
+          await new Promise<void>(resolve =>
+            setTimeout(() => resolve(), Math.max(300, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN))
+          );
+          continue;
         }
 
         // Issue 3: never POST a reaching request without an image. A failed
@@ -1591,7 +1656,16 @@ function AppInner(): React.JSX.Element {
     if (settingsRef.current.useWearablesCamera) {
       wakeWordResumeRef.current?.();
     }
-  }, [announceTapToStart, handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed, waitForGoodPosture]);
+  }, [
+    announceTapToStart,
+    handleiOSReaching,
+    hasSubmittedRtabFrame,
+    rememberRtabSubmittedFrame,
+    resolveReachingPipeline,
+    startKasraFeed,
+    stopKasraFeed,
+    waitForGoodPosture,
+  ]);
 
   // ============================================================================
   // Stop helpers
