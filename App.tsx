@@ -182,6 +182,9 @@ function AppInner(): React.JSX.Element {
   const continuousBackendInFlightRef = useRef(false);
   const continuousTtsSpeakingRef = useRef(false);
   const continuousTtsGenerationRef = useRef(0);
+  const continuousSpeechQueueRef = useRef<string[]>([]);
+  const continuousSpeechDrainingRef = useRef(false);
+  const continuousSpeechCurrentTextRef = useRef('');
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
   const prefetchedPhotoRef = useRef<string | null>(null);
   const activeCapturePromiseRef = useRef<Promise<string> | null>(null);
@@ -870,6 +873,108 @@ function AppInner(): React.JSX.Element {
     }, KASRA_FEED_INTERVAL_MS);
   }, [hasSubmittedRtabFrame, reactivateCameraAndCapture, rememberRtabSubmittedFrame]);
 
+  const resetContinuousSpeechQueue = useCallback(() => {
+    continuousSpeechQueueRef.current = [];
+    continuousSpeechCurrentTextRef.current = '';
+    continuousSpeechDrainingRef.current = false;
+  }, []);
+
+  const drainContinuousSpeechQueue = useCallback(async () => {
+    if (continuousSpeechDrainingRef.current) return;
+
+    const drainGeneration = continuousTtsGenerationRef.current;
+    continuousSpeechDrainingRef.current = true;
+    continuousTtsSpeakingRef.current = true;
+    setIsSpeaking(true);
+
+    try {
+      while (
+        continuousTtsGenerationRef.current === drainGeneration &&
+        !continuousModeAbortRef.current &&
+        !isEmergencyStopped.current
+      ) {
+        const nextText = continuousSpeechQueueRef.current.shift();
+        if (!nextText) break;
+
+        continuousSpeechCurrentTextRef.current = nextText;
+        try {
+          await speachesSentenceChunker.synthesizeSpeechChunked(nextText);
+        } catch (e: any) {
+          if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+            console.warn('🔄 [ContinuousMode] Queued TTS error (non-fatal):', e?.message);
+          }
+        }
+
+        if (
+          continuousBackendInFlightRef.current &&
+          isContinuousModeRunning.current &&
+          !continuousModeAbortRef.current &&
+          !isEmergencyStopped.current &&
+          !screenReaderEnabledRef.current &&
+          !settingsRef.current.useWearablesCamera
+        ) {
+          playThinkingStarted();
+        }
+      }
+    } finally {
+      if (continuousTtsGenerationRef.current === drainGeneration) {
+        continuousSpeechCurrentTextRef.current = '';
+        continuousSpeechDrainingRef.current = false;
+        continuousTtsSpeakingRef.current = false;
+        setIsSpeaking(false);
+
+        if (!isContinuousModeRunning.current) {
+          stopLatencyLoop().catch(() => { });
+        }
+      }
+    }
+  }, []);
+
+  const enqueueContinuousSpeech = useCallback((text: string) => {
+    const spoken = (text || '').trim();
+    if (!spoken || continuousModeAbortRef.current || isEmergencyStopped.current) return;
+
+    const pending = continuousSpeechQueueRef.current;
+    const alreadySpeaking = continuousSpeechDrainingRef.current &&
+      continuousSpeechCurrentTextRef.current === spoken;
+    const alreadyPending = pending.length > 0 && pending[pending.length - 1] === spoken;
+
+    if (alreadySpeaking || alreadyPending) {
+      console.log('🔄 [ContinuousMode] Skipping duplicate queued TTS');
+      return;
+    }
+
+    // Let the current instruction finish, but collapse any unsaid backlog into
+    // the newest backend guidance so speech does not lag behind navigation.
+    continuousSpeechQueueRef.current = [spoken];
+    drainContinuousSpeechQueue().catch((e: any) => {
+      if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+        console.warn('🔄 [ContinuousMode] TTS queue drain failed:', e?.message);
+      }
+    });
+  }, [drainContinuousSpeechQueue]);
+
+  const waitForContinuousSpeechQueueIdle = useCallback(async (options?: { ignoreAbort?: boolean }) => {
+    while (
+      continuousSpeechDrainingRef.current &&
+      !isEmergencyStopped.current &&
+      (options?.ignoreAbort === true || !continuousModeAbortRef.current)
+    ) {
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
+    }
+  }, []);
+
+  const speakContinuousSpeechAndWait = useCallback(async (
+    text: string,
+    options?: { ignoreAbort?: boolean }
+  ) => {
+    const spoken = (text || '').trim();
+    if (!spoken || isEmergencyStopped.current) return;
+
+    enqueueContinuousSpeech(spoken);
+    await waitForContinuousSpeechQueueIdle(options);
+  }, [enqueueContinuousSpeech, waitForContinuousSpeechQueueIdle]);
+
   // ============================================================================
   // iOS Reaching helper — shared by both reaching blocks
   // Accepts the full result + image dims, calls ReachingModule, resets state.
@@ -1035,6 +1140,7 @@ function AppInner(): React.JSX.Element {
     continuousBackendInFlightRef.current = false;
     continuousTtsSpeakingRef.current = false;
     continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     prefetchedPhotoRef.current = null;
     kasraLastSentFrameRef.current = '';
     rtabSubmittedFrameUrisRef.current.clear();
@@ -1333,7 +1439,7 @@ function AppInner(): React.JSX.Element {
         // ── Structured debug log (EVERY cycle) ────────────────────────────
         const cycleElapsed = Date.now() - cycleStart;
         debugLogger.logAPI(
-          `🔄 Cycle #${cycleCount} | ${isNullResponse ? '⏭️ NULL' : '🔊 SPEAK'} | ${cycleElapsed}ms`,
+          `🔄 Cycle #${cycleCount} | ${isNullResponse ? '⏭️ NULL' : result.text ? '🔊 QUEUE' : '🔇 NO_TTS'} | ${cycleElapsed}ms`,
           `mode=${loopMode} nav=${result.navigation} reach=${result.reaching_flag} ios=${result.reaching_ios} smart=${usedSmartGuidance} text="${(rawText || '').substring(0, 80)}"`,
         );
 
@@ -1363,15 +1469,7 @@ function AppInner(): React.JSX.Element {
           debugLogger.logAPI('🎯 RTAB→Reaching handoff', `text="${(result.text || '').substring(0, 60)}"`);
 
           if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
-            setIsSpeaking(true);
-            try {
-              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            } catch (e: any) {
-              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
-                console.warn('⚠️ [RTAB→Reaching] arrival TTS error (non-fatal):', e?.message);
-              }
-            }
-            setIsSpeaking(false);
+            await speakContinuousSpeechAndWait(result.text);
           }
 
           if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
@@ -1400,15 +1498,12 @@ function AppInner(): React.JSX.Element {
             // ── ARKit path: intro TTS + silent ARKit bootstrap in parallel ─
             let introSpeechPromise: Promise<void> | undefined;
             if (result.text) {
-              setIsSpeaking(true);
-              introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+              introSpeechPromise = speakContinuousSpeechAndWait(result.text, { ignoreAbort: true })
                 .then(() => {
-                  setIsSpeaking(false);
                   // Bug 4 defense — see continuous-mode .then() above.
                   stopLatencyLoop().catch(() => { });
                 })
                 .catch((e: any) => {
-                  setIsSpeaking(false);
                   stopLatencyLoop().catch(() => { });
                   if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
                     console.warn('⚠️ [ARKit] Intro TTS error (non-fatal):', e?.message);
@@ -1438,9 +1533,7 @@ function AppInner(): React.JSX.Element {
             if (result.reaching_completed === true) {
               // Backend says object reached — speak final message and reset
               if (result.text) {
-                setIsSpeaking(true);
-                await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-                setIsSpeaking(false);
+                await speakContinuousSpeechAndWait(result.text);
               }
               console.log('✅ [Reaching] reaching_completed=true — resetting session');
               resetSessionId();
@@ -1454,9 +1547,7 @@ function AppInner(): React.JSX.Element {
 
         if (smartGuidanceActiveRef.current && result.reaching_completed === true) {
           if (result.text) {
-            setIsSpeaking(true);
-            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            setIsSpeaking(false);
+            await speakContinuousSpeechAndWait(result.text);
           }
           console.log('✅ [SmartGuidance] reaching_completed=true — resetting session');
           smartGuidanceActiveRef.current = false;
@@ -1473,9 +1564,7 @@ function AppInner(): React.JSX.Element {
         // signal or the user stopping — never transiently-dropped flags.
         if (reacquiringRef.current && result.reaching_completed === true) {
           if (result.text) {
-            setIsSpeaking(true);
-            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            setIsSpeaking(false);
+            await speakContinuousSpeechAndWait(result.text);
           }
           console.log('✅ [Reaching] reaching_completed during reacquisition — done');
           reacquiringRef.current = false;
@@ -1502,9 +1591,7 @@ function AppInner(): React.JSX.Element {
 
         if (bothInactive) {
           if (result.text) {
-            setIsSpeaking(true);
-            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            setIsSpeaking(false);
+            await speakContinuousSpeechAndWait(result.text);
           }
           announceIfNoVoiceOver('Task complete.');
           stopContinuousMode('both flags false', true);
@@ -1522,69 +1609,13 @@ function AppInner(): React.JSX.Element {
           result.text = ''; // Prevent downstream TTS from overlapping with transition speech
         }
 
-        // ── Speak (fire-and-forget) + immediately continue loop ───────────
+        // ── Speak sequentially while the loop keeps polling ────────────────
         //
-        // KEY FIX: Do NOT await TTS before starting the next cycle.
-        // Old pattern:  await backend → await TTS (7s) → next capture
-        //               cycle time = backend RTT + TTS duration = 8–10s
-        //
-        // New pattern:  await backend → fire TTS (no await) → next capture
-        //               cycle time = backend RTT + MIN_CYCLE_COOLDOWN = ~2s
-        //               TTS plays in background while next backend call runs.
-        //
-        // "Latest wins": if a new response arrives before current TTS finishes,
-        // speachesSentenceChunker.stop() (called at the start of each new TTS
-        // call) cuts off the stale guidance and plays the fresher one.
-        // This is correct behaviour — the user has moved since the old guidance.
-        //
+        // Keep capture/backend cadence fast, but do not start a new TTS session
+        // while another instruction is mid-sentence. The speech queue finishes
+        // the current utterance and keeps only the newest pending guidance.
         if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
-          const ttsGeneration = ++continuousTtsGenerationRef.current;
-          continuousTtsSpeakingRef.current = true;
-          setIsSpeaking(true);
-          // Fire TTS — do NOT await. Loop proceeds to next capture immediately.
-          speachesSentenceChunker.synthesizeSpeechChunked(result.text)
-            .then(() => {
-              if (continuousTtsGenerationRef.current !== ttsGeneration) return;
-              continuousTtsSpeakingRef.current = false;
-              setIsSpeaking(false);
-              if (
-                continuousBackendInFlightRef.current &&
-                isContinuousModeRunning.current &&
-                !continuousModeAbortRef.current &&
-                !isEmergencyStopped.current &&
-                !screenReaderEnabledRef.current &&
-                !settingsRef.current.useWearablesCamera
-              ) {
-                playThinkingStarted();
-              }
-              // Bug 4 defense: if no next cycle is running yet (e.g. the
-              // loop aborted between fire-and-forget start and now),
-              // make sure the latency thinking sound isn't left playing.
-              if (!isContinuousModeRunning.current) {
-                stopLatencyLoop().catch(() => { });
-              }
-            })
-            .catch((e: any) => {
-              if (continuousTtsGenerationRef.current !== ttsGeneration) return;
-              continuousTtsSpeakingRef.current = false;
-              setIsSpeaking(false);
-              if (
-                continuousBackendInFlightRef.current &&
-                isContinuousModeRunning.current &&
-                !continuousModeAbortRef.current &&
-                !isEmergencyStopped.current &&
-                !screenReaderEnabledRef.current &&
-                !settingsRef.current.useWearablesCamera
-              ) {
-                playThinkingStarted();
-              }
-              if (!isContinuousModeRunning.current) {
-                stopLatencyLoop().catch(() => { });
-              }
-              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
-                console.warn('🔄 [ContinuousMode] TTS error (non-fatal):', e?.message);
-              }
-            });
+          enqueueContinuousSpeech(result.text);
         } else if (isNullResponse) {
           // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
           const nullCooldown = fastReachingCycle
@@ -1610,7 +1641,7 @@ function AppInner(): React.JSX.Element {
 
         const cycleMs = Date.now() - cycleStart;
         debugLogger.logAPI(
-          `🔄 Cycle #${cycleCount} DONE | ${isNullResponse ? 'NULL→SKIP' : 'SPOKE'} | ${(cycleMs / 1000).toFixed(1)}s`,
+          `🔄 Cycle #${cycleCount} DONE | ${isNullResponse ? 'NULL→SKIP' : result.text ? 'QUEUED' : 'NO_TTS'} | ${(cycleMs / 1000).toFixed(1)}s`,
         );
         console.log(`🔄 ═══ CYCLE #${cycleCount} DONE (${(cycleMs / 1000).toFixed(1)}s) ${isNullResponse ? '[NULL-SKIP]' : ''} ═══`);
 
@@ -1638,6 +1669,7 @@ function AppInner(): React.JSX.Element {
     continuousBackendInFlightRef.current = false;
     continuousTtsSpeakingRef.current = false;
     continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     stopContinuousMode('loop ended', false);
     smartGuidanceActiveRef.current = false;
     smartGuidanceResumeMainRef.current = false;
@@ -1658,10 +1690,13 @@ function AppInner(): React.JSX.Element {
     }
   }, [
     announceTapToStart,
+    enqueueContinuousSpeech,
     handleiOSReaching,
     hasSubmittedRtabFrame,
     rememberRtabSubmittedFrame,
+    resetContinuousSpeechQueue,
     resolveReachingPipeline,
+    speakContinuousSpeechAndWait,
     startKasraFeed,
     stopKasraFeed,
     waitForGoodPosture,
@@ -1690,6 +1725,8 @@ function AppInner(): React.JSX.Element {
     }
 
     await stopLatencyLoop();
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     await speachesSentenceChunker.stop();
     stopContinuousMode('user interrupt', false);
     setIsNavigation(false);
@@ -1706,13 +1743,15 @@ function AppInner(): React.JSX.Element {
       }
     }
     announceTapToStart('Stopped.');
-  }, [announceTapToStart, isNavigation, isReaching, stopKasraFeed]);
+  }, [announceTapToStart, isNavigation, isReaching, resetContinuousSpeechQueue, stopKasraFeed]);
 
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
     stopKasraFeed();
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
     await stopLatencyLoop(); // FIX: was missing — latency SFX survived nav interrupt
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     await speachesSentenceChunker.stop();
     stopContinuousMode('user interrupt', false);
     setIsNavigation(false);
@@ -1725,7 +1764,7 @@ function AppInner(): React.JSX.Element {
       await playStopReachingSound();
     }
     announceTapToStart('Navigation stopped.');
-  }, [announceTapToStart, stopKasraFeed]);
+  }, [announceTapToStart, resetContinuousSpeechQueue, stopKasraFeed]);
 
   // ============================================================================
   // Handle Voice Command  ← defined BEFORE handleAutoSubmit so ref is stable
@@ -2374,6 +2413,8 @@ function AppInner(): React.JSX.Element {
     }
 
     await stopLatencyLoop(); // FIX: kill thinking SFX immediately on emergency stop
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     await speachesSentenceChunker.stop();
     try { await cancelSTT(); } catch { }
     // Pause wake word listening during emergency stop
