@@ -251,7 +251,7 @@ export const sendToWorkflow = async (
       throw new Error('Request cancelled');
     }
 
-    const isContinuousIteration = request.navigation === true || request.reaching_flag === true;
+    const isContinuousIteration = request.navigation === true || request.reaching_flag === true || request.reaching_ios === true;
 
     if (!isContinuousIteration && (!request.text || !request.text.trim())) {
       const message = 'No voice command provided. Please speak your request.';
@@ -279,6 +279,17 @@ export const sendToWorkflow = async (
     formData.append('session_id', SESSION_ID);
     formData.append('continuousMode', isContinuousIteration ? 'true' : 'false');
 
+    // ── mode field — n8n Redis expression references $json.body.mode ────
+    // Derive from the three-flag system so the backend always has it.
+    const modeValue = request.reaching_ios === true
+      ? 'reaching_ios'
+      : request.reaching_flag === true
+        ? 'reaching'
+        : request.navigation === true
+          ? 'navigation'
+          : 'default';
+    formData.append('mode', modeValue);
+
     // ── session_start signal — fires once per fresh session ─────────────
     // Coordinated with Melody's backend tracker container: when this is
     // true, the backend reinitializes the tracker for this session_id
@@ -295,6 +306,11 @@ export const sendToWorkflow = async (
     // session_id send session_start=false.
     isNewSession = false;
 
+    // ── Image dimensions — always sent so backend JSON.stringify never
+    // encounters undefined for $json.body.imageWidth / imageHeight ──────
+    formData.append('imageWidth', String(request.imageWidth ?? 0));
+    formData.append('imageHeight', String(request.imageHeight ?? 0));
+
     // Add image if provided
     if (request.imageUri) {
       let imageUri = request.imageUri;
@@ -308,10 +324,7 @@ export const sendToWorkflow = async (
         name: 'photo.jpg',
       } as any);
 
-      // send image dimensions
       if (request.imageWidth && request.imageHeight) {
-        formData.append('imageWidth', String(request.imageWidth));
-        formData.append('imageHeight', String(request.imageHeight));
         console.log(`📐 Image dimensions: ${request.imageWidth}×${request.imageHeight}`);
       }
     }
@@ -322,6 +335,7 @@ export const sendToWorkflow = async (
     console.log('🔄 Navigation:', navigationValue);
     console.log('🎯 Reaching:', reachingValue);
     console.log('🍎 Reaching iOS:', reachingIOSValue);
+    console.log('🎮 Mode:', modeValue);
     console.log('🆔 Session:', SESSION_ID);
 
     requestStartTime = Date.now();

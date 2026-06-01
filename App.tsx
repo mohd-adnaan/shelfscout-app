@@ -1376,7 +1376,8 @@ function AppInner(): React.JSX.Element {
               imageWidth: lastImageDimensions.current.width,
               imageHeight: lastImageDimensions.current.height,
               navigation: loopMode === 'navigation',
-              reaching_flag: loopMode === 'reaching',
+              reaching_flag: loopMode === 'reaching' && (Platform.OS !== 'ios' || settingsRef.current.preferAlternativeReaching),
+              reaching_ios: loopMode === 'reaching' && Platform.OS === 'ios' && !settingsRef.current.preferAlternativeReaching,
             },
             abortCtrl.signal
           );
@@ -1495,6 +1496,15 @@ function AppInner(): React.JSX.Element {
           });
 
           if (loopPipeline === 'arkit') {
+            const hasValidBbox = !!bboxToArray(result.bbox);
+            if (!hasValidBbox) {
+              console.log('🔄 [ARKit] Continuous mode: no valid bbox yet, continuing search...');
+              if (result.text) {
+                await speakContinuousSpeechAndWait(result.text);
+              }
+              continue;
+            }
+
             // ── ARKit path: intro TTS + silent ARKit bootstrap in parallel ─
             let introSpeechPromise: Promise<void> | undefined;
             if (result.text) {
