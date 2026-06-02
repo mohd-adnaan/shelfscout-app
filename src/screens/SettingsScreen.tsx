@@ -215,6 +215,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     settings,
     updatePreferAlternativeReaching,
     updateUseWearablesCamera,
+    updateWearablesMicrophoneSource,
     updateTtsRate,
     updateDeveloperMode,
     updateReachingMode,
@@ -242,6 +243,16 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
   // ActivityManagerError (error: 11): "A session already exists for this device".
   const wearablesTransitioningRef = useRef(false);
 
+  const refreshWearablesStatus = useCallback(async () => {
+    try {
+      const status = await wearablesCamera.getStatus();
+      setWearablesStatus(status);
+    } catch (error) {
+      console.warn('[Wearables] Status refresh failed:', error);
+      setWearablesStatus('unknown');
+    }
+  }, []);
+
   const handleAcquisitionToggle = useCallback(
     async (value: boolean) => {
       await updateEnableAcquisitionAutoExit(value);
@@ -251,6 +262,19 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       AccessibilityInfo.announceForAccessibility(label);
     },
     [updateEnableAcquisitionAutoExit],
+  );
+
+  const handleWearablesMicrophoneToggle = useCallback(
+    async (useGlassesMic: boolean) => {
+      const nextSource = useGlassesMic ? 'wearables' : 'phone';
+      await updateWearablesMicrophoneSource(nextSource);
+
+      const label = useGlassesMic
+        ? 'Meta Ray-Ban microphone selected for Hey ShelfScout.'
+        : 'iPhone microphone selected for Hey ShelfScout.';
+      AccessibilityInfo.announceForAccessibility(label);
+    },
+    [updateWearablesMicrophoneSource],
   );
 
   const handleWearablesToggle = useCallback(
@@ -324,16 +348,6 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     },
     [updateUseWearablesCamera, refreshWearablesStatus],
   );
-
-  const refreshWearablesStatus = useCallback(async () => {
-    try {
-      const status = await wearablesCamera.getStatus();
-      setWearablesStatus(status);
-    } catch (error) {
-      console.warn('[Wearables] Status refresh failed:', error);
-      setWearablesStatus('unknown');
-    }
-  }, []);
 
   useEffect(() => {
     refreshWearablesStatus();
@@ -471,8 +485,8 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         ══════════════════════════════════════════ */}
         <Section title="Meta Ray-Ban Glasses">
           <Text style={styles.settingDescription}>
-            Use the glasses camera feed when connected via the Meta AI app. Audio
-            plays through the current Bluetooth output automatically.
+            Use the glasses camera feed when connected via the Meta AI app.
+            Hey ShelfScout listens through the glasses microphone by default.
           </Text>
 
           <View style={styles.settingRow}>
@@ -502,6 +516,41 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 text: settings.useWearablesCamera
                   ? 'Glasses camera enabled'
                   : 'Phone camera enabled',
+              }}
+            />
+          </View>
+
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabelBlock}>
+              <Text style={styles.settingLabel}>Use glasses microphone</Text>
+              <Text style={styles.settingSubLabel}>
+                {settings.wearablesMicrophoneSource === 'wearables'
+                  ? 'Default for Hey ShelfScout'
+                  : 'iPhone microphone selected'}
+              </Text>
+            </View>
+            <Switch
+              value={settings.wearablesMicrophoneSource === 'wearables'}
+              onValueChange={handleWearablesMicrophoneToggle}
+              trackColor={{ false: C.border, true: C.primary }}
+              thumbColor={
+                settings.wearablesMicrophoneSource === 'wearables'
+                  ? C.primary
+                  : C.sliderThumb
+              }
+              ios_backgroundColor={C.border}
+              accessible={true}
+              accessibilityRole="switch"
+              accessibilityLabel="Use Meta Ray-Ban microphone"
+              accessibilityHint={
+                settings.wearablesMicrophoneSource === 'wearables'
+                  ? 'Double tap to use the iPhone microphone instead.'
+                  : 'Double tap to use the glasses microphone for Hey ShelfScout.'
+              }
+              accessibilityValue={{
+                text: settings.wearablesMicrophoneSource === 'wearables'
+                  ? 'Glasses microphone selected'
+                  : 'iPhone microphone selected',
               }}
             />
           </View>

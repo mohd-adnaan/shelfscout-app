@@ -17,11 +17,15 @@ import { iOSTts } from '../services/iOSTtsClient';
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
+export type WearablesMicrophoneSource = 'wearables' | 'phone';
+
 export interface AppSettings {
   /** When true, ignore reaching_ios → use the generic "reaching" pipeline */
   preferAlternativeReaching: boolean;
   /** When true, use Meta Ray-Ban camera feed instead of phone camera */
   useWearablesCamera: boolean;
+  /** Microphone used for "Hey ShelfScout" when glasses mode is active */
+  wearablesMicrophoneSource: WearablesMicrophoneSource;
   /** iOS TTS speech rate (0.1 = slowest, 1.0 = fastest). Default 0.5 */
   ttsRate: number;
   /** When true, shows the debug overlay bug button. Default false. */
@@ -39,6 +43,7 @@ interface SettingsContextValue {
   isLoaded: boolean;
   updatePreferAlternativeReaching: (value: boolean) => Promise<void>;
   updateUseWearablesCamera: (value: boolean) => Promise<void>;
+  updateWearablesMicrophoneSource: (source: WearablesMicrophoneSource) => Promise<void>;
   updateTtsRate: (rate: number) => Promise<void>;
   updateDeveloperMode: (value: boolean) => Promise<void>;
   updateReachingMode: (mode: 'handFree' | 'withHand') => Promise<void>;
@@ -61,6 +66,7 @@ interface SettingsContextValue {
 const DEFAULT_SETTINGS: AppSettings = {
   preferAlternativeReaching: false,
   useWearablesCamera: false,
+  wearablesMicrophoneSource: 'wearables',
   ttsRate: 0.5,
   developerMode: false,
   reachingMode: 'handFree',
@@ -136,6 +142,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setSettings(next);
       await persist(next);
       console.log(`[Settings] Wearables camera → ${value ? 'ON' : 'OFF'}`);
+    },
+    [settings, persist],
+  );
+
+  const updateWearablesMicrophoneSource = useCallback(
+    async (source: WearablesMicrophoneSource) => {
+      const next = { ...settings, wearablesMicrophoneSource: source };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Wearables microphone → ${source === 'wearables' ? 'Meta glasses' : 'iPhone'}`);
     },
     [settings, persist],
   );
@@ -223,6 +239,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     isLoaded,
     updatePreferAlternativeReaching,
     updateUseWearablesCamera,
+    updateWearablesMicrophoneSource,
     updateTtsRate,
     updateDeveloperMode,
     updateReachingMode,

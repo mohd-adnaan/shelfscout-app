@@ -2249,6 +2249,7 @@ function AppInner(): React.JSX.Element {
     onQueryDetected: handleWakeWordQuery,
     onWakeWordHeard: handleWakeWordHeard,
     enabled: settings.useWearablesCamera && !showSettings && !showStartupLoader,
+    microphoneSource: settings.wearablesMicrophoneSource,
     silenceThreshold: 1500,
     enableOpenAIVAD: true,
   });

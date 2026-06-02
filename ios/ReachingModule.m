@@ -26,6 +26,10 @@ RCT_EXTERN_METHOD(configurePlaybackSession:(NSNumber *)useSpeaker
 RCT_EXTERN_METHOD(configureBluetoothRecordingSession:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 
+RCT_EXTERN_METHOD(configureRecordingSession:(NSString *)preferredSource
+                  resolver:(RCTPromiseResolveBlock)resolver
+                  rejecter:(RCTPromiseRejectBlock)rejecter)
+
 RCT_EXTERN_METHOD(playSystemShutter:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 

@@ -83,6 +83,21 @@ const SOUND_FILES: Record<string, string> = {
   stop_reaching: 'soundshelfstudio-ui-notification-stop-reaching.wav',
 };
 
+export type RecordingMicrophoneSource = 'wearables' | 'phone';
+
+export interface RecordingSessionResult {
+  success: boolean;
+  requestedSource?: RecordingMicrophoneSource;
+  source?: RecordingMicrophoneSource;
+  inputPort?: string;
+  inputType?: string;
+  fallbackReason?: string;
+  availableInputs?: Array<{
+    portName: string;
+    portType: string;
+  }>;
+}
+
 // ── Sound instances ────────────────────────────────────────────────────────
 type SoundKey = keyof typeof SOUND_FILES;
 const sounds: Partial<Record<SoundKey, Sound>> = {};
@@ -230,36 +245,81 @@ export const prepareForRecording = (): void => {
 };
 
 /**
- * Configure the audio session for Bluetooth HFP mic recording.
+ * Configure the audio session for the chosen recording microphone.
  *
  * Unlike prepareForRecording() (which just sets the category via
  * react-native-sound), this calls into native code to set:
- *   .playAndRecord + .allowBluetooth + setActive(true)
+ *   .playAndRecord + selected input + setActive(true)
  *
- * The .allowBluetooth option is what tells iOS to route the microphone
- * input through the connected HFP Bluetooth device (e.g. Meta Ray-Ban
- * glasses). Without it, iOS uses the phone's built-in mic.
+ * For the Meta Ray-Ban path, native code explicitly prefers Bluetooth HFP.
+ * If no HFP mic is available, the result reports the fallback input.
  *
  * Returns the active input port info for logging/debugging.
  */
-export const configureBluetoothRecordingSession = async (): Promise<{
-  success: boolean;
-  inputPort?: string;
-  inputType?: string;
-}> => {
-  if (Platform.OS !== 'ios' || !ReachingModule?.configureBluetoothRecordingSession) {
+export const configureBluetoothRecordingSession = async (
+  preferredSource: RecordingMicrophoneSource = 'wearables',
+): Promise<RecordingSessionResult> => {
+  if (Platform.OS !== 'ios') {
     // Fallback: just set PlayAndRecord without BT options
     Sound.setCategory('PlayAndRecord', false);
-    return { success: true, inputPort: 'builtin', inputType: 'builtin' };
+    return {
+      success: true,
+      requestedSource: preferredSource,
+      source: 'phone',
+      inputPort: 'builtin',
+      inputType: 'builtin',
+    };
   }
+
   try {
-    const result = await ReachingModule.configureBluetoothRecordingSession();
-    return result;
+    if (ReachingModule?.configureRecordingSession) {
+      const result = await ReachingModule.configureRecordingSession(preferredSource);
+      return result;
+    }
+
+    if (preferredSource === 'wearables' && ReachingModule?.configureBluetoothRecordingSession) {
+      const result = await ReachingModule.configureBluetoothRecordingSession();
+      return {
+        ...result,
+        requestedSource: 'wearables',
+        source: result?.source || 'wearables',
+      };
+    }
+
+    Sound.setCategory('PlayAndRecord', false);
+    return {
+      success: true,
+      requestedSource: preferredSource,
+      source: 'phone',
+      inputPort: 'iPhone microphone',
+      inputType: 'builtin',
+      fallbackReason: 'Native microphone source selection is unavailable; using the iPhone microphone.',
+    };
   } catch (e: any) {
     console.warn('⚠️ [SFX] configureBluetoothRecordingSession failed:', e?.message);
-    // Fallback
     Sound.setCategory('PlayAndRecord', false);
-    return { success: false };
+    return {
+      success: false,
+      requestedSource: preferredSource,
+      source: 'phone',
+      fallbackReason: e?.message || 'Recording session configuration failed.',
+    };
+  }
+};
+
+export const configureRecordingSession = async (
+  preferredSource: RecordingMicrophoneSource,
+): Promise<RecordingSessionResult> => {
+  try {
+    const result = await configureBluetoothRecordingSession(preferredSource);
+    return result;
+  } catch (e: any) {
+    return {
+      success: false,
+      requestedSource: preferredSource,
+      source: 'phone',
+      fallbackReason: e?.message || 'Recording session configuration failed.',
+    };
   }
 };
 

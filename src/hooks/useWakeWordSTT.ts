@@ -4,8 +4,8 @@
  * Wake-word activated Speech-to-Text for Meta glasses mode.
  *
  * When `useWearablesCamera` is ON this hook replaces the tap-to-speak flow.
- * It continuously listens via iOS native speech recognition (which routes to
- * the glasses' BT microphone automatically) and watches for the wake phrase
+ * It continuously listens via iOS native speech recognition (preferring the
+ * selected glasses microphone route by default) and watches for the wake phrase
  * "hey shelfscout". Everything the user says AFTER the wake phrase is treated
  * as the query.
  *
@@ -29,6 +29,7 @@ import Voice, {
 } from '@react-native-voice/voice';
 import { openAIVADService } from '../services/OpenAIVADService';
 import { configureBluetoothRecordingSession } from '../utils/soundEffects';
+import type { RecordingMicrophoneSource } from '../utils/soundEffects';
 
 // ============================================================================
 // Types
@@ -47,6 +48,8 @@ interface UseWakeWordSTTOptions {
   openAIVADMinConfidence?: number;
   /** Whether the hook should be actively listening (master switch) */
   enabled: boolean;
+  /** Preferred microphone source for wake-word listening in glasses mode */
+  microphoneSource?: RecordingMicrophoneSource;
 }
 
 interface UseWakeWordSTTReturn {
@@ -265,6 +268,7 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
     onQueryDetected,
     onWakeWordHeard,
     enabled,
+    microphoneSource = 'wearables',
     silenceThreshold = DEFAULT_SILENCE_THRESHOLD,
     enableOpenAIVAD = true,
     openAIVADMinConfidence = 0.55,
@@ -279,6 +283,7 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
 
   // ── Refs ───────────────────────────────────────────────────────────────
   const enabledRef = useRef(enabled);
+  const microphoneSourceRef = useRef<RecordingMicrophoneSource>(microphoneSource);
   const isPausedRef = useRef(false);
   const isActiveRef = useRef(false);    // Voice.start() is live
   const isRestartingRef = useRef(false); // prevents overlapping restarts
@@ -296,6 +301,7 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
   useEffect(() => { onQueryDetectedRef.current = onQueryDetected; }, [onQueryDetected]);
   useEffect(() => { onWakeWordHeardRef.current = onWakeWordHeard; }, [onWakeWordHeard]);
   useEffect(() => { enabledRef.current = enabled; }, [enabled]);
+  useEffect(() => { microphoneSourceRef.current = microphoneSource; }, [microphoneSource]);
 
   // Handler refs — populated after handler definitions, used in startRecognition
   // to re-register listeners right before Voice.start()
@@ -426,10 +432,15 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
       try { await Voice.cancel(); } catch { /* ignore */ }
       try { await Voice.destroy(); } catch { /* ignore */ }
 
-      const audioResult = await configureBluetoothRecordingSession();
+      const requestedMicSource = microphoneSourceRef.current;
+      const audioResult = await configureBluetoothRecordingSession(requestedMicSource);
       const micInfo = audioResult.inputPort || 'unknown';
       const micType = audioResult.inputType || '?';
-      setDebugStatus(`Mic: ${micInfo} (${micType})`);
+      const activeSource = audioResult.source || requestedMicSource;
+      const fallbackSuffix = audioResult.fallbackReason
+        ? ` fallback: ${audioResult.fallbackReason}`
+        : '';
+      setDebugStatus(`Mic: ${activeSource} - ${micInfo} (${micType})${fallbackSuffix}`);
       console.log('🎤 [WakeWord] Audio session configured:', JSON.stringify(audioResult));
 
       // Small delay to let audio session settle after category switch
@@ -442,7 +453,7 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
       Voice.onSpeechPartialResults = handleSpeechPartialResultsRef.current;
       Voice.onSpeechError = handleSpeechErrorRef.current;
 
-      setDebugStatus(`Starting Voice... (mic: ${micInfo})`);
+      setDebugStatus(`Starting Voice... (mic: ${activeSource} - ${micInfo})`);
       await Voice.start('en-US');
       isActiveRef.current = true;
       restartFailCountRef.current = 0;
@@ -451,7 +462,7 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
         setIsAwaitingWakeWord(true);
       }
 
-      setDebugStatus(`✅ Listening (mic: ${micInfo})`);
+      setDebugStatus(`✅ Listening (mic: ${activeSource} - ${micInfo})`);
       setDebugRawTranscript('');
       console.log('✅ [WakeWord] Voice recognition started');
     } catch (err: any) {
@@ -737,9 +748,9 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
       // Small delay to let TTS audio session fully release
       await new Promise(r => setTimeout(r, 500));
 
-      // Re-assert Bluetooth recording session before restarting Voice.
+      // Re-assert the selected recording session before restarting Voice.
       // TTS playback switches the session back to Playback mode.
-      await configureBluetoothRecordingSession();
+      await configureBluetoothRecordingSession(microphoneSourceRef.current);
       await new Promise(r => setTimeout(r, 200));
 
       await startRecognition();
