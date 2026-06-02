@@ -87,6 +87,13 @@ const SOUND_FILES: Record<string, string> = {
 type SoundKey = keyof typeof SOUND_FILES;
 const sounds: Partial<Record<SoundKey, Sound>> = {};
 let latencyLooping = false;
+
+/**
+ * Tracks whether the listen sound is currently playing.
+ * Prevents redundant .stop() calls on an already-finished Sound object,
+ * which on iOS can produce brief audio artifacts ("beat" / replay glitch).
+ */
+let _listenPlaying = false;
 /**
  * Generation counter for the latency loop.
  *
@@ -178,16 +185,27 @@ const _playOnce = (key: SoundKey, onFinish?: () => void): void => {
  * Resolves when the cue finishes so recording can start after the full sound.
  */
 export const playListenSound = (): Promise<void> => {
-  return new Promise((resolve) => _playOnce('listen', resolve));
+  _listenPlaying = true;
+  return new Promise((resolve) => _playOnce('listen', () => {
+    _listenPlaying = false;
+    resolve();
+  }));
 };
 
+/**
+ * Stop the listen sound if it is currently playing.
+ * Guarded by _listenPlaying to avoid calling .stop() on an already-finished
+ * Sound object, which on iOS produces brief audio artifacts.
+ */
 export const stopListenSound = (): Promise<void> => {
   return new Promise((resolve) => {
     const s = sounds.listen;
-    if (!s) {
+    if (!s || !_listenPlaying) {
+      _listenPlaying = false;
       resolve();
       return;
     }
+    _listenPlaying = false;
     s.stop(() => resolve());
   });
 };
@@ -247,9 +265,16 @@ export const configureBluetoothRecordingSession = async (): Promise<{
 
 /**
  * Start the only thinking sound: the latency loop while waiting for backend/RTAB.
+ *
+ * NOTE: The listen sound is NOT stopped here — callers (handleVoiceCommand,
+ * handleAutoSubmit) already call stopListenSound() before this function.
+ * Calling sounds.listen?.stop() here was causing iOS AVAudioPlayer to
+ * produce brief audio artifacts (the user-reported "beat" / listen-sound
+ * replaying during the listening→thinking transition).
  */
 export const playThinkingStarted = (): void => {
-    sounds.listen?.stop(() => {});
+    // Ensure the listen flag is cleared (defensive, in case caller skipped stopListenSound).
+    _listenPlaying = false;
     // Bump the generation so any in-flight callbacks from a previous loop
     // (e.g. a queued s.play() inside a pre-flight stop callback) are
     // considered superseded and silently bail out. This is the fundamental
