@@ -195,6 +195,7 @@ function AppInner(): React.JSX.Element {
     object?: string;
     bbox?: any;
     annotatedImage?: string;
+    confidence?: number;
   } | null>(null);
   // Issue 5: the Qwen seed bbox is handed to the tracker container ONLY on the
   // first smart-guidance call after the tracker locks. While tracking is
@@ -1318,6 +1319,7 @@ function AppInner(): React.JSX.Element {
                 annotated_image: annotatedImage,
                 success: true,
                 session_id: getSessionId(),
+                confidence: cached?.confidence,
               },
               abortCtrl.signal
             );
@@ -1353,6 +1355,7 @@ function AppInner(): React.JSX.Element {
               object: smartResponse?.class_name || objectName,
               bbox: cached?.bbox,
               annotatedImage: cached?.annotatedImage || annotatedImage,
+              confidence: cached?.confidence,
             };
 
             if (smartResponse?.tracking_active === false) {
@@ -1396,6 +1399,7 @@ function AppInner(): React.JSX.Element {
               object: result?.object || smartGuidanceCacheRef.current?.object,
               bbox: result?.bbox || smartGuidanceCacheRef.current?.bbox,
               annotatedImage: result?.annotated_image || smartGuidanceCacheRef.current?.annotatedImage,
+              confidence: result?.confidence || smartGuidanceCacheRef.current?.confidence,
             };
           }
         }

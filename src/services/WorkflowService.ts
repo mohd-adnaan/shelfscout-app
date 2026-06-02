@@ -485,6 +485,7 @@ export interface SmartGuidanceRequest {
   image: string;
   annotated_image: string;
   success: boolean;
+  confidence?: number;
   session_id?: string;
 }
 
@@ -519,6 +520,7 @@ export const sendToSmartGuidance = async (
         image: payload.image,
         annotated_image: payload.annotated_image,
         success: payload.success,
+        confidence: payload.confidence,
         // Always include session_id — the tracker container keys its
         // per-session state on it. Fall back to the current session id
         // rather than dropping the field entirely.
@@ -856,6 +858,8 @@ function parseWorkflowResponse(
   );
   const annotated_image = annotatedImageRaw || undefined;
 
+  const confidence = pickNumber(['confidence']);
+
   // Depth from backend (meters)
   const depthValue = pickNumber(['depth']);
   const depth = depthValue !== undefined ? String(depthValue) : undefined;
@@ -878,6 +882,7 @@ function parseWorkflowResponse(
     reaching_ios,
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
     object,
+    confidence,
     depth,
     tracking_active,
     reached,
@@ -891,6 +896,7 @@ function parseWorkflowResponse(
     bbox,
     object,
     depth,
+    confidence,
     hand_direction: hand_direction || undefined,
     annotated_image,
     tracking_active,

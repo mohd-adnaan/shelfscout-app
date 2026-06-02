@@ -28,6 +28,7 @@ export interface WorkflowResponse {
   depth?: string;
   hand_direction?: string;
   annotated_image?: string;
+  confidence?: number;
 
   // Melody's tracker is locked on the target → backend has stopped
   // querying Qwen for this iteration. Informational for now (logged);
