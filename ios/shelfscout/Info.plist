@@ -55,6 +55,8 @@
 	<string>ShelfScout needs camera access to capture images of products and shelves for visual identification and navigation assistance.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>ShelfScout needs microphone access to receive voice commands and provide audio feedback for hands-free navigation.</string>
+	<key>NSMotionUsageDescription</key>
+	<string>ShelfScout uses motion sensors to detect phone orientation and improve camera guidance.</string>
 	<key>NSPhotoLibraryAddUsageDescription</key>
 	<string>ShelfScout may save captured images to your photo library for reference.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>

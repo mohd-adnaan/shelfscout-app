@@ -18,11 +18,43 @@ extension ReachingViewController {
   func handlePlaceAndHoldFrame(_ frame: ARFrame) -> Bool {
     guard placeAndHoldPrototype else { return false }
     if !anchorPlaced {
+      guard placeAndHoldInitialBboxReady(frame) else { return true }
       attemptPlaceAndHold(frame)
       return true
     }
+    tryDav2Refine(frame)        // parallel, non-blocking DAv2 depth correction
+
+    // Place-and-hold owns its own refinement policy. It never uses the live
+    // camera->anchor ray because that redefines the target from wherever the
+    // phone is currently pointing. Depth can improve only along the original
+    // bbox line of sight, then it locks.
+    if !placeAndHoldDepthLocked {
+      tryPlaceAndHoldLockedRayDepthRefine(frame: frame)
+    }
+
     processARFrameHandFree(frame)
     return true
+  }
+
+  private func placeAndHoldInitialBboxReady(_ frame: ARFrame) -> Bool {
+    switch initialReseedStatus {
+    case .pending:
+      if arFrameCount >= initialReseedFrameWait {
+        initialReseedStatus = .inFlight
+        requestInitialBboxFromAR(frame: frame)
+      }
+      return false
+    case .inFlight:
+      let elapsed = ProcessInfo.processInfo.systemUptime - initialReseedStartTime
+      if elapsed > initialReseedTimeoutSec {
+        NSLog("🅿️ [PlaceHold] Initial reseed timed out after %.1fs — using original bbox", elapsed)
+        initialReseedStatus = .failed
+        detectionFrameCameraTransform = nil
+      }
+      return false
+    case .succeeded, .failed, .skipped:
+      return true
+    }
   }
 
   private func attemptPlaceAndHold(_ frame: ARFrame) {
@@ -65,60 +97,372 @@ extension ReachingViewController {
     let rY = Float((arPxY - cy) / fy)
     let rayCam = simd_normalize(simd_float3(rX, -rY, -1.0))
 
-    let camT = camera.transform
-    let worldRayDir = simd_normalize(simd_make_float3(camT * simd_float4(rayCam, 0)))
-    let camPos = simd_make_float3(camT.columns.3)
+    let placementT = detectionFrameCameraTransform ?? camera.transform
+    let poseSource = detectionFrameCameraTransform == nil ? "live pose" : "saved detection pose"
+    let worldRayDir = simd_normalize(simd_make_float3(placementT * simd_float4(rayCam, 0)))
+    let camPos = simd_make_float3(placementT.columns.3)
 
-    if framesSinceStart == 5 {
-      NSLog("🅿️ [PlaceHold] photo(%.3f,%.3f)→AR(%.3f,%.3f)→px(%.0f,%.0f) ray=(%.3f,%.3f,%.3f)",
-            photoCenterX, photoCenterY, arNormX, arNormY, arPxX, arPxY,
-            worldRayDir.x, worldRayDir.y, worldRayDir.z)
-      speakInitialDirection(photoCenterX: photoCenterX, photoCenterY: photoCenterY)
-    }
+    NSLog("🅿️ [PlaceHold] photo(%.3f,%.3f)→AR(%.3f,%.3f)→px(%.0f,%.0f) ray=(%.3f,%.3f,%.3f) pose=%@",
+          photoCenterX, photoCenterY, arNormX, arNormY, arPxX, arPxY,
+          worldRayDir.x, worldRayDir.y, worldRayDir.z, poseSource)
+    speakInitialDirection(photoCenterX: photoCenterX, photoCenterY: photoCenterY)
 
-    // ── Try ARKit raycast along the bbox ray ─────────────────────────────
-    let targets: [(ARRaycastQuery.Target, ARRaycastQuery.TargetAlignment, String)] = [
-      (.existingPlaneGeometry, .any, "existingGeometry"),
-      (.estimatedPlane,        .any, "estimatedPlane"),
+    // ═══════════════════════════════════════════════════════════════════════
+    // PLACE IMMEDIATELY — never block on DAv2.
+    // ═══════════════════════════════════════════════════════════════════════
+    //
+    // Blocking placement on DAv2 was the "box shows up a minute later" bug:
+    // DAv2 needs an ARKit scale anchor, and on a non-LiDAR device that anchor
+    // doesn't exist until the user has walked around long enough for planes to
+    // form. The old state machine held EVERY frame until then.
+    //
+    // Now we place NOW from the best depth available this frame (raycast →
+    // backend → near default) and arm DAv2 to run IN PARALLEL. tryDav2Refine()
+    // snaps the anchor to the DAv2 metric depth a frame or two later, the
+    // moment DAv2 succeeds — without ever freezing the box.
+    // ═══════════════════════════════════════════════════════════════════════
+
+    var placedDepth: Float? = nil
+    var placedSource = ""
+
+    // 1. ARKit raycast along the bbox ray — best immediate depth IF a plane
+    //    already exists. Usually nothing this early; that's expected.
+    let targets: [(ARRaycastQuery.Target, String)] = [
+      (.existingPlaneGeometry, "existingGeometry"),
+      (.estimatedPlane,        "estimatedPlane"),
     ]
-    for (target, alignment, label) in targets {
+    for (target, label) in targets {
       let query = ARRaycastQuery(origin: camPos, direction: worldRayDir,
-                                 allowing: target, alignment: alignment)
-      let results = sceneView.session.raycast(query)
-      if let hit = results.first {
+                                 allowing: target, alignment: .any)
+      if let hit = sceneView.session.raycast(query).first {
         let hitPos = simd_make_float3(hit.worldTransform.columns.3)
         let d = simd_length(hitPos - camPos)
         if d >= 0.15 && d <= 5.0 {
-          NSLog("🅿️ [PlaceHold] ✅ ARKit HIT at %.2fm via %@", d, label)
-          finalizePlacement(worldPos: hitPos, depth: d, camera: camera,
-                            horizScale: horizScale, source: "raycast:\(label)")
-          return
+          placedDepth = d; placedSource = "raycast:\(label)"; break
         }
       }
     }
 
-    // ── No hit — use backend depth if available ─────────────────────────
-    if let bd = backendDepth, bd >= 0.1, bd <= 10.0 {
-      let worldPos = camPos + worldRayDir * bd
-      NSLog("🅿️ [PlaceHold] No raycast hit — placing at backend depth %.2fm", bd)
-      finalizePlacement(worldPos: worldPos, depth: bd, camera: camera,
-                        horizScale: horizScale, source: "backend-depth")
+    // 2. Feature-point cone depth (no planes needed). Use the median distance
+    //    of points near the bbox ray to avoid far-wall hits.
+    if placedDepth == nil, let cloud = frame.rawFeaturePoints {
+      var dists: [Float] = []
+      dists.reserveCapacity(min(cloud.points.count, 64))
+      let coneCos: Float = 0.94  // ~20 deg
+      for p in cloud.points {
+        let toP = p - camPos
+        let d = simd_length(toP)
+        guard d > 0.25 && d < 4.0 else { continue }
+        let dot = simd_dot(toP / d, worldRayDir)
+        if dot > coneCos { dists.append(d) }
+      }
+      if dists.count >= 6 {
+        dists.sort()
+        let n = dists.count
+        let median = n % 2 == 0 ? (dists[n/2-1] + dists[n/2]) / 2.0 : dists[n/2]
+        let q1 = dists[n/4], q3 = dists[3*n/4]
+        let iqr = q3 - q1
+        if iqr < 0.25 {
+          placedDepth = median
+          placedSource = "featurePoints"
+        }
+      }
+    }
+
+    // 3. Scene-distance default.
+    //    ARKit continuous refinement + DAv2 correct this as planes form.
+    let depth = placedDepth ?? placeAndHoldDefaultDepth
+    if placedDepth == nil {
+      placedSource = String(format: "default(%.1fm, refinement pending)", placeAndHoldDefaultDepth)
+    }
+
+    let worldPos = camPos + worldRayDir * depth
+
+    // Stash the ray so a late DAv2 result can re-place along the same bearing.
+    placementRayOrigin = camPos
+    placementRayDir = worldRayDir
+    placementHorizScale = horizScale
+
+    finalizePlacement(worldPos: worldPos, depth: depth, camera: camera,
+                      horizScale: horizScale, source: "\(placedSource), \(poseSource)", frame: frame)
+    detectionFrameCameraTransform = nil
+
+    // Arm parallel DAv2 refinement — handled by tryDav2Refine() on later frames.
+    dav2RefineState = .pending
+    dav2RequestInFlight = false
+    dav2NoAnchorLogCount = 0
+    dav2RefineDeadline = ProcessInfo.processInfo.systemUptime + dav2RefineWindowSec
+    NSLog("🅿️ [PlaceHold] 🌊 DAv2 refinement armed (%.0fs window) — placement NOT blocked", dav2RefineWindowSec)
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Parallel DAv2 Depth Refinement
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // Runs DAv2 metric-depth estimation IN PARALLEL with the live guidance loop,
+  // after the anchor is already placed. Non-blocking: at most one inference is
+  // in flight at a time, and the whole thing self-disables after the first
+  // success or once the refine window expires. The box is already on screen
+  // and guiding the user the entire time this runs.
+
+  func tryDav2Refine(_ frame: ARFrame) {
+    guard dav2RefineState == .pending, !dav2RequestInFlight else { return }
+
+    if ProcessInfo.processInfo.systemUptime > dav2RefineDeadline {
+      dav2RefineState = .done
+      NSLog("🅿️ [PlaceHold] 🌊 DAv2 refine window expired — keeping fallback depth %.2fm", anchorDepth)
       return
     }
 
-    // ── No depth — wait for geometry ────────────────────────────────────
-    let elapsed = ProcessInfo.processInfo.systemUptime - sessionStartTime
-    if elapsed < 10.0 {
-      if framesSinceStart % 30 == 0 {
-        NSLog("🅿️ [PlaceHold] no hit, no backend depth (%.1fs) — waiting", elapsed)
+    // AR-portrait normalized bbox for DAv2 (crop-corrected X, same column the
+    // placement ray points through).
+    let hs = placementHorizScale
+    let ho = (1.0 - hs) / 2.0
+    let arBboxNormalized: [CGFloat] = [
+      bboxNormalized[0] * hs + ho, bboxNormalized[1],
+      bboxNormalized[2] * hs + ho, bboxNormalized[3]
+    ]
+
+    dav2RequestInFlight = true
+    estimateMetricDepth(frame: frame, bboxARNormalized: arBboxNormalized) { [weak self] estimate in
+      guard let self = self else { return }
+      self.dav2RequestInFlight = false
+      guard self.dav2RefineState == .pending else { return }
+      if let estimate = estimate, self.applyDav2Depth(estimate) {
+        self.dav2RefineState = .done
+      }
+      // nil → still .pending; the next frame retries until the deadline.
+    }
+  }
+
+  /// Snap the already-placed anchor to a DAv2 metric depth along the stored
+  /// placement ray. Runs on visionQ (estimateMetricDepth's completion queue),
+  /// the same queue as frame processing — no locking needed.
+  @discardableResult
+  private func applyDav2Depth(_ estimate: DAv2MetricDepthEstimate) -> Bool {
+    guard anchorPlaced else { return false }
+    let metric = estimate.depth
+    let oldDepth = anchorDepth
+    guard metric > 0.20 && metric < 5.0 else {
+      NSLog("🅿️ [PlaceHold] 🌊 Rejected DAv2 depth %.2fm (out of range)", metric)
+      return false
+    }
+
+    let delta = abs(metric - oldDepth)
+    let offBboxScaleAnchor = estimate.anchorLabel != "bbox center"
+      && !estimate.anchorLabel.hasPrefix("featurePoints")
+    if offBboxScaleAnchor && delta > 0.25 {
+      if metric < oldDepth && estimate.ratio < 0.75 {
+        NSLog("🅿️ [PlaceHold] 🌊 Holding DAv2 %.2fm from %@ (anchor=%.2fm ratio=%.3f) — off-bbox shrink from %.2fm needs ARKit vote",
+              metric, estimate.anchorLabel, estimate.anchorDepth, estimate.ratio, oldDepth)
+        return false
+      }
+      if metric > oldDepth && estimate.ratio > 1.45 {
+        NSLog("🅿️ [PlaceHold] 🌊 Holding DAv2 %.2fm from %@ (anchor=%.2fm ratio=%.3f) — off-bbox expansion from %.2fm needs ARKit vote",
+              metric, estimate.anchorLabel, estimate.anchorDepth, estimate.ratio, oldDepth)
+        return false
+      }
+    }
+
+    applyPlaceAndHoldDepth(metric, source: "DAv2")
+    placeAndHoldRefinementHits.removeAll()
+
+    NSLog("🅿️ [PlaceHold] 🌊 ✅ DAv2 refined depth %.2fm → %.2fm (Δ%.0fcm, source=%@, ratio=%.3f)",
+          oldDepth, metric, delta * 100, estimate.anchorLabel, estimate.ratio)
+    return true
+  }
+
+  private func tryPlaceAndHoldLockedRayDepthRefine(frame: ARFrame) {
+    guard anchorPlaced else { return }
+    guard simd_length(placementRayDir) > 0.5 else { return }
+
+    var candidateDepth: Float?
+    var candidateSource = ""
+
+    // 1. ARKit planes along the original bbox ray. This is the important
+    // distinction from legacy refinement: current phone aim never changes
+    // the target bearing.
+    for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
+      let query = ARRaycastQuery(origin: placementRayOrigin, direction: placementRayDir,
+                                 allowing: target, alignment: .any)
+      for hit in sceneView.session.raycast(query) {
+        let hp = simd_make_float3(hit.worldTransform.columns.3)
+        let d = simd_dot(hp - placementRayOrigin, placementRayDir)
+        guard d > 0.25 && d < 4.5 else { continue }
+
+        if mode == .handFree && hit.targetAlignment == .horizontal {
+          let belowPlacementCamera = placementRayOrigin.y - hp.y
+          if belowPlacementCamera > 1.1 {
+            NSLog("🅿️ [PlaceHoldRefine] Skipped floor hit %.2fm below placement camera", belowPlacementCamera)
+            continue
+          }
+        }
+
+        candidateDepth = d
+        candidateSource = target == .existingPlaneGeometry ? "existingPlaneLockedRay" : "estimatedPlaneLockedRay"
+        break
+      }
+      if candidateDepth != nil { break }
+    }
+
+    // 2. Feature points close to the original ray. Use a tube, not only a
+    // cone, so far wall points in the same general direction do not dominate.
+    if candidateDepth == nil, let cloud = frame.rawFeaturePoints {
+      var dists: [Float] = []
+      dists.reserveCapacity(min(cloud.points.count, 64))
+      for p in cloud.points {
+        let fromOrigin = p - placementRayOrigin
+        let along = simd_dot(fromOrigin, placementRayDir)
+        guard along > 0.25 && along < 4.5 else { continue }
+
+        let closest = placementRayOrigin + placementRayDir * along
+        let lateral = simd_length(p - closest)
+        let maxLateral = max(0.06, along * 0.08)
+        guard lateral <= maxLateral else { continue }
+
+        dists.append(along)
+      }
+
+      if dists.count >= 5 {
+        dists.sort()
+        let n = dists.count
+        let median = n % 2 == 0 ? (dists[n/2-1] + dists[n/2]) / 2.0 : dists[n/2]
+        let q1 = dists[n/4], q3 = dists[3*n/4]
+        let iqr = q3 - q1
+        if iqr < 0.12 {
+          candidateDepth = median
+          candidateSource = "featurePointTube(\(dists.count))"
+        }
+      }
+    }
+
+    guard let depth = candidateDepth else {
+      if arFrameCount % 90 == 0 {
+        NSLog("🅿️ [PlaceHoldRefine] No locked-ray depth yet (%d buffered)", placeAndHoldRefinementHits.count)
       }
       return
     }
 
-    NSLog("🅿️ [PlaceHold] ⚠️ FALLBACK 1.0m")
-    let worldPos = camPos + worldRayDir * Float(1.0)
-    finalizePlacement(worldPos: worldPos, depth: 1.0, camera: camera,
-                      horizScale: horizScale, source: "fixed-fallback")
+    let jump = abs(depth - anchorDepth)
+    if jump > placeAndHoldRefinementHardJump {
+      _ = recordPlaceAndHoldAlternateDepth(depth, source: candidateSource)
+      return
+    }
+
+    let softRebaseJump = max(anchorDepth * 0.35, 0.55)
+    if jump > softRebaseJump,
+       recordPlaceAndHoldAlternateDepth(depth, source: candidateSource) {
+      return
+    }
+    if jump < 0.30 {
+      placeAndHoldAlternateDepthHits.removeAll()
+    }
+
+    placeAndHoldRefinementHits.append(depth)
+    if placeAndHoldRefinementHits.count > placeAndHoldRefinementMaxHits {
+      placeAndHoldRefinementHits.removeFirst()
+    }
+
+    NSLog("🅿️ [PlaceHoldRefine] Hit #%d: %.2fm via %@",
+          placeAndHoldRefinementHits.count, depth, candidateSource)
+
+    guard placeAndHoldRefinementHits.count >= placeAndHoldRefinementMinHits else { return }
+
+    let sorted = placeAndHoldRefinementHits.sorted()
+    let n = sorted.count
+    let median = n % 2 == 0 ? (sorted[n/2-1] + sorted[n/2]) / 2.0 : sorted[n/2]
+    let q1 = sorted[n/4], q3 = sorted[3*n/4]
+    let iqr = q3 - q1
+
+    guard iqr <= placeAndHoldRefinementIQR else {
+      NSLog("🅿️ [PlaceHoldRefine] IQR %.2fm too wide (need %.2fm)", iqr, placeAndHoldRefinementIQR)
+      return
+    }
+
+    let medianJump = abs(median - anchorDepth)
+    let softJump = max(anchorDepth * 0.55, 0.45)
+    if medianJump > softJump && placeAndHoldRefinementHits.count < placeAndHoldRefinementMaxHits {
+      NSLog("🅿️ [PlaceHoldRefine] Median %.2fm differs %.0fcm from current %.2fm — waiting for max evidence",
+            median, medianJump * 100, anchorDepth)
+      return
+    }
+
+    let old = anchorDepth
+    applyPlaceAndHoldDepth(median, source: "ARKit locked ray")
+    placeAndHoldDepthLocked = true
+    dav2RefineState = .done
+    placeAndHoldRefinementHits.removeAll()
+
+    NSLog("🅿️ [PlaceHoldRefine] ✅ DEPTH LOCKED %.2fm → %.2fm (IQR %.2fm, Δ%.0fcm)",
+          old, median, iqr, abs(old - median) * 100)
+  }
+
+  @discardableResult
+  private func recordPlaceAndHoldAlternateDepth(_ depth: Float, source: String) -> Bool {
+    placeAndHoldAlternateDepthHits.append(depth)
+    if placeAndHoldAlternateDepthHits.count > placeAndHoldAlternateDepthMaxHits {
+      placeAndHoldAlternateDepthHits.removeFirst()
+    }
+
+    let count = placeAndHoldAlternateDepthHits.count
+    if count <= 3 || count % 3 == 0 {
+      NSLog("🅿️ [PlaceHoldRefine] Correction candidate %.2fm via %@ — collecting alternate evidence (%d/%d)",
+            depth, source, count, placeAndHoldAlternateDepthMinHits)
+    }
+
+    guard count >= placeAndHoldAlternateDepthMinHits else { return false }
+
+    let sorted = placeAndHoldAlternateDepthHits.sorted()
+    let n = sorted.count
+    let median = n % 2 == 0 ? (sorted[n/2-1] + sorted[n/2]) / 2.0 : sorted[n/2]
+    let q1 = sorted[n/4], q3 = sorted[3*n/4]
+    let iqr = q3 - q1
+
+    guard iqr <= placeAndHoldAlternateDepthIQR else {
+      NSLog("🅿️ [PlaceHoldRefine] Alternate cluster IQR %.2fm too wide (need %.2fm)",
+            iqr, placeAndHoldAlternateDepthIQR)
+      return false
+    }
+
+    let old = anchorDepth
+    applyPlaceAndHoldDepth(median, source: "ARKit locked ray rebase")
+    placeAndHoldAlternateDepthHits.removeAll()
+    placeAndHoldRefinementHits.removeAll()
+
+    if iqr <= placeAndHoldRefinementIQR {
+      placeAndHoldDepthLocked = true
+      dav2RefineState = .done
+      NSLog("🅿️ [PlaceHoldRefine] ✅ DEPTH LOCKED %.2fm → %.2fm via alternate cluster (IQR %.2fm, Δ%.0fcm)",
+            old, median, iqr, abs(old - median) * 100)
+    } else {
+      NSLog("🅿️ [PlaceHoldRefine] ✅ REBASED %.2fm → %.2fm via alternate cluster (IQR %.2fm, Δ%.0fcm) — continuing refinement",
+            old, median, iqr, abs(old - median) * 100)
+    }
+    return true
+  }
+
+  private func applyPlaceAndHoldDepth(_ depth: Float, source: String) {
+    let worldPos = placementRayOrigin + placementRayDir * depth
+    objectWorldPosition = worldPos
+    anchorDepth = depth
+    liveDistanceToObject = depth
+    placeAndHoldLastDepthSource = source
+
+    let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
+    let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
+    objectWorldHalfW = min(depth * Float(bboxNormW * placementHorizScale) * 0.5, depth * 0.45)
+    objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.45)
+
+    if let camT = lastARFrame?.camera.transform {
+      let right = -simd_normalize(simd_make_float3(camT.columns.1))
+      let up    =  simd_normalize(simd_make_float3(camT.columns.0))
+      objectWorldCornerTR = worldPos + right * objectWorldHalfW + up * objectWorldHalfH
+      objectWorldCornerBL = worldPos - right * objectWorldHalfW - up * objectWorldHalfH
+    }
+
+    DispatchQueue.main.async { [weak self] in
+      self?.distanceLabel.text = "\(Int(depth * 100)) cm"
+    }
   }
 
   private func speakInitialDirection(photoCenterX: CGFloat, photoCenterY: CGFloat) {
@@ -133,39 +477,48 @@ extension ReachingViewController {
     if guidanceAudioEnabled { say(msg) }
   }
 
-  private func finalizePlacement(worldPos: simd_float3, depth: Float,
-                                   camera: ARCamera, horizScale: CGFloat,
-                                   source: String) {
-      objectWorldPosition = worldPos
-      anchorDepth = depth
-      liveDistanceToObject = depth
+    private func finalizePlacement(worldPos: simd_float3, depth: Float,
+                                     camera: ARCamera, horizScale: CGFloat,
+                                     source: String, frame: ARFrame) {
+        objectWorldPosition = worldPos
+        anchorDepth = depth
+        liveDistanceToObject = depth
+        placeAndHoldDepthLocked = false
+        placeAndHoldRefinementHits.removeAll()
+        placeAndHoldAlternateDepthHits.removeAll()
+        placeAndHoldLastDepthSource = source
 
-      // Box size from the REAL detected bbox — no cap, so the overlay
-      // wraps the actual object instead of a fixed narrow pill.
-      // Loose safety rail (depth * 0.45) only catches a runaway full-screen
-      // VLM detection; real object boxes stay well under it.
-      let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
-      let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-      objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.45)
-      objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.45)
+        // Box size from the REAL detected bbox — no cap, so the overlay
+        // wraps the actual object instead of a fixed narrow pill.
+        // Loose safety rail (depth * 0.45) only catches a runaway full-screen
+        // VLM detection; real object boxes stay well under it.
+        let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
+        let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
+        objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.45)
+        objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.45)
 
-      let camT = camera.transform
-      let right = -simd_normalize(simd_make_float3(camT.columns.1))
-      let up    =  simd_normalize(simd_make_float3(camT.columns.0))
-      objectWorldCornerTR = worldPos + right * objectWorldHalfW + up * objectWorldHalfH
-      objectWorldCornerBL = worldPos - right * objectWorldHalfW - up * objectWorldHalfH
-      anchorPlaced = true
+        let camT = camera.transform
+        let right = -simd_normalize(simd_make_float3(camT.columns.1))
+        let up    =  simd_normalize(simd_make_float3(camT.columns.0))
+        objectWorldCornerTR = worldPos + right * objectWorldHalfW + up * objectWorldHalfH
+        objectWorldCornerBL = worldPos - right * objectWorldHalfW - up * objectWorldHalfH
+        anchorPlaced = true
 
-      NSLog("🅿️ [PlaceHold] ✅ ANCHOR at (%.3f,%.3f,%.3f) depth=%.2fm halfW=%.3f halfH=%.3f via %@",
-            worldPos.x, worldPos.y, worldPos.z, depth, objectWorldHalfW, objectWorldHalfH, source)
+        NSLog("🅿️ [PlaceHold] ✅ ANCHOR at (%.3f,%.3f,%.3f) depth=%.2fm halfW=%.3f halfH=%.3f via %@",
+              worldPos.x, worldPos.y, worldPos.z, depth, objectWorldHalfW, objectWorldHalfH, source)
 
-      let viewSize = CGSize(width: cachedSW, height: cachedSH)
-      let back = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
-      NSLog("🅿️ [PlaceHold] SelfCheck → screen (%.0f,%.0f)", back.x, back.y)
+        let viewSize = CGSize(width: cachedSW, height: cachedSH)
+        let back = camera.projectPoint(worldPos, orientation: .portrait, viewportSize: viewSize)
+        NSLog("🅿️ [PlaceHold] SelfCheck → screen (%.0f,%.0f)", back.x, back.y)
 
-      DispatchQueue.main.async { [weak self] in
-        self?.distanceLabel.text = "\(Int(depth * 100)) cm"
+        // ── Seed visual tracker so subsequent refinement uses fresh 2D pixel target ──
+        if trackerEnabled {
+          seedTracker(initialBboxPhotoNorm: bboxNormalized, frame: frame)
+        }
+
+        DispatchQueue.main.async { [weak self] in
+          self?.distanceLabel.text = "\(Int(depth * 100)) cm"
+        }
+        say("Target locked.")
       }
-      say("Target locked.")
-    }
 }

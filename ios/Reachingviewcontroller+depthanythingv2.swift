@@ -95,6 +95,17 @@ private final class DepthAnythingV2Loader {
 
 // MARK: - Startup Validation (call once to confirm model is bundled & loadable)
 
+/// Pre-warms the DepthAnythingV2 model by forcing it to load into the cached singleton.
+/// Call this from a background thread to avoid blocking the main UI.
+func prewarmDepthAnythingV2Model() {
+  let t0 = ProcessInfo.processInfo.systemUptime
+  let model = DepthAnythingV2Loader.shared.model()
+  let elapsedMs = (ProcessInfo.processInfo.systemUptime - t0) * 1000
+  if model != nil {
+    NSLog("🌊 [DAv2] Prewarm ready in %.0fms", elapsedMs)
+  }
+}
+
 /// Eagerly loads and validates the DepthAnythingV2 model, logging detailed
 /// diagnostics. Call from viewDidLoad() so you get immediate confirmation
 /// in the console that the model is present and functional — no AR session needed.
@@ -209,6 +220,13 @@ func validateDepthAnythingModel() {
 
 extension ReachingViewController {
 
+  struct DAv2MetricDepthEstimate {
+    let depth: Float
+    let anchorDepth: Float
+    let ratio: Float
+    let anchorLabel: String
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Public Entry Point
   // ═══════════════════════════════════════════════════════════════════════════
@@ -222,7 +240,7 @@ extension ReachingViewController {
 
   func estimateMetricDepth(frame: ARFrame,
                            bboxARNormalized: [CGFloat],
-                           completion: @escaping (Float?) -> Void) {
+                           completion: @escaping (DAv2MetricDepthEstimate?) -> Void) {
     // Snapshot all inputs synchronously — `frame` cannot be retained off-thread.
     let pixelBuffer = frame.capturedImage
     let camera = frame.camera
@@ -268,20 +286,17 @@ extension ReachingViewController {
     // we got a metric hit, then propagate the scale factor to the bbox center.
     let sampleCandidates: [(CGFloat, CGFloat, String)] = [
       (cx, cy, "bbox center"),
-      (cx, cy + 0.10, "below bbox"),
-      (cx - 0.10, cy + 0.10, "below-left"),
-      (cx + 0.10, cy + 0.10, "below-right"),
-      (cx, 0.85, "lower screen"),
-      (0.30, 0.85, "lower-left screen"),
-      (0.70, 0.85, "lower-right screen"),
-      (cx, cy - 0.10, "above bbox"),
-      (cx, 0.50, "screen center"),
+      (cx, cy + 0.08, "below bbox"),
+      (cx - 0.08, cy + 0.08, "below-left"),
+      (cx + 0.08, cy + 0.08, "below-right"),
+      (cx, cy - 0.08, "above bbox"),
     ]
 
     var scaleAnchorMetricDepth: Float? = nil
     var scaleAnchorPixelX: CGFloat = cx  // for sampling DAv2 at this pixel later
     var scaleAnchorPixelY: CGFloat = cy
     var scaleAnchorLabel: String = "none"
+    let baselineDepth: Float? = (anchorDepth > 0.2 && anchorDepth < 6.0) ? anchorDepth : nil
 
     for (sx, sy, label) in sampleCandidates {
       // Clamp to valid normalized range
@@ -300,6 +315,18 @@ extension ReachingViewController {
         let hp = simd_make_float3(hit.worldTransform.columns.3)
         let dist = simd_length(hp - camPos)
         if dist > 0.3 && dist < 8.0 {
+          if let base = baselineDepth {
+            let maxJump = max(1.5, base * 2.0)
+            if label == "bbox center" && abs(dist - base) > maxJump {
+              NSLog("🌊 [DAv2] Skipping bbox-center anchor: %.2fm (base=%.2fm, maxJump=%.2fm)",
+                    dist, base, maxJump)
+              continue
+            }
+            if hit.targetAlignment == .vertical && dist > base * 2.0 {
+              NSLog("🌊 [DAv2] Skipping vertical anchor: %.2fm (>2x base %.2fm)", dist, base)
+              continue
+            }
+          }
           scaleAnchorMetricDepth = dist
           scaleAnchorPixelX = ssx
           scaleAnchorPixelY = ssy
@@ -310,18 +337,73 @@ extension ReachingViewController {
       }
     }
 
+    // ── Feature-point fallback scale anchor ────────────────────────────────
+    //
+    // Raycasts need ARKit PLANES, which on a non-LiDAR device only form after
+    // the user walks around for several seconds — that is the cold-start
+    // failure that left DAv2 unable to produce depth at all.
+    //
+    // Raw feature points appear within ~1s from the natural hand-shake of
+    // holding a phone — no walking required. We take points whose bearing
+    // falls inside the bbox cone, but accept them only when there are enough
+    // points and their depth spread is compact. A tiny two-point cluster was
+    // too easy to scale-anchor on the wrong surface.
+    var featureAnchorRejectReason: String? = nil
+    if scaleAnchorMetricDepth == nil, let cloud = frame.rawFeaturePoints {
+      var dists: [Float] = []
+      for p in cloud.points {
+        let toP = p - camPos
+        let d = simd_length(toP)
+        guard d > 0.3 && d < 8.0 else { continue }
+        let dot = simd_dot(toP / d, worldRay)
+        // Within ~35 deg of the bbox-center ray (cos 35 deg ~= 0.819).
+        // Widened from 18° to catch more desk-edge/surface feature points
+        // near smooth objects like water bottles.
+        if dot > 0.819 { dists.append(d) }
+      }
+      let minFeatureAnchorPoints = 6
+      if dists.count >= minFeatureAnchorPoints {
+        dists.sort()
+        let n = dists.count
+        let med = n % 2 == 0 ? (dists[n/2-1] + dists[n/2]) / 2.0 : dists[n/2]
+        let q1 = dists[n/4], q3 = dists[3*n/4]
+        let iqr = q3 - q1
+        let maxIQR = max(Float(0.18), med * 0.12)
+        if iqr <= maxIQR {
+          scaleAnchorMetricDepth = med
+          scaleAnchorPixelX = cx
+          scaleAnchorPixelY = cy
+          scaleAnchorLabel = String(format: "featurePoints(%d,cone35,iqr=%.2f)", dists.count, iqr)
+          NSLog("🌊 [DAv2] Scale anchor from %d feature points in bbox cone (35°) → %.2fm (IQR %.2fm)",
+                dists.count, med, iqr)
+        } else {
+          featureAnchorRejectReason = String(format: "feature anchor wide (points=%d, iqr=%.2fm, need≤%.2fm)",
+                                             dists.count, iqr, maxIQR)
+        }
+      } else if !dists.isEmpty {
+        featureAnchorRejectReason = "feature anchor weak (points=\(dists.count), need≥\(minFeatureAnchorPoints))"
+      }
+    }
+
+    let featureCount = frame.rawFeaturePoints?.points.count ?? 0
+
     guard let metricAnchor = scaleAnchorMetricDepth else {
-      NSLog("🌊 [DAv2] No raycast hit available at any of %d sample points — DAv2 cannot produce metric depth", sampleCandidates.count)
+      // Throttle log: only emit once per ~60 frames (~1/sec at 60fps)
+      self.dav2NoAnchorLogCount += 1
+      if self.dav2NoAnchorLogCount == 1 || self.dav2NoAnchorLogCount % 60 == 0 {
+        let reasonSuffix = featureAnchorRejectReason.map { " — \($0)" } ?? ""
+        NSLog("🌊 [DAv2] No scale anchor (featurePoints=%d) — attempt #%d, retrying...%@",
+              featureCount, self.dav2NoAnchorLogCount, reasonSuffix)
+      }
       // No way to convert relative→metric without a scale reference.
       completion(nil)
       return
     }
-    _ = worldRay  // suppress unused warning; we no longer use it directly
-    _ = scaleAnchorLabel  // suppress unused warning; only useful for logging
     // Const-copy for closure capture; these will be read on a background queue
     // after the guard above succeeds.
     let anchorPixelX: CGFloat = scaleAnchorPixelX
     let anchorPixelY: CGFloat = scaleAnchorPixelY
+    let anchorLabel = scaleAnchorLabel
 
     // Run DAv2 on a dedicated queue so we don't stall the AR/vision thread.
     depthAnythingQ.async { [weak self] in
@@ -404,7 +486,13 @@ extension ReachingViewController {
         // DAv2 output is INVERSE depth (disparity): larger values = closer.
         // Convert ratio: metric_obj / metric_anchor = (1/dRelObj) / (1/dRelAnchor)
         //                                            = dRelAnchor / dRelObj
-        let metricObj = metricAnchor * (dRelAnchor / dRelObj)
+        let ratio = dRelAnchor / dRelObj
+        if ratio < 0.4 || ratio > 2.5 {
+          NSLog("🌊 [DAv2] Ratio out of bounds: %.3f (anchor=%.2fm)", ratio, metricAnchor)
+          self.visionQ.async { completion(nil) }
+          return
+        }
+        let metricObj = metricAnchor * ratio
 
         // Sanity bound: reject implausible results.
         guard metricObj > 0.2, metricObj < 6.0 else {
@@ -415,10 +503,16 @@ extension ReachingViewController {
         }
 
         let elapsedMs = (ProcessInfo.processInfo.systemUptime - t0) * 1000
-        NSLog("🌊 [DAv2] ✅ Metric depth=%.2fm (anchor=%.2fm, ratio=%.3f, inference=%.0fms, mapDims=%dx%d)",
-              metricObj, metricAnchor, dRelAnchor / dRelObj, elapsedMs, dW, dH)
+        NSLog("🌊 [DAv2] ✅ Metric depth=%.2fm (anchor=%.2fm, ratio=%.3f, source=%@, inference=%.0fms, mapDims=%dx%d)",
+              metricObj, metricAnchor, ratio, anchorLabel, elapsedMs, dW, dH)
 
-        self.visionQ.async { completion(metricObj) }
+        let estimate = DAv2MetricDepthEstimate(
+          depth: metricObj,
+          anchorDepth: metricAnchor,
+          ratio: ratio,
+          anchorLabel: anchorLabel
+        )
+        self.visionQ.async { completion(estimate) }
       }
 
       request.imageCropAndScaleOption = .scaleFit

@@ -2,13 +2,13 @@
 // ─────────────────────────────────────────────────────────────────────────────
 // CyberSight — iOS Sound Effects
 //
-// Five physical audio files replace verbal state announcements:
+// App state audio cues:
 //
-//   siri-begin-improved.caf    → Listening started  (Siri-style chime)
-//   jbl_begin_sae.caf          → Thinking started   (replaces "Thinking" TTS)
-//   jbl_latency_sae.caf        → Loops while waiting for backend response
-//   jbl_success_sae.caf        → Right before speaking the result
-//   jbl_stopped_ios_sae.mp3    → Error returned from backend
+//   soundshelfstudio-ui-notification-listening-start.mp3 → Interaction/listening started
+//   jbl_latency_sae.caf                                  → Loops while waiting for backend/RTAB
+//   jbl_success_sae.caf                                  → Right before speaking the result
+//   jbl_stopped_ios_sae.mp3                              → Error returned from backend
+//   soundshelfstudio-ui-notification-stop-reaching.wav   → Manual reaching stop
 //
 // FILE PLACEMENT (see SOUND_SETUP_GUIDE.md):
 //   iOS  → ios/<ProjectName>/sounds/<filename>  (added to Xcode bundle)
@@ -74,20 +74,41 @@ const _safeSetPlaybackCategory = (): void => {
 // Sound.setCategory('Playback', false); ← REMOVED (caused BT-HFP conflict)
 
 // ── File → bundle key map ──────────────────────────────────────────────────
-// NOTE: "jbl_stopped,IOS_sae.mp3" has been RENAMED to "jbl_stopped_ios_sae.mp3"
-// on disk. Do that rename before building.
 const SOUND_FILES: Record<string, string> = {
-  listen:   'siri-begin-improved.caf',
+  listen:   'soundshelfstudio-ui-notification-listening-start.mp3',
   begin:    'jbl_begin_sae.caf',
   latency:  'jbl_latency_sae.caf',
   success:  'jbl_success_sae.caf',
-  stopped:  'jbl_stopped_ios_sae.mp3',  // ← renamed from "jbl_stopped,IOS_sae.mp3"
+  stopped:  'jbl_stopped_ios_sae.mp3',
+  stop_reaching: 'soundshelfstudio-ui-notification-stop-reaching.wav',
 };
+
+export type RecordingMicrophoneSource = 'wearables' | 'phone';
+
+export interface RecordingSessionResult {
+  success: boolean;
+  requestedSource?: RecordingMicrophoneSource;
+  source?: RecordingMicrophoneSource;
+  inputPort?: string;
+  inputType?: string;
+  fallbackReason?: string;
+  availableInputs?: Array<{
+    portName: string;
+    portType: string;
+  }>;
+}
 
 // ── Sound instances ────────────────────────────────────────────────────────
 type SoundKey = keyof typeof SOUND_FILES;
 const sounds: Partial<Record<SoundKey, Sound>> = {};
 let latencyLooping = false;
+
+/**
+ * Tracks whether the listen sound is currently playing.
+ * Prevents redundant .stop() calls on an already-finished Sound object,
+ * which on iOS can produce brief audio artifacts ("beat" / replay glitch).
+ */
+let _listenPlaying = false;
 /**
  * Generation counter for the latency loop.
  *
@@ -176,10 +197,39 @@ const _playOnce = (key: SoundKey, onFinish?: () => void): void => {
 
 /**
  * Play when the app enters LISTENING state.
- * Replaces the "Listening" verbal announcement.
+ * Resolves when the cue finishes so recording can start after the full sound.
  */
-export const playListenSound = (): void => {
-  _playOnce('listen');
+export const playListenSound = (): Promise<void> => {
+  _listenPlaying = true;
+  return new Promise((resolve) => _playOnce('listen', () => {
+    _listenPlaying = false;
+    resolve();
+  }));
+};
+
+/**
+ * Stop the listen sound if it is currently playing.
+ * Guarded by _listenPlaying to avoid calling .stop() on an already-finished
+ * Sound object, which on iOS produces brief audio artifacts.
+ */
+export const stopListenSound = (): Promise<void> => {
+  return new Promise((resolve) => {
+    const s = sounds.listen;
+    if (!s || !_listenPlaying) {
+      _listenPlaying = false;
+      resolve();
+      return;
+    }
+    _listenPlaying = false;
+    s.stop(() => resolve());
+  });
+};
+
+/**
+ * Play when the user stops reaching manually or when it goes back to default.
+ */
+export const playStopReachingSound = (): Promise<void> => {
+  return new Promise((resolve) => _playOnce('stop_reaching', resolve));
 };
 
 /**
@@ -195,45 +245,96 @@ export const prepareForRecording = (): void => {
 };
 
 /**
- * Configure the audio session for Bluetooth HFP mic recording.
+ * Configure the audio session for the chosen recording microphone.
  *
  * Unlike prepareForRecording() (which just sets the category via
  * react-native-sound), this calls into native code to set:
- *   .playAndRecord + .allowBluetooth + setActive(true)
+ *   .playAndRecord + selected input + setActive(true)
  *
- * The .allowBluetooth option is what tells iOS to route the microphone
- * input through the connected HFP Bluetooth device (e.g. Meta Ray-Ban
- * glasses). Without it, iOS uses the phone's built-in mic.
+ * For the Meta Ray-Ban path, native code explicitly prefers Bluetooth HFP.
+ * If no HFP mic is available, the result reports the fallback input.
  *
  * Returns the active input port info for logging/debugging.
  */
-export const configureBluetoothRecordingSession = async (): Promise<{
-  success: boolean;
-  inputPort?: string;
-  inputType?: string;
-}> => {
-  if (Platform.OS !== 'ios' || !ReachingModule?.configureBluetoothRecordingSession) {
+export const configureBluetoothRecordingSession = async (
+  preferredSource: RecordingMicrophoneSource = 'wearables',
+): Promise<RecordingSessionResult> => {
+  if (Platform.OS !== 'ios') {
     // Fallback: just set PlayAndRecord without BT options
     Sound.setCategory('PlayAndRecord', false);
-    return { success: true, inputPort: 'builtin', inputType: 'builtin' };
+    return {
+      success: true,
+      requestedSource: preferredSource,
+      source: 'phone',
+      inputPort: 'builtin',
+      inputType: 'builtin',
+    };
   }
+
   try {
-    const result = await ReachingModule.configureBluetoothRecordingSession();
-    return result;
+    if (ReachingModule?.configureRecordingSession) {
+      const result = await ReachingModule.configureRecordingSession(preferredSource);
+      return result;
+    }
+
+    if (preferredSource === 'wearables' && ReachingModule?.configureBluetoothRecordingSession) {
+      const result = await ReachingModule.configureBluetoothRecordingSession();
+      return {
+        ...result,
+        requestedSource: 'wearables',
+        source: result?.source || 'wearables',
+      };
+    }
+
+    Sound.setCategory('PlayAndRecord', false);
+    return {
+      success: true,
+      requestedSource: preferredSource,
+      source: 'phone',
+      inputPort: 'iPhone microphone',
+      inputType: 'builtin',
+      fallbackReason: 'Native microphone source selection is unavailable; using the iPhone microphone.',
+    };
   } catch (e: any) {
     console.warn('⚠️ [SFX] configureBluetoothRecordingSession failed:', e?.message);
-    // Fallback
     Sound.setCategory('PlayAndRecord', false);
-    return { success: false };
+    return {
+      success: false,
+      requestedSource: preferredSource,
+      source: 'phone',
+      fallbackReason: e?.message || 'Recording session configuration failed.',
+    };
+  }
+};
+
+export const configureRecordingSession = async (
+  preferredSource: RecordingMicrophoneSource,
+): Promise<RecordingSessionResult> => {
+  try {
+    const result = await configureBluetoothRecordingSession(preferredSource);
+    return result;
+  } catch (e: any) {
+    return {
+      success: false,
+      requestedSource: preferredSource,
+      source: 'phone',
+      fallbackReason: e?.message || 'Recording session configuration failed.',
+    };
   }
 };
 
 /**
- * Play when the app enters THINKING state (photo taken, request sent).
- * Replaces the "Thinking" verbal announcement.
- * Immediately starts the latency loop AFTER the begin tone finishes.
+ * Start the only thinking sound: the latency loop while waiting for backend/RTAB.
+ *
+ * NOTE: The listen sound is NOT stopped here — callers (handleVoiceCommand,
+ * handleAutoSubmit) already call stopListenSound() before this function.
+ * Calling sounds.listen?.stop() here was causing iOS AVAudioPlayer to
+ * produce brief audio artifacts (the user-reported "beat" / listen-sound
+ * replaying during the listening→thinking transition).
  */
 export const playThinkingStarted = (): void => {
+    // Ensure the listen flag is cleared (defensive, in case caller skipped stopListenSound).
+    _listenPlaying = false;
     // Bump the generation so any in-flight callbacks from a previous loop
     // (e.g. a queued s.play() inside a pre-flight stop callback) are
     // considered superseded and silently bail out. This is the fundamental

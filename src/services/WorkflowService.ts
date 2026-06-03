@@ -19,6 +19,26 @@ import { debugLogger } from './DebugLogger';
 // This will be the bridge to Swift ViewController
 const { ReachingModule: CybsGuidanceModule } = NativeModules;
 
+let dav2PrewarmStarted = false;
+
+const looksLikeReachingRequest = (text?: string): boolean => {
+  const normalized = (text || '').toLowerCase();
+  return /\b(take|guide|lead|walk|navigate|bring)\s+(me\s+)?to\b/.test(normalized)
+    || /\b(reach|grab|get)\b/.test(normalized);
+};
+
+const prewarmDAv2InBackground = (reason: string) => {
+  if (Platform.OS !== 'ios' || dav2PrewarmStarted || !CybsGuidanceModule?.prewarmDAv2) return;
+
+  dav2PrewarmStarted = true;
+  console.log(`🔥 [Workflow] Pre-warming DAv2 model (${reason})`);
+  CybsGuidanceModule.prewarmDAv2()
+    .catch((e: any) => {
+      dav2PrewarmStarted = false;
+      console.warn('⚠️ [Workflow] DAv2 prewarm failed:', e?.message || e);
+    });
+};
+
 /**
  * Trigger iOS ARKit reaching with bounding box data
  * 
@@ -150,6 +170,15 @@ export const getCurrentLoopDelay = (): number => {
   return continuousModeState.currentLoopDelay;
 };
 
+export const getContinuousModeRateLimitDelay = (minIntervalMs?: number): number => {
+  const { lastRequestTime } = continuousModeState;
+  if (lastRequestTime <= 0) return 0;
+
+  const minInterval = minIntervalMs ?? NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS;
+  const timeSinceLastRequest = Date.now() - lastRequestTime;
+  return Math.max(0, minInterval - timeSinceLastRequest);
+};
+
 export const startContinuousMode = (
   mode: 'navigation' | 'reaching',
   loopDelay?: number
@@ -197,18 +226,11 @@ export const stopContinuousMode = (reason?: string, resetSession: boolean = fals
   }
 };
 
-export const shouldPreventInfiniteLoop = (minIntervalMs?: number): boolean => {
-  const { iterationCount, lastRequestTime } = continuousModeState;
+export const shouldPreventInfiniteLoop = (_minIntervalMs?: number): boolean => {
+  const { iterationCount } = continuousModeState;
 
   if (iterationCount >= NAVIGATION_CONFIG.MAX_LOOP_ITERATIONS) {
     console.warn('⚠️ Max iterations reached');
-    return true;
-  }
-
-  const timeSinceLastRequest = Date.now() - lastRequestTime;
-  const minInterval = minIntervalMs ?? NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS;
-  if (lastRequestTime > 0 && timeSinceLastRequest < minInterval) {
-    console.warn('⚠️ Request rate too high');
     return true;
   }
 
@@ -229,7 +251,7 @@ export const sendToWorkflow = async (
       throw new Error('Request cancelled');
     }
 
-    const isContinuousIteration = request.navigation === true || request.reaching_flag === true;
+    const isContinuousIteration = request.navigation === true || request.reaching_flag === true || request.reaching_ios === true;
 
     if (!isContinuousIteration && (!request.text || !request.text.trim())) {
       const message = 'No voice command provided. Please speak your request.';
@@ -257,6 +279,17 @@ export const sendToWorkflow = async (
     formData.append('session_id', SESSION_ID);
     formData.append('continuousMode', isContinuousIteration ? 'true' : 'false');
 
+    // ── mode field — n8n Redis expression references $json.body.mode ────
+    // Derive from the three-flag system so the backend always has it.
+    const modeValue = request.reaching_ios === true
+      ? 'reaching_ios'
+      : request.reaching_flag === true
+        ? 'reaching'
+        : request.navigation === true
+          ? 'navigation'
+          : 'default';
+    formData.append('mode', modeValue);
+
     // ── session_start signal — fires once per fresh session ─────────────
     // Coordinated with Melody's backend tracker container: when this is
     // true, the backend reinitializes the tracker for this session_id
@@ -273,6 +306,11 @@ export const sendToWorkflow = async (
     // session_id send session_start=false.
     isNewSession = false;
 
+    // ── Image dimensions — always sent so backend JSON.stringify never
+    // encounters undefined for $json.body.imageWidth / imageHeight ──────
+    formData.append('imageWidth', String(request.imageWidth ?? 0));
+    formData.append('imageHeight', String(request.imageHeight ?? 0));
+
     // Add image if provided
     if (request.imageUri) {
       let imageUri = request.imageUri;
@@ -286,10 +324,7 @@ export const sendToWorkflow = async (
         name: 'photo.jpg',
       } as any);
 
-      // send image dimensions
       if (request.imageWidth && request.imageHeight) {
-        formData.append('imageWidth', String(request.imageWidth));
-        formData.append('imageHeight', String(request.imageHeight));
         console.log(`📐 Image dimensions: ${request.imageWidth}×${request.imageHeight}`);
       }
     }
@@ -300,6 +335,7 @@ export const sendToWorkflow = async (
     console.log('🔄 Navigation:', navigationValue);
     console.log('🎯 Reaching:', reachingValue);
     console.log('🍎 Reaching iOS:', reachingIOSValue);
+    console.log('🎮 Mode:', modeValue);
     console.log('🆔 Session:', SESSION_ID);
 
     requestStartTime = Date.now();
@@ -310,6 +346,15 @@ export const sendToWorkflow = async (
 
     if (signal?.aborted) {
       throw new Error('Request cancelled');
+    }
+
+    // Pre-warm DAv2 while the backend request is in flight. On the first user
+    // request reaching_ios is still false because the backend has not replied,
+    // so use the transcript intent too.
+    if (reachingIOSValue === 'true' || looksLikeReachingRequest(request.text)) {
+      prewarmDAv2InBackground(
+        reachingIOSValue === 'true' ? 'reaching_ios request' : 'likely reaching transcript'
+      );
     }
 
     // ========================================================================
@@ -342,7 +387,13 @@ export const sendToWorkflow = async (
     // ========================================================================
     // Parse response with THREE-FLAG support (including reaching_ios)
     // ========================================================================
-    const parsedResponse = parseWorkflowResponse(response.data);
+    const parsedResponse = parseWorkflowResponse(response.data, {
+      reachingRequest: request.reaching_flag === true,
+    });
+
+    if (parsedResponse.reaching_ios === true) {
+      prewarmDAv2InBackground('reaching_ios response');
+    }
 
     console.log('📄 Response:', {
       textLength: parsedResponse.text?.length || 0,
@@ -434,6 +485,7 @@ export interface SmartGuidanceRequest {
   image: string;
   annotated_image: string;
   success: boolean;
+  confidence?: number;
   session_id?: string;
 }
 
@@ -468,7 +520,11 @@ export const sendToSmartGuidance = async (
         image: payload.image,
         annotated_image: payload.annotated_image,
         success: payload.success,
-        ...(payload.session_id ? { session_id: payload.session_id } : {}),
+        confidence: payload.confidence,
+        // Always include session_id — the tracker container keys its
+        // per-session state on it. Fall back to the current session id
+        // rather than dropping the field entirely.
+        session_id: payload.session_id || getSessionId(),
       },
     },
     {
@@ -498,7 +554,10 @@ export const sendToSmartGuidance = async (
 // RESPONSE PARSER (with reaching_ios support)
 // =============================================================================
 
-function parseWorkflowResponse(data: any): WorkflowResponse {
+function parseWorkflowResponse(
+  data: any,
+  opts: { reachingRequest?: boolean } = {},
+): WorkflowResponse {
   const defaultResponse: WorkflowResponse = {
     text: '',
     navigation: false,
@@ -647,6 +706,18 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     return '';
   };
 
+  const pickStringByKeyPriority = (keys: string[]): string => {
+    for (const key of keys) {
+      for (const payload of orderedPayloads) {
+        const value = payload[key];
+        if (typeof value === 'string' && value.trim()) {
+          return value.trim();
+        }
+      }
+    }
+    return '';
+  };
+
   const pickNumber = (keys: string[]): number | undefined => {
     for (const payload of orderedPayloads) {
       for (const key of keys) {
@@ -742,6 +813,13 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     parseBoolean(payload.navigation_completed) === true
   );
 
+  // reaching_completed flag — standard/Melody reaching pipeline says the
+  // object has been reached. Used to end a reacquisition loop cleanly.
+  const reaching_completed = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.reaching_completed) === true ||
+    parseBoolean(payload.reachingCompleted) === true
+  );
+
   // Extract guidance text with hand-direction precedence.
   const hand_direction = normalizeBackendString(
     pickString(['hand_direction', 'handDirection']),
@@ -752,14 +830,15 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   );
 
   const nonReachingText = normalizeBackendString(
-    pickString(['response', 'text', 'message']),
+    pickStringByKeyPriority(['response', 'text', 'message']),
   );
 
   let text = '';
-  if (hand_direction) {
-    text = hand_direction;
-  } else if (reaching_flag || tracking_active) {
-    text = reachingText || normalizeBackendString(pickString(['text', 'message']));
+  if (opts.reachingRequest === true) {
+    // Outgoing reaching loops speak reaching-only guidance. The backend can
+    // also set reaching/tracking flags on the initial scene-description
+    // response, so those response flags must not decide the spoken field.
+    text = hand_direction || reachingText || normalizeBackendString(pickString(['text', 'message', 'response']));
   } else {
     text = nonReachingText || reachingText;
   }
@@ -779,12 +858,14 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
   );
   const annotated_image = annotatedImageRaw || undefined;
 
+  const confidence = pickNumber(['confidence']);
+
   // Depth from backend (meters)
   const depthValue = pickNumber(['depth']);
   const depth = depthValue !== undefined ? String(depthValue) : undefined;
 
   // Loop delay
-  let loopDelay = NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS;
+  let loopDelay: number = NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS;
   const loopDelayValue = pickNumber(['loopDelay']);
   if (loopDelayValue && loopDelayValue > 0) {
     loopDelay = loopDelayValue;
@@ -801,6 +882,7 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     reaching_ios,
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
     object,
+    confidence,
     depth,
     tracking_active,
     reached,
@@ -814,9 +896,11 @@ function parseWorkflowResponse(data: any): WorkflowResponse {
     bbox,
     object,
     depth,
+    confidence,
     hand_direction: hand_direction || undefined,
     annotated_image,
     tracking_active,
+    reaching_completed,
     reached,
     loopDelay,
     session_id,
@@ -896,6 +980,7 @@ export default {
   getCurrentMode,
   getContinuousModeIteration,
   getCurrentLoopDelay,
+  getContinuousModeRateLimitDelay,
   startContinuousMode,
   stopContinuousMode,
   incrementContinuousMode,

@@ -17,6 +17,8 @@ import CoreHaptics
 
 class ReachingViewController: UIViewController {
 
+  private static var dav2PrewarmRequested = false
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Enums
   // ═══════════════════════════════════════════════════════════════════════════
@@ -160,6 +162,55 @@ class ReachingViewController: UIViewController {
   /// Re-detection still runs (for logging) but CANNOT move the anchor.
   var anchorLockedForHandFree = false
 
+  // ── DAv2 parallel depth refinement (place-and-hold path) ─────────────────
+  // Placement NO LONGER waits for DAv2. The anchor is placed IMMEDIATELY from
+  // the fallback ladder (raycast → feature points → near default) so the box appears
+  // the instant detection lands. DAv2 then runs IN PARALLEL; when it returns a
+  // metric depth, the anchor is snapped to it along the original bbox ray.
+  //
+  // This is the fix for the "box appears a minute later" freeze: the old state
+  // machine held EVERY frame until DAv2 got a scale anchor, and on a non-LiDAR
+  // device that needs the user to walk around until ARKit builds planes.
+  enum DAv2RefineState { case pending, done }
+  var dav2RefineState: DAv2RefineState = .pending
+  /// True while a DAv2 inference is in flight — prevents stacking requests.
+  var dav2RequestInFlight = false
+  /// Counter for throttling DAv2 "no scale anchor" log messages
+  var dav2NoAnchorLogCount: Int = 0
+  /// Wall-clock deadline; after this we stop retrying DAv2 and keep the
+  /// fallback-ladder depth. Set at placement time.
+  var dav2RefineDeadline: TimeInterval = 0
+  /// How long after placement to keep retrying DAv2 before giving up.
+  let dav2RefineWindowSec: TimeInterval = 45.0
+  /// Placement ray captured at anchor time so a late DAv2 result can re-place
+  /// the anchor at the corrected depth along the exact same bearing.
+  var placementRayOrigin: simd_float3 = .zero
+  var placementRayDir: simd_float3 = .zero
+  var placementHorizScale: CGFloat = 1.0
+  /// Place-and-hold: true after ARKit has approved a stable depth along the
+  /// original placement ray. DAv2 can seed depth, but does not get to move the
+  /// anchor laterally or permanently lock the target by itself.
+  var placeAndHoldDepthLocked = false
+  /// Place-and-hold depth refinement buffer. Unlike the legacy refinement
+  /// buffer, these samples are measured only on the original placement ray,
+  /// so they cannot drag the target toward the live phone reticle.
+  var placeAndHoldRefinementHits: [Float] = []
+  /// Default scene-distance seed when ARKit has not formed geometry yet.
+  /// 1.5m is a safer non-LiDAR cold-start prior than desk-reach 0.9m because
+  /// it lets the locked-ray consensus accept real mid-room evidence.
+  let placeAndHoldDefaultDepth: Float = 1.5
+  /// Large-jump candidates are not trusted individually, but a stable cluster
+  /// means the current seed is wrong and the anchor should be rebased.
+  var placeAndHoldAlternateDepthHits: [Float] = []
+  let placeAndHoldRefinementMinHits = 7
+  let placeAndHoldRefinementMaxHits = 12
+  let placeAndHoldRefinementIQR: Float = 0.08
+  let placeAndHoldRefinementHardJump: Float = 1.25
+  let placeAndHoldAlternateDepthMinHits = 6
+  let placeAndHoldAlternateDepthMaxHits = 14
+  let placeAndHoldAlternateDepthIQR: Float = 0.18
+  var placeAndHoldLastDepthSource = "none"
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - ARKit
   // ═══════════════════════════════════════════════════════════════════════════
@@ -198,10 +249,12 @@ class ReachingViewController: UIViewController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   // Master feature flag. false → original behavior, true → tracker drives refinement.
-  let trackerEnabled: Bool = true
+  var trackerEnabled: Bool { return !placeAndHoldPrototype }
 
   var trackerSequenceHandler = VNSequenceRequestHandler()
+  var activeTrackerRequest: VNTrackObjectRequest?
   var lastTrackedObservation: VNDetectedObjectObservation?
+  var lastTrackedConfidence: VNConfidence = 0
   var trackingActive: Bool = false
   var consecutiveLowConfFrames: Int = 0
   let trackerLowConfThreshold: Float = 0.40
@@ -464,9 +517,14 @@ class ReachingViewController: UIViewController {
     setupHaptics()
     setupTapToDismiss()
 
-    // Eagerly validate DepthAnythingV2 model on startup — logs detailed diagnostics
-    DispatchQueue.global(qos: .userInitiated).async {
-      validateDepthAnythingModel()
+    // Keep this lightweight: the JS/native bridge prewarms DAv2 as soon as a
+    // reaching-like command is heard. This is only a last-chance warmup if the
+    // bridge did not get there first.
+    if !Self.dav2PrewarmRequested {
+      Self.dav2PrewarmRequested = true
+      DispatchQueue.global(qos: .userInitiated).async {
+        prewarmDepthAnythingV2Model()
+      }
     }
   }
 
@@ -588,8 +646,29 @@ class ReachingViewController: UIViewController {
     }
 
     bboxNormalized = bboxNormalized.map { min(max($0, 0), 1) }
-    let bw = bboxNormalized[2] - bboxNormalized[0]
-    let bh = bboxNormalized[3] - bboxNormalized[1]
+    var bw = bboxNormalized[2] - bboxNormalized[0]
+    var bh = bboxNormalized[3] - bboxNormalized[1]
+    if bw > 0, bh > 0 {
+      let minW: CGFloat = 0.05, minH: CGFloat = 0.05
+      let maxW: CGFloat = 0.20, maxH: CGFloat = 0.28
+      var scale: CGFloat = 1.0
+      if bw < minW || bh < minH {
+        scale = max(minW / bw, minH / bh)
+      } else if bw > maxW || bh > maxH {
+        scale = min(maxW / bw, maxH / bh)
+      }
+      if abs(scale - 1.0) > 0.001 {
+        let cx = (bboxNormalized[0] + bboxNormalized[2]) * 0.5
+        let cy = (bboxNormalized[1] + bboxNormalized[3]) * 0.5
+        let newW = bw * scale
+        let newH = bh * scale
+        bboxNormalized = [cx - newW * 0.5, cy - newH * 0.5, cx + newW * 0.5, cy + newH * 0.5]
+        bboxNormalized = bboxNormalized.map { min(max($0, 0), 1) }
+        bw = bboxNormalized[2] - bboxNormalized[0]
+        bh = bboxNormalized[3] - bboxNormalized[1]
+        NSLog("⚖️ [ReachingVC] Bbox size clamped to %.3f×%.3f (scale=%.2f)", bw, bh, scale)
+      }
+    }
     if bw < 0.01 || bh < 0.01 {
       bboxNormalized = [0.35, 0.35, 0.65, 0.65]
       NSLog("⚠️ [ReachingVC] Bbox degenerate (%.3f×%.3f) — using center fallback", bw, bh)
@@ -683,7 +762,9 @@ class ReachingViewController: UIViewController {
     handGuidanceActive = false
     handGuidanceAnnounced = false
     // Reset tracker state — fresh handler on next session
+    cancelTracker()
     trackingActive = false
+    activeTrackerRequest = nil
     lastTrackedObservation = nil
     consecutiveLowConfFrames = 0
     isTrackerReseeding = false

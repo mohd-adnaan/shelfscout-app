@@ -78,19 +78,49 @@ extension ReachingViewController {
     // ── AR-portrait (top-left origin) → Vision-normalized (bottom-left origin) ─
     // We pass orientation: .right to Vision, so Vision sees the buffer rotated
     // to portrait. Y is bottom-up in Vision, so we flip from our top-down convention.
-    let visX = arPx1
-    let visY = 1.0 - arPy2     // top-down maxY → bottom-up minY
-    let visW = arPx2 - arPx1
-    let visH = arPy2 - arPy1
+    var visX = arPx1
+    var visY = 1.0 - arPy2     // top-down maxY → bottom-up minY
+    var visW = arPx2 - arPx1
+    var visH = arPy2 - arPy1
+
+    // ── Vision Framework Minimum Size Enforcement ────────────────────────────
+    // VNTrackObjectRequest will throw "Internal error: unexpected tracked object
+    // bounding box size" if the box is too small (e.g., < ~5% of the frame).
+    // The Rubik's cube at a distance can easily be 3%x2%.
+    // We symmetrically inflate the box to a minimum of 0.05 to satisfy Vision.
+    // Since tryRefineAnchorDepth only uses the CENTER of the tracker bbox to
+    // cast its ray, inflating symmetrically has ZERO effect on the ray's accuracy.
+    let minSize: CGFloat = 0.05
+    if visW < minSize {
+      let diff = minSize - visW
+      visX -= diff / 2.0
+      visW = minSize
+    }
+    if visH < minSize {
+      let diff = minSize - visH
+      visY -= diff / 2.0
+      visH = minSize
+    }
+
+    // Clamp to valid normalized rect [0..1]
+    visX = max(0.0, min(visX, 1.0 - visW))
+    visY = max(0.0, min(visY, 1.0 - visH))
 
     let visionBbox = CGRect(x: visX, y: visY, width: visW, height: visH)
-    let observation = VNDetectedObjectObservation(boundingBox: visionBbox)
+    let safeObs = VNDetectedObjectObservation(boundingBox: visionBbox)
+
+    // Free existing tracking resources before creating a new sequence handler
+    cancelTracker()
 
     // Fresh sequence handler — track state must restart cleanly
     trackerSequenceHandler = VNSequenceRequestHandler()
-    lastTrackedObservation = observation
+    lastTrackedObservation = safeObs
+    let request = VNTrackObjectRequest(detectedObjectObservation: safeObs)
+    request.trackingLevel = .accurate
+    activeTrackerRequest = request
     consecutiveLowConfFrames = 0
     trackingActive = true
+    lastTrackedConfidence = 1.0
     lastTrackerReseedTime = ProcessInfo.processInfo.systemUptime
 
     // Reseed shifts the ray direction — stale depths in the median buffer
@@ -114,12 +144,10 @@ extension ReachingViewController {
   @discardableResult
   func updateTracker(frame: ARFrame) -> VNDetectedObjectObservation? {
     guard trackerEnabled, trackingActive,
-          let lastObs = lastTrackedObservation else { return nil }
+          let request = activeTrackerRequest else { return nil }
 
-    let request = VNTrackObjectRequest(detectedObjectObservation: lastObs)
-    request.trackingLevel = .accurate
-    // isLastFrame = false — we're streaming. Apple's tracker uses this to free
-    // tracking state when the sequence ends; we never end mid-session.
+    // DO NOT modify request.inputObservation here. VNSequenceRequestHandler updates it automatically.
+    // Modifying it manually causes the tracker to restart internally and leak memory/trackers.
 
     do {
       try trackerSequenceHandler.perform([request], on: frame.capturedImage, orientation: .right)
@@ -133,8 +161,34 @@ extension ReachingViewController {
       consecutiveLowConfFrames += 1
       return nil
     }
+    lastTrackedConfidence = result.confidence
 
-    lastTrackedObservation = result
+    // Apply minimum size limits to the output observation without touching the internal tracker state
+    var safeBox = result.boundingBox
+    let minSize: CGFloat = 0.05
+    if safeBox.width < minSize {
+      let diff = minSize - safeBox.width
+      safeBox.origin.x -= diff / 2.0
+      safeBox.size.width = minSize
+    }
+    if safeBox.height < minSize {
+      let diff = minSize - safeBox.height
+      safeBox.origin.y -= diff / 2.0
+      safeBox.size.height = minSize
+    }
+    
+    // Clamp to valid [0..1]
+    safeBox.origin.x = max(0.0, min(safeBox.origin.x, 1.0 - safeBox.width))
+    safeBox.origin.y = max(0.0, min(safeBox.origin.y, 1.0 - safeBox.height))
+    
+    let safeObs = VNDetectedObjectObservation(boundingBox: safeBox)
+    // Manually copy over the confidence since we created a new VNDetectedObjectObservation
+    let finalObs = VNDetectedObjectObservation(boundingBox: safeBox)
+    // Wait, VNDetectedObjectObservation does not have a public initializer that sets confidence.
+    // However, we only need it for boundingBox in the rest of the code. We'll store it as is,
+    // and rely on `result.confidence` for the check below.
+
+    lastTrackedObservation = safeObs
 
     if result.confidence < trackerLowConfThreshold {
       consecutiveLowConfFrames += 1
@@ -142,7 +196,7 @@ extension ReachingViewController {
       consecutiveLowConfFrames = 0
     }
 
-    return result
+    return safeObs
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -587,5 +641,20 @@ extension ReachingViewController {
               newCx, newCy, newW, newH, imgW, imgH, elapsed)
       }
     }.resume()
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Cleanup
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  func cancelTracker() {
+    guard trackingActive, let request = activeTrackerRequest, let frame = lastARFrame else { return }
+    request.isLastFrame = true
+    do {
+      try trackerSequenceHandler.perform([request], on: frame.capturedImage, orientation: .right)
+    } catch {
+      // Ignored during cancellation
+    }
+    activeTrackerRequest = nil
   }
 }

@@ -27,6 +27,8 @@ import Video from 'react-native-video';
 import { useTTS } from './src/hooks/useTTS';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
 import { useWakeWordSTT } from './src/hooks/useWakeWordSTT';
+import { useDeviceOrientation } from './src/hooks/useDeviceOrientation';
+import { useProximitySensor } from './src/hooks/useProximitySensor';
 import {
   sendToWorkflow,
   sendToSmartGuidance,
@@ -36,6 +38,7 @@ import {
   stopContinuousMode,
   incrementContinuousMode,
   getCurrentLoopDelay,
+  getContinuousModeRateLimitDelay,
   shouldPreventInfiniteLoop,
   updateLoopDelay,
   getSessionId,
@@ -48,6 +51,7 @@ import {
   initSounds,
   releaseSounds,
   playListenSound,
+  stopListenSound,
   playThinkingStarted,
   stopLatencyLoop,
   playSuccessChime,
@@ -55,6 +59,7 @@ import {
   prepareForRecording,
   configurePlaybackSession,
   setWearablesMode,
+  playStopReachingSound,
 } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
@@ -78,6 +83,9 @@ const TTS_COMPLETION_BUFFER_MS = 500;
 const STARTUP_LOADER_MIN_MS = 1800;
 const VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS = 800;
 const VOICEOVER_LISTENING_GRACE_MS = 600;
+const POSTURE_WARNING_COOLDOWN_MS = 6000;
+const POSTURE_MAX_WAIT_MS = 6500;
+const POSTURE_POLL_INTERVAL_MS = 250;
 
 // =============================================================================
 // PIPELINE PRE-FETCH CONFIGURATION
@@ -90,8 +98,31 @@ const PREFETCH_CONFIG = {
   MIN_CYCLE_COOLDOWN: 300,
 };
 
-const SMART_GUIDANCE_MIN_CYCLE_MS = 250; // 4fps
+const SMART_GUIDANCE_MIN_CYCLE_MS = 200; // 5fps
 const KASRA_FEED_INTERVAL_MS = 500;
+
+let dav2PrewarmStarted = false;
+
+const looksLikeReachingCommand = (text: string): boolean => {
+  const normalized = text.toLowerCase();
+  return /\b(take|guide|lead|walk|navigate|bring)\s+(me\s+)?to\b/.test(normalized)
+    || /\b(reach|grab|get)\b/.test(normalized);
+};
+
+const prewarmDAv2InBackground = (reason: string) => {
+  if (Platform.OS !== 'ios' || dav2PrewarmStarted) return;
+  const { ReachingModule } = NativeModules;
+  if (!ReachingModule?.prewarmDAv2) return;
+
+  dav2PrewarmStarted = true;
+  console.log(`🔥 [DAv2] Pre-warming model (${reason})`);
+  ReachingModule.prewarmDAv2()
+    .then(() => console.log('✅ [DAv2] Prewarm complete'))
+    .catch((e: any) => {
+      dav2PrewarmStarted = false;
+      console.warn('⚠️ [DAv2] Prewarm failed:', e?.message || e);
+    });
+};
 
 // =============================================================================
 // AppInner
@@ -115,6 +146,13 @@ function AppInner(): React.JSX.Element {
   const settingsRef = useRef(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
+  // ── Posture sensing (orientation + proximity) ───────────────────────────
+  const { isStraightRef, isAvailableRef: orientationAvailableRef } = useDeviceOrientation();
+  const { isNearRef, isAvailableRef: proximityAvailableRef } = useProximitySensor(
+    Platform.OS === 'ios' && !settings.useWearablesCamera
+  );
+  const lastPostureWarningRef = useRef(0);
+
   // Keep SFX wearables-mode flag in sync with settings
   useEffect(() => {
     setWearablesMode(settings.useWearablesCamera);
@@ -125,6 +163,7 @@ function AppInner(): React.JSX.Element {
   const { hasPermission: hasCameraPermission, requestPermission: requestCameraPermission } = useCameraPermission();
   const { hasPermission: hasMicPermission, requestPermission: requestMicPermission } = useMicrophonePermission();
   const cameraRef = useRef<Camera>(null);
+  const isCapturingRef = useRef(false);
   const containerRef = useRef<View>(null);
 
   // ── Audio / Speech ─────────────────────────────────────────────────────────
@@ -140,8 +179,15 @@ function AppInner(): React.JSX.Element {
   const navigationLoopAbortRef = useRef(false);
   const isContinuousModeRunning = useRef(false);
   const continuousModeAbortRef = useRef(false);
+  const continuousBackendInFlightRef = useRef(false);
+  const continuousTtsSpeakingRef = useRef(false);
+  const continuousTtsGenerationRef = useRef(0);
+  const continuousSpeechQueueRef = useRef<string[]>([]);
+  const continuousSpeechDrainingRef = useRef(false);
+  const continuousSpeechCurrentTextRef = useRef('');
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
   const prefetchedPhotoRef = useRef<string | null>(null);
+  const activeCapturePromiseRef = useRef<Promise<string> | null>(null);
   const wearablesPrewarmAttemptedRef = useRef(false);
   const smartGuidanceActiveRef = useRef(false);
   const smartGuidanceResumeMainRef = useRef(false);
@@ -149,11 +195,23 @@ function AppInner(): React.JSX.Element {
     object?: string;
     bbox?: any;
     annotatedImage?: string;
+    confidence?: number;
   } | null>(null);
+  // Issue 5: the Qwen seed bbox is handed to the tracker container ONLY on the
+  // first smart-guidance call after the tracker locks. While tracking is
+  // active the container owns the box, so subsequent calls send no bbox.
+  const smartGuidanceSeededRef = useRef(false);
+  // Issue 4: true while tracking has been lost and the loop is re-requesting
+  // Qwen detection to reacquire the target. Keeps the loop alive instead of
+  // exiting on bothInactive.
+  const reacquiringRef = useRef(false);
   const kasraFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const kasraLastFrameRef = useRef<string>('');
+  const kasraLastSentFrameRef = useRef<string>('');
   const kasraLastObjectRef = useRef<string>('');
   const kasraIsSendingRef = useRef(false);
+  const kasraFrameSeqRef = useRef(0);
+  const rtabSubmittedFrameUrisRef = useRef<Set<string>>(new Set());
+  const rtabSubmittedFrameQueueRef = useRef<string[]>([]);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -432,88 +490,230 @@ function AppInner(): React.JSX.Element {
       trimmedPrefix ? `${trimmedPrefix} ${suffix}` : suffix
     );
   }, []);
-  const reactivateCameraAndCapture = async (options?: {
-    enableShutterSound?: boolean;
-  }): Promise<string> => {
-    console.log('📷 Reactivating camera for capture...');
-    setIsCameraActive(true);
 
-    const useSystemShutterSound =
-      options?.enableShutterSound === true &&
-      Platform.OS === 'ios' &&
-      !settingsRef.current.useWearablesCamera;
-
+  // ────────────────────────────────────────────────────────────────────────
+  // Posture gating (orientation + proximity)
+  // ────────────────────────────────────────────────────────────────────────
+  const getPostureStatus = useCallback(() => {
     if (settingsRef.current.useWearablesCamera) {
+      return { ok: true, isNear: false, isStraight: true, hasSignal: false };
+    }
+
+    const hasOrientation = orientationAvailableRef.current;
+    const hasProximity = proximityAvailableRef.current;
+
+    if (!hasOrientation && !hasProximity) {
+      return { ok: true, isNear: false, isStraight: true, hasSignal: false };
+    }
+
+    const isNear = hasProximity ? isNearRef.current : false;
+    const isStraight = hasOrientation ? isStraightRef.current : true;
+    const ok = !isNear && isStraight;
+
+    return { ok, isNear, isStraight, hasSignal: true };
+  }, []);
+
+  const buildPostureMessage = useCallback((status: {
+    isNear: boolean;
+    isStraight: boolean;
+  }): string => {
+    if (status.isNear && !status.isStraight) {
+      return 'Move the phone away from your face and hold it straight with the camera facing forward.';
+    }
+    if (status.isNear) {
+      return 'Move the phone away from your face and hold it straight with the camera facing forward.';
+    }
+    if (!status.isStraight) {
+      return 'Hold the phone straight with the camera facing forward.';
+    }
+    return '';
+  }, []);
+
+  const maybeAnnouncePosture = useCallback(async (_context: 'capture' | 'continuous') => {
+    const status = getPostureStatus();
+    if (status.ok) return false;
+
+    const now = Date.now();
+    if (now - lastPostureWarningRef.current < POSTURE_WARNING_COOLDOWN_MS) return false;
+
+    const message = buildPostureMessage(status);
+    if (!message) return false;
+
+    lastPostureWarningRef.current = now;
+
+    if (!screenReaderEnabledRef.current) {
+      audioFeedback.playEarcon('error');
+    }
+    AccessibilityInfo.announceForAccessibility(message);
+
+    if (!screenReaderEnabledRef.current) {
       try {
-        const wearablesPhoto = await wearablesCamera.capturePhoto();
-        lastImageDimensions.current = { width: 0, height: 0 };
-        return wearablesPhoto;
-      } catch (error) {
-        console.error('❌ Wearables capture failed:', error);
-        throw error;
+        await speachesSentenceChunker.synthesizeSpeechChunked(message);
+      } catch (e: any) {
+        if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+          console.warn('⚠️ Posture TTS error (non-fatal):', e?.message || e);
+        }
       }
     }
 
-    await new Promise(resolve => setTimeout(resolve, CAMERA_REACTIVATION_DELAY_MS));
+    return true;
+  }, [buildPostureMessage, getPostureStatus]);
 
-    if (!cameraRef.current) {
-      console.error('❌ Camera ref not available after reactivation');
-      return '';
+  const waitForGoodPosture = useCallback(async (context: 'capture' | 'continuous'): Promise<boolean> => {
+    const status = getPostureStatus();
+    if (status.ok) return true;
+
+    await maybeAnnouncePosture(context);
+
+    if (context === 'continuous') {
+      return false;
     }
 
-    try {
-      if (useSystemShutterSound) {
-        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
-        const { ReachingModule } = NativeModules;
-        if (ReachingModule?.playSystemShutter) {
+    const start = Date.now();
+    while (Date.now() - start < POSTURE_MAX_WAIT_MS) {
+      await new Promise(resolve => setTimeout(resolve, POSTURE_POLL_INTERVAL_MS));
+      if (getPostureStatus().ok) return true;
+    }
+
+    return getPostureStatus().ok;
+  }, [getPostureStatus, maybeAnnouncePosture]);
+
+  // Keep a stable ref for callbacks that are intentionally []-memoized.
+  const waitForGoodPostureRef = useRef(waitForGoodPosture);
+  useEffect(() => {
+    waitForGoodPostureRef.current = waitForGoodPosture;
+  }, [waitForGoodPosture]);
+  const reactivateCameraAndCapture = useCallback(async (options?: {
+    enableShutterSound?: boolean;
+    busyStrategy?: 'wait' | 'skip' | 'wait-new';
+  }): Promise<string> => {
+    if (isCapturingRef.current) {
+      if (options?.busyStrategy === 'skip') {
+        console.log('📷 Capture already in progress, skipping fresh-frame request...');
+        return '';
+      }
+
+      if (options?.busyStrategy === 'wait-new') {
+        if (activeCapturePromiseRef.current) {
+          console.log('📷 Capture already in progress, waiting before fresh-frame request...');
           try {
-            await ReachingModule.playSystemShutter();
-          } catch (e: any) {
-            console.warn('⚠️ System shutter sound failed:', e?.message || e);
+            await activeCapturePromiseRef.current;
+          } catch {
+            // The follow-up capture below is the one the caller will use.
           }
         } else {
-          console.warn('⚠️ System shutter unavailable — rebuild iOS app');
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
         }
+
+        if (isCapturingRef.current) {
+          console.log('📷 Capture still in progress after wait; skipping fresh-frame request...');
+          return '';
+        }
+      } else if (activeCapturePromiseRef.current) {
+        console.log('📷 Capture already in progress, waiting for fresh frame...');
+        return activeCapturePromiseRef.current;
       }
-      const photo = await cameraRef.current.takePhoto({
-        enableShutterSound: useSystemShutterSound,
-        flash: 'off',
-      });
-      const fixedImage = await fixImageOrientation(photo.path);
-      lastImageDimensions.current = {
-        width: fixedImage.width || 0,
-        height: fixedImage.height || 0,
-      };
-      console.log('✅ Photo captured & fixed:', fixedImage.uri,
-        `(${fixedImage.width}×${fixedImage.height})`);
-      return fixedImage.uri;
-    } catch (error) {
-      console.error('❌ Photo capture failed, retrying:', error);
-      await new Promise(resolve => setTimeout(resolve, 500));
-      try {
-        if (useSystemShutterSound) {
-          await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
-          const { ReachingModule } = NativeModules;
-          if (ReachingModule?.playSystemShutter) {
-            try {
-              await ReachingModule.playSystemShutter();
-            } catch (e: any) {
-              console.warn('⚠️ System shutter sound failed (retry):', e?.message || e);
-            }
-          } else {
-            console.warn('⚠️ System shutter unavailable (retry) — rebuild iOS app');
-          }
-        }
-        const retry = await cameraRef.current.takePhoto({
-          enableShutterSound: useSystemShutterSound,
-        });
-        return retry.path;
-      } catch (e) {
-        console.error('❌ Retry also failed:', e);
+
+      if (isCapturingRef.current) {
+        console.log('📷 Capture already in progress, no active promise to await.');
         return '';
       }
     }
-  };
+    isCapturingRef.current = true;
+
+    const capturePromise = (async (): Promise<string> => {
+      try {
+        console.log('📷 Reactivating camera for capture...');
+        setIsCameraActive(true);
+
+        const useSystemShutterSound =
+          options?.enableShutterSound === true &&
+          Platform.OS === 'ios' &&
+          !settingsRef.current.useWearablesCamera;
+
+        if (settingsRef.current.useWearablesCamera) {
+          try {
+            const wearablesPhoto = await wearablesCamera.capturePhoto();
+            lastImageDimensions.current = { width: 0, height: 0 };
+            return wearablesPhoto;
+          } catch (error) {
+            console.error('❌ Wearables capture failed:', error);
+            throw error;
+          }
+        }
+
+        await new Promise(resolve => setTimeout(resolve, CAMERA_REACTIVATION_DELAY_MS));
+
+        if (!cameraRef.current) {
+          console.error('❌ Camera ref not available after reactivation');
+          return '';
+        }
+
+        try {
+          if (useSystemShutterSound) {
+            await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+            const { ReachingModule } = NativeModules;
+            if (ReachingModule?.playSystemShutter) {
+              try {
+                await ReachingModule.playSystemShutter();
+              } catch (e: any) {
+                console.warn('⚠️ System shutter sound failed:', e?.message || e);
+              }
+            } else {
+              console.warn('⚠️ System shutter unavailable — rebuild iOS app');
+            }
+          }
+          const photo = await cameraRef.current.takePhoto({
+            enableShutterSound: useSystemShutterSound,
+            flash: 'off',
+          });
+          const fixedImage = await fixImageOrientation(photo.path);
+          lastImageDimensions.current = {
+            width: fixedImage.width || 0,
+            height: fixedImage.height || 0,
+          };
+          console.log('✅ Photo captured & fixed:', fixedImage.uri,
+            `(${fixedImage.width}×${fixedImage.height})`);
+          return fixedImage.uri;
+        } catch (error) {
+          console.error('❌ Photo capture failed, retrying:', error);
+          await new Promise(resolve => setTimeout(resolve, 500));
+          try {
+            if (useSystemShutterSound) {
+              await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+              const { ReachingModule } = NativeModules;
+              if (ReachingModule?.playSystemShutter) {
+                try {
+                  await ReachingModule.playSystemShutter();
+                } catch (e: any) {
+                  console.warn('⚠️ System shutter sound failed (retry):', e?.message || e);
+                }
+              } else {
+                console.warn('⚠️ System shutter unavailable (retry) — rebuild iOS app');
+              }
+            }
+            const retry = await cameraRef.current.takePhoto({
+              enableShutterSound: useSystemShutterSound,
+            });
+            return retry.path;
+          } catch (e) {
+            console.error('❌ Retry also failed:', e);
+            return '';
+          }
+        }
+      } finally {
+        isCapturingRef.current = false;
+        activeCapturePromiseRef.current = null;
+      }
+    })();
+
+    activeCapturePromiseRef.current = capturePromise;
+    return capturePromise;
+  }, []);
+  const reactivateCameraAndCaptureRef = useRef(reactivateCameraAndCapture);
+  useEffect(() => {
+    reactivateCameraAndCaptureRef.current = reactivateCameraAndCapture;
+  }, [reactivateCameraAndCapture]);
 
   const toDataUrl = (value: string): string => {
     if (!value) return '';
@@ -598,34 +798,183 @@ function AppInner(): React.JSX.Element {
     return undefined;
   };
 
+  const rememberRtabSubmittedFrame = useCallback((photoPath: string) => {
+    if (!photoPath || rtabSubmittedFrameUrisRef.current.has(photoPath)) return;
+
+    rtabSubmittedFrameUrisRef.current.add(photoPath);
+    rtabSubmittedFrameQueueRef.current.push(photoPath);
+
+    while (rtabSubmittedFrameQueueRef.current.length > 120) {
+      const oldest = rtabSubmittedFrameQueueRef.current.shift();
+      if (oldest) {
+        rtabSubmittedFrameUrisRef.current.delete(oldest);
+      }
+    }
+  }, []);
+
+  const hasSubmittedRtabFrame = useCallback((photoPath: string) => {
+    return !!photoPath && rtabSubmittedFrameUrisRef.current.has(photoPath);
+  }, []);
+
   const stopKasraFeed = useCallback(() => {
     if (kasraFeedIntervalRef.current) {
       clearInterval(kasraFeedIntervalRef.current);
       kasraFeedIntervalRef.current = null;
     }
     kasraIsSendingRef.current = false;
+    kasraLastSentFrameRef.current = '';
+    kasraFrameSeqRef.current = 0;
   }, []);
 
   const startKasraFeed = useCallback(() => {
     if (kasraFeedIntervalRef.current) return;
 
-    kasraFeedIntervalRef.current = setInterval(() => {
+    kasraFeedIntervalRef.current = setInterval(async () => {
       if (!isContinuousModeRunning.current || getCurrentMode() !== 'navigation') return;
+      if (kasraIsSendingRef.current) return;
 
-      const imageUri = kasraLastFrameRef.current;
       const objectName = kasraLastObjectRef.current;
-      if (!imageUri || !objectName || kasraIsSendingRef.current) return;
+      if (!objectName) return;
 
       kasraIsSendingRef.current = true;
-      sendToKasraGuidance({ imageUri, objectName })
-        .catch((err: any) => {
-          console.warn('[Kasra] Guidance send failed:', err?.message || err);
-        })
-        .finally(() => {
-          kasraIsSendingRef.current = false;
+      try {
+        // Capture a NEW frame here so RTAB gets a fresh image every interval,
+        // rather than sending the exact same image multiple times.
+        const photoPath = await reactivateCameraAndCapture({
+          enableShutterSound: false,
+          busyStrategy: 'skip',
         });
+        if (photoPath) {
+          if (hasSubmittedRtabFrame(photoPath)) {
+            console.warn('[Kasra] Skipping frame already submitted to RTAB:', photoPath);
+            return;
+          }
+
+          if (photoPath === kasraLastSentFrameRef.current) {
+            console.warn('[Kasra] Skipping duplicate frame URI:', photoPath);
+            return;
+          }
+
+          const capturedAtMs = Date.now();
+          const frameId = `rtab-${capturedAtMs}-${++kasraFrameSeqRef.current}`;
+          kasraLastSentFrameRef.current = photoPath;
+          rememberRtabSubmittedFrame(photoPath);
+          await sendToKasraGuidance({
+            imageUri: photoPath,
+            objectName,
+            frameId,
+            capturedAtMs,
+          });
+        }
+      } catch (err: any) {
+        console.warn('[Kasra] Guidance send failed:', err?.message || err);
+      } finally {
+        kasraIsSendingRef.current = false;
+      }
     }, KASRA_FEED_INTERVAL_MS);
+  }, [hasSubmittedRtabFrame, reactivateCameraAndCapture, rememberRtabSubmittedFrame]);
+
+  const resetContinuousSpeechQueue = useCallback(() => {
+    continuousSpeechQueueRef.current = [];
+    continuousSpeechCurrentTextRef.current = '';
+    continuousSpeechDrainingRef.current = false;
   }, []);
+
+  const drainContinuousSpeechQueue = useCallback(async () => {
+    if (continuousSpeechDrainingRef.current) return;
+
+    const drainGeneration = continuousTtsGenerationRef.current;
+    continuousSpeechDrainingRef.current = true;
+    continuousTtsSpeakingRef.current = true;
+    setIsSpeaking(true);
+
+    try {
+      while (
+        continuousTtsGenerationRef.current === drainGeneration &&
+        !continuousModeAbortRef.current &&
+        !isEmergencyStopped.current
+      ) {
+        const nextText = continuousSpeechQueueRef.current.shift();
+        if (!nextText) break;
+
+        continuousSpeechCurrentTextRef.current = nextText;
+        try {
+          await speachesSentenceChunker.synthesizeSpeechChunked(nextText);
+        } catch (e: any) {
+          if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+            console.warn('🔄 [ContinuousMode] Queued TTS error (non-fatal):', e?.message);
+          }
+        }
+
+        if (
+          continuousBackendInFlightRef.current &&
+          isContinuousModeRunning.current &&
+          !continuousModeAbortRef.current &&
+          !isEmergencyStopped.current &&
+          !screenReaderEnabledRef.current &&
+          !settingsRef.current.useWearablesCamera
+        ) {
+          playThinkingStarted();
+        }
+      }
+    } finally {
+      if (continuousTtsGenerationRef.current === drainGeneration) {
+        continuousSpeechCurrentTextRef.current = '';
+        continuousSpeechDrainingRef.current = false;
+        continuousTtsSpeakingRef.current = false;
+        setIsSpeaking(false);
+
+        if (!isContinuousModeRunning.current) {
+          stopLatencyLoop().catch(() => { });
+        }
+      }
+    }
+  }, []);
+
+  const enqueueContinuousSpeech = useCallback((text: string) => {
+    const spoken = (text || '').trim();
+    if (!spoken || continuousModeAbortRef.current || isEmergencyStopped.current) return;
+
+    const pending = continuousSpeechQueueRef.current;
+    const alreadySpeaking = continuousSpeechDrainingRef.current &&
+      continuousSpeechCurrentTextRef.current === spoken;
+    const alreadyPending = pending.length > 0 && pending[pending.length - 1] === spoken;
+
+    if (alreadySpeaking || alreadyPending) {
+      console.log('🔄 [ContinuousMode] Skipping duplicate queued TTS');
+      return;
+    }
+
+    // Let the current instruction finish, but collapse any unsaid backlog into
+    // the newest backend guidance so speech does not lag behind navigation.
+    continuousSpeechQueueRef.current = [spoken];
+    drainContinuousSpeechQueue().catch((e: any) => {
+      if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+        console.warn('🔄 [ContinuousMode] TTS queue drain failed:', e?.message);
+      }
+    });
+  }, [drainContinuousSpeechQueue]);
+
+  const waitForContinuousSpeechQueueIdle = useCallback(async (options?: { ignoreAbort?: boolean }) => {
+    while (
+      continuousSpeechDrainingRef.current &&
+      !isEmergencyStopped.current &&
+      (options?.ignoreAbort === true || !continuousModeAbortRef.current)
+    ) {
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
+    }
+  }, []);
+
+  const speakContinuousSpeechAndWait = useCallback(async (
+    text: string,
+    options?: { ignoreAbort?: boolean }
+  ) => {
+    const spoken = (text || '').trim();
+    if (!spoken || isEmergencyStopped.current) return;
+
+    enqueueContinuousSpeech(spoken);
+    await waitForContinuousSpeechQueueIdle(options);
+  }, [enqueueContinuousSpeech, waitForContinuousSpeechQueueIdle]);
 
   // ============================================================================
   // iOS Reaching helper — shared by both reaching blocks
@@ -684,6 +1033,7 @@ function AppInner(): React.JSX.Element {
     }
 
     console.log('🎯 [ARKit] Launching native reaching for:', result.object, 'bbox:', bbox);
+    prewarmDAv2InBackground('reaching_ios response');
 
     AccessibilityInfo.announceForAccessibility(
       `Guiding you to ${result.object || 'object'}. Follow the audio beeps. Tap anywhere when you have it.`
@@ -696,6 +1046,9 @@ function AppInner(): React.JSX.Element {
     try {
       const { ReachingModule } = NativeModules;
       if (ReachingModule?.startReaching) {
+        const acquisitionUrl = settingsRef.current.enableAcquisitionAutoExit
+          ? ACQUISITION_URL
+          : undefined;
         const reachingPromise = ReachingModule.startReaching({
           bbox,
           object: result.object || 'object',
@@ -704,7 +1057,7 @@ function AppInner(): React.JSX.Element {
           imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
           detectionUrl: DETECTION_URL,
-          acquisitionUrl: ACQUISITION_URL,
+          ...(acquisitionUrl ? { acquisitionUrl } : {}),
           mode: settingsRef.current.reachingMode,
           startupSilent: options?.startupSilent === true,
           ttsRate: settingsRef.current.ttsRate,
@@ -732,6 +1085,13 @@ function AppInner(): React.JSX.Element {
         const reachingResult = await reachingPromise;
 
         console.log('✅ [ARKit] Native result:', reachingResult);
+
+        if (
+          (reachingResult?.reason === 'user_confirmed' || reachingResult?.reason === 'user_cancelled') &&
+          !screenReaderEnabledRef.current
+        ) {
+          await playStopReachingSound();
+        }
 
         // Manual exit: reason will be "user_confirmed" or "ar_error"
         const msg = reachingResult?.reason === 'user_confirmed'
@@ -778,7 +1138,16 @@ function AppInner(): React.JSX.Element {
 
     isContinuousModeRunning.current = true;
     continuousModeAbortRef.current = false;
+    continuousBackendInFlightRef.current = false;
+    continuousTtsSpeakingRef.current = false;
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     prefetchedPhotoRef.current = null;
+    kasraLastSentFrameRef.current = '';
+    rtabSubmittedFrameUrisRef.current.clear();
+    rtabSubmittedFrameQueueRef.current = [];
+    smartGuidanceSeededRef.current = false;
+    reacquiringRef.current = false;
     let cycleCount = 0;
 
     const currentMode = getCurrentMode();
@@ -790,12 +1159,26 @@ function AppInner(): React.JSX.Element {
         smartGuidanceActiveRef.current = false;
         smartGuidanceResumeMainRef.current = false;
         smartGuidanceCacheRef.current = null;
+        smartGuidanceSeededRef.current = false;
+        reacquiringRef.current = false;
       }
 
-      const minIntervalOverride = smartGuidanceActiveRef.current
+      const fastReachingCycle =
+        smartGuidanceActiveRef.current ||
+        smartGuidanceResumeMainRef.current ||
+        reacquiringRef.current;
+
+      const minIntervalOverride = fastReachingCycle
         ? SMART_GUIDANCE_MIN_CYCLE_MS
-        : undefined;
-      if (shouldPreventInfiniteLoop(minIntervalOverride)) {
+        : Math.max(NAVIGATION_CONFIG.MIN_REQUEST_INTERVAL_MS, getCurrentLoopDelay());
+      const rateLimitDelay = getContinuousModeRateLimitDelay(minIntervalOverride);
+      if (rateLimitDelay > 0) {
+        console.log(`🔄 [ContinuousMode] Rate-limit cooldown: ${rateLimitDelay}ms`);
+        await new Promise<void>(resolve => setTimeout(resolve, rateLimitDelay));
+        if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
+      }
+
+      if (shouldPreventInfiniteLoop()) {
         AccessibilityInfo.announceForAccessibility('Stopped due to time limit.');
         break;
       }
@@ -808,6 +1191,15 @@ function AppInner(): React.JSX.Element {
         incrementContinuousMode();
         const loopMode = getCurrentMode();
 
+        // ── Posture gate (skip cycles when phone is near face / tilted) ──
+        if (!settingsRef.current.useWearablesCamera) {
+          const postureOk = await waitForGoodPosture('continuous');
+          if (!postureOk) {
+            await new Promise(r => setTimeout(r, Math.max(300, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN)));
+            continue;
+          }
+        }
+
         // ── Capture ────────────────────────────────────────────────────────
         let photoPath = '';
         if (prefetchedPhotoRef.current) {
@@ -815,18 +1207,58 @@ function AppInner(): React.JSX.Element {
           prefetchedPhotoRef.current = null;
           console.log('🔄 ✅ Using PRE-FETCHED photo');
         } else {
-          photoPath = await reactivateCameraAndCapture({
+          photoPath = await reactivateCameraAndCaptureRef.current({
             enableShutterSound: false,
+            // Navigation workflow and the direct Kasra feed both end up at RTAB.
+            // Wait for an in-flight Kasra capture, then take our own frame so
+            // the same local JPEG is never posted through both routes.
+            busyStrategy: loopMode === 'navigation' ? 'wait-new' : 'wait',
           });
         }
 
         if (loopMode === 'navigation') {
+          if (photoPath && hasSubmittedRtabFrame(photoPath)) {
+            console.warn('🔄 [Navigation] Captured frame was already submitted to RTAB — recapturing once');
+            photoPath = await reactivateCameraAndCaptureRef.current({
+              enableShutterSound: false,
+              busyStrategy: 'wait-new',
+            });
+          }
+
+          if (photoPath && hasSubmittedRtabFrame(photoPath)) {
+            console.warn('🔄 [Navigation] Recapture still matched an RTAB-submitted frame — skipping cycle');
+            photoPath = '';
+          }
+
           if (photoPath) {
-            kasraLastFrameRef.current = photoPath;
+            rememberRtabSubmittedFrame(photoPath);
           }
           startKasraFeed();
         } else {
           stopKasraFeed();
+        }
+
+        if (!photoPath && loopMode === 'navigation') {
+          console.warn('🔄 [Navigation] Empty capture — skipping cycle, will retry');
+          await new Promise<void>(resolve =>
+            setTimeout(() => resolve(), Math.max(300, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN))
+          );
+          continue;
+        }
+
+        // Issue 3: never POST a reaching request without an image. A failed
+        // capture right after the navigation→reaching switch left Melody's
+        // tracker container with no image (and no usable session) to
+        // initialize from. Retry once, then skip the cycle rather than
+        // sending an imageless request.
+        if (!photoPath && loopMode === 'reaching') {
+          console.warn('🔄 [Reaching] Empty capture — retrying once before send');
+          photoPath = await reactivateCameraAndCaptureRef.current({ enableShutterSound: false });
+          if (!photoPath) {
+            console.warn('🔄 [Reaching] Still no image — skipping cycle, will retry');
+            await new Promise(r => setTimeout(r, SMART_GUIDANCE_MIN_CYCLE_MS));
+            continue;
+          }
         }
 
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
@@ -836,8 +1268,14 @@ function AppInner(): React.JSX.Element {
         const abortCtrl = new AbortController();
         abortControllerRef.current = abortCtrl;
 
-        // Skip SFX when VoiceOver is on or in glasses mode (BluetoothHFP audio session conflict)
-        if (!screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera) {
+        continuousBackendInFlightRef.current = true;
+        // Skip SFX when VoiceOver is on or in glasses mode (BluetoothHFP audio session conflict).
+        // During navigation/RTAB, this fills the otherwise-silent wait between spoken responses.
+        if (
+          !continuousTtsSpeakingRef.current &&
+          !screenReaderEnabledRef.current &&
+          !settingsRef.current.useWearablesCamera
+        ) {
           playThinkingStarted(); // ← start thinking SFX for this cycle
         }
 
@@ -848,29 +1286,48 @@ function AppInner(): React.JSX.Element {
         if (shouldUseSmartGuidance) {
           const cached = smartGuidanceCacheRef.current;
           const imageDataUrl = await readImageAsDataUrl(photoPath || '');
-          const bboxString = bboxToString(cached?.bbox);
+          const seedBbox = bboxToString(cached?.bbox);
           const objectName = cached?.object || 'object';
           const annotatedImage = cached?.annotatedImage
             ? toDataUrl(cached.annotatedImage)
             : (imageDataUrl || '');
 
-          if (!imageDataUrl || !bboxString) {
+          // Issue 5: hand the Qwen seed bbox to the tracker container ONLY on
+          // the first call after the tracker locks. While tracking is active
+          // the container's tracker owns the box — echoing it back (or the
+          // tracker's own normalized output) makes the container think Qwen
+          // is still detecting.
+          const needsSeed = !smartGuidanceSeededRef.current;
+          const bboxToSend = needsSeed ? seedBbox : '';
+
+          if (!imageDataUrl || (needsSeed && !seedBbox)) {
+            // Issue 3: incomplete payload — don't send a partial request to
+            // the container. Resume the main workflow; reacquiringRef keeps
+            // the loop alive so Qwen detection retries.
             console.warn('⚠️ [SmartGuidance] Missing payload, resuming main workflow');
             smartGuidanceActiveRef.current = false;
             smartGuidanceResumeMainRef.current = true;
+            smartGuidanceSeededRef.current = false;
+            reacquiringRef.current = true;
           } else {
             usedSmartGuidance = true;
             const smartResponse = await sendToSmartGuidance(
               {
                 object: objectName,
-                bbox: bboxString,
+                bbox: bboxToSend,
                 image: imageDataUrl,
                 annotated_image: annotatedImage,
                 success: true,
                 session_id: getSessionId(),
+                confidence: cached?.confidence,
               },
               abortCtrl.signal
             );
+            // Seed has now gone out — every later call sends an empty bbox.
+            if (needsSeed) {
+              smartGuidanceSeededRef.current = true;
+              console.log('🎯 [SmartGuidance] Seed bbox sent — tracker owns the box now');
+            }
 
             const handDirection = normalizeTextValue(smartResponse?.hand_direction);
             const guidance = normalizeTextValue(smartResponse?.guidance);
@@ -891,15 +1348,25 @@ function AppInner(): React.JSX.Element {
               loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
             };
 
+            // Keep the ORIGINAL Qwen seed bbox in the cache — never overwrite
+            // it with the tracker's normalized output. If tracking is lost the
+            // cache is refreshed from a fresh Qwen detection (see below).
             smartGuidanceCacheRef.current = {
               object: smartResponse?.class_name || objectName,
-              bbox: smartResponse?.bbox || cached?.bbox,
+              bbox: cached?.bbox,
               annotatedImage: cached?.annotatedImage || annotatedImage,
+              confidence: cached?.confidence,
             };
 
             if (smartResponse?.tracking_active === false) {
+              // Issue 4: tracking lost — resume the main workflow so the
+              // backend re-runs Qwen detection to reacquire the target.
+              // reacquiringRef keeps the loop alive instead of exiting.
+              console.log('🔄 [SmartGuidance] tracking lost — reacquiring via Qwen detection');
               smartGuidanceActiveRef.current = false;
               smartGuidanceResumeMainRef.current = true;
+              smartGuidanceSeededRef.current = false;
+              reacquiringRef.current = true;
             }
           }
         }
@@ -912,7 +1379,8 @@ function AppInner(): React.JSX.Element {
               imageWidth: lastImageDimensions.current.width,
               imageHeight: lastImageDimensions.current.height,
               navigation: loopMode === 'navigation',
-              reaching_flag: loopMode === 'reaching',
+              reaching_flag: loopMode === 'reaching' && (Platform.OS !== 'ios' || settingsRef.current.preferAlternativeReaching),
+              reaching_ios: loopMode === 'reaching' && Platform.OS === 'ios' && !settingsRef.current.preferAlternativeReaching,
             },
             abortCtrl.signal
           );
@@ -923,14 +1391,20 @@ function AppInner(): React.JSX.Element {
 
           if (loopMode === 'reaching' && result?.tracking_active === true && result?.bbox && result?.object) {
             smartGuidanceActiveRef.current = true;
+            // Fresh Qwen detection → fresh seed bbox to hand the tracker, and
+            // reacquisition (if any was in progress) is now complete.
+            smartGuidanceSeededRef.current = false;
+            reacquiringRef.current = false;
             smartGuidanceCacheRef.current = {
               object: result?.object || smartGuidanceCacheRef.current?.object,
               bbox: result?.bbox || smartGuidanceCacheRef.current?.bbox,
               annotatedImage: result?.annotated_image || smartGuidanceCacheRef.current?.annotatedImage,
+              confidence: result?.confidence || smartGuidanceCacheRef.current?.confidence,
             };
           }
         }
 
+        continuousBackendInFlightRef.current = false;
         await stopLatencyLoop(); // ← stop thinking SFX when result arrives
         await stopLatencyLoop(); // Bug 3 defense: second stop for audio session race
         setIsProcessing(false);
@@ -970,12 +1444,51 @@ function AppInner(): React.JSX.Element {
         // ── Structured debug log (EVERY cycle) ────────────────────────────
         const cycleElapsed = Date.now() - cycleStart;
         debugLogger.logAPI(
-          `🔄 Cycle #${cycleCount} | ${isNullResponse ? '⏭️ NULL' : '🔊 SPEAK'} | ${cycleElapsed}ms`,
+          `🔄 Cycle #${cycleCount} | ${isNullResponse ? '⏭️ NULL' : result.text ? '🔊 QUEUE' : '🔇 NO_TTS'} | ${cycleElapsed}ms`,
           `mode=${loopMode} nav=${result.navigation} reach=${result.reaching_flag} ios=${result.reaching_ios} smart=${usedSmartGuidance} text="${(rawText || '').substring(0, 80)}"`,
         );
 
         if (isNullResponse) {
           console.log(`🔄 ⏭️ Cycle #${cycleCount} — "Null" response, skipping TTS, fast-polling…`);
+        }
+
+        // ── RTAB → Reaching auto-handoff (Kasra) ──────────────────────────
+        //
+        // When the navigation pipeline returns reached=true (text "You have
+        // arrived"), force a transition into reaching mode regardless of how
+        // the backend toggled navigation/reaching_flag in the same response.
+        // This makes the handoff resilient to backend flag-routing glitches
+        // that previously left the loop stuck or exited it via bothInactive.
+        //
+        // We:
+        //   1. speak the arrival message (await — short and important),
+        //   2. flip loopMode to 'reaching' so the next iteration polls the
+        //      reaching pipeline,
+        //   3. `continue` to the next iteration.
+        //
+        // Only triggers from navigation mode. If we're already in reaching
+        // (e.g. a stale `reached=true` echoes), fall through to existing
+        // logic so reaching_completed/bothInactive can finish the session.
+        if (result.reached === true && loopMode === 'navigation') {
+          console.log('🎯 [RTAB→Reaching] reached=true in navigation mode — handoff');
+          debugLogger.logAPI('🎯 RTAB→Reaching handoff', `text="${(result.text || '').substring(0, 60)}"`);
+
+          if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
+            await speakContinuousSpeechAndWait(result.text);
+          }
+
+          if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
+
+          // Flip the loop mode so the next iteration sends reaching_flag=true
+          // even if the current response did not have it set.
+          startContinuousMode('reaching', result.loopDelay);
+          setIsNavigation(false);
+          setIsReaching(true);
+          announceIfNoVoiceOver('Arrived. Switching to object guidance.');
+
+          // Cooldown before next capture (give user a moment to stabilize camera after arrival).
+          await new Promise(r => setTimeout(r, Math.max(1200, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN)));
+          continue; // ★ next iteration runs with loopMode='reaching'
         }
 
         // ── iOS ARKit reaching check (respects user preference) ───────────
@@ -987,18 +1500,24 @@ function AppInner(): React.JSX.Element {
           });
 
           if (loopPipeline === 'arkit') {
+            const hasValidBbox = !!bboxToArray(result.bbox);
+            if (!hasValidBbox) {
+              console.log('🔄 [ARKit] Continuous mode: no valid bbox yet, continuing search...');
+              if (result.text) {
+                await speakContinuousSpeechAndWait(result.text);
+              }
+              continue;
+            }
+
             // ── ARKit path: intro TTS + silent ARKit bootstrap in parallel ─
             let introSpeechPromise: Promise<void> | undefined;
             if (result.text) {
-              setIsSpeaking(true);
-              introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+              introSpeechPromise = speakContinuousSpeechAndWait(result.text, { ignoreAbort: true })
                 .then(() => {
-                  setIsSpeaking(false);
                   // Bug 4 defense — see continuous-mode .then() above.
                   stopLatencyLoop().catch(() => { });
                 })
                 .catch((e: any) => {
-                  setIsSpeaking(false);
                   stopLatencyLoop().catch(() => { });
                   if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
                     console.warn('⚠️ [ARKit] Intro TTS error (non-fatal):', e?.message);
@@ -1028,9 +1547,7 @@ function AppInner(): React.JSX.Element {
             if (result.reaching_completed === true) {
               // Backend says object reached — speak final message and reset
               if (result.text) {
-                setIsSpeaking(true);
-                await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-                setIsSpeaking(false);
+                await speakContinuousSpeechAndWait(result.text);
               }
               console.log('✅ [Reaching] reaching_completed=true — resetting session');
               resetSessionId();
@@ -1044,9 +1561,7 @@ function AppInner(): React.JSX.Element {
 
         if (smartGuidanceActiveRef.current && result.reaching_completed === true) {
           if (result.text) {
-            setIsSpeaking(true);
-            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            setIsSpeaking(false);
+            await speakContinuousSpeechAndWait(result.text);
           }
           console.log('✅ [SmartGuidance] reaching_completed=true — resetting session');
           smartGuidanceActiveRef.current = false;
@@ -1056,67 +1571,41 @@ function AppInner(): React.JSX.Element {
           break;
         }
 
+        // ── Reacquisition completion guard ─────────────────────────────────
+        // Issue 4: while reacquiring, the loop is kept alive (reachingActive
+        // is forced true below) so the backend keeps re-running Qwen
+        // detection. The ONLY clean ways out are an explicit completion
+        // signal or the user stopping — never transiently-dropped flags.
+        if (reacquiringRef.current && result.reaching_completed === true) {
+          if (result.text) {
+            await speakContinuousSpeechAndWait(result.text);
+          }
+          console.log('✅ [Reaching] reaching_completed during reacquisition — done');
+          reacquiringRef.current = false;
+          resetSessionId();
+          stopContinuousMode('reaching complete', true);
+          break;
+        }
+
+        // A genuine navigation handoff ends any in-progress reacquisition.
+        if (result.navigation === true) reacquiringRef.current = false;
+
         // ── Flag check ─────────────────────────────────────────────────────
         const navigationActive = result.navigation === true;
         const smartGuidanceActive = smartGuidanceActiveRef.current;
-        const reachingActive = result.reaching_flag === true || smartGuidanceActive || smartGuidanceResumeMainRef.current;
+        // Issue 4: reacquiringRef keeps reaching active across the transient
+        // window where tracking is lost and the backend has not yet re-set
+        // reaching_flag — otherwise bothInactive would exit the pipeline.
+        const reachingActive = result.reaching_flag === true || smartGuidanceActive
+          || smartGuidanceResumeMainRef.current || reacquiringRef.current;
         const bothInactive = !navigationActive && !reachingActive;
 
         setIsNavigation(navigationActive);
         setIsReaching(reachingActive);
 
-        // ── RTAB → Reaching auto-handoff (Kasra) ──────────────────────────
-        //
-        // When the navigation pipeline returns reached=true (text "You have
-        // arrived"), force a transition into reaching mode regardless of how
-        // the backend toggled navigation/reaching_flag in the same response.
-        // This makes the handoff resilient to backend flag-routing glitches
-        // that previously left the loop stuck or exited it via bothInactive.
-        //
-        // We:
-        //   1. speak the arrival message (await — short and important),
-        //   2. flip loopMode to 'reaching' so the next iteration polls the
-        //      reaching pipeline,
-        //   3. `continue` to the next iteration.
-        //
-        // Only triggers from navigation mode. If we're already in reaching
-        // (e.g. a stale `reached=true` echoes), fall through to existing
-        // logic so reaching_completed/bothInactive can finish the session.
-        if (result.reached === true && loopMode === 'navigation') {
-          console.log('🎯 [RTAB→Reaching] reached=true in navigation mode — handoff');
-          debugLogger.logAPI('🎯 RTAB→Reaching handoff', `text="${(result.text || '').substring(0, 60)}"`);
-
-          if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
-            setIsSpeaking(true);
-            try {
-              await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            } catch (e: any) {
-              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
-                console.warn('⚠️ [RTAB→Reaching] arrival TTS error (non-fatal):', e?.message);
-              }
-            }
-            setIsSpeaking(false);
-          }
-
-          if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
-
-          // Flip the loop mode so the next iteration sends reaching_flag=true
-          // even if the current response did not have it set.
-          startContinuousMode('reaching', result.loopDelay);
-          setIsNavigation(false);
-          setIsReaching(true);
-          announceIfNoVoiceOver('Arrived. Switching to object guidance.');
-
-          // Cooldown before next capture (skip null fast-poll path).
-          await new Promise(r => setTimeout(r, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN));
-          continue; // ★ next iteration runs with loopMode='reaching'
-        }
-
         if (bothInactive) {
           if (result.text) {
-            setIsSpeaking(true);
-            await speachesSentenceChunker.synthesizeSpeechChunked(result.text);
-            setIsSpeaking(false);
+            await speakContinuousSpeechAndWait(result.text);
           }
           announceIfNoVoiceOver('Task complete.');
           stopContinuousMode('both flags false', true);
@@ -1127,51 +1616,23 @@ function AppInner(): React.JSX.Element {
         if (navigationActive && !reachingActive && loopMode !== 'navigation') {
           startContinuousMode('navigation', result.loopDelay);
           announceIfNoVoiceOver('Switching to navigation.');
+          result.text = ''; // Prevent downstream TTS from overlapping with transition speech
         } else if (reachingActive && !navigationActive && loopMode !== 'reaching') {
           startContinuousMode('reaching', result.loopDelay);
           announceIfNoVoiceOver('Switching to object guidance.');
+          result.text = ''; // Prevent downstream TTS from overlapping with transition speech
         }
 
-        // ── Speak (fire-and-forget) + immediately continue loop ───────────
+        // ── Speak sequentially while the loop keeps polling ────────────────
         //
-        // KEY FIX: Do NOT await TTS before starting the next cycle.
-        // Old pattern:  await backend → await TTS (7s) → next capture
-        //               cycle time = backend RTT + TTS duration = 8–10s
-        //
-        // New pattern:  await backend → fire TTS (no await) → next capture
-        //               cycle time = backend RTT + MIN_CYCLE_COOLDOWN = ~2s
-        //               TTS plays in background while next backend call runs.
-        //
-        // "Latest wins": if a new response arrives before current TTS finishes,
-        // speachesSentenceChunker.stop() (called at the start of each new TTS
-        // call) cuts off the stale guidance and plays the fresher one.
-        // This is correct behaviour — the user has moved since the old guidance.
-        //
+        // Keep capture/backend cadence fast, but do not start a new TTS session
+        // while another instruction is mid-sentence. The speech queue finishes
+        // the current utterance and keeps only the newest pending guidance.
         if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
-          setIsSpeaking(true);
-          // Fire TTS — do NOT await. Loop proceeds to next capture immediately.
-          speachesSentenceChunker.synthesizeSpeechChunked(result.text)
-            .then(() => {
-              setIsSpeaking(false);
-              // Bug 4 defense: if no next cycle is running yet (e.g. the
-              // loop aborted between fire-and-forget start and now),
-              // make sure the latency thinking sound isn't left playing.
-              if (!isContinuousModeRunning.current) {
-                stopLatencyLoop().catch(() => { });
-              }
-            })
-            .catch((e: any) => {
-              setIsSpeaking(false);
-              if (!isContinuousModeRunning.current) {
-                stopLatencyLoop().catch(() => { });
-              }
-              if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
-                console.warn('🔄 [ContinuousMode] TTS error (non-fatal):', e?.message);
-              }
-            });
+          enqueueContinuousSpeech(result.text);
         } else if (isNullResponse) {
           // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
-          const nullCooldown = smartGuidanceActiveRef.current
+          const nullCooldown = fastReachingCycle
             ? SMART_GUIDANCE_MIN_CYCLE_MS
             : 500;
           console.log(`🔄 ⏭️ Null fast-poll — waiting ${nullCooldown}ms before next cycle`);
@@ -1182,9 +1643,9 @@ function AppInner(): React.JSX.Element {
         // prevents hammering the backend faster than it can handle.
         // TTS is already playing in background; this does NOT wait for it.
         if (!isNullResponse && !continuousModeAbortRef.current) {
-          const minCycleMs = smartGuidanceActiveRef.current
+          const minCycleMs = fastReachingCycle
             ? SMART_GUIDANCE_MIN_CYCLE_MS
-            : PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN;
+            : Math.max(PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN, getCurrentLoopDelay());
           const elapsed = Date.now() - cycleStart;
           const cooldown = Math.max(0, minCycleMs - elapsed);
           if (cooldown > 0) {
@@ -1194,13 +1655,21 @@ function AppInner(): React.JSX.Element {
 
         const cycleMs = Date.now() - cycleStart;
         debugLogger.logAPI(
-          `🔄 Cycle #${cycleCount} DONE | ${isNullResponse ? 'NULL→SKIP' : 'SPOKE'} | ${(cycleMs / 1000).toFixed(1)}s`,
+          `🔄 Cycle #${cycleCount} DONE | ${isNullResponse ? 'NULL→SKIP' : result.text ? 'QUEUED' : 'NO_TTS'} | ${(cycleMs / 1000).toFixed(1)}s`,
         );
         console.log(`🔄 ═══ CYCLE #${cycleCount} DONE (${(cycleMs / 1000).toFixed(1)}s) ${isNullResponse ? '[NULL-SKIP]' : ''} ═══`);
 
       } catch (error: any) {
         console.error('🔄 [ContinuousMode] Error:', error);
         if (error.message?.includes('cancel')) break;
+        continuousBackendInFlightRef.current = false;
+        continuousTtsSpeakingRef.current = false;
+        continuousTtsGenerationRef.current++;
+        await stopLatencyLoop();
+        if (!screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera) {
+          audioFeedback.playEarcon('cancel');
+          await playErrorSound();
+        }
         AccessibilityInfo.announceForAccessibility(`Error: ${error.message}`);
         break;
       }
@@ -1211,10 +1680,16 @@ function AppInner(): React.JSX.Element {
     await stopLatencyLoop();
     stopKasraFeed();
     isContinuousModeRunning.current = false;
+    continuousBackendInFlightRef.current = false;
+    continuousTtsSpeakingRef.current = false;
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     stopContinuousMode('loop ended', false);
     smartGuidanceActiveRef.current = false;
     smartGuidanceResumeMainRef.current = false;
     smartGuidanceCacheRef.current = null;
+    smartGuidanceSeededRef.current = false;
+    reacquiringRef.current = false;
     setIsNavigation(false);
     setIsReaching(false);
     setIsProcessing(false);
@@ -1227,13 +1702,34 @@ function AppInner(): React.JSX.Element {
     if (settingsRef.current.useWearablesCamera) {
       wakeWordResumeRef.current?.();
     }
-  }, [announceTapToStart, handleiOSReaching, resolveReachingPipeline, startKasraFeed, stopKasraFeed]);
+  }, [
+    announceTapToStart,
+    enqueueContinuousSpeech,
+    handleiOSReaching,
+    hasSubmittedRtabFrame,
+    rememberRtabSubmittedFrame,
+    resetContinuousSpeechQueue,
+    resolveReachingPipeline,
+    speakContinuousSpeechAndWait,
+    startKasraFeed,
+    stopKasraFeed,
+    waitForGoodPosture,
+  ]);
 
   // ============================================================================
   // Stop helpers
   // ============================================================================
   const stopContinuousModeLoop = useCallback(async () => {
     console.log('🛑 Stopping continuous mode');
+    const wasContinuous =
+      isNavigation ||
+      isContinuousModeRunning.current ||
+      isReaching ||
+      getCurrentMode() === 'navigation' ||
+      getCurrentMode() === 'reaching' ||
+      smartGuidanceActiveRef.current ||
+      smartGuidanceResumeMainRef.current ||
+      reacquiringRef.current;
     continuousModeAbortRef.current = true;
     stopKasraFeed();
 
@@ -1243,6 +1739,8 @@ function AppInner(): React.JSX.Element {
     }
 
     await stopLatencyLoop();
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     await speachesSentenceChunker.stop();
     stopContinuousMode('user interrupt', false);
     setIsNavigation(false);
@@ -1252,15 +1750,22 @@ function AppInner(): React.JSX.Element {
     isContinuousModeRunning.current = false;
     setIsCameraActive(true);
 
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
+    if (!screenReaderEnabledRef.current) { 
+      audioFeedback.playEarcon('cancel'); 
+      if (wasContinuous) {
+        await playStopReachingSound();
+      }
+    }
     announceTapToStart('Stopped.');
-  }, [announceTapToStart, stopKasraFeed]);
+  }, [announceTapToStart, isNavigation, isReaching, resetContinuousSpeechQueue, stopKasraFeed]);
 
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
     stopKasraFeed();
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
     await stopLatencyLoop(); // FIX: was missing — latency SFX survived nav interrupt
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     await speachesSentenceChunker.stop();
     stopContinuousMode('user interrupt', false);
     setIsNavigation(false);
@@ -1268,9 +1773,12 @@ function AppInner(): React.JSX.Element {
     setIsSpeaking(false);
     isNavigationLoopRunning.current = false;
     setIsCameraActive(true);
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('cancel'); }
+    if (!screenReaderEnabledRef.current) { 
+      audioFeedback.playEarcon('cancel'); 
+      await playStopReachingSound();
+    }
     announceTapToStart('Navigation stopped.');
-  }, [announceTapToStart, stopKasraFeed]);
+  }, [announceTapToStart, resetContinuousSpeechQueue, stopKasraFeed]);
 
   // ============================================================================
   // Handle Voice Command  ← defined BEFORE handleAutoSubmit so ref is stable
@@ -1288,6 +1796,9 @@ function AppInner(): React.JSX.Element {
 
     try {
       console.log('⚡ Processing:', command);
+      if (looksLikeReachingCommand(command)) {
+        prewarmDAv2InBackground('voice command');
+      }
       isProcessingRef.current = true;
       setIsProcessing(true);
 
@@ -1303,7 +1814,7 @@ function AppInner(): React.JSX.Element {
         // FIX: Restore full-volume audio session after STT's Record+Measurement
         await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
-        audioFeedback.playEarcon('thinking');
+        await stopListenSound();
         playThinkingStarted();
       }
 
@@ -1547,19 +2058,23 @@ function AppInner(): React.JSX.Element {
     }
 
     console.log('⚡ Processing:', finalText);
-    setIsProcessing(true);
-    isCapturingPhotoRef.current = true;
-    if (!screenReaderEnabledRef.current) {
-      audioFeedback.playEarcon('thinking');
-    }
-    // ── Bug 1 fix: Only announce 'Thinking' when VoiceOver is OFF. ──────
-    // When VoiceOver is ON, the button's accessibilityLabel already changes
-    // to 'Thinking' (via isProcessing state), and VoiceOver reads that
-    // automatically. A manual announcement creates double-speech.
-    if (!screenReaderEnabledRef.current) {
-      AccessibilityInfo.announceForAccessibility('Thinking');
+    if (looksLikeReachingCommand(finalText)) {
+      prewarmDAv2InBackground('voice command');
     }
 
+    await stopListenSound();
+
+    const postureOk = await waitForGoodPostureRef.current('capture');
+    if (!postureOk) {
+      setIsProcessing(false);
+      isCapturingPhotoRef.current = false;
+      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      announceTapToStart('Ready.');
+      return;
+    }
+
+    setIsProcessing(true);
+    isCapturingPhotoRef.current = true;
     try {
       try { await cancelSTT(); } catch { }
 
@@ -1573,8 +2088,8 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture({
-          enableShutterSound: true,
+        photoPath = await reactivateCameraAndCaptureRef.current({
+          enableShutterSound: false,
         });
       } catch (e: any) {
         console.error('❌ Camera error:', e);
@@ -1658,15 +2173,20 @@ function AppInner(): React.JSX.Element {
     }
 
     console.log('⚡ [WakeWord] Processing:', query);
-    setIsProcessing(true);
-    isCapturingPhotoRef.current = true;
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('thinking'); }
-    // Bug 1 fix: Only announce 'Thinking' when VoiceOver is OFF —
-    // the label change to 'Thinking' is read automatically by VoiceOver.
-    if (!screenReaderEnabledRef.current) {
-      AccessibilityInfo.announceForAccessibility('Thinking');
+    if (looksLikeReachingCommand(query)) {
+      prewarmDAv2InBackground('wake word command');
     }
 
+    const postureOk = await waitForGoodPostureRef.current('capture');
+    if (!postureOk) {
+      setIsProcessing(false);
+      isCapturingPhotoRef.current = false;
+      wakeWordResumeRef.current?.();
+      return;
+    }
+
+    setIsProcessing(true);
+    isCapturingPhotoRef.current = true;
     try {
       // Configure audio for playback before capture/backend call.
       // Skip in glasses mode — audio session is locked by BluetoothHFP.
@@ -1676,7 +2196,7 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture({ enableShutterSound: false });
+        photoPath = await reactivateCameraAndCaptureRef.current({ enableShutterSound: false });
       } catch (e: any) {
         console.error('❌ [WakeWord] Camera error:', e);
         if (isWearablesCaptureError(e)) {
@@ -1714,12 +2234,7 @@ function AppInner(): React.JSX.Element {
   }, []);
   const handleWakeWordHeard = useCallback(() => {
     console.log('🎤 [WakeWord] Wake phrase detected!');
-    if (!screenReaderEnabledRef.current) {
-      audioFeedback.playEarcon('listening');
-    }
-    // VoiceOver reads the label change to "Listening" automatically.
-    announceIfNoVoiceOver('Listening');
-  }, [announceIfNoVoiceOver]);
+  }, []);
 
   const {
     isAwaitingWakeWord,
@@ -1734,6 +2249,7 @@ function AppInner(): React.JSX.Element {
     onQueryDetected: handleWakeWordQuery,
     onWakeWordHeard: handleWakeWordHeard,
     enabled: settings.useWearablesCamera && !showSettings && !showStartupLoader,
+    microphoneSource: settings.wearablesMicrophoneSource,
     silenceThreshold: 1500,
     enableOpenAIVAD: true,
   });
@@ -1775,6 +2291,7 @@ function AppInner(): React.JSX.Element {
     }
 
     try {
+      await stopLatencyLoop(); // ensure no stale thinking loop continues into listening
       if (Platform.OS === 'android') {
         const granted = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.RECORD_AUDIO
@@ -1802,14 +2319,9 @@ function AppInner(): React.JSX.Element {
         // route — matching the reaching pipeline's audio config.
         await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
-        audioFeedback.playEarcon('listening');
-        playListenSound();
+        await playListenSound();
 
-        // ✅ FIX: The earcon sets Sound.setCategory('Playback', false) which
-        // locks the audio session in exclusive-playback mode. Voice.start()
-        // needs PlayAndRecord. Reset the category BEFORE starting STT so the
-        // mic can be acquired. PlayAndRecord allows the earcon to keep playing
-        // while recording begins simultaneously.
+        // The listening cue is finished now; switch to recording for STT.
         prepareForRecording();
       }
 
@@ -1855,16 +2367,20 @@ function AppInner(): React.JSX.Element {
         return;
       }
 
+      const postureOk = await waitForGoodPosture('capture');
+      if (!postureOk) {
+        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        announceTapToStart('Ready.');
+        return;
+      }
+
       isCapturingPhotoRef.current = true;
-      if (!screenReaderEnabled) { audioFeedback.playEarcon('thinking'); }
-      // Label change to "Thinking" already announces this for VoiceOver users.
-      announceIfNoVoiceOver('Thinking');
       await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
       if (isEmergencyStopped.current) { isCapturingPhotoRef.current = false; return; }
 
       let photoPath = '';
       try {
-        photoPath = await reactivateCameraAndCapture({
+        photoPath = await reactivateCameraAndCaptureRef.current({
           enableShutterSound: true,
         });
       } catch (e: any) {
@@ -1912,6 +2428,8 @@ function AppInner(): React.JSX.Element {
     }
 
     await stopLatencyLoop(); // FIX: kill thinking SFX immediately on emergency stop
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
     await speachesSentenceChunker.stop();
     try { await cancelSTT(); } catch { }
     // Pause wake word listening during emergency stop

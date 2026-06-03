@@ -237,16 +237,69 @@ class ReachingModule: NSObject {
   // recognizer receives audio from the glasses' mic.
   // ═══════════════════════════════════════════════════════════════════════════
 
-  @objc func configureBluetoothRecordingSession(
-    _ resolver: @escaping RCTPromiseResolveBlock,
-    rejecter: @escaping RCTPromiseRejectBlock
-  ) {
-    do {
-      let session = AVAudioSession.sharedInstance()
+  private enum RecordingMicrophoneSource: String {
+    case wearables
+    case phone
+  }
 
-      // .playAndRecord allows simultaneous input + output.
-      // .allowBluetooth enables HFP mic from the glasses.
-      // .defaultToSpeaker is NOT set — HFP routes output to the glasses too.
+  private func ensureMicrophonePermission() async -> Bool {
+    let session = AVAudioSession.sharedInstance()
+
+    switch session.recordPermission {
+    case .granted:
+      return true
+    case .denied:
+      return false
+    case .undetermined:
+      return await withCheckedContinuation { continuation in
+        session.requestRecordPermission { granted in
+          continuation.resume(returning: granted)
+        }
+      }
+    @unknown default:
+      return false
+    }
+  }
+
+  private func isLikelyMetaGlassesInput(_ input: AVAudioSessionPortDescription) -> Bool {
+    let name = input.portName.lowercased()
+    return name.contains("meta") ||
+           name.contains("ray-ban") ||
+           name.contains("rayban") ||
+           name.contains("ray ban") ||
+           name.contains("glasses")
+  }
+
+  private func inputPayload(_ inputs: [AVAudioSessionPortDescription]) -> [[String: String]] {
+    return inputs.map { input in
+      [
+        "portName": input.portName,
+        "portType": input.portType.rawValue,
+      ]
+    }
+  }
+
+  private func configureRecordingSession(
+    preferredSource: RecordingMicrophoneSource
+  ) async throws -> [String: Any] {
+    guard await ensureMicrophonePermission() else {
+      throw NSError(
+        domain: "ReachingModule",
+        code: 2001,
+        userInfo: [NSLocalizedDescriptionKey:
+          "Microphone permission denied. Enable microphone access for ShelfScout in iOS Settings."]
+      )
+    }
+
+    let session = AVAudioSession.sharedInstance()
+    var selectedSource = preferredSource.rawValue
+    var fallbackReason: String?
+    var preferredInput: AVAudioSessionPortDescription?
+
+    switch preferredSource {
+    case .wearables:
+      // .allowBluetooth enables the HFP microphone. We then explicitly select
+      // the HFP input because iOS may otherwise keep the built-in iPhone mic.
       try session.setCategory(
         .playAndRecord,
         mode: .default,
@@ -254,19 +307,105 @@ class ReachingModule: NSObject {
       )
       try session.setActive(true)
 
-      // Log the active input to confirm BT routing
-      let input = session.currentRoute.inputs.first
-      let output = session.currentRoute.outputs.first
-      NSLog("🎤 [ReachingModule] BT Recording → input: %@ (%@), output: %@ (%@)",
-            input?.portName ?? "none", input?.portType.rawValue ?? "?",
-            output?.portName ?? "none", output?.portType.rawValue ?? "?")
+      let inputs = session.availableInputs ?? []
+      let hfpInputs = inputs.filter { $0.portType == .bluetoothHFP }
 
-      resolver(["success": true,
-                "inputPort": input?.portName ?? "unknown",
-                "inputType": input?.portType.rawValue ?? "unknown"])
-    } catch {
-      NSLog("❌ [ReachingModule] configureBluetoothRecordingSession error: %@", error.localizedDescription)
-      resolver(["success": false, "error": error.localizedDescription])
+      if let metaInput = hfpInputs.first(where: isLikelyMetaGlassesInput) {
+        preferredInput = metaInput
+      } else if let bluetoothInput = hfpInputs.first {
+        preferredInput = bluetoothInput
+        fallbackReason = "No Meta-named Bluetooth microphone was advertised; using the available Bluetooth HFP microphone."
+      } else {
+        selectedSource = RecordingMicrophoneSource.phone.rawValue
+        preferredInput = inputs.first { $0.portType == .builtInMic }
+        fallbackReason = "No Bluetooth HFP microphone is available; using the iPhone microphone."
+      }
+
+      if let preferredInput {
+        try session.setPreferredInput(preferredInput)
+      }
+
+    case .phone:
+      // Omit .allowBluetooth so the recognizer uses the local iPhone mic even
+      // when glasses or another headset are connected.
+      try session.setCategory(
+        .playAndRecord,
+        mode: .default,
+        options: []
+      )
+      try session.setActive(true)
+
+      let inputs = session.availableInputs ?? []
+      preferredInput = inputs.first { $0.portType == .builtInMic }
+      if let preferredInput {
+        try session.setPreferredInput(preferredInput)
+      } else {
+        try session.setPreferredInput(nil)
+        fallbackReason = "Built-in microphone was not advertised; using the system-selected input."
+      }
+    }
+
+    try session.setActive(true)
+    try? await Task.sleep(nanoseconds: 100_000_000)
+
+    let input = session.currentRoute.inputs.first ?? preferredInput
+    let output = session.currentRoute.outputs.first
+    let availableInputs = session.availableInputs ?? []
+
+    NSLog("🎤 [ReachingModule] Recording → requested=%@ selected=%@ input=%@ (%@), output=%@ (%@)",
+          preferredSource.rawValue,
+          selectedSource,
+          input?.portName ?? "none",
+          input?.portType.rawValue ?? "?",
+          output?.portName ?? "none",
+          output?.portType.rawValue ?? "?")
+
+    var payload: [String: Any] = [
+      "success": true,
+      "requestedSource": preferredSource.rawValue,
+      "source": selectedSource,
+      "inputPort": input?.portName ?? "unknown",
+      "inputType": input?.portType.rawValue ?? "unknown",
+      "availableInputs": inputPayload(availableInputs),
+    ]
+
+    if let fallbackReason {
+      payload["fallbackReason"] = fallbackReason
+    }
+
+    return payload
+  }
+
+  @objc func configureBluetoothRecordingSession(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    configureRecordingSession("wearables" as NSString, resolver: resolver, rejecter: rejecter)
+  }
+
+  @objc func configureRecordingSession(
+    _ preferredSource: NSString,
+    resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    let source = RecordingMicrophoneSource(rawValue: preferredSource as String) ?? .wearables
+
+    Task { [weak self] in
+      guard let self else { return }
+      do {
+        let payload = try await self.configureRecordingSession(preferredSource: source)
+        resolver(payload)
+      } catch {
+        NSLog("❌ [ReachingModule] configureRecordingSession error: %@", error.localizedDescription)
+        resolver([
+          "success": false,
+          "requestedSource": source.rawValue,
+          "source": "phone",
+          "inputPort": "unknown",
+          "inputType": "unknown",
+          "fallbackReason": error.localizedDescription,
+        ])
+      }
     }
   }
 
@@ -281,6 +420,16 @@ class ReachingModule: NSObject {
   ) {
     AudioServicesPlaySystemSound(1108)
     resolver(["success": true])
+  }
+
+  @objc func prewarmDAv2(
+    _ resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    DispatchQueue.global(qos: .userInitiated).async {
+      prewarmDepthAnythingV2Model()
+      resolver(["success": true])
+    }
   }
 
   private func presentReachingVC(
