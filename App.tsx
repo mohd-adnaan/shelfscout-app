@@ -86,6 +86,7 @@ const VOICEOVER_LISTENING_GRACE_MS = 600;
 const POSTURE_WARNING_COOLDOWN_MS = 6000;
 const POSTURE_MAX_WAIT_MS = 6500;
 const POSTURE_POLL_INTERVAL_MS = 250;
+const WEARABLES_PREWARM_RETRY_DELAYS_MS = [1500, 3000, 6000, 10000, 15000, 20000];
 
 // =============================================================================
 // PIPELINE PRE-FETCH CONFIGURATION
@@ -323,32 +324,60 @@ function AppInner(): React.JSX.Element {
 
   // Auto-prewarm wearables on app start when toggle is already ON.
   useEffect(() => {
-    if (!settings.useWearablesCamera || Platform.OS !== 'ios') return;
+    if (!settings.useWearablesCamera || Platform.OS !== 'ios') {
+      wearablesPrewarmAttemptedRef.current = false;
+      return;
+    }
     if (wearablesPrewarmAttemptedRef.current) return;
 
-    let timeoutId: ReturnType<typeof setTimeout> | null = null;
     let sub: { remove: () => void } | null = null;
+    let cancelled = false;
+    let cancelWait: (() => void) | null = null;
 
-    const runPrewarm = async () => {
+    const wait = (delayMs: number) =>
+      new Promise<void>((resolve) => {
+        const timeoutId = setTimeout(() => {
+          cancelWait = null;
+          resolve();
+        }, delayMs);
+        cancelWait = () => {
+          clearTimeout(timeoutId);
+          cancelWait = null;
+          resolve();
+        };
+      });
+
+    const runPrewarmWithRetry = async () => {
       wearablesPrewarmAttemptedRef.current = true;
-      try {
-        await wearablesCamera.startRegistration();
-        await wearablesCamera.preWarm();
-      } catch (error) {
-        console.warn('[Wearables] Auto-prewarm failed:', error);
+
+      for (let i = 0; i < WEARABLES_PREWARM_RETRY_DELAYS_MS.length; i += 1) {
+        await wait(WEARABLES_PREWARM_RETRY_DELAYS_MS[i]);
+        if (cancelled || !settingsRef.current.useWearablesCamera) return;
+
+        try {
+          await wearablesCamera.startRegistration();
+          await wearablesCamera.preWarm();
+          console.log(`[Wearables] Auto-prewarm connected on attempt ${i + 1}`);
+          return;
+        } catch (error) {
+          console.warn(
+            `[Wearables] Auto-prewarm attempt ${i + 1}/${WEARABLES_PREWARM_RETRY_DELAYS_MS.length} failed:`,
+            error,
+          );
+        }
       }
+
+      console.warn('[Wearables] Auto-prewarm exhausted retries. Keeping glasses mode enabled so capture or the settings toggle can retry.');
     };
 
     if (AppState.currentState === 'active') {
-      timeoutId = setTimeout(() => {
-        runPrewarm().catch((error) => {
-          console.warn('[Wearables] Auto-prewarm failed:', error);
-        });
-      }, 1500);
+      runPrewarmWithRetry().catch((error) => {
+        console.warn('[Wearables] Auto-prewarm failed:', error);
+      });
     } else {
       sub = AppState.addEventListener('change', (state) => {
         if (state === 'active' && !wearablesPrewarmAttemptedRef.current) {
-          runPrewarm().catch((error) => {
+          runPrewarmWithRetry().catch((error) => {
             console.warn('[Wearables] Auto-prewarm failed:', error);
           });
           sub?.remove();
@@ -357,7 +386,8 @@ function AppInner(): React.JSX.Element {
     }
 
     return () => {
-      if (timeoutId) clearTimeout(timeoutId);
+      cancelled = true;
+      cancelWait?.();
       sub?.remove();
     };
   }, [settings.useWearablesCamera]);

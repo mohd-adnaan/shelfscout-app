@@ -145,7 +145,12 @@ class WearablesCameraModule: NSObject {
         return false
       }
       group.addTask {
-        try? await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+        do {
+          try await Task.sleep(nanoseconds: UInt64(timeoutSeconds * 1_000_000_000))
+        } catch {
+          return false
+        }
+        guard !Task.isCancelled else { return false }
         NSLog("⏱️ [Wearables] waitForActiveDevice timed out after %.0fs", timeoutSeconds)
         return false
       }

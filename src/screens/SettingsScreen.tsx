@@ -48,6 +48,8 @@ const C = {
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
+const WEARABLES_SETTINGS_PREWARM_RETRY_DELAYS_MS = [0, 2500, 5000, 8000];
+
 function rateLabel(rate: number): string {
   if (rate <= 0.25) return 'Very Slow';
   if (rate <= 0.45) return 'Slow';
@@ -307,20 +309,34 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             await wearablesCamera.startRegistration();
 
             // Pre-warm: grant permission → wait for device → start session/stream.
-            // Without this, the first capturePhoto loses a race against the
-            // permission/device handshake and throws "No eligible device available".
-            //
-            // We DO surface preWarm failures because they are user-actionable
-            // ("open Meta AI app", "grant camera permission", etc).
-            try {
-              await wearablesCamera.preWarm();
-              // Refresh status pill so it flips from "Not connected" to "Connected"
-              await refreshWearablesStatus();
-            } catch (preWarmErr: any) {
+            // The Meta SDK can report "paired" before the glasses are actually
+            // active, so retry briefly instead of making the user toggle OFF/ON.
+            let preWarmErr: any = null;
+            for (let i = 0; i < WEARABLES_SETTINGS_PREWARM_RETRY_DELAYS_MS.length; i += 1) {
+              const delayMs = WEARABLES_SETTINGS_PREWARM_RETRY_DELAYS_MS[i];
+              if (delayMs > 0) {
+                await new Promise<void>((resolve) => setTimeout(() => resolve(), delayMs));
+              }
+
+              try {
+                await wearablesCamera.preWarm();
+                preWarmErr = null;
+                // Refresh status pill so it flips from "Not connected" to "Connected"
+                await refreshWearablesStatus();
+                break;
+              } catch (error: any) {
+                preWarmErr = error;
+                console.warn(
+                  `[Wearables] Pre-warm attempt ${i + 1}/${WEARABLES_SETTINGS_PREWARM_RETRY_DELAYS_MS.length} failed:`,
+                  error?.message || error,
+                );
+              }
+            }
+
+            if (preWarmErr) {
               const msg =
                 preWarmErr?.message ||
                 'Could not start the glasses camera stream.';
-              console.warn('[Wearables] Pre-warm failed:', msg);
               AccessibilityInfo.announceForAccessibility(msg);
               Alert.alert('Glasses Camera', msg, [{ text: 'OK', style: 'default' }]);
               // Don't auto-revert the toggle — capturePhoto will retry on next tap
