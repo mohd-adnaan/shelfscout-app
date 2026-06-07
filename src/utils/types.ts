@@ -4,6 +4,8 @@ export interface WorkflowRequest {
   imageWidth?: number;   
   imageHeight?: number;
   navigation?: boolean;
+  navigation_pipeline?: 'kasra' | 'arkit';
+  navigation_ios_preferred?: boolean;
   reaching_flag?: boolean;
   reaching_ios?: boolean;
   // Sent once per fresh client session (app open OR resetSessionId).
@@ -17,6 +19,12 @@ export interface WorkflowResponse {
   
   // Continuous mode flags (THREE-FLAG SYSTEM)
   navigation: boolean;
+  navigation_ios?: boolean;
+  navigation_arkit?: boolean;
+  navigation_target?: string;
+  route_map_id?: string;
+  route_map_name?: string;
+  navigation_error?: string;
   reaching_flag: boolean;
   reaching_completed?: boolean;
   

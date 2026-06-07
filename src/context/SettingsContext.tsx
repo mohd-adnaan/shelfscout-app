@@ -18,8 +18,11 @@ import { iOSTts } from '../services/iOSTtsClient';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type WearablesMicrophoneSource = 'wearables' | 'phone';
+export type NavigationPipeline = 'kasra' | 'arkit';
 
 export interface AppSettings {
+  /** Indoor route navigation engine. Defaults to RTAB for compatibility. */
+  navigationPipeline: NavigationPipeline;
   /** When true, ignore reaching_ios → use the generic "reaching" pipeline */
   preferAlternativeReaching: boolean;
   /** When true, use Meta Ray-Ban camera feed instead of phone camera */
@@ -43,6 +46,7 @@ interface SettingsContextValue {
   isLoaded: boolean;
   updatePreferAlternativeReaching: (value: boolean) => Promise<void>;
   updateUseWearablesCamera: (value: boolean) => Promise<void>;
+  updateNavigationPipeline: (pipeline: NavigationPipeline) => Promise<void>;
   updateWearablesMicrophoneSource: (source: WearablesMicrophoneSource) => Promise<void>;
   updateTtsRate: (rate: number) => Promise<void>;
   updateDeveloperMode: (value: boolean) => Promise<void>;
@@ -57,6 +61,15 @@ interface SettingsContextValue {
     reaching_ios?: boolean;
     reaching?: boolean;
   }) => 'arkit' | 'standard' | 'none';
+  /**
+   * Given backend navigation flags, decide which navigation pipeline to use.
+   * Returns 'arkit' only when user opted in and the platform can present ARKit.
+   */
+  resolveNavigationPipeline: (flags: {
+    navigation?: boolean;
+    navigation_ios?: boolean;
+    navigation_arkit?: boolean;
+  }) => NavigationPipeline | 'none';
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -64,6 +77,7 @@ interface SettingsContextValue {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS: AppSettings = {
+  navigationPipeline: 'kasra',
   preferAlternativeReaching: false,
   useWearablesCamera: false,
   wearablesMicrophoneSource: 'wearables',
@@ -142,6 +156,18 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       setSettings(next);
       await persist(next);
       console.log(`[Settings] Wearables camera → ${value ? 'ON' : 'OFF'}`);
+    },
+    [settings, persist],
+  );
+
+  const updateNavigationPipeline = useCallback(
+    async (pipeline: NavigationPipeline) => {
+      const next = { ...settings, navigationPipeline: pipeline };
+      setSettings(next);
+      await persist(next);
+      console.log(
+        `[Settings] Navigation pipeline → ${pipeline === 'arkit' ? 'ARKit on-device' : 'RTAB'}`,
+      );
     },
     [settings, persist],
   );
@@ -232,6 +258,30 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings.preferAlternativeReaching],
   );
 
+  const resolveNavigationPipeline = useCallback(
+    (flags: {
+      navigation?: boolean;
+      navigation_ios?: boolean;
+      navigation_arkit?: boolean;
+    }): NavigationPipeline | 'none' => {
+      const wantsNavigation =
+        flags.navigation === true ||
+        flags.navigation_ios === true ||
+        flags.navigation_arkit === true;
+
+      if (!wantsNavigation) {
+        return 'none';
+      }
+
+      if (settings.navigationPipeline === 'arkit' && Platform.OS === 'ios') {
+        return 'arkit';
+      }
+
+      return 'kasra';
+    },
+    [settings.navigationPipeline],
+  );
+
   // ── Value ─────────────────────────────────────────────────────────────────
 
   const value: SettingsContextValue = {
@@ -239,6 +289,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     isLoaded,
     updatePreferAlternativeReaching,
     updateUseWearablesCamera,
+    updateNavigationPipeline,
     updateWearablesMicrophoneSource,
     updateTtsRate,
     updateDeveloperMode,
@@ -246,6 +297,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateDistanceUnit,
     updateEnableAcquisitionAutoExit,
     resolveReachingPipeline,
+    resolveNavigationPipeline,
   };
 
   return (

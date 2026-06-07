@@ -19,6 +19,10 @@ import {
 import { useSettings } from '../context/SettingsContext';
 import { iOSTts } from '../services/iOSTtsClient';
 import { wearablesCamera, WearablesCameraStatus } from '../services/WearablesCamera';
+import {
+  ARKitNavigationBridge,
+  isARKitNavigationModuleLinked,
+} from '../native/ARKitNavigationModule';
 
 const { width: SCREEN_WIDTH } = Dimensions.get('window');
 const SLIDER_TRACK_WIDTH = SCREEN_WIDTH - 80; // 40px padding each side
@@ -216,6 +220,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
   const {
     settings,
     updatePreferAlternativeReaching,
+    updateNavigationPipeline,
     updateUseWearablesCamera,
     updateWearablesMicrophoneSource,
     updateTtsRate,
@@ -239,6 +244,48 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     },
     [updatePreferAlternativeReaching],
   );
+
+  // ── Navigation toggle ─────────────────────────────────────────────────────
+
+  const handleNavigationPipelineToggle = useCallback(
+    async (useARKit: boolean) => {
+      const nextPipeline = useARKit ? 'arkit' : 'kasra';
+      await updateNavigationPipeline(nextPipeline);
+      AccessibilityInfo.announceForAccessibility(
+        useARKit
+          ? 'ARKit on-device navigation enabled.'
+          : 'Kasra RTAB navigation enabled.',
+      );
+    },
+    [updateNavigationPipeline],
+  );
+
+  const handleManageARRoutes = useCallback(async () => {
+    try {
+      if (Platform.OS !== 'ios' || !isARKitNavigationModuleLinked) {
+        Alert.alert(
+          'ARKit module not linked',
+          'Rebuild and reinstall the iOS app so the native ARKit navigation module is included.',
+        );
+        return;
+      }
+
+      const available = await ARKitNavigationBridge.isAvailable();
+      if (!available) {
+        Alert.alert(
+          'ARKit unavailable',
+          'ARKit route mapping is available on iPhone or iPad devices that support ARKit.',
+        );
+        return;
+      }
+      await ARKitNavigationBridge.presentRouteManager();
+    } catch (error: any) {
+      Alert.alert(
+        'Could not open AR Route Maps',
+        error?.message || 'Rebuild the iOS app with the ARKit navigation module linked.',
+      );
+    }
+  }, []);
 
   // Guard: prevent overlapping connect/disconnect operations on the Meta SDK.
   // Rapid OFF→ON toggling without this creates zombie sessions that cause
@@ -435,7 +482,77 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       >
 
         {/* ══════════════════════════════════════════
-            SECTION 1 — Reaching Pipeline
+            SECTION 1 — Navigation Pipeline
+        ══════════════════════════════════════════ */}
+        <Section title="Navigation Pipeline">
+          <View style={styles.pipelineBadgeRow}>
+            <View
+              style={[
+                styles.pipelineBadge,
+                settings.navigationPipeline === 'arkit'
+                  ? styles.badgeArkit
+                  : styles.badgeStandard,
+              ]}
+            >
+              <Text style={styles.pipelineBadgeText}>
+                {settings.navigationPipeline === 'arkit'
+                  ? 'ARKit On-Device'
+                  : 'RTAB'}
+              </Text>
+            </View>
+          </View>
+
+          <Text style={styles.settingDescription}>
+            Choose how ShelfScout handles indoor route guidance. RTAB stays the default.
+          </Text>
+
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabelBlock}>
+              <Text style={styles.settingLabel}>Use ARKit navigation</Text>
+              <Text style={styles.settingSubLabel}>
+                {settings.navigationPipeline === 'arkit'
+                  ? 'On-device route maps and guidance'
+                  : 'Server RTAB route guidance'}
+              </Text>
+            </View>
+            <Switch
+              value={settings.navigationPipeline === 'arkit'}
+              onValueChange={handleNavigationPipelineToggle}
+              trackColor={{ false: C.border, true: C.success }}
+              thumbColor={settings.navigationPipeline === 'arkit' ? C.success : C.sliderThumb}
+              ios_backgroundColor={C.border}
+              accessible={true}
+              accessibilityRole="switch"
+              accessibilityLabel="Use ARKit navigation"
+              accessibilityHint={
+                settings.navigationPipeline === 'arkit'
+                  ? 'Double tap to switch back to Kasra RTAB navigation.'
+                  : 'Double tap to use on-device ARKit navigation.'
+              }
+              accessibilityValue={{
+                text: settings.navigationPipeline === 'arkit'
+                  ? 'ARKit on-device navigation active'
+                  : 'Kasra RTAB navigation active',
+              }}
+            />
+          </View>
+
+          {Platform.OS === 'ios' && (
+            <TouchableOpacity
+              style={styles.testBtn}
+              onPress={handleManageARRoutes}
+              accessible={true}
+              accessibilityRole="button"
+              accessibilityLabel="Manage AR route maps"
+              accessibilityHint="Double tap to open the ARKit route mapping screen"
+            >
+              <Text style={styles.testBtnText}>Manage AR Route Maps</Text>
+            </TouchableOpacity>
+          )}
+        </Section>
+
+        {/* ══════════════════════════════════════════
+            SECTION 1.1 — Reaching Pipeline
         ══════════════════════════════════════════ */}
         <Section title="Reaching Pipeline">
           {/* Active pipeline badge */}

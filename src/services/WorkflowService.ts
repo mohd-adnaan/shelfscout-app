@@ -270,8 +270,12 @@ export const sendToWorkflow = async (
     const navigationValue = request.navigation === true ? 'true' : 'false';
     const reachingValue = request.reaching_flag === true ? 'true' : 'false';
     const reachingIOSValue = request.reaching_ios === true ? 'true' : 'false';
+    const navigationPipelineValue = request.navigation_pipeline || 'kasra';
+    const navigationIOSPreferredValue = request.navigation_ios_preferred === true ? 'true' : 'false';
 
     formData.append('navigation', navigationValue);
+    formData.append('navigation_pipeline', navigationPipelineValue);
+    formData.append('navigation_ios_preferred', navigationIOSPreferredValue);
     formData.append('reaching_flag', reachingValue);
     formData.append('reaching_ios', reachingIOSValue);
     formData.append('user_id', 'mobile-user');
@@ -333,6 +337,7 @@ export const sendToWorkflow = async (
     console.log('🚀 Sending to workflow:', WORKFLOW_URL);
     console.log('📝 Transcript:', request.text || '(continuous mode)');
     console.log('🔄 Navigation:', navigationValue);
+    console.log('🧭 Navigation pipeline:', navigationPipelineValue, 'iOS preferred:', navigationIOSPreferredValue);
     console.log('🎯 Reaching:', reachingValue);
     console.log('🍎 Reaching iOS:', reachingIOSValue);
     console.log('🎮 Mode:', modeValue);
@@ -341,7 +346,7 @@ export const sendToWorkflow = async (
     requestStartTime = Date.now();
     debugLogger.logAPI(
       `→ POST ${WORKFLOW_URL.replace('https://cybersight.cim.mcgill.ca', '')}`,
-      `transcript="${(request.text || '').substring(0, 60)}" nav=${navigationValue} reach=${reachingValue} ios=${reachingIOSValue} img=${!!request.imageUri}`,
+      `transcript="${(request.text || '').substring(0, 60)}" nav=${navigationValue} navPipeline=${navigationPipelineValue} navIOS=${navigationIOSPreferredValue} reach=${reachingValue} ios=${reachingIOSValue} img=${!!request.imageUri}`,
     );
 
     if (signal?.aborted) {
@@ -398,6 +403,9 @@ export const sendToWorkflow = async (
     console.log('📄 Response:', {
       textLength: parsedResponse.text?.length || 0,
       navigation: parsedResponse.navigation,
+      navigation_ios: parsedResponse.navigation_ios,
+      navigation_target: parsedResponse.navigation_target,
+      route_map_id: parsedResponse.route_map_id,
       reaching_flag: parsedResponse.reaching_flag,
       reaching_ios: parsedResponse.reaching_ios,
       bbox: !!parsedResponse.bbox,
@@ -405,7 +413,7 @@ export const sendToWorkflow = async (
     });
 
     debugLogger.logAPI(
-      `← Parsed: nav=${parsedResponse.navigation} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox} track=${!!parsedResponse.tracking_active} reached=${!!parsedResponse.reached}`,
+      `← Parsed: nav=${parsedResponse.navigation} navIOS=${!!parsedResponse.navigation_ios || !!parsedResponse.navigation_arkit} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox} track=${!!parsedResponse.tracking_active} reached=${!!parsedResponse.reached}`,
       `text="${(parsedResponse.text || '').substring(0, 80)}"`,
     );
 
@@ -666,6 +674,10 @@ function parseWorkflowResponse(
       score += 3;
     }
     if (
+      parseBoolean(payload.navigation_ios) === true ||
+      parseBoolean(payload.navigationIos) === true ||
+      parseBoolean(payload.navigation_arkit) === true ||
+      parseBoolean(payload.navigationArkit) === true ||
       parseBoolean(payload.navigation) === true ||
       parseBoolean(payload.navigation_flag) === true
     ) {
@@ -788,6 +800,18 @@ function parseWorkflowResponse(
     parseBoolean(payload.navigation_flag) === true
   );
 
+  // iOS native ARKit navigation hints. These are optional and backward
+  // compatible: old backend responses may only set `navigation=true`.
+  const navigation_ios = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.navigation_ios) === true ||
+    parseBoolean(payload.navigationIos) === true
+  );
+
+  const navigation_arkit = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.navigation_arkit) === true ||
+    parseBoolean(payload.navigationArkit) === true
+  );
+
   // Reaching flag (Android LLM-based)
   const reaching_flag = normalizedPayloads.some((payload) =>
     parseBoolean(payload.reaching_flag) === true ||
@@ -853,6 +877,45 @@ function parseWorkflowResponse(
   // =========================================================================
   const object = pickString(['object', 'objectName']) || undefined;
 
+  const navigation_target =
+    pickStringByKeyPriority([
+      'navigation_target',
+      'navigationTarget',
+      'target_name',
+      'targetName',
+      'target',
+    ]) || undefined;
+
+  const route_map_id =
+    pickStringByKeyPriority([
+      'route_map_id',
+      'routeMapId',
+      'route_id',
+      'routeId',
+      'map_id',
+      'mapId',
+    ]) || undefined;
+
+  const route_map_name =
+    pickStringByKeyPriority([
+      'route_map_name',
+      'routeMapName',
+      'route_name',
+      'routeName',
+      'map_name',
+      'mapName',
+    ]) || undefined;
+
+  const navigation_error =
+    normalizeBackendString(
+      pickStringByKeyPriority([
+        'navigation_error',
+        'navigationError',
+        'nav_error',
+        'navError',
+      ]),
+    ) || undefined;
+
   const annotatedImageRaw = normalizeBackendString(
     pickString(['annotated_image', 'annotatedImage', 'annotated_image_base64', 'annotatedImageBase64']),
   );
@@ -878,6 +941,10 @@ function parseWorkflowResponse(
     text: text.substring(0, 50),
     hand_direction: hand_direction || 'none',
     navigation,
+    navigation_ios,
+    navigation_arkit,
+    navigation_target,
+    route_map_id,
     reaching_flag,
     reaching_ios,
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
@@ -891,6 +958,12 @@ function parseWorkflowResponse(
   return {
     text,
     navigation,
+    navigation_ios,
+    navigation_arkit,
+    navigation_target,
+    route_map_id,
+    route_map_name,
+    navigation_error,
     reaching_flag,
     reaching_ios,
     bbox,

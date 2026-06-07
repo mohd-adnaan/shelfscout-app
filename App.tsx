@@ -70,6 +70,7 @@ import SettingsScreen from './src/screens/SettingsScreen';
 import { debugLogger } from './src/services/DebugLogger';
 import { DebugOverlay } from './src/components/DebugOverlay';
 import { wearablesCamera } from './src/services/WearablesCamera';
+import { ARKitNavigationBridge, ARKitNavigationResult } from './src/native/ARKitNavigationModule';
 import RNFS from 'react-native-fs';
 
 const { width, height } = Dimensions.get('window');
@@ -142,7 +143,7 @@ function AppInner(): React.JSX.Element {
   const [showStartupLoader, setShowStartupLoader] = useState(true);
 
   // ── Settings ───────────────────────────────────────────────────────────────
-  const { settings, resolveReachingPipeline } = useSettings();
+  const { settings, resolveReachingPipeline, resolveNavigationPipeline } = useSettings();
   // Ref always holds the latest settings — avoids stale closure in useCallback
   const settingsRef = useRef(settings);
   useEffect(() => { settingsRef.current = settings; }, [settings]);
@@ -1409,6 +1410,8 @@ function AppInner(): React.JSX.Element {
               imageWidth: lastImageDimensions.current.width,
               imageHeight: lastImageDimensions.current.height,
               navigation: loopMode === 'navigation',
+              navigation_pipeline: settingsRef.current.navigationPipeline,
+              navigation_ios_preferred: Platform.OS === 'ios' && settingsRef.current.navigationPipeline === 'arkit',
               reaching_flag: loopMode === 'reaching' && (Platform.OS !== 'ios' || settingsRef.current.preferAlternativeReaching),
               reaching_ios: loopMode === 'reaching' && Platform.OS === 'ios' && !settingsRef.current.preferAlternativeReaching,
             },
@@ -1747,6 +1750,180 @@ function AppInner(): React.JSX.Element {
   ]);
 
   // ============================================================================
+  // ARKit Navigation helper — native on-device route guidance takeover
+  // ============================================================================
+  const handleARKitNavigation = useCallback(async (
+    result: any,
+    options?: { introSpeechPromise?: Promise<void> },
+  ): Promise<boolean> => {
+    const pipeline = resolveNavigationPipeline({
+      navigation: result.navigation,
+      navigation_ios: result.navigation_ios,
+      navigation_arkit: result.navigation_arkit,
+    });
+
+    if (pipeline !== 'arkit') {
+      return false;
+    }
+
+    const targetName = normalizeTextValue(result.navigation_target) ||
+      normalizeTextValue(result.object);
+
+    if (!targetName) {
+      if (options?.introSpeechPromise) {
+        try { await options.introSpeechPromise; } catch { }
+      }
+      await speakContinuousSpeechAndWait(
+        'I could not identify the navigation target. Please ask for the destination again.',
+        { ignoreAbort: true },
+      );
+      setIsNavigation(false);
+      setIsProcessing(false);
+      setIsCameraActive(true);
+      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      announceTapToStart('Ready.');
+      return true;
+    }
+
+    let arAvailable = false;
+    try {
+      arAvailable = await ARKitNavigationBridge.isAvailable();
+    } catch {
+      arAvailable = false;
+    }
+
+    if (!arAvailable) {
+      if (options?.introSpeechPromise) {
+        try { await options.introSpeechPromise; } catch { }
+      }
+      await speakContinuousSpeechAndWait(
+        'ARKit navigation is not available on this device. Falling back to Kasra navigation.',
+        { ignoreAbort: true },
+      );
+      result.navigation = true;
+      result.navigation_ios = false;
+      result.navigation_arkit = false;
+      return false;
+    }
+
+    if (options?.introSpeechPromise) {
+      try {
+        await options.introSpeechPromise;
+      } catch (e: any) {
+        if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+          console.warn('⚠️ [ARKitNavigation] Intro TTS warning:', e?.message || e);
+        }
+      }
+    } else if (!result.text) {
+      await speakContinuousSpeechAndWait(
+        `Starting ARKit route guidance to ${targetName}.`,
+        { ignoreAbort: true },
+      );
+    }
+
+    if (isEmergencyStopped.current) return true;
+
+    console.log('🧭 [ARKitNavigation] Launching native navigation:', {
+      targetName,
+      routeMapId: result.route_map_id,
+      routeMapName: result.route_map_name,
+    });
+
+    stopKasraFeed();
+    stopContinuousMode('ARKit navigation takeover', false);
+    continuousModeAbortRef.current = true;
+    continuousTtsGenerationRef.current++;
+    resetContinuousSpeechQueue();
+    setIsNavigation(true);
+    setIsReaching(false);
+    setIsProcessing(false);
+    setIsSpeaking(false);
+    setIsCameraActive(false);
+    kasraLastObjectRef.current = targetName;
+
+    let navResult: ARKitNavigationResult;
+    try {
+      navResult = await ARKitNavigationBridge.startNavigation({
+        targetName,
+        routeMapId: normalizeTextValue(result.route_map_id) || undefined,
+        routeMapName: normalizeTextValue(result.route_map_name) || undefined,
+        sessionId: getSessionId(),
+        speakLandmarks: true,
+        ttsRate: settingsRef.current.ttsRate,
+      });
+    } catch (e: any) {
+      navResult = {
+        success: false,
+        reason: 'error',
+        targetName,
+        message: e?.message || 'ARKit navigation ended with an error.',
+      };
+    }
+
+    console.log('🧭 [ARKitNavigation] Native result:', navResult);
+
+    setIsNavigation(false);
+    setIsCameraActive(true);
+
+    if (navResult?.success && navResult.reason === 'arrived') {
+      await speakContinuousSpeechAndWait(
+        navResult.message || `Arrived at ${targetName}. Switching to object guidance.`,
+        { ignoreAbort: true },
+      );
+
+      if (isEmergencyStopped.current) return true;
+
+      stopContinuousMode('resetting for ARKit navigation to reaching handoff', false);
+      await new Promise(resolve => setTimeout(resolve, 250));
+      startContinuousMode('reaching', result.loopDelay || NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS);
+      setIsReaching(true);
+      setIsProcessing(false);
+      await runContinuousLoop();
+      return true;
+    }
+
+    if (navResult.reason === 'ar_unavailable') {
+      await speakContinuousSpeechAndWait(
+        navResult.message || 'ARKit navigation is unavailable. Falling back to Kasra navigation.',
+        { ignoreAbort: true },
+      );
+      setIsProcessing(false);
+      result.navigation = true;
+      result.navigation_ios = false;
+      result.navigation_arkit = false;
+      return false;
+    }
+
+    const fallbackMessages: Record<string, string> = {
+      map_not_found: `No saved AR route map was found for ${targetName}. Open Settings, Manage AR Route Maps, and map the route first.`,
+      target_not_found: `${targetName} is not in the saved AR route maps. Add it as a destination or landmark, then try again.`,
+      relocalization_failed: 'I could not relocalize against the saved AR map. Return to the route start and slowly scan the area.',
+      cancelled: 'ARKit navigation cancelled.',
+      error: navResult.message || 'ARKit navigation ended with an error.',
+    };
+
+    await speakContinuousSpeechAndWait(
+      fallbackMessages[navResult.reason] || navResult.message || 'ARKit navigation ended.',
+      { ignoreAbort: true },
+    );
+    stopContinuousMode('ARKit navigation ended', false);
+    setIsReaching(false);
+    setIsProcessing(false);
+    setIsSpeaking(false);
+    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+    announceTapToStart('Ready.');
+    return true;
+  }, [
+    announceTapToStart,
+    resetContinuousSpeechQueue,
+    resolveNavigationPipeline,
+    runContinuousLoop,
+    speakContinuousSpeechAndWait,
+    startKasraFeed,
+    stopKasraFeed,
+  ]);
+
+  // ============================================================================
   // Stop helpers
   // ============================================================================
   const stopContinuousModeLoop = useCallback(async () => {
@@ -1762,6 +1939,7 @@ function AppInner(): React.JSX.Element {
       reacquiringRef.current;
     continuousModeAbortRef.current = true;
     stopKasraFeed();
+    try { await ARKitNavigationBridge.stopNavigation(); } catch { }
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
@@ -1792,6 +1970,7 @@ function AppInner(): React.JSX.Element {
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
     stopKasraFeed();
+    try { await ARKitNavigationBridge.stopNavigation(); } catch { }
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
     await stopLatencyLoop(); // FIX: was missing — latency SFX survived nav interrupt
     continuousTtsGenerationRef.current++;
@@ -1870,6 +2049,8 @@ function AppInner(): React.JSX.Element {
           imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
           navigation: false,
+          navigation_pipeline: settingsRef.current.navigationPipeline,
+          navigation_ios_preferred: Platform.OS === 'ios' && settingsRef.current.navigationPipeline === 'arkit',
           reaching_flag: false,
         },
         abortCtrl.signal
@@ -1934,6 +2115,19 @@ function AppInner(): React.JSX.Element {
       if (isEmergencyStopped.current) return;
 
       finalTranscriptRef.current = '';
+
+      // ── iOS ARKit navigation on first response (opt-in setting) ─────────
+      if (
+        Platform.OS === 'ios' &&
+        (result.navigation === true || result.navigation_ios === true || result.navigation_arkit === true)
+      ) {
+        const handled = await handleARKitNavigation(result, {
+          introSpeechPromise,
+        });
+        if (handled) return;
+        // If not handled because ARKit is unavailable, fall through to the
+        // existing Kasra loop using the mutated fallback navigation flag.
+      }
 
       // ── iOS ARKit reaching on first response (respects user preference) ──
       if (Platform.OS === 'ios' && result.reaching_ios === true) {
@@ -2025,7 +2219,7 @@ function AppInner(): React.JSX.Element {
       finalTranscriptRef.current = '';
       abortControllerRef.current = null;
     }
-  }, [handleiOSReaching, runContinuousLoop]);
+  }, [handleARKitNavigation, handleiOSReaching, runContinuousLoop]);
 
   // Keep ref in sync so handleAutoSubmit can call latest version
   useEffect(() => {
@@ -2451,6 +2645,7 @@ function AppInner(): React.JSX.Element {
     isEmergencyStopped.current = true;
     isStartingRef.current = false; // ← release re-entry guard
     continuousModeAbortRef.current = true;
+    try { await ARKitNavigationBridge.stopNavigation(); } catch { }
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
