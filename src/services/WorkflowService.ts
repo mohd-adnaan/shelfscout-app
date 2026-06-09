@@ -270,7 +270,7 @@ export const sendToWorkflow = async (
     const navigationValue = request.navigation === true ? 'true' : 'false';
     const reachingValue = request.reaching_flag === true ? 'true' : 'false';
     const reachingIOSValue = request.reaching_ios === true ? 'true' : 'false';
-    const navigationPipelineValue = request.navigation_pipeline || 'kasra';
+    const navigationPipelineValue = request.navigation_pipeline || 'rtab';
     const navigationIOSPreferredValue = request.navigation_ios_preferred === true ? 'true' : 'false';
 
     formData.append('navigation', navigationValue);
@@ -831,7 +831,7 @@ function parseWorkflowResponse(
     parseBoolean(payload.trackingActive) === true
   );
 
-  // reached flag — RTAB navigation completion (Kasra).
+  // reached flag — RTAB navigation completion (Rtab).
   const reached = normalizedPayloads.some((payload) =>
     parseBoolean(payload.reached) === true ||
     parseBoolean(payload.navigation_completed) === true

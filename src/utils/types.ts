@@ -4,7 +4,7 @@ export interface WorkflowRequest {
   imageWidth?: number;   
   imageHeight?: number;
   navigation?: boolean;
-  navigation_pipeline?: 'kasra' | 'arkit';
+  navigation_pipeline?: 'rtab' | 'arkit';
   navigation_ios_preferred?: boolean;
   reaching_flag?: boolean;
   reaching_ios?: boolean;
@@ -43,7 +43,7 @@ export interface WorkflowResponse {
   // backend gates the Qwen call internally based on this flag.
   tracking_active?: boolean;
 
-  // RTAB navigation completion signal (Kasra). When `reached === true`
+  // RTAB navigation completion signal (Rtab). When `reached === true`
   // and the loop is currently in navigation mode, the app force-switches
   // to reaching mode so the next iteration requests reaching processing.
   reached?: boolean;

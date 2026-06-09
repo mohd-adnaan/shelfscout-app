@@ -249,12 +249,12 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
 
   const handleNavigationPipelineToggle = useCallback(
     async (useARKit: boolean) => {
-      const nextPipeline = useARKit ? 'arkit' : 'kasra';
+      const nextPipeline = useARKit ? 'arkit' : 'rtab';
       await updateNavigationPipeline(nextPipeline);
       AccessibilityInfo.announceForAccessibility(
         useARKit
           ? 'ARKit on-device navigation enabled.'
-          : 'Kasra RTAB navigation enabled.',
+          : 'Rtab RTAB navigation enabled.',
       );
     },
     [updateNavigationPipeline],
@@ -526,13 +526,13 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
               accessibilityLabel="Use ARKit navigation"
               accessibilityHint={
                 settings.navigationPipeline === 'arkit'
-                  ? 'Double tap to switch back to Kasra RTAB navigation.'
+                  ? 'Double tap to switch back to Rtab RTAB navigation.'
                   : 'Double tap to use on-device ARKit navigation.'
               }
               accessibilityValue={{
                 text: settings.navigationPipeline === 'arkit'
                   ? 'ARKit on-device navigation active'
-                  : 'Kasra RTAB navigation active',
+                  : 'Rtab RTAB navigation active',
               }}
             />
           </View>

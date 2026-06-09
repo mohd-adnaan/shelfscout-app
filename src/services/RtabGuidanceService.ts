@@ -1,16 +1,16 @@
 import axios from 'axios';
 import { Platform } from 'react-native';
-import { CONFIG, KASRA_GUIDANCE_URL } from '../utils/constants';
+import { CONFIG, RTAB_GUIDANCE_URL } from '../utils/constants';
 
-export interface KasraGuidanceRequest {
+export interface RtabGuidanceRequest {
   objectName: string;
   imageUri: string;
   frameId?: string;
   capturedAtMs?: number;
 }
 
-export const sendToKasraGuidance = async (
-  payload: KasraGuidanceRequest,
+export const sendToRtabGuidance = async (
+  payload: RtabGuidanceRequest,
   signal?: AbortSignal
 ): Promise<void> => {
   const formData = new FormData();
@@ -32,7 +32,7 @@ export const sendToKasraGuidance = async (
     name: `${frameId.replace(/[^a-zA-Z0-9_-]/g, '_')}.jpg`,
   } as any);
 
-  await axios.post(KASRA_GUIDANCE_URL, formData, {
+  await axios.post(RTAB_GUIDANCE_URL, formData, {
     headers: {
       'Content-Type': 'multipart/form-data',
       'Accept': 'application/json',

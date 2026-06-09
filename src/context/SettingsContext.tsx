@@ -18,7 +18,7 @@ import { iOSTts } from '../services/iOSTtsClient';
 // ─────────────────────────────────────────────────────────────────────────────
 
 export type WearablesMicrophoneSource = 'wearables' | 'phone';
-export type NavigationPipeline = 'kasra' | 'arkit';
+export type NavigationPipeline = 'rtab' | 'arkit';
 
 export interface AppSettings {
   /** Indoor route navigation engine. Defaults to RTAB for compatibility. */
@@ -77,7 +77,7 @@ interface SettingsContextValue {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS: AppSettings = {
-  navigationPipeline: 'kasra',
+  navigationPipeline: 'rtab',
   preferAlternativeReaching: false,
   useWearablesCamera: false,
   wearablesMicrophoneSource: 'wearables',
@@ -277,7 +277,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         return 'arkit';
       }
 
-      return 'kasra';
+      return 'rtab';
     },
     [settings.navigationPipeline],
   );

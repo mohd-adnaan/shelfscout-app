@@ -45,7 +45,7 @@ import {
   resetSessionId,
   determineActionMode,
 } from './src/services/WorkflowService';
-import { sendToKasraGuidance } from './src/services/KasraGuidanceService';
+import { sendToRtabGuidance } from './src/services/RtabGuidanceService';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import {
   initSounds,
@@ -101,7 +101,7 @@ const PREFETCH_CONFIG = {
 };
 
 const SMART_GUIDANCE_MIN_CYCLE_MS = 200; // 5fps
-const KASRA_FEED_INTERVAL_MS = 500;
+const RTAB_FEED_INTERVAL_MS = 500;
 
 let dav2PrewarmStarted = false;
 
@@ -207,11 +207,11 @@ function AppInner(): React.JSX.Element {
   // Qwen detection to reacquire the target. Keeps the loop alive instead of
   // exiting on bothInactive.
   const reacquiringRef = useRef(false);
-  const kasraFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const kasraLastSentFrameRef = useRef<string>('');
-  const kasraLastObjectRef = useRef<string>('');
-  const kasraIsSendingRef = useRef(false);
-  const kasraFrameSeqRef = useRef(0);
+  const rtabFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const rtabLastSentFrameRef = useRef<string>('');
+  const rtabLastObjectRef = useRef<string>('');
+  const rtabIsSendingRef = useRef(false);
+  const rtabFrameSeqRef = useRef(0);
   const rtabSubmittedFrameUrisRef = useRef<Set<string>>(new Set());
   const rtabSubmittedFrameQueueRef = useRef<string[]>([]);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
@@ -847,27 +847,27 @@ function AppInner(): React.JSX.Element {
     return !!photoPath && rtabSubmittedFrameUrisRef.current.has(photoPath);
   }, []);
 
-  const stopKasraFeed = useCallback(() => {
-    if (kasraFeedIntervalRef.current) {
-      clearInterval(kasraFeedIntervalRef.current);
-      kasraFeedIntervalRef.current = null;
+  const stopRtabFeed = useCallback(() => {
+    if (rtabFeedIntervalRef.current) {
+      clearInterval(rtabFeedIntervalRef.current);
+      rtabFeedIntervalRef.current = null;
     }
-    kasraIsSendingRef.current = false;
-    kasraLastSentFrameRef.current = '';
-    kasraFrameSeqRef.current = 0;
+    rtabIsSendingRef.current = false;
+    rtabLastSentFrameRef.current = '';
+    rtabFrameSeqRef.current = 0;
   }, []);
 
-  const startKasraFeed = useCallback(() => {
-    if (kasraFeedIntervalRef.current) return;
+  const startRtabFeed = useCallback(() => {
+    if (rtabFeedIntervalRef.current) return;
 
-    kasraFeedIntervalRef.current = setInterval(async () => {
+    rtabFeedIntervalRef.current = setInterval(async () => {
       if (!isContinuousModeRunning.current || getCurrentMode() !== 'navigation') return;
-      if (kasraIsSendingRef.current) return;
+      if (rtabIsSendingRef.current) return;
 
-      const objectName = kasraLastObjectRef.current;
+      const objectName = rtabLastObjectRef.current;
       if (!objectName) return;
 
-      kasraIsSendingRef.current = true;
+      rtabIsSendingRef.current = true;
       try {
         // Capture a NEW frame here so RTAB gets a fresh image every interval,
         // rather than sending the exact same image multiple times.
@@ -877,20 +877,20 @@ function AppInner(): React.JSX.Element {
         });
         if (photoPath) {
           if (hasSubmittedRtabFrame(photoPath)) {
-            console.warn('[Kasra] Skipping frame already submitted to RTAB:', photoPath);
+            console.warn('[Rtab] Skipping frame already submitted to RTAB:', photoPath);
             return;
           }
 
-          if (photoPath === kasraLastSentFrameRef.current) {
-            console.warn('[Kasra] Skipping duplicate frame URI:', photoPath);
+          if (photoPath === rtabLastSentFrameRef.current) {
+            console.warn('[Rtab] Skipping duplicate frame URI:', photoPath);
             return;
           }
 
           const capturedAtMs = Date.now();
-          const frameId = `rtab-${capturedAtMs}-${++kasraFrameSeqRef.current}`;
-          kasraLastSentFrameRef.current = photoPath;
+          const frameId = `rtab-${capturedAtMs}-${++rtabFrameSeqRef.current}`;
+          rtabLastSentFrameRef.current = photoPath;
           rememberRtabSubmittedFrame(photoPath);
-          await sendToKasraGuidance({
+          await sendToRtabGuidance({
             imageUri: photoPath,
             objectName,
             frameId,
@@ -898,11 +898,11 @@ function AppInner(): React.JSX.Element {
           });
         }
       } catch (err: any) {
-        console.warn('[Kasra] Guidance send failed:', err?.message || err);
+        console.warn('[Rtab] Guidance send failed:', err?.message || err);
       } finally {
-        kasraIsSendingRef.current = false;
+        rtabIsSendingRef.current = false;
       }
-    }, KASRA_FEED_INTERVAL_MS);
+    }, RTAB_FEED_INTERVAL_MS);
   }, [hasSubmittedRtabFrame, reactivateCameraAndCapture, rememberRtabSubmittedFrame]);
 
   const resetContinuousSpeechQueue = useCallback(() => {
@@ -1174,7 +1174,7 @@ function AppInner(): React.JSX.Element {
     continuousTtsGenerationRef.current++;
     resetContinuousSpeechQueue();
     prefetchedPhotoRef.current = null;
-    kasraLastSentFrameRef.current = '';
+    rtabLastSentFrameRef.current = '';
     rtabSubmittedFrameUrisRef.current.clear();
     rtabSubmittedFrameQueueRef.current = [];
     smartGuidanceSeededRef.current = false;
@@ -1240,8 +1240,8 @@ function AppInner(): React.JSX.Element {
         } else {
           photoPath = await reactivateCameraAndCaptureRef.current({
             enableShutterSound: false,
-            // Navigation workflow and the direct Kasra feed both end up at RTAB.
-            // Wait for an in-flight Kasra capture, then take our own frame so
+            // Navigation workflow and the direct Rtab feed both end up at RTAB.
+            // Wait for an in-flight Rtab capture, then take our own frame so
             // the same local JPEG is never posted through both routes.
             busyStrategy: loopMode === 'navigation' ? 'wait-new' : 'wait',
           });
@@ -1264,9 +1264,9 @@ function AppInner(): React.JSX.Element {
           if (photoPath) {
             rememberRtabSubmittedFrame(photoPath);
           }
-          startKasraFeed();
+          startRtabFeed();
         } else {
-          stopKasraFeed();
+          stopRtabFeed();
         }
 
         if (!photoPath && loopMode === 'navigation') {
@@ -1446,7 +1446,7 @@ function AppInner(): React.JSX.Element {
         if (continuousModeAbortRef.current || isEmergencyStopped.current) break;
 
         if (loopMode === 'navigation' && result?.object) {
-          kasraLastObjectRef.current = result.object;
+          rtabLastObjectRef.current = result.object;
         }
 
         console.log('🔄 Loop result:', {
@@ -1485,7 +1485,7 @@ function AppInner(): React.JSX.Element {
           console.log(`🔄 ⏭️ Cycle #${cycleCount} — "Null" response, skipping TTS, fast-polling…`);
         }
 
-        // ── RTAB → Reaching auto-handoff (Kasra) ──────────────────────────
+        // ── RTAB → Reaching auto-handoff (Rtab) ──────────────────────────
         //
         // When the navigation pipeline returns reached=true (text "You have
         // arrived"), force a transition into reaching mode regardless of how
@@ -1711,7 +1711,7 @@ function AppInner(): React.JSX.Element {
     // ── Cleanup ────────────────────────────────────────────────────────────
     console.log('🔄 [ContinuousMode] Loop ended');
     await stopLatencyLoop();
-    stopKasraFeed();
+    stopRtabFeed();
     isContinuousModeRunning.current = false;
     continuousBackendInFlightRef.current = false;
     continuousTtsSpeakingRef.current = false;
@@ -1744,8 +1744,8 @@ function AppInner(): React.JSX.Element {
     resetContinuousSpeechQueue,
     resolveReachingPipeline,
     speakContinuousSpeechAndWait,
-    startKasraFeed,
-    stopKasraFeed,
+    startRtabFeed,
+    stopRtabFeed,
     waitForGoodPosture,
   ]);
 
@@ -1797,7 +1797,7 @@ function AppInner(): React.JSX.Element {
         try { await options.introSpeechPromise; } catch { }
       }
       await speakContinuousSpeechAndWait(
-        'ARKit navigation is not available on this device. Falling back to Kasra navigation.',
+        'ARKit navigation is not available on this device. Falling back to Rtab navigation.',
         { ignoreAbort: true },
       );
       result.navigation = true;
@@ -1829,7 +1829,7 @@ function AppInner(): React.JSX.Element {
       routeMapName: result.route_map_name,
     });
 
-    stopKasraFeed();
+    stopRtabFeed();
     stopContinuousMode('ARKit navigation takeover', false);
     continuousModeAbortRef.current = true;
     continuousTtsGenerationRef.current++;
@@ -1839,7 +1839,7 @@ function AppInner(): React.JSX.Element {
     setIsProcessing(false);
     setIsSpeaking(false);
     setIsCameraActive(false);
-    kasraLastObjectRef.current = targetName;
+    rtabLastObjectRef.current = targetName;
 
     let navResult: ARKitNavigationResult;
     try {
@@ -1885,7 +1885,7 @@ function AppInner(): React.JSX.Element {
 
     if (navResult.reason === 'ar_unavailable') {
       await speakContinuousSpeechAndWait(
-        navResult.message || 'ARKit navigation is unavailable. Falling back to Kasra navigation.',
+        navResult.message || 'ARKit navigation is unavailable. Falling back to Rtab navigation.',
         { ignoreAbort: true },
       );
       setIsProcessing(false);
@@ -1920,8 +1920,8 @@ function AppInner(): React.JSX.Element {
     resolveNavigationPipeline,
     runContinuousLoop,
     speakContinuousSpeechAndWait,
-    startKasraFeed,
-    stopKasraFeed,
+    startRtabFeed,
+    stopRtabFeed,
   ]);
 
   // ============================================================================
@@ -1939,7 +1939,7 @@ function AppInner(): React.JSX.Element {
       smartGuidanceResumeMainRef.current ||
       reacquiringRef.current;
     continuousModeAbortRef.current = true;
-    stopKasraFeed();
+    stopRtabFeed();
     try { await ARKitNavigationBridge.stopNavigation(); } catch { }
 
     if (abortControllerRef.current) {
@@ -1966,11 +1966,11 @@ function AppInner(): React.JSX.Element {
       }
     }
     announceTapToStart('Stopped.');
-  }, [announceTapToStart, isNavigation, isReaching, resetContinuousSpeechQueue, stopKasraFeed]);
+  }, [announceTapToStart, isNavigation, isReaching, resetContinuousSpeechQueue, stopRtabFeed]);
 
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
-    stopKasraFeed();
+    stopRtabFeed();
     try { await ARKitNavigationBridge.stopNavigation(); } catch { }
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
     await stopLatencyLoop(); // FIX: was missing — latency SFX survived nav interrupt
@@ -1988,7 +1988,7 @@ function AppInner(): React.JSX.Element {
       await playStopReachingSound();
     }
     announceTapToStart('Navigation stopped.');
-  }, [announceTapToStart, resetContinuousSpeechQueue, stopKasraFeed]);
+  }, [announceTapToStart, resetContinuousSpeechQueue, stopRtabFeed]);
 
   // ============================================================================
   // Handle Voice Command  ← defined BEFORE handleAutoSubmit so ref is stable
@@ -2060,7 +2060,7 @@ function AppInner(): React.JSX.Element {
       if (isEmergencyStopped.current) return;
 
       if (result?.object) {
-        kasraLastObjectRef.current = result.object;
+        rtabLastObjectRef.current = result.object;
       }
 
       await stopLatencyLoop();
@@ -2127,7 +2127,7 @@ function AppInner(): React.JSX.Element {
         });
         if (handled) return;
         // If not handled because ARKit is unavailable, fall through to the
-        // existing Kasra loop using the mutated fallback navigation flag.
+        // existing Rtab loop using the mutated fallback navigation flag.
       }
 
       // ── iOS ARKit reaching on first response (respects user preference) ──
