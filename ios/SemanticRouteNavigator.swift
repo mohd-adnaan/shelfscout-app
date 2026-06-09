@@ -299,13 +299,15 @@ final class SemanticRouteNavigator: ObservableObject {
     private var shouldSpeakLandmarks = true
     private var shouldEnableErrorRecovery = true
 
-    private let arrivalThresholdMeters = 0.45
+    private let arrivalThresholdMeters = 1.2
+    private let destinationProximityMeters = 2.0
     private let turnAnnouncementThresholdMeters = 1.0
     private let crossTrackRecoveryThreshold = 1.65
     private let recoverySnapThreshold = 1.15
     private let headingRecoveryThreshold = 105.0
-    private let recoveryHoldSeconds: TimeInterval = 2.0
-    private let recoveryCueCooldownSeconds: TimeInterval = 8.0
+    private let recoveryHoldSeconds: TimeInterval = 4.0
+    private let recoveryCueCooldownSeconds: TimeInterval = 12.0
+    private let recoveryAutoResumeSeconds: TimeInterval = 15.0
     private let guidanceIntroProtectionSeconds: TimeInterval = 4.0
     private let autoSampleDistanceMeters = 0.60
     private let autoSampleTurnDegrees = 24.0
@@ -1013,12 +1015,40 @@ final class SemanticRouteNavigator: ObservableObject {
                 crossTrackError: crossTrackError,
                 isMoving: imuState.isMoving,
                 arLocalized: arLocalized,
-                pose: Self.routePoint(from: arPosition),
+                pose: Self.routePoint(from: arPosition) ?? SemanticRoutePoint(x: Double(imuState.position.x), y: Double(imuState.position.y)),
                 liveHeading: liveHeading
             )
         }
 
+        // ── Destination proximity check ──────────────────────────────
+        // If AR pose is close to the final destination node, trigger
+        // arrival even if segment progress is throttled by heading gating.
+        if currentStepIndex >= routeSteps.count - 1,
+           let destNode = routeSteps.last?.to,
+           let arPoint = Self.routePoint(from: arPosition),
+           arPoint.distance(to: destNode.point) <= destinationProximityMeters {
+            advanceStepOrArrive()
+            rebuildRAGContext()
+            return
+        }
+
+        // ── Turn/node proximity check ────────────────────────────────
+        // If AR pose is close to the next node, advance the step even
+        // if PDR progress is lagging due to heading gating after a turn.
+        if let arPoint = Self.routePoint(from: arPosition),
+           arLocalized,
+           arPoint.distance(to: step.to.point) <= arrivalThresholdMeters + 0.3 {
+            advanceStepOrArrive()
+            rebuildRAGContext()
+            return
+        }
+
         if phase == .recovering {
+            // During recovery, still check segment-based arrival but
+            // skip normal instruction updates.
+            if segmentRemainingMeters <= arrivalThresholdMeters {
+                advanceStepOrArrive()
+            }
             rebuildRAGContext()
             return
         }
@@ -1275,6 +1305,19 @@ final class SemanticRouteNavigator: ObservableObject {
 
         guard Date().timeIntervalSince(recoveryStartedAt ?? Date()) >= recoveryHoldSeconds else { return }
 
+        // Auto-resume after prolonged recovery — don't block the user forever
+        if phase == .recovering,
+           let recoveryStart = recoveryStartedAt,
+           Date().timeIntervalSince(recoveryStart) >= recoveryAutoResumeSeconds {
+            phase = .navigating
+            recoveryReason = nil
+            recoveryStartedAt = nil
+            lastRecoveredAt = Date()
+            currentInstruction = "Resuming guidance. Accuracy may be reduced."
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            return
+        }
+
         phase = .recovering
         if crossTrackBad {
             recoveryReason = String(format: "You appear %.1fm away from the mapped route.", crossTrackError ?? 0)
@@ -1288,7 +1331,7 @@ final class SemanticRouteNavigator: ObservableObject {
         let hint = expectedRecoveryLandmarkHint() ?? activeStep.map {
             "the route from \(Self.sanitizedSpokenLabel($0.from.name, fallback: "the last point")) to \(Self.sanitizedSpokenLabel($0.to.name, fallback: "the next point"))"
         } ?? "the mapped route"
-        currentInstruction = "Pause. Slowly scan left and right toward \(hint). I will resume when the route matches."
+        currentInstruction = "Off route. Look toward \(hint)."
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
         lastRecoveryCueAt = Date()
     }
@@ -1362,6 +1405,7 @@ final class SemanticRouteNavigator: ObservableObject {
             segmentProgressMeters = activeStep?.edge.distanceMeters ?? segmentProgressMeters
             segmentRemainingMeters = 0
             totalRemainingMeters = 0
+            recoveryReason = nil
             currentInstruction = "Arrived at \(targetName). Start object search and reaching mode."
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             rebuildRAGContext()
@@ -1377,8 +1421,16 @@ final class SemanticRouteNavigator: ObservableObject {
         lastAnnouncedRemainingMeter = nil
         lastAnnouncedLandmarkID = nil
         announcedLandmarkIDs.removeAll()
-        let destinationName = Self.sanitizedSpokenLabel(next.to.name, fallback: "the next point")
-        currentInstruction = "\(turn). Then walk \(Self.formatMeters(next.edge.distanceMeters)) toward \(destinationName)."
+        recoveryStartedAt = nil
+        recoveryReason = nil
+        if phase == .recovering { phase = .navigating }
+        let nextContext: String
+        if let nextTurnHint = next.to.turnHint {
+            nextContext = "then \(nextTurnHint.spokenInstruction)"
+        } else {
+            nextContext = "toward \(Self.sanitizedSpokenLabel(next.to.name, fallback: "the next point"))"
+        }
+        currentInstruction = "\(turn.capitalized). Walk \(Self.formatMeters(next.edge.distanceMeters)), \(nextContext)."
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
     }
 
@@ -1395,10 +1447,13 @@ final class SemanticRouteNavigator: ObservableObject {
             return partial + pair.element.edge.distanceMeters
         }
 
-        let context = Self.sanitizedSpokenLabel(
-            step.edge.spokenContext,
-            fallback: "toward \(Self.sanitizedSpokenLabel(step.to.name, fallback: "the next point"))"
-        )
+        // Use turn direction for intersection nodes, destination name for destinations
+        let context: String
+        if let turnHint = step.to.turnHint {
+            context = "then \(turnHint.spokenInstruction)"
+        } else {
+            context = "toward \(Self.sanitizedSpokenLabel(step.to.name, fallback: "the next point"))"
+        }
         if segmentRemainingMeters <= turnAnnouncementThresholdMeters, currentStepIndex < routeSteps.count - 1 {
             let next = routeSteps[currentStepIndex + 1]
             let turn = Self.turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees)
@@ -1406,9 +1461,9 @@ final class SemanticRouteNavigator: ObservableObject {
         } else {
             let landmarkContext = shouldSpeakLandmarks ? nextLandmarkPhrase(on: step, after: segmentProgressMeters) : nil
             if let landmarkContext {
-                currentInstruction = "Walk \(Self.formatMeters(segmentRemainingMeters)) \(context), passing \(landmarkContext)."
+                currentInstruction = "Walk \(Self.formatMeters(segmentRemainingMeters)), \(context). Passing \(landmarkContext)."
             } else {
-                currentInstruction = "Walk \(Self.formatMeters(segmentRemainingMeters)) \(context)."
+                currentInstruction = "Walk \(Self.formatMeters(segmentRemainingMeters)), \(context)."
             }
         }
 
