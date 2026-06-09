@@ -15,6 +15,7 @@ export interface ARKitNavigationConfig {
   routeMapName?: string;
   sessionId?: string;
   speakLandmarks?: boolean;
+  errorRecovery?: boolean;
   ttsRate?: number;
 }
 

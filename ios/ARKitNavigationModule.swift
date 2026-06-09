@@ -43,6 +43,7 @@ final class ARKitNavigationModule: NSObject {
                 launchRouteMapId: nil,
                 launchRouteMapName: nil,
                 speakLandmarks: true,
+                errorRecovery: true,
                 ttsRate: nil,
                 onDone: { [weak self] in
                     self?.dismissPresentedController(resolveCancelledNavigation: false)
@@ -118,6 +119,7 @@ final class ARKitNavigationModule: NSObject {
             let routeMapId = config["routeMapId"] as? String
             let routeMapName = config["routeMapName"] as? String
             let speakLandmarks = (config["speakLandmarks"] as? NSNumber)?.boolValue ?? true
+            let errorRecovery = (config["errorRecovery"] as? NSNumber)?.boolValue ?? true
             let ttsRate = (config["ttsRate"] as? NSNumber)?.doubleValue
 
             let host = ARKitRouteHostView(
@@ -125,6 +127,7 @@ final class ARKitNavigationModule: NSObject {
                 launchRouteMapId: routeMapId,
                 launchRouteMapName: routeMapName,
                 speakLandmarks: speakLandmarks,
+                errorRecovery: errorRecovery,
                 ttsRate: ttsRate,
                 onDone: { [weak self] in
                     self?.finishNavigation(ARKitNavigationNativeResult(
@@ -236,6 +239,7 @@ private struct ARKitRouteHostView: View {
     let launchRouteMapId: String?
     let launchRouteMapName: String?
     let speakLandmarks: Bool
+    let errorRecovery: Bool
     let onDone: () -> Void
     let onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
 
@@ -244,6 +248,7 @@ private struct ARKitRouteHostView: View {
         launchRouteMapId: String?,
         launchRouteMapName: String?,
         speakLandmarks: Bool,
+        errorRecovery: Bool,
         ttsRate: Double?,
         onDone: @escaping () -> Void,
         onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
@@ -257,6 +262,7 @@ private struct ARKitRouteHostView: View {
         self.launchRouteMapId = launchRouteMapId
         self.launchRouteMapName = launchRouteMapName
         self.speakLandmarks = speakLandmarks
+        self.errorRecovery = errorRecovery
         self.onDone = onDone
         self.onAutomationComplete = onAutomationComplete
     }
@@ -268,6 +274,7 @@ private struct ARKitRouteHostView: View {
                 launchRouteMapId: launchRouteMapId,
                 launchRouteMapName: launchRouteMapName,
                 launchSpeakLandmarks: speakLandmarks,
+                launchErrorRecovery: errorRecovery,
                 onAutomationComplete: onAutomationComplete
             )
             .environmentObject(sensorManager)

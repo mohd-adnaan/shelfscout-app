@@ -1849,6 +1849,7 @@ function AppInner(): React.JSX.Element {
         routeMapName: normalizeTextValue(result.route_map_name) || undefined,
         sessionId: getSessionId(),
         speakLandmarks: true,
+        errorRecovery: false,
         ttsRate: settingsRef.current.ttsRate,
       });
     } catch (e: any) {

@@ -71,6 +71,7 @@ struct ARMappingView: View {
     private let launchRouteMapId: String?
     private let launchRouteMapName: String?
     private let launchSpeakLandmarks: Bool
+    private let launchErrorRecovery: Bool
     private let onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
     @State private var newPOIName: String = ""
     @State private var mapName: String = ""
@@ -88,6 +89,7 @@ struct ARMappingView: View {
         launchRouteMapId: String? = nil,
         launchRouteMapName: String? = nil,
         launchSpeakLandmarks: Bool = true,
+        launchErrorRecovery: Bool = true,
         onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)? = nil
     ) {
         _sourceSelection = sourceSelection
@@ -95,6 +97,7 @@ struct ARMappingView: View {
         self.launchRouteMapId = launchRouteMapId
         self.launchRouteMapName = launchRouteMapName
         self.launchSpeakLandmarks = launchSpeakLandmarks
+        self.launchErrorRecovery = launchErrorRecovery
         self.onAutomationComplete = onAutomationComplete
     }
 
@@ -355,7 +358,8 @@ struct ARMappingView: View {
             arPosition: mappingManager.cameraMapPosition,
             imuState: sensorManager.imuState,
             activeARWorldMapID: mappingManager.activeMapID,
-            speakLandmarks: launchSpeakLandmarks
+            speakLandmarks: launchSpeakLandmarks,
+            errorRecovery: launchErrorRecovery
         )
 
         if didStart {
@@ -949,13 +953,14 @@ struct ARMappingView: View {
         mappingManager.saveMap(named: resolvedName)
     }
 
-    private func startSemanticNavigation(_ target: String, speakLandmarks: Bool) {
+    private func startSemanticNavigation(_ target: String, speakLandmarks: Bool, errorRecovery: Bool) {
         semanticNavigator.startNavigation(
             to: target,
             arPosition: mappingManager.cameraMapPosition,
             imuState: sensorManager.imuState,
             activeARWorldMapID: mappingManager.activeMapID,
-            speakLandmarks: speakLandmarks
+            speakLandmarks: speakLandmarks,
+            errorRecovery: errorRecovery
         )
     }
 

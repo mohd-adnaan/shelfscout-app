@@ -297,6 +297,7 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastRecoveryCueAt: Date?
     private var guidanceIntroProtectedUntil: Date?
     private var shouldSpeakLandmarks = true
+    private var shouldEnableErrorRecovery = true
 
     private let arrivalThresholdMeters = 0.45
     private let turnAnnouncementThresholdMeters = 1.0
@@ -840,7 +841,8 @@ final class SemanticRouteNavigator: ObservableObject {
         arPosition: simd_float3?,
         imuState: IMUState,
         activeARWorldMapID: String? = nil,
-        speakLandmarks: Bool = true
+        speakLandmarks: Bool = true,
+        errorRecovery: Bool = true
     ) -> Bool {
         guard let map = activeMap else {
             currentInstruction = "No semantic map loaded."
@@ -903,6 +905,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastAnnouncedLandmarkID = nil
         announcedLandmarkIDs.removeAll()
         shouldSpeakLandmarks = speakLandmarks
+        shouldEnableErrorRecovery = errorRecovery
         recoveryStartedAt = nil
         lastRecoveredAt = nil
         lastRecoveryCueAt = nil
@@ -1004,14 +1007,16 @@ final class SemanticRouteNavigator: ObservableObject {
             crossTrackError: crossTrackError
         )
 
-        updateRecoveryIfNeeded(
-            headingError: headingError,
-            crossTrackError: crossTrackError,
-            isMoving: imuState.isMoving,
-            arLocalized: arLocalized,
-            pose: Self.routePoint(from: arPosition),
-            liveHeading: liveHeading
-        )
+        if shouldEnableErrorRecovery {
+            updateRecoveryIfNeeded(
+                headingError: headingError,
+                crossTrackError: crossTrackError,
+                isMoving: imuState.isMoving,
+                arLocalized: arLocalized,
+                pose: Self.routePoint(from: arPosition),
+                liveHeading: liveHeading
+            )
+        }
 
         if phase == .recovering {
             rebuildRAGContext()

@@ -23,7 +23,7 @@ struct SemanticNavigationPanel: View {
     let captureTurn: (SemanticTurnHint) -> Void
     let captureLandmark: (String, SemanticRouteSide, String, Bool) -> Void
     let saveWalkthrough: () -> Void
-    let startNavigation: (String, Bool) -> Void
+    let startNavigation: (String, Bool, Bool) -> Void
     let snapToRoute: () -> Void
 
     @State private var mode: RoutePanelMode = .map
@@ -37,6 +37,7 @@ struct SemanticNavigationPanel: View {
     @State private var showsLandmarkForm = false
     @State private var showsReview = false
     @State private var speakLandmarks = true
+    @State private var errorRecoveryEnabled = false
     @State private var routeIDPendingDeletion: String?
     @State private var showsDeleteRouteConfirm = false
 
@@ -351,6 +352,11 @@ struct SemanticNavigationPanel: View {
                 }
                 .font(.subheadline.weight(.semibold))
 
+                Toggle(isOn: $errorRecoveryEnabled) {
+                    Label("Error recovery", systemImage: "exclamationmark.triangle")
+                }
+                .font(.subheadline.weight(.semibold))
+
                 if !isARSessionActive && !savedARMaps.isEmpty {
                     Button {
                         loadARMap()
@@ -364,7 +370,7 @@ struct SemanticNavigationPanel: View {
 
                 HStack(spacing: 10) {
                     Button {
-                        startNavigation(targetName, speakLandmarks)
+                        startNavigation(targetName, speakLandmarks, errorRecoveryEnabled)
                     } label: {
                         Label("Start Guidance", systemImage: "figure.walk")
                             .frame(maxWidth: .infinity)
