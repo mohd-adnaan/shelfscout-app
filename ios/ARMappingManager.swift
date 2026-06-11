@@ -2003,7 +2003,7 @@ private final class ARMapStore {
     }
 }
 
-private final class ARFrameFingerprinter {
+final class ARFrameFingerprinter {
     private let context = CIContext(options: [.cacheIntermediates: false])
     private let dimension = 16
     private let hashDimension = 8

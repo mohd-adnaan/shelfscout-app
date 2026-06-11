@@ -241,7 +241,8 @@ struct ARMappingView: View {
             imuState: imuState,
             arPosition: mappingManager.cameraMapPosition,
             arHeading: mappingManager.arHeadingDegrees,
-            arLocalized: mappingManager.isLocalized || mappingManager.isMapping
+            arLocalized: mappingManager.isLocalized || mappingManager.isMapping,
+            capturedImage: currentCapturedImage
         )
     }
 
@@ -905,7 +906,8 @@ struct ARMappingView: View {
             named: resolvedName,
             arPosition: mappingManager.cameraMapPosition,
             arHeading: mappingManager.arHeadingDegrees,
-            imuState: sensorManager.imuState
+            imuState: sensorManager.imuState,
+            capturedImage: currentCapturedImage
         )
         sourceSelection = resolvedName
     }
@@ -919,6 +921,7 @@ struct ARMappingView: View {
             side: side,
             context: context,
             arPosition: mappingManager.cameraMapPosition,
+            capturedImage: currentCapturedImage,
             isDestination: isDestination
         )
         if didCapture, isDestination {
@@ -931,7 +934,8 @@ struct ARMappingView: View {
             named: name,
             arPosition: mappingManager.cameraMapPosition,
             arHeading: mappingManager.arHeadingDegrees,
-            imuState: sensorManager.imuState
+            imuState: sensorManager.imuState,
+            capturedImage: currentCapturedImage
         )
     }
 
@@ -940,7 +944,8 @@ struct ARMappingView: View {
             hint,
             arPosition: mappingManager.cameraMapPosition,
             arHeading: mappingManager.arHeadingDegrees,
-            imuState: sensorManager.imuState
+            imuState: sensorManager.imuState,
+            capturedImage: currentCapturedImage
         )
     }
 
@@ -980,6 +985,10 @@ struct ARMappingView: View {
             _ = mappingManager.addVisualSample(name: trimmed)
         }
         newPOIName = trimmed
+    }
+
+    private var currentCapturedImage: CVPixelBuffer? {
+        mappingManager.session.currentFrame?.capturedImage
     }
 
     private func speakSemanticCue(_ cue: SemanticSpeechCue?) {

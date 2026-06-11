@@ -21,6 +21,7 @@ export interface WorkflowResponse {
   navigation: boolean;
   navigation_ios?: boolean;
   navigation_arkit?: boolean;
+  navigation_pipeline?: 'rtab' | 'arkit';
   navigation_target?: string;
   route_map_id?: string;
   route_map_name?: string;

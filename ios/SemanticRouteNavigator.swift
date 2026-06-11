@@ -1,4 +1,5 @@
 import Foundation
+import CoreVideo
 import simd
 
 struct SemanticRoutePoint: Codable, Equatable {
@@ -168,6 +169,7 @@ struct SemanticRouteMap: Identifiable, Codable, Equatable {
     var edges: [SemanticRouteEdge]
     var landmarks: [SemanticRouteLandmark]
     var keyframes: [SemanticRouteKeyframe]?
+    var visualFingerprints: [String: ARVisualFingerprint]? = nil
     var source: String?
     var notes: String?
 
@@ -230,6 +232,7 @@ struct SemanticRouteObservation: Equatable {
     var source: String
     var confidence: Double
     var crossTrackError: Double?
+    var visualMatchConfidence: Double?
 }
 
 struct SemanticRouteRAGContext: Codable, Equatable {
@@ -282,6 +285,7 @@ final class SemanticRouteNavigator: ObservableObject {
     @Published var speechCue: SemanticSpeechCue?
 
     private let store = SemanticRouteMapStore()
+    private let frameFingerprinter = ARFrameFingerprinter()
     private var activeMapDraft: SemanticRouteMap?
     private var lastCapturedNodeID: String?
     private var lastAutoSampledPoint: SemanticRoutePoint?
@@ -296,6 +300,9 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastRecoveredAt: Date?
     private var lastRecoveryCueAt: Date?
     private var guidanceIntroProtectedUntil: Date?
+    private var lastVisualRouteMatchAt: TimeInterval = 0
+    private var lastVisualRouteMatch: VisualRouteMatch?
+    private var arrivalVisualHoldStartedAt: Date?
     private var shouldSpeakLandmarks = true
     private var shouldEnableErrorRecovery = true
 
@@ -315,10 +322,41 @@ final class SemanticRouteNavigator: ObservableObject {
     private let targetNodeSnapDistance = 0.35
     private let manualNodeSnapDistance = 0.28
     private let routeStartEdgeSnapThreshold = 1.6
+    private let visualRouteMatchInterval: TimeInterval = 0.45
+    private let visualRouteMinimumConfidence = 0.68
+    private let visualRouteSnapConfidence = 0.78
+    private let visualRouteArrivalConfidence = 0.76
+    private let visualRouteAmbiguousGap = 0.10
+    private let visualArrivalMaxHoldSeconds: TimeInterval = 4.5
 
     private struct NavigationStart {
         var nodePath: [String]
         var initialProgressMeters: Double
+    }
+
+    private struct VisualFingerprintSample {
+        let id: String
+        let fingerprint: ARVisualFingerprint
+    }
+
+    private struct VisualRouteMatch {
+        let stepIndex: Int
+        let progressMeters: Double
+        let confidence: Double
+        let keyframeID: String?
+        let landmarkID: String?
+        let landmarkName: String?
+        let cue: String?
+    }
+
+    private struct VisualRouteCandidate {
+        let stepIndex: Int
+        let progressMeters: Double
+        let fingerprint: ARVisualFingerprint
+        let keyframeID: String?
+        let landmarkID: String?
+        let landmarkName: String?
+        let cue: String?
     }
 
     init() {
@@ -489,7 +527,8 @@ final class SemanticRouteNavigator: ObservableObject {
         named requestedName: String,
         arPosition: simd_float3?,
         arHeading: Double?,
-        imuState: IMUState
+        imuState: IMUState,
+        capturedImage: CVPixelBuffer? = nil
     ) -> Bool {
         let trimmed = Self.sanitizedSpokenLabel(requestedName)
         let name = trimmed.isEmpty ? "Start" : trimmed
@@ -500,7 +539,8 @@ final class SemanticRouteNavigator: ObservableObject {
             arPosition: arPosition,
             arHeading: arHeading,
             imuState: imuState,
-            poiAnchorId: name
+            poiAnchorId: name,
+            capturedImage: capturedImage
         )
     }
 
@@ -510,7 +550,8 @@ final class SemanticRouteNavigator: ObservableObject {
         kind: SemanticRouteNodeKind,
         arPosition: simd_float3?,
         arHeading: Double?,
-        imuState: IMUState
+        imuState: IMUState,
+        capturedImage: CVPixelBuffer? = nil
     ) -> Bool {
         guard phase == .mapping else { return false }
         let trimmed = Self.sanitizedSpokenLabel(requestedName)
@@ -525,11 +566,12 @@ final class SemanticRouteNavigator: ObservableObject {
             x: imuState.position.x,
             y: imuState.position.y
         )
+        let heading = arHeading ?? imuState.bearing
         let node = SemanticRouteNode(
             id: UUID().uuidString,
             name: trimmed,
             point: point,
-            headingDegrees: arHeading ?? imuState.bearing,
+            headingDegrees: heading,
             kind: kind,
             turnHint: nil,
             aliases: Self.aliases(for: trimmed),
@@ -552,6 +594,15 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         workingMap.nodes.append(node)
+        appendVisualKeyframe(
+            to: &workingMap,
+            pose: node.point,
+            heading: heading,
+            distanceFromSegmentStart: 0,
+            segmentID: nil,
+            capturedImage: capturedImage,
+            capturedAt: Date()
+        )
         if kind == .entrance {
             workingMap.startNodeId = node.id
         } else if kind == .destination {
@@ -577,7 +628,8 @@ final class SemanticRouteNavigator: ObservableObject {
         named requestedName: String,
         arPosition: simd_float3?,
         arHeading: Double?,
-        imuState: IMUState
+        imuState: IMUState,
+        capturedImage: CVPixelBuffer? = nil
     ) -> Bool {
         let trimmed = Self.sanitizedSpokenLabel(requestedName)
         let pointNumber = ((activeMapDraft ?? activeMap)?.nodes.count ?? 0) + 1
@@ -589,7 +641,8 @@ final class SemanticRouteNavigator: ObservableObject {
             arPosition: arPosition,
             arHeading: arHeading,
             imuState: imuState,
-            poiAnchorId: nil
+            poiAnchorId: nil,
+            capturedImage: capturedImage
         )
     }
 
@@ -598,7 +651,8 @@ final class SemanticRouteNavigator: ObservableObject {
         _ hint: SemanticTurnHint,
         arPosition: simd_float3?,
         arHeading: Double?,
-        imuState: IMUState
+        imuState: IMUState,
+        capturedImage: CVPixelBuffer? = nil
     ) -> Bool {
         let turnCount = (activeMapDraft ?? activeMap)?.nodes.filter { $0.kind == .intersection }.count ?? 0
         return insertManualNode(
@@ -608,7 +662,8 @@ final class SemanticRouteNavigator: ObservableObject {
             arPosition: arPosition,
             arHeading: arHeading,
             imuState: imuState,
-            poiAnchorId: nil
+            poiAnchorId: nil,
+            capturedImage: capturedImage
         )
     }
 
@@ -619,7 +674,8 @@ final class SemanticRouteNavigator: ObservableObject {
         arPosition: simd_float3?,
         arHeading: Double?,
         imuState: IMUState,
-        poiAnchorId: String?
+        poiAnchorId: String?,
+        capturedImage: CVPixelBuffer?
     ) -> Bool {
         guard phase == .mapping else { return false }
         guard var workingMap = activeMapDraft ?? activeMap else { return false }
@@ -650,6 +706,15 @@ final class SemanticRouteNavigator: ObservableObject {
                 workingMap.destinationNodeIds = Array(Set((workingMap.destinationNodeIds ?? []) + [workingMap.nodes[previousIndex].id]))
             }
             workingMap.updatedAt = Date()
+            appendVisualKeyframe(
+                to: &workingMap,
+                pose: workingMap.nodes[previousIndex].point,
+                heading: heading,
+                distanceFromSegmentStart: 0,
+                segmentID: nil,
+                capturedImage: capturedImage,
+                capturedAt: Date()
+            )
             activeMapDraft = workingMap
             activeMap = workingMap
             lastAutoSampledPoint = workingMap.nodes[previousIndex].point
@@ -692,6 +757,15 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         workingMap.nodes.append(node)
+        appendVisualKeyframe(
+            to: &workingMap,
+            pose: node.point,
+            heading: heading,
+            distanceFromSegmentStart: 0,
+            segmentID: nil,
+            capturedImage: capturedImage,
+            capturedAt: Date()
+        )
         if kind == .entrance {
             workingMap.startNodeId = node.id
         } else if kind == .destination {
@@ -724,6 +798,7 @@ final class SemanticRouteNavigator: ObservableObject {
         side: SemanticRouteSide,
         context: String,
         arPosition: simd_float3?,
+        capturedImage: CVPixelBuffer? = nil,
         isDestination: Bool = false
     ) -> Bool {
         guard phase == .mapping else { return false }
@@ -779,6 +854,12 @@ final class SemanticRouteNavigator: ObservableObject {
                 to: &workingMap.edges[edgeIndex]
             )
         }
+        let visualSample = makeVisualFingerprint(from: capturedImage)
+        if let visualSample {
+            var fingerprints = workingMap.visualFingerprints ?? [:]
+            fingerprints[visualSample.id] = visualSample.fingerprint
+            workingMap.visualFingerprints = fingerprints
+        }
         let landmark = SemanticRouteLandmark(
             id: UUID().uuidString,
             name: trimmed,
@@ -790,7 +871,7 @@ final class SemanticRouteNavigator: ObservableObject {
             context: Self.sanitizedSpokenLabel(context).nilIfBlank,
             priority: isDestination ? 20 : 10,
             kind: isDestination ? .destinationContext : .object,
-            visualFingerprintIds: [trimmed]
+            visualFingerprintIds: visualSample.map { [$0.id] }
         )
         workingMap.landmarks.removeAll { Self.matches($0.name, trimmed) }
         workingMap.landmarks.append(landmark)
@@ -911,6 +992,9 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryStartedAt = nil
         lastRecoveredAt = nil
         lastRecoveryCueAt = nil
+        lastVisualRouteMatchAt = 0
+        lastVisualRouteMatch = nil
+        arrivalVisualHoldStartedAt = nil
         guidanceIntroProtectedUntil = Date().addingTimeInterval(guidanceIntroProtectionSeconds)
         recoveryReason = nil
         phase = .navigating
@@ -939,6 +1023,9 @@ final class SemanticRouteNavigator: ObservableObject {
         announcedLandmarkIDs.removeAll()
         recoveryStartedAt = nil
         lastRecoveryCueAt = nil
+        lastVisualRouteMatchAt = 0
+        lastVisualRouteMatch = nil
+        arrivalVisualHoldStartedAt = nil
         guidanceIntroProtectedUntil = nil
         capturedPointCount = activeMap?.nodes.count ?? 0
         capturedTurnCount = activeMap?.nodes.filter { $0.kind == .intersection }.count ?? 0
@@ -955,10 +1042,21 @@ final class SemanticRouteNavigator: ObservableObject {
         rebuildRAGContext()
     }
 
-    func update(imuState: IMUState, arPosition: simd_float3?, arHeading: Double?, arLocalized: Bool) {
+    func update(
+        imuState: IMUState,
+        arPosition: simd_float3?,
+        arHeading: Double?,
+        arLocalized: Bool,
+        capturedImage: CVPixelBuffer? = nil
+    ) {
         if phase == .mapping {
             updatePassiveObservation(imuState: imuState, arPosition: arPosition, arHeading: arHeading, arLocalized: arLocalized)
-            autoSampleWalkthrough(arPosition: arPosition, arHeading: arHeading, arLocalized: arLocalized)
+            autoSampleWalkthrough(
+                arPosition: arPosition,
+                arHeading: arHeading,
+                arLocalized: arLocalized,
+                capturedImage: capturedImage
+            )
             return
         }
 
@@ -970,6 +1068,10 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         guard let step = activeStep else { return }
 
+        let visualMatch = currentVisualRouteMatch(
+            capturedImage: capturedImage,
+            timestamp: Date().timeIntervalSinceReferenceDate
+        )
         let pdrDelta = pdrDistanceDelta(from: imuState)
         let expectedHeading = step.edge.bearingDegrees
         let liveHeading = arHeading ?? imuState.bearing
@@ -992,6 +1094,18 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
 
+        if let visualMatch,
+           visualMatch.stepIndex == currentStepIndex,
+           visualMatch.confidence >= visualRouteMinimumConfidence {
+            observationConfidence = max(observationConfidence, 0.80 + min(visualMatch.confidence * 0.18, 0.18))
+            if visualMatch.confidence >= visualRouteSnapConfidence {
+                let correctedProgress = min(max(visualMatch.progressMeters, 0), step.edge.distanceMeters)
+                if abs(correctedProgress - segmentProgressMeters) <= 3.0 || phase == .recovering || observationConfidence < 0.45 {
+                    segmentProgressMeters = max(segmentProgressMeters, correctedProgress)
+                }
+            }
+        }
+
         segmentProgressMeters = min(segmentProgressMeters, step.edge.distanceMeters)
         segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
         confidence = Self.confidence(
@@ -1006,7 +1120,8 @@ final class SemanticRouteNavigator: ObservableObject {
             headingDegrees: liveHeading,
             source: arPosition == nil ? "pdr" : "ar_pdr",
             confidence: confidence,
-            crossTrackError: crossTrackError
+            crossTrackError: crossTrackError,
+            visualMatchConfidence: visualMatch?.confidence
         )
 
         if shouldEnableErrorRecovery {
@@ -1016,7 +1131,8 @@ final class SemanticRouteNavigator: ObservableObject {
                 isMoving: imuState.isMoving,
                 arLocalized: arLocalized,
                 pose: Self.routePoint(from: arPosition) ?? SemanticRoutePoint(x: Double(imuState.position.x), y: Double(imuState.position.y)),
-                liveHeading: liveHeading
+                liveHeading: liveHeading,
+                visualMatch: visualMatch
             )
         }
 
@@ -1027,6 +1143,10 @@ final class SemanticRouteNavigator: ObservableObject {
            let destNode = routeSteps.last?.to,
            let arPoint = Self.routePoint(from: arPosition),
            arPoint.distance(to: destNode.point) <= destinationProximityMeters {
+            if shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
+                rebuildRAGContext()
+                return
+            }
             advanceStepOrArrive()
             rebuildRAGContext()
             return
@@ -1038,6 +1158,11 @@ final class SemanticRouteNavigator: ObservableObject {
         if let arPoint = Self.routePoint(from: arPosition),
            arLocalized,
            arPoint.distance(to: step.to.point) <= arrivalThresholdMeters + 0.3 {
+            if currentStepIndex >= routeSteps.count - 1,
+               shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
+                rebuildRAGContext()
+                return
+            }
             advanceStepOrArrive()
             rebuildRAGContext()
             return
@@ -1047,6 +1172,11 @@ final class SemanticRouteNavigator: ObservableObject {
             // During recovery, still check segment-based arrival but
             // skip normal instruction updates.
             if segmentRemainingMeters <= arrivalThresholdMeters {
+                if currentStepIndex >= routeSteps.count - 1,
+                   shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
+                    rebuildRAGContext()
+                    return
+                }
                 advanceStepOrArrive()
             }
             rebuildRAGContext()
@@ -1054,9 +1184,15 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         if segmentRemainingMeters <= arrivalThresholdMeters {
+            if currentStepIndex >= routeSteps.count - 1,
+               shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
+                rebuildRAGContext()
+                return
+            }
             advanceStepOrArrive()
         } else {
             updateInstruction(forceSpeech: false)
+            announceVisualLandmarkIfNeeded(visualMatch)
         }
         rebuildRAGContext()
     }
@@ -1093,11 +1229,17 @@ final class SemanticRouteNavigator: ObservableObject {
             headingDegrees: arHeading ?? imuState.bearing,
             source: arPosition == nil ? "pdr" : "ar",
             confidence: arLocalized ? 0.76 : 0.45,
-            crossTrackError: nil
+            crossTrackError: nil,
+            visualMatchConfidence: nil
         )
     }
 
-    private func autoSampleWalkthrough(arPosition: simd_float3?, arHeading: Double?, arLocalized: Bool) {
+    private func autoSampleWalkthrough(
+        arPosition: simd_float3?,
+        arHeading: Double?,
+        arLocalized: Bool,
+        capturedImage: CVPixelBuffer?
+    ) {
         guard arLocalized, let pose = Self.routePoint(from: arPosition), var workingMap = activeMapDraft ?? activeMap else {
             mappingQualityText = "Waiting for AR tracking"
             currentSegmentDraftMeters = 0
@@ -1134,19 +1276,15 @@ final class SemanticRouteNavigator: ObservableObject {
             return
         }
 
-        let keyframe = SemanticRouteKeyframe(
-            id: UUID().uuidString,
-            segmentID: nil,
+        appendVisualKeyframe(
+            to: &workingMap,
             pose: pose,
-            headingDegrees: heading,
+            heading: heading,
             distanceFromSegmentStart: currentSegmentDraftMeters,
-            visualFingerprintId: nil,
-            trackingQuality: arLocalized ? "ar_world_tracking" : "pdr",
+            segmentID: nil,
+            capturedImage: capturedImage,
             capturedAt: now
         )
-        var keyframes = workingMap.keyframes ?? []
-        keyframes.append(keyframe)
-        workingMap.keyframes = Array(keyframes.suffix(120))
         workingMap.updatedAt = now
         activeMapDraft = workingMap
         activeMap = workingMap
@@ -1237,6 +1375,49 @@ final class SemanticRouteNavigator: ObservableObject {
         }
     }
 
+    private func makeVisualFingerprint(from capturedImage: CVPixelBuffer?) -> VisualFingerprintSample? {
+        guard let capturedImage,
+              let fingerprint = frameFingerprinter.makeFingerprint(from: capturedImage) else {
+            return nil
+        }
+
+        return VisualFingerprintSample(
+            id: UUID().uuidString,
+            fingerprint: fingerprint
+        )
+    }
+
+    private func appendVisualKeyframe(
+        to map: inout SemanticRouteMap,
+        pose: SemanticRoutePoint,
+        heading: Double?,
+        distanceFromSegmentStart: Double,
+        segmentID: String?,
+        capturedImage: CVPixelBuffer?,
+        capturedAt: Date
+    ) {
+        let visualSample = makeVisualFingerprint(from: capturedImage)
+        if let visualSample {
+            var fingerprints = map.visualFingerprints ?? [:]
+            fingerprints[visualSample.id] = visualSample.fingerprint
+            map.visualFingerprints = fingerprints
+        }
+
+        let keyframe = SemanticRouteKeyframe(
+            id: UUID().uuidString,
+            segmentID: segmentID,
+            pose: pose,
+            headingDegrees: heading,
+            distanceFromSegmentStart: distanceFromSegmentStart,
+            visualFingerprintId: visualSample?.id,
+            trackingQuality: visualSample == nil ? "ar_world_tracking" : "ar_world_tracking_visual",
+            capturedAt: capturedAt
+        )
+        var keyframes = map.keyframes ?? []
+        keyframes.append(keyframe)
+        map.keyframes = Array(keyframes.suffix(120))
+    }
+
     private func pdrDistanceDelta(from imuState: IMUState) -> Double {
         defer {
             lastIMUStepCount = imuState.stepCount
@@ -1261,7 +1442,8 @@ final class SemanticRouteNavigator: ObservableObject {
         isMoving: Bool,
         arLocalized: Bool,
         pose: SemanticRoutePoint?,
-        liveHeading: Double
+        liveHeading: Double,
+        visualMatch: VisualRouteMatch?
     ) {
         let crossTrackBad = arLocalized && (crossTrackError ?? 0) > crossTrackRecoveryThreshold
         let awayFromDecisionPoint = segmentProgressMeters > 1.2 && segmentRemainingMeters > 1.2
@@ -1286,7 +1468,7 @@ final class SemanticRouteNavigator: ObservableObject {
             return
         }
 
-        if let snap = bestRecoverySnap(pose: pose, liveHeading: liveHeading),
+        if let snap = bestRecoverySnap(pose: pose, liveHeading: liveHeading, visualMatch: visualMatch),
            shouldAcceptRecoverySnap(snap, crossTrackBad: crossTrackBad, headingBad: headingBad) {
             applyRecoverySnap(snap)
             return
@@ -1343,9 +1525,14 @@ final class SemanticRouteNavigator: ObservableObject {
         let headingError: Double
         let score: Double
         let context: String
+        let visualConfidence: Double?
     }
 
-    private func bestRecoverySnap(pose: SemanticRoutePoint?, liveHeading: Double) -> RecoverySnapCandidate? {
+    private func bestRecoverySnap(
+        pose: SemanticRoutePoint?,
+        liveHeading: Double,
+        visualMatch: VisualRouteMatch?
+    ) -> RecoverySnapCandidate? {
         guard let pose, !routeSteps.isEmpty else { return nil }
         return routeSteps.enumerated().compactMap { pair -> RecoverySnapCandidate? in
             let index = pair.offset
@@ -1354,16 +1541,22 @@ final class SemanticRouteNavigator: ObservableObject {
             let headingError = abs(SemanticRouteMath.signedAngleDifference(liveHeading, step.edge.bearingDegrees))
             let keyframeDistance = nearestKeyframeDistance(on: step, to: pose)
             let evidenceBonus = keyframeDistance.map { max(0, 0.45 - min($0 / 4.0, 0.45)) } ?? 0
+            let visualForStep = visualMatch?.stepIndex == index ? visualMatch : nil
+            let visualBonus = visualForStep.map { min(0.82, max(0, $0.confidence - visualRouteMinimumConfidence) * 3.0) } ?? 0
             let indexPenalty = Double(abs(index - currentStepIndex)) * 0.22
             let headingPenalty = min(headingError / 120.0, 1.0) * 0.42
-            let score = projection.crossTrackMeters + indexPenalty + headingPenalty - evidenceBonus
+            let score = projection.crossTrackMeters + indexPenalty + headingPenalty - evidenceBonus - visualBonus
+            let progress = visualForStep?.progressMeters ?? projection.alongTrackMeters
+            let context = visualForStep?.cue.map { "near \($0)" }
+                ?? recoveryContext(on: step, progressMeters: progress)
             return RecoverySnapCandidate(
                 stepIndex: index,
-                progressMeters: projection.alongTrackMeters,
+                progressMeters: progress,
                 crossTrackMeters: projection.crossTrackMeters,
                 headingError: headingError,
                 score: score,
-                context: recoveryContext(on: step, progressMeters: projection.alongTrackMeters)
+                context: context,
+                visualConfidence: visualForStep?.confidence
             )
         }
         .min { $0.score < $1.score }
@@ -1374,6 +1567,11 @@ final class SemanticRouteNavigator: ObservableObject {
         crossTrackBad: Bool,
         headingBad: Bool
     ) -> Bool {
+        if let visualConfidence = candidate.visualConfidence,
+           visualConfidence >= visualRouteSnapConfidence,
+           candidate.crossTrackMeters <= max(3.0, recoverySnapThreshold * 2.2) {
+            return true
+        }
         if headingBad && !crossTrackBad {
             return candidate.crossTrackMeters <= 0.75 && candidate.headingError <= 75
         }
@@ -1390,6 +1588,7 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryStartedAt = nil
         recoveryReason = nil
         lastRecoveredAt = Date()
+        arrivalVisualHoldStartedAt = nil
         guidanceIntroProtectedUntil = nil
         phase = .navigating
         updateInstruction(forceSpeech: false)
@@ -1406,6 +1605,7 @@ final class SemanticRouteNavigator: ObservableObject {
             segmentRemainingMeters = 0
             totalRemainingMeters = 0
             recoveryReason = nil
+            arrivalVisualHoldStartedAt = nil
             currentInstruction = "Arrived at \(targetName). Start object search and reaching mode."
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             rebuildRAGContext()
@@ -1423,6 +1623,7 @@ final class SemanticRouteNavigator: ObservableObject {
         announcedLandmarkIDs.removeAll()
         recoveryStartedAt = nil
         recoveryReason = nil
+        arrivalVisualHoldStartedAt = nil
         if phase == .recovering { phase = .navigating }
         let nextContext: String
         if let nextTurnHint = next.to.turnHint {
@@ -1605,6 +1806,253 @@ final class SemanticRouteNavigator: ObservableObject {
             return landmark.phrase.replacingOccurrences(of: ".", with: "")
         }
         return nextLandmarkPhrase(on: step, after: max(0, segmentProgressMeters - 1.0))
+    }
+
+    private func currentVisualRouteMatch(
+        capturedImage: CVPixelBuffer?,
+        timestamp: TimeInterval
+    ) -> VisualRouteMatch? {
+        guard let map = activeMap,
+              let fingerprints = map.visualFingerprints,
+              !fingerprints.isEmpty,
+              !routeSteps.isEmpty else {
+            lastVisualRouteMatch = nil
+            return nil
+        }
+
+        if timestamp - lastVisualRouteMatchAt < visualRouteMatchInterval {
+            return lastVisualRouteMatch
+        }
+
+        lastVisualRouteMatchAt = timestamp
+        guard let capturedImage,
+              let liveFingerprint = frameFingerprinter.makeFingerprint(from: capturedImage) else {
+            lastVisualRouteMatch = nil
+            return nil
+        }
+
+        let matches = visualRouteCandidates(in: map, fingerprints: fingerprints)
+            .compactMap { candidate -> VisualRouteMatch? in
+                let similarity = frameFingerprinter.similarity(liveFingerprint, candidate.fingerprint)
+                let confidence = visualConfidence(from: similarity)
+                guard confidence >= visualRouteMinimumConfidence else { return nil }
+                return VisualRouteMatch(
+                    stepIndex: candidate.stepIndex,
+                    progressMeters: candidate.progressMeters,
+                    confidence: confidence,
+                    keyframeID: candidate.keyframeID,
+                    landmarkID: candidate.landmarkID,
+                    landmarkName: candidate.landmarkName,
+                    cue: candidate.cue
+                )
+            }
+            .sorted { $0.confidence > $1.confidence }
+
+        guard let best = matches.first else {
+            lastVisualRouteMatch = nil
+            return nil
+        }
+
+        if let second = matches.dropFirst().first,
+           best.confidence - second.confidence < visualRouteAmbiguousGap {
+            lastVisualRouteMatch = nil
+            return nil
+        }
+
+        lastVisualRouteMatch = best
+        return best
+    }
+
+    private func visualRouteCandidates(
+        in map: SemanticRouteMap,
+        fingerprints: [String: ARVisualFingerprint]
+    ) -> [VisualRouteCandidate] {
+        var candidates: [VisualRouteCandidate] = []
+        let keyframes = map.keyframes ?? []
+
+        for pair in routeSteps.enumerated() {
+            let stepIndex = pair.offset
+            let step = pair.element
+            let baseEdgeID = Self.baseEdgeID(step.edge.id)
+            let keyframeIDs = Set(step.edge.keyframeIds ?? [])
+            let reversed = step.edge.id.hasSuffix(".reverse")
+
+            for keyframe in keyframes {
+                let belongsToStep = keyframe.segmentID == baseEdgeID || keyframeIDs.contains(keyframe.id)
+                guard belongsToStep,
+                      let fingerprintID = keyframe.visualFingerprintId,
+                      let fingerprint = fingerprints[fingerprintID] else {
+                    continue
+                }
+
+                let progress = reversed
+                    ? max(0, step.edge.distanceMeters - keyframe.distanceFromSegmentStart)
+                    : min(max(keyframe.distanceFromSegmentStart, 0), step.edge.distanceMeters)
+                candidates.append(
+                    VisualRouteCandidate(
+                        stepIndex: stepIndex,
+                        progressMeters: progress,
+                        fingerprint: fingerprint,
+                        keyframeID: keyframe.id,
+                        landmarkID: nil,
+                        landmarkName: nil,
+                        cue: nil
+                    )
+                )
+            }
+
+            for landmark in map.landmarks {
+                guard let progress = landmarkProgressMeters(
+                    for: landmark,
+                    on: step,
+                    baseEdgeID: baseEdgeID,
+                    reversed: reversed
+                ) else {
+                    continue
+                }
+
+                let name = Self.sanitizedSpokenLabel(landmark.name)
+                let side = Self.side(landmark.side, reversed: reversed)
+                let cue = name.isEmpty ? nil : "Passing \(name) \(Self.sidePhrase(side))."
+
+                for fingerprintID in landmark.visualFingerprintIds ?? [] {
+                    guard let fingerprint = fingerprints[fingerprintID] else { continue }
+                    candidates.append(
+                        VisualRouteCandidate(
+                            stepIndex: stepIndex,
+                            progressMeters: min(max(progress, 0), step.edge.distanceMeters),
+                            fingerprint: fingerprint,
+                            keyframeID: nil,
+                            landmarkID: landmark.id,
+                            landmarkName: name,
+                            cue: cue
+                        )
+                    )
+                }
+            }
+        }
+
+        return candidates
+    }
+
+    private func visualConfidence(from similarity: Float) -> Double {
+        let confidence = (Double(similarity) - 0.62) / 0.26
+        return min(max(confidence, 0), 1)
+    }
+
+    private func announceVisualLandmarkIfNeeded(_ visualMatch: VisualRouteMatch?) {
+        guard shouldSpeakLandmarks,
+              let visualMatch,
+              visualMatch.stepIndex == currentStepIndex,
+              visualMatch.confidence >= visualRouteSnapConfidence,
+              let landmarkID = visualMatch.landmarkID,
+              let cue = visualMatch.cue,
+              !announcedLandmarkIDs.contains(landmarkID) else {
+            return
+        }
+
+        let routineSpeechAllowed = guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
+        guard routineSpeechAllowed else { return }
+
+        announcedLandmarkIDs.insert(landmarkID)
+        lastAnnouncedLandmarkID = landmarkID
+        speechCue = SemanticSpeechCue(text: cue, priority: .priority)
+    }
+
+    private func shouldHoldForVisualArrival(
+        on step: SemanticRouteStep,
+        visualMatch: VisualRouteMatch?
+    ) -> Bool {
+        guard hasDestinationVisualEvidence(on: step) else {
+            arrivalVisualHoldStartedAt = nil
+            return false
+        }
+
+        if isVisualArrivalConfirmed(on: step, visualMatch: visualMatch) {
+            arrivalVisualHoldStartedAt = nil
+            return false
+        }
+
+        let now = Date()
+        if arrivalVisualHoldStartedAt == nil {
+            arrivalVisualHoldStartedAt = now
+            currentInstruction = "Near \(targetName). Look toward the target to confirm arrival."
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+        }
+
+        if let started = arrivalVisualHoldStartedAt,
+           now.timeIntervalSince(started) >= visualArrivalMaxHoldSeconds {
+            arrivalVisualHoldStartedAt = nil
+            return false
+        }
+
+        return true
+    }
+
+    private func hasDestinationVisualEvidence(on step: SemanticRouteStep) -> Bool {
+        guard currentStepIndex >= routeSteps.count - 1,
+              let map = activeMap,
+              let fingerprints = map.visualFingerprints,
+              !fingerprints.isEmpty else {
+            return false
+        }
+
+        let baseEdgeID = Self.baseEdgeID(step.edge.id)
+        let keyframeIDs = Set(step.edge.keyframeIds ?? [])
+        let destinationWindowStart = max(0, step.edge.distanceMeters - 1.7)
+
+        if (map.keyframes ?? []).contains(where: { keyframe in
+            let belongsToStep = keyframe.segmentID == baseEdgeID || keyframeIDs.contains(keyframe.id)
+            guard belongsToStep,
+                  keyframe.distanceFromSegmentStart >= destinationWindowStart,
+                  let fingerprintID = keyframe.visualFingerprintId else {
+                return false
+            }
+            return fingerprints[fingerprintID] != nil
+        }) {
+            return true
+        }
+
+        return map.landmarks.contains { landmark in
+            guard landmark.kind == .destinationContext || landmark.priority >= 20 || landmark.nodeID == step.to.id,
+                  let progress = landmarkProgressMeters(
+                    for: landmark,
+                    on: step,
+                    baseEdgeID: baseEdgeID,
+                    reversed: step.edge.id.hasSuffix(".reverse")
+                  ),
+                  progress >= destinationWindowStart else {
+                return false
+            }
+            return (landmark.visualFingerprintIds ?? []).contains { fingerprints[$0] != nil }
+        }
+    }
+
+    private func isVisualArrivalConfirmed(
+        on step: SemanticRouteStep,
+        visualMatch: VisualRouteMatch?
+    ) -> Bool {
+        guard currentStepIndex >= routeSteps.count - 1,
+              let visualMatch,
+              visualMatch.stepIndex == currentStepIndex,
+              visualMatch.confidence >= visualRouteArrivalConfidence else {
+            return false
+        }
+
+        if let landmarkID = visualMatch.landmarkID,
+           isDestinationLandmark(landmarkID, on: step) {
+            return true
+        }
+
+        let destinationWindowStart = max(0, step.edge.distanceMeters - 1.7)
+        return visualMatch.progressMeters >= destinationWindowStart
+    }
+
+    private func isDestinationLandmark(_ landmarkID: String, on step: SemanticRouteStep) -> Bool {
+        guard let landmark = activeMap?.landmarks.first(where: { $0.id == landmarkID }) else {
+            return false
+        }
+        return landmark.kind == .destinationContext || landmark.priority >= 20 || landmark.nodeID == step.to.id
     }
 
     private func recoveryContext(on step: SemanticRouteStep, progressMeters: Double) -> String {
@@ -2043,6 +2491,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private static func sanitizedMap(_ map: SemanticRouteMap) -> SemanticRouteMap {
         var cleaned = map
+        let storedFingerprints = map.visualFingerprints ?? [:]
         cleaned.name = sanitizedSpokenLabel(map.name, fallback: "AR Route")
         cleaned.nodes = map.nodes.map { node in
             var copy = node
@@ -2058,6 +2507,14 @@ final class SemanticRouteNavigator: ObservableObject {
             copy.spokenContext = sanitizedSpokenLabel(edge.spokenContext ?? "").nilIfBlank
             return copy
         }
+        cleaned.keyframes = map.keyframes?.map { keyframe in
+            var copy = keyframe
+            if let fingerprintID = copy.visualFingerprintId,
+               storedFingerprints[fingerprintID] == nil {
+                copy.visualFingerprintId = nil
+            }
+            return copy
+        }
         cleaned.landmarks = map.landmarks.compactMap { landmark in
             let name = sanitizedSpokenLabel(landmark.name)
             guard !name.isEmpty else { return nil }
@@ -2066,13 +2523,21 @@ final class SemanticRouteNavigator: ObservableObject {
             copy.aliases = aliases(for: name)
             copy.context = sanitizedSpokenLabel(landmark.context ?? "").nilIfBlank
             copy.visualFingerprintIds = (landmark.visualFingerprintIds ?? [])
-                .map { sanitizedSpokenLabel($0) }
-                .filter { !$0.isEmpty }
+                .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+                .filter { !$0.isEmpty && storedFingerprints[$0] != nil }
             if copy.visualFingerprintIds?.isEmpty == true {
                 copy.visualFingerprintIds = nil
             }
             return copy
         }
+        let referencedFingerprintIDs = Set(
+            (cleaned.keyframes ?? []).compactMap(\.visualFingerprintId)
+            + cleaned.landmarks.flatMap { $0.visualFingerprintIds ?? [] }
+        )
+        let referencedFingerprints = Dictionary(uniqueKeysWithValues: referencedFingerprintIDs.compactMap { id in
+            storedFingerprints[id].map { (id, $0) }
+        })
+        cleaned.visualFingerprints = referencedFingerprints.isEmpty ? nil : referencedFingerprints
         return cleaned
     }
 

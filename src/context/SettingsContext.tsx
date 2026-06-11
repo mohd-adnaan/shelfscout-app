@@ -69,6 +69,7 @@ interface SettingsContextValue {
     navigation?: boolean;
     navigation_ios?: boolean;
     navigation_arkit?: boolean;
+    navigation_pipeline?: NavigationPipeline;
   }) => NavigationPipeline | 'none';
 }
 
@@ -263,17 +264,22 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       navigation?: boolean;
       navigation_ios?: boolean;
       navigation_arkit?: boolean;
+      navigation_pipeline?: NavigationPipeline;
     }): NavigationPipeline | 'none' => {
       const wantsNavigation =
         flags.navigation === true ||
         flags.navigation_ios === true ||
-        flags.navigation_arkit === true;
+        flags.navigation_arkit === true ||
+        flags.navigation_pipeline === 'arkit';
 
       if (!wantsNavigation) {
         return 'none';
       }
 
-      if (settings.navigationPipeline === 'arkit' && Platform.OS === 'ios') {
+      if (
+        Platform.OS === 'ios' &&
+        (settings.navigationPipeline === 'arkit' || flags.navigation_pipeline === 'arkit')
+      ) {
         return 'arkit';
       }
 

@@ -111,6 +111,27 @@ const looksLikeReachingCommand = (text: string): boolean => {
     || /\b(reach|grab|get)\b/.test(normalized);
 };
 
+const inferNavigationTargetFromCommand = (text?: string | null): string => {
+  const source = (text || '').trim();
+  if (!source) return '';
+
+  const patterns = [
+    /\b(?:take|guide|lead|walk|navigate|bring)\s+(?:me\s+)?to\s+(?:the\s+)?(.+)$/i,
+    /\b(?:go\s+to|find|locate|where\s+is)\s+(?:the\s+)?(.+)$/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = source.match(pattern);
+    const target = match?.[1]
+      ?.replace(/[?.!]+$/g, '')
+      .replace(/\b(?:please|for me)\b$/i, '')
+      .trim();
+    if (target) return target;
+  }
+
+  return '';
+};
+
 const prewarmDAv2InBackground = (reason: string) => {
   if (Platform.OS !== 'ios' || dav2PrewarmStarted) return;
   const { ReachingModule } = NativeModules;
@@ -1754,12 +1775,13 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   const handleARKitNavigation = useCallback(async (
     result: any,
-    options?: { introSpeechPromise?: Promise<void> },
+    options?: { introSpeechPromise?: Promise<void>; requestedText?: string },
   ): Promise<boolean> => {
     const pipeline = resolveNavigationPipeline({
       navigation: result.navigation,
       navigation_ios: result.navigation_ios,
       navigation_arkit: result.navigation_arkit,
+      navigation_pipeline: result.navigation_pipeline,
     });
 
     if (pipeline !== 'arkit') {
@@ -1767,7 +1789,8 @@ function AppInner(): React.JSX.Element {
     }
 
     const targetName = normalizeTextValue(result.navigation_target) ||
-      normalizeTextValue(result.object);
+      normalizeTextValue(result.object) ||
+      inferNavigationTargetFromCommand(options?.requestedText);
 
     if (!targetName) {
       if (options?.introSpeechPromise) {
@@ -2072,6 +2095,7 @@ function AppInner(): React.JSX.Element {
       console.log('✅ Response:', {
         text: result.text.substring(0, 50) + '...',
         navigation: result.navigation,
+        navigation_pipeline: result.navigation_pipeline,
         reaching_flag: result.reaching_flag,
         reaching_ios: result.reaching_ios,
         loopDelay: result.loopDelay,
@@ -2120,10 +2144,16 @@ function AppInner(): React.JSX.Element {
       // ── iOS ARKit navigation on first response (opt-in setting) ─────────
       if (
         Platform.OS === 'ios' &&
-        (result.navigation === true || result.navigation_ios === true || result.navigation_arkit === true)
+        (
+          result.navigation === true ||
+          result.navigation_ios === true ||
+          result.navigation_arkit === true ||
+          result.navigation_pipeline === 'arkit'
+        )
       ) {
         const handled = await handleARKitNavigation(result, {
           introSpeechPromise,
+          requestedText: command,
         });
         if (handled) return;
         // If not handled because ARKit is unavailable, fall through to the

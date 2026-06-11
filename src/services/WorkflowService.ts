@@ -94,7 +94,7 @@ export const triggerIOSReaching = async (
       console.warn('⚠️ CybsGuidanceModule not available - is the native module linked?');
 
       // Fallback: Announce to user
-      AccessibilityService.announceForAccessibility(
+      AccessibilityService.announce(
         `Guiding you to ${objectName}. ARKit module initializing.`
       );
       return false;
@@ -404,6 +404,7 @@ export const sendToWorkflow = async (
       textLength: parsedResponse.text?.length || 0,
       navigation: parsedResponse.navigation,
       navigation_ios: parsedResponse.navigation_ios,
+      navigation_pipeline: parsedResponse.navigation_pipeline,
       navigation_target: parsedResponse.navigation_target,
       route_map_id: parsedResponse.route_map_id,
       reaching_flag: parsedResponse.reaching_flag,
@@ -413,7 +414,7 @@ export const sendToWorkflow = async (
     });
 
     debugLogger.logAPI(
-      `← Parsed: nav=${parsedResponse.navigation} navIOS=${!!parsedResponse.navigation_ios || !!parsedResponse.navigation_arkit} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox} track=${!!parsedResponse.tracking_active} reached=${!!parsedResponse.reached}`,
+      `← Parsed: nav=${parsedResponse.navigation} navIOS=${!!parsedResponse.navigation_ios || !!parsedResponse.navigation_arkit} navPipeline=${parsedResponse.navigation_pipeline || 'none'} reach=${parsedResponse.reaching_flag} ios=${parsedResponse.reaching_ios} bbox=${!!parsedResponse.bbox} track=${!!parsedResponse.tracking_active} reached=${!!parsedResponse.reached}`,
       `text="${(parsedResponse.text || '').substring(0, 80)}"`,
     );
 
@@ -432,7 +433,15 @@ export const sendToWorkflow = async (
     // handoff (introSpeechPromise).
     // ========================================================================
     if (!parsedResponse.text || !parsedResponse.text.trim()) {
-      if (!isContinuousIteration && !parsedResponse.reaching_ios) {
+      const isARKitNavigationHandoff =
+        Platform.OS === 'ios' &&
+        (
+          parsedResponse.navigation_pipeline === 'arkit' ||
+          parsedResponse.navigation_arkit === true ||
+          parsedResponse.navigation_ios === true
+        );
+
+      if (!isContinuousIteration && !parsedResponse.reaching_ios && !isARKitNavigationHandoff) {
         const message = 'Server returned empty response. Please try again.';
         AccessibilityService.announceError(message, false);
         throw new Error(message);
@@ -562,7 +571,7 @@ export const sendToSmartGuidance = async (
 // RESPONSE PARSER (with reaching_ios support)
 // =============================================================================
 
-function parseWorkflowResponse(
+export function parseWorkflowResponse(
   data: any,
   opts: { reachingRequest?: boolean } = {},
 ): WorkflowResponse {
@@ -790,6 +799,23 @@ function parseWorkflowResponse(
     return s;
   };
 
+  const normalizeNavigationPipeline = (value: any): 'rtab' | 'arkit' | undefined => {
+    if (typeof value !== 'string') return undefined;
+    const normalized = normalizeBackendString(value)
+      .trim()
+      .toLowerCase()
+      .replace(/^navigation_pipeline\s*:\s*/, '')
+      .replace(/^navigationpipeline\s*:\s*/, '');
+
+    if (normalized === 'arkit' || normalized === 'ar_kit' || normalized === 'ios_arkit') {
+      return 'arkit';
+    }
+    if (normalized === 'rtab' || normalized === 'rtabmap' || normalized === 'rtab_map') {
+      return 'rtab';
+    }
+    return undefined;
+  };
+
   // =========================================================================
   // FLAG EXTRACTION
   // =========================================================================
@@ -811,6 +837,16 @@ function parseWorkflowResponse(
     parseBoolean(payload.navigation_arkit) === true ||
     parseBoolean(payload.navigationArkit) === true
   );
+
+  const navigation_pipeline = (() => {
+    for (const payload of orderedPayloads) {
+      const candidate = normalizeNavigationPipeline(
+        payload.navigation_pipeline ?? payload.navigationPipeline ?? payload.pipeline,
+      );
+      if (candidate) return candidate;
+    }
+    return undefined;
+  })();
 
   // Reaching flag (Android LLM-based)
   const reaching_flag = normalizedPayloads.some((payload) =>
@@ -943,6 +979,7 @@ function parseWorkflowResponse(
     navigation,
     navigation_ios,
     navigation_arkit,
+    navigation_pipeline,
     navigation_target,
     route_map_id,
     reaching_flag,
@@ -960,6 +997,7 @@ function parseWorkflowResponse(
     navigation,
     navigation_ios,
     navigation_arkit,
+    navigation_pipeline,
     navigation_target,
     route_map_id,
     route_map_name,
