@@ -305,6 +305,8 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastVisualRouteMatch: VisualRouteMatch?
     private var arrivalVisualHoldStartedAt: Date?
     private var lastRouteAdvanceAt: Date?
+    private var pendingProgressCorrection: PendingProgressCorrection?
+    private var pendingRouteAdvance: PendingRouteAdvance?
     private var shouldSpeakLandmarks = true
     private var shouldEnableErrorRecovery = true
 
@@ -330,6 +332,16 @@ final class SemanticRouteNavigator: ObservableObject {
     private let visualRouteAmbiguousGap = 0.10
     private let visualRouteAdvanceCooldownSeconds: TimeInterval = 1.4
     private let visualArrivalMaxHoldSeconds: TimeInterval = 4.5
+    private let maxImmediateARProgressCorrectionMeters = 1.25
+    private let maxImmediateVisualProgressCorrectionMeters = 1.75
+    private let largeProgressCorrectionConfirmationSeconds: TimeInterval = 0.85
+    private let largeProgressCorrectionRequiredSamples = 3
+    private let visualDecisionAdvanceConfidence = 0.86
+    private let visualDecisionImmediateConfidence = 0.96
+    private let decisionAdvanceConfirmationSeconds: TimeInterval = 0.65
+    private let decisionAdvanceRequiredSamples = 2
+    private let routeAdvanceMaxUnconfirmedRemainingMeters = 1.20
+    private let routeStartHeadingPenaltyMeters = 1.25
     private let offAxisProgressExtraMeters = 1.25
     private let offAxisProgressMaxMeters = 3.4
     private let backwardProgressCorrectionMaxMeters = 1.15
@@ -349,6 +361,22 @@ final class SemanticRouteNavigator: ObservableObject {
         let instruction: String
         let reason: String
         let key: String
+    }
+
+    private struct PendingProgressCorrection {
+        let stepIndex: Int
+        let source: String
+        var progressMeters: Double
+        var firstSeenAt: Date
+        var lastSeenAt: Date
+        var sampleCount: Int
+    }
+
+    private struct PendingRouteAdvance {
+        let key: String
+        var firstSeenAt: Date
+        var lastSeenAt: Date
+        var sampleCount: Int
     }
 
     private struct NavigationStart {
@@ -955,7 +983,8 @@ final class SemanticRouteNavigator: ObservableObject {
         imuState: IMUState,
         activeARWorldMapID: String? = nil,
         speakLandmarks: Bool = true,
-        errorRecovery: Bool = true
+        errorRecovery: Bool = true,
+        arHeading: Double? = nil
     ) -> Bool {
         guard let map = activeMap else {
             currentInstruction = "No semantic map loaded."
@@ -986,7 +1015,8 @@ final class SemanticRouteNavigator: ObservableObject {
             in: map,
             targetNodeID: targetNode.id,
             arPosition: arPosition,
-            imuState: imuState
+            imuState: imuState,
+            headingDegrees: arHeading ?? imuState.bearing
         ) else {
             currentInstruction = "Could not resolve a start point."
             return false
@@ -1026,6 +1056,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastVisualRouteMatch = nil
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
+        resetRouteCorrectionGuards()
         guidanceIntroProtectedUntil = Date().addingTimeInterval(guidanceIntroProtectionSeconds)
         recoveryReason = nil
         phase = .navigating
@@ -1058,6 +1089,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastVisualRouteMatch = nil
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
+        resetRouteCorrectionGuards()
         guidanceIntroProtectedUntil = nil
         capturedPointCount = activeMap?.nodes.count ?? 0
         capturedTurnCount = activeMap?.nodes.filter { $0.kind == .intersection }.count ?? 0
@@ -1123,19 +1155,29 @@ final class SemanticRouteNavigator: ObservableObject {
             routeProjection = projection
             crossTrackError = projection.crossTrackMeters
             if arLocalized && projection.crossTrackMeters <= crossTrackRecoveryThreshold {
-                segmentProgressMeters = stabilizedSegmentProgress(
+                if let correctedProgress = guardedSegmentProgressCorrection(
                     toward: projection.alongTrackMeters,
                     on: step,
-                    allowBackward: true
-                )
-                observationConfidence = 0.86 - min(projection.crossTrackMeters / 4.0, 0.35)
+                    source: "ar_projection",
+                    maxImmediateForwardMeters: maxImmediateARProgressCorrectionMeters
+                ) {
+                    segmentProgressMeters = correctedProgress
+                    observationConfidence = 0.86 - min(projection.crossTrackMeters / 4.0, 0.35)
+                } else {
+                    observationConfidence = 0.40
+                }
             } else if arLocalized && shouldTrustOffAxisProgress(projection, on: step) {
-                segmentProgressMeters = stabilizedSegmentProgress(
+                if let correctedProgress = guardedSegmentProgressCorrection(
                     toward: projection.alongTrackMeters,
                     on: step,
-                    allowBackward: true
-                )
-                observationConfidence = 0.70 - min(projection.crossTrackMeters / 6.0, 0.28)
+                    source: "ar_projection",
+                    maxImmediateForwardMeters: maxImmediateARProgressCorrectionMeters
+                ) {
+                    segmentProgressMeters = correctedProgress
+                    observationConfidence = 0.70 - min(projection.crossTrackMeters / 6.0, 0.28)
+                } else {
+                    observationConfidence = 0.36
+                }
             } else if arLocalized {
                 observationConfidence = 0.48
             }
@@ -1152,11 +1194,17 @@ final class SemanticRouteNavigator: ObservableObject {
                     phase == .recovering ||
                     observationConfidence < 0.45 ||
                     nearDecisionPoint {
-                    segmentProgressMeters = stabilizedSegmentProgress(
+                    if let guardedProgress = guardedSegmentProgressCorrection(
                         toward: correctedProgress,
                         on: step,
-                        allowBackward: true
-                    )
+                        source: "visual_route",
+                        maxImmediateForwardMeters: maxImmediateVisualProgressCorrectionMeters,
+                        visualConfidence: visualMatch.confidence
+                    ) {
+                        segmentProgressMeters = guardedProgress
+                    } else {
+                        observationConfidence = min(observationConfidence, 0.58)
+                    }
                 }
             }
         }
@@ -1219,7 +1267,8 @@ final class SemanticRouteNavigator: ObservableObject {
         // if PDR progress is lagging due to heading gating after a turn.
         if let arPoint = Self.routePoint(from: arPosition),
            arLocalized,
-           arPoint.distance(to: step.to.point) <= nodeArrivalRadiusMeters(for: step) {
+           arPoint.distance(to: step.to.point) <= nodeArrivalRadiusMeters(for: step),
+           shouldAdvanceFromARNodeProximity(on: step, visualMatch: visualMatch) {
             if currentStepIndex >= routeSteps.count - 1,
                shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
                 rebuildRAGContext()
@@ -1277,6 +1326,7 @@ final class SemanticRouteNavigator: ObservableObject {
             segmentRemainingMeters = max(0, matchedStep.edge.distanceMeters - segmentProgressMeters)
             phase = .navigating
             recoveryReason = nil
+            resetRouteCorrectionGuards()
             updateInstruction(forceSpeech: true)
         } else {
             currentInstruction = "Nearest graph edge is \(Self.sanitizedSpokenLabel(edgeMatch.edge.spokenContext, fallback: "a saved route segment"))."
@@ -1503,7 +1553,7 @@ final class SemanticRouteNavigator: ObservableObject {
         on step: SemanticRouteStep
     ) -> Bool {
         guard let visualMatch,
-              visualMatch.confidence >= visualRouteSnapConfidence else {
+              visualMatch.confidence >= visualDecisionAdvanceConfidence else {
             return false
         }
         if let lastRouteAdvanceAt,
@@ -1516,6 +1566,12 @@ final class SemanticRouteNavigator: ObservableObject {
 
             if currentStepIndex >= routeSteps.count - 1,
                isVisualArrivalConfirmed(on: step, visualMatch: visualMatch) {
+                guard shouldConfirmRouteAdvance(
+                    key: "visual_arrival_\(currentStepIndex)",
+                    confidence: visualMatch.confidence
+                ) else {
+                    return false
+                }
                 segmentProgressMeters = step.edge.distanceMeters
                 segmentRemainingMeters = 0
                 advanceStepOrArrive()
@@ -1523,6 +1579,12 @@ final class SemanticRouteNavigator: ObservableObject {
             }
 
             if currentStepIndex < routeSteps.count - 1, nearStepEnd {
+                guard shouldConfirmRouteAdvance(
+                    key: "visual_step_end_\(currentStepIndex)",
+                    confidence: visualMatch.confidence
+                ) else {
+                    return false
+                }
                 segmentProgressMeters = step.edge.distanceMeters
                 segmentRemainingMeters = 0
                 advanceStepOrArrive()
@@ -1533,6 +1595,12 @@ final class SemanticRouteNavigator: ObservableObject {
         if visualMatch.stepIndex == currentStepIndex + 1,
            currentStepIndex < routeSteps.count - 1,
            visualMatch.progressMeters <= visualDecisionWindowMeters(for: routeSteps[currentStepIndex + 1]) {
+            guard shouldConfirmRouteAdvance(
+                key: "visual_next_step_\(currentStepIndex + 1)",
+                confidence: visualMatch.confidence
+            ) else {
+                return false
+            }
             segmentProgressMeters = step.edge.distanceMeters
             segmentRemainingMeters = 0
             advanceStepOrArrive()
@@ -1599,6 +1667,154 @@ final class SemanticRouteNavigator: ObservableObject {
         return max(observed, segmentProgressMeters - correctionLimit)
     }
 
+    private func guardedSegmentProgressCorrection(
+        toward observedProgress: Double,
+        on step: SemanticRouteStep,
+        source: String,
+        maxImmediateForwardMeters: Double,
+        visualConfidence: Double? = nil
+    ) -> Double? {
+        let observed = min(max(observedProgress, 0), step.edge.distanceMeters)
+        let forwardDelta = observed - segmentProgressMeters
+        if forwardDelta <= maxImmediateForwardMeters {
+            pendingProgressCorrection = nil
+            return stabilizedSegmentProgress(toward: observed, on: step, allowBackward: true)
+        }
+
+        let strongVisualEvidence = (visualConfidence ?? 0) >= visualDecisionAdvanceConfidence
+        let immediateVisualEvidence = (visualConfidence ?? 0) >= visualDecisionImmediateConfidence
+        if immediateVisualEvidence {
+            pendingProgressCorrection = nil
+            return stabilizedSegmentProgress(toward: observed, on: step, allowBackward: true)
+        }
+
+        let decisionWindowStart = max(
+            0,
+            step.edge.distanceMeters - max(routeAdvanceMaxUnconfirmedRemainingMeters, visualDecisionWindowMeters(for: step))
+        )
+        if observed >= decisionWindowStart, !strongVisualEvidence {
+            stagePendingProgressCorrection(source: source, observedProgress: observed)
+            return nil
+        }
+
+        guard isLargeProgressCorrectionConfirmed(source: source, observedProgress: observed) else {
+            return nil
+        }
+
+        return stabilizedSegmentProgress(toward: observed, on: step, allowBackward: true)
+    }
+
+    @discardableResult
+    private func stagePendingProgressCorrection(
+        source: String,
+        observedProgress: Double
+    ) -> PendingProgressCorrection {
+        let now = Date()
+        if var pending = pendingProgressCorrection,
+           pending.stepIndex == currentStepIndex,
+           pending.source == source,
+           abs(pending.progressMeters - observedProgress) <= 0.90,
+           now.timeIntervalSince(pending.lastSeenAt) <= 1.40 {
+            pending.progressMeters = (pending.progressMeters + observedProgress) / 2.0
+            pending.lastSeenAt = now
+            pending.sampleCount += 1
+            pendingProgressCorrection = pending
+            return pending
+        }
+
+        let pending = PendingProgressCorrection(
+            stepIndex: currentStepIndex,
+            source: source,
+            progressMeters: observedProgress,
+            firstSeenAt: now,
+            lastSeenAt: now,
+            sampleCount: 1
+        )
+        pendingProgressCorrection = pending
+        return pending
+    }
+
+    private func isLargeProgressCorrectionConfirmed(
+        source: String,
+        observedProgress: Double
+    ) -> Bool {
+        let pending = stagePendingProgressCorrection(
+            source: source,
+            observedProgress: observedProgress
+        )
+        let oldEnough = Date().timeIntervalSince(pending.firstSeenAt) >= largeProgressCorrectionConfirmationSeconds
+        let enoughSamples = pending.sampleCount >= largeProgressCorrectionRequiredSamples
+        if oldEnough && enoughSamples {
+            pendingProgressCorrection = nil
+            return true
+        }
+        return false
+    }
+
+    private func shouldConfirmRouteAdvance(
+        key: String,
+        confidence: Double
+    ) -> Bool {
+        if confidence >= visualDecisionImmediateConfidence {
+            pendingRouteAdvance = nil
+            return true
+        }
+
+        let now = Date()
+        if var pending = pendingRouteAdvance,
+           pending.key == key,
+           now.timeIntervalSince(pending.lastSeenAt) <= 1.40 {
+            pending.lastSeenAt = now
+            pending.sampleCount += 1
+            pendingRouteAdvance = pending
+        } else {
+            pendingRouteAdvance = PendingRouteAdvance(
+                key: key,
+                firstSeenAt: now,
+                lastSeenAt: now,
+                sampleCount: 1
+            )
+        }
+
+        guard let pending = pendingRouteAdvance else { return false }
+        let oldEnough = now.timeIntervalSince(pending.firstSeenAt) >= decisionAdvanceConfirmationSeconds
+        let enoughSamples = pending.sampleCount >= decisionAdvanceRequiredSamples
+        if oldEnough && enoughSamples {
+            pendingRouteAdvance = nil
+            return true
+        }
+        return false
+    }
+
+    private func shouldAdvanceFromARNodeProximity(
+        on step: SemanticRouteStep,
+        visualMatch: VisualRouteMatch?
+    ) -> Bool {
+        if segmentRemainingMeters <= routeAdvanceMaxUnconfirmedRemainingMeters {
+            pendingRouteAdvance = nil
+            return true
+        }
+
+        guard let visualMatch,
+              visualMatch.confidence >= visualDecisionAdvanceConfidence else {
+            return false
+        }
+
+        let nearCurrentStepEnd = visualMatch.stepIndex == currentStepIndex &&
+            visualMatch.progressMeters >= max(0, step.edge.distanceMeters - visualDecisionWindowMeters(for: step))
+        let nearNextStepStart = visualMatch.stepIndex == currentStepIndex + 1 &&
+            currentStepIndex < routeSteps.count - 1 &&
+            visualMatch.progressMeters <= visualDecisionWindowMeters(for: routeSteps[currentStepIndex + 1])
+        guard nearCurrentStepEnd || nearNextStepStart else {
+            return false
+        }
+
+        return shouldConfirmRouteAdvance(
+            key: "visual_ar_node_\(currentStepIndex)",
+            confidence: visualMatch.confidence
+        )
+    }
+
     private func destinationArrivalCorridorMeters(for step: SemanticRouteStep) -> Double {
         let halfWidth = max(0, (step.edge.walkableWidthMeters ?? 1.2) / 2.0)
         return min(destinationCorridorMaxMeters, max(0.85, halfWidth + destinationCorridorExtraMeters))
@@ -1622,13 +1838,20 @@ final class SemanticRouteNavigator: ObservableObject {
 
         guard arLocalized, let arPoint else { return false }
         if arPoint.distance(to: step.to.point) <= destinationArrivalRadiusMeters(for: step) {
-            return true
+            return segmentRemainingMeters <= max(
+                routeAdvanceMaxUnconfirmedRemainingMeters,
+                destinationAlongTrackArrivalWindowMeters(for: step)
+            )
         }
 
         let projection = Self.project(arPoint, onto: step)
         let destinationWindowStart = max(0, step.edge.distanceMeters - destinationAlongTrackArrivalWindowMeters(for: step))
         return projection.alongTrackMeters >= destinationWindowStart &&
-            projection.crossTrackMeters <= destinationArrivalCorridorMeters(for: step)
+            projection.crossTrackMeters <= destinationArrivalCorridorMeters(for: step) &&
+            segmentRemainingMeters <= max(
+                routeAdvanceMaxUnconfirmedRemainingMeters,
+                destinationAlongTrackArrivalWindowMeters(for: step)
+            )
     }
 
     private func updateRecoveryIfNeeded(
@@ -1691,7 +1914,13 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         if let snap = bestRecoverySnap(pose: pose, liveHeading: liveHeading, visualMatch: visualMatch),
-           shouldAcceptRecoverySnap(snap, crossTrackBad: crossTrackBad, headingBad: headingBad, backwardBad: backwardBad) {
+           shouldAcceptRecoverySnap(
+            snap,
+            crossTrackBad: crossTrackBad,
+            headingBad: headingBad,
+            backwardBad: backwardBad,
+            localizationBad: localizationBad
+           ) {
             applyRecoverySnap(snap, announce: phase == .recovering)
             return
         }
@@ -1833,6 +2062,7 @@ final class SemanticRouteNavigator: ObservableObject {
         guard let pose, !routeSteps.isEmpty else { return nil }
         return routeSteps.enumerated().compactMap { pair -> RecoverySnapCandidate? in
             let index = pair.offset
+            guard abs(index - currentStepIndex) <= 1 else { return nil }
             let step = pair.element
             let projection = Self.project(pose, onto: step)
             let headingError = abs(SemanticRouteMath.signedAngleDifference(liveHeading, step.edge.bearingDegrees))
@@ -1863,8 +2093,23 @@ final class SemanticRouteNavigator: ObservableObject {
         _ candidate: RecoverySnapCandidate,
         crossTrackBad: Bool,
         headingBad: Bool,
-        backwardBad: Bool
+        backwardBad: Bool,
+        localizationBad: Bool
     ) -> Bool {
+        let hasStrongVisualEvidence = (candidate.visualConfidence ?? 0) >= visualDecisionAdvanceConfidence
+        if localizationBad {
+            return hasStrongVisualEvidence &&
+                candidate.stepIndex >= currentStepIndex &&
+                candidate.crossTrackMeters <= max(1.50, recoverySnapThreshold)
+        }
+        if candidate.stepIndex > currentStepIndex, !hasStrongVisualEvidence {
+            return false
+        }
+        if candidate.stepIndex == currentStepIndex,
+           candidate.progressMeters - segmentProgressMeters > maxImmediateARProgressCorrectionMeters,
+           !hasStrongVisualEvidence {
+            return false
+        }
         if let visualConfidence = candidate.visualConfidence,
            visualConfidence >= visualRouteSnapConfidence,
            candidate.crossTrackMeters <= max(3.0, recoverySnapThreshold * 2.2) {
@@ -1895,6 +2140,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastRecoveredAt = Date()
         arrivalVisualHoldStartedAt = nil
         guidanceIntroProtectedUntil = nil
+        resetRouteCorrectionGuards()
         phase = .navigating
         updateInstruction(forceSpeech: false)
         if announce {
@@ -1906,6 +2152,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private func advanceStepOrArrive() {
         lastRouteAdvanceAt = Date()
+        resetRouteCorrectionGuards()
         guard currentStepIndex < routeSteps.count - 1 else {
             phase = .arrived
             segmentProgressMeters = activeStep?.edge.distanceMeters ?? segmentProgressMeters
@@ -2060,6 +2307,11 @@ final class SemanticRouteNavigator: ObservableObject {
         } else {
             ragContextJSON = "{}"
         }
+    }
+
+    private func resetRouteCorrectionGuards() {
+        pendingProgressCorrection = nil
+        pendingRouteAdvance = nil
     }
 
     private func nearbyLandmarkNames() -> [String] {
@@ -2482,7 +2734,8 @@ final class SemanticRouteNavigator: ObservableObject {
         in map: SemanticRouteMap,
         targetNodeID: String,
         arPosition: simd_float3?,
-        imuState: IMUState
+        imuState: IMUState,
+        headingDegrees: Double?
     ) -> NavigationStart? {
         let pose = map.coordinateSpace == "ar_world_xz"
             ? Self.routePoint(from: arPosition)
@@ -2496,8 +2749,13 @@ final class SemanticRouteNavigator: ObservableObject {
             if !forwardTail.isEmpty {
                 let path = [edgeMatch.edge.fromNodeID] + forwardTail
                 let progress = edgeMatch.alongTrackMeters
+                let headingPenalty = routeStartHeadingPenalty(
+                    liveHeading: headingDegrees,
+                    routeBearing: edgeMatch.edge.bearingDegrees
+                )
                 let cost = max(0, edgeMatch.edge.distanceMeters - edgeMatch.alongTrackMeters)
                     + pathCost(for: forwardTail, in: map)
+                    + headingPenalty
                 options.append((path, progress, cost))
             }
 
@@ -2505,7 +2763,12 @@ final class SemanticRouteNavigator: ObservableObject {
             if !reverseTail.isEmpty {
                 let path = [edgeMatch.edge.toNodeID] + reverseTail
                 let progress = max(0, edgeMatch.edge.distanceMeters - edgeMatch.alongTrackMeters)
+                let headingPenalty = routeStartHeadingPenalty(
+                    liveHeading: headingDegrees,
+                    routeBearing: SemanticRouteMath.normalizedDegrees(edgeMatch.edge.bearingDegrees + 180)
+                )
                 let cost = max(0, edgeMatch.alongTrackMeters) + pathCost(for: reverseTail, in: map)
+                    + headingPenalty
                 options.append((path, progress, cost))
             }
 
@@ -2584,6 +2847,15 @@ final class SemanticRouteNavigator: ObservableObject {
             total += edge.distanceMeters
         }
         return total
+    }
+
+    private func routeStartHeadingPenalty(
+        liveHeading: Double?,
+        routeBearing: Double
+    ) -> Double {
+        guard let liveHeading else { return 0 }
+        let error = abs(SemanticRouteMath.signedAngleDifference(liveHeading, routeBearing))
+        return min(error / 90.0, 1.0) * routeStartHeadingPenaltyMeters
     }
 
     private func buildSteps(for nodePath: [String], in map: SemanticRouteMap) -> [SemanticRouteStep] {

@@ -368,7 +368,8 @@ struct ARMappingView: View {
             imuState: sensorManager.imuState,
             activeARWorldMapID: mappingManager.activeMapID,
             speakLandmarks: launchSpeakLandmarks,
-            errorRecovery: launchErrorRecovery
+            errorRecovery: launchErrorRecovery,
+            arHeading: mappingManager.arHeadingDegrees
         )
 
         if didStart {
@@ -1101,7 +1102,8 @@ struct ARMappingView: View {
             imuState: sensorManager.imuState,
             activeARWorldMapID: mappingManager.activeMapID,
             speakLandmarks: speakLandmarks,
-            errorRecovery: errorRecovery
+            errorRecovery: errorRecovery,
+            arHeading: mappingManager.arHeadingDegrees
         )
     }
 
