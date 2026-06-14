@@ -166,16 +166,22 @@ final class ARKitNavigationModule: NSObject {
             let resolver = self.pendingResolve
             self.pendingResolve = nil
             self.activeTargetName = nil
+            let shouldResolveBeforeDismiss = result.success && result.reason == "arrived"
 
-            let dismissThenResolve: () -> Void = {
+            let resolveResult: () -> Void = {
                 resolver?(result.dictionary())
             }
 
             if let controller = self.presentedController {
                 self.presentedController = nil
-                controller.dismiss(animated: true, completion: dismissThenResolve)
+                if shouldResolveBeforeDismiss {
+                    resolveResult()
+                    controller.dismiss(animated: true)
+                } else {
+                    controller.dismiss(animated: true, completion: resolveResult)
+                }
             } else {
-                dismissThenResolve()
+                resolveResult()
             }
         }
     }
@@ -285,6 +291,7 @@ private struct ARKitRouteHostView: View {
                 }
             }
         }
+        .accentColor(launchTargetName == nil ? Color.accentColor : Color(red: 0.18, green: 0.72, blue: 0.62))
         .navigationViewStyle(.stack)
     }
 }

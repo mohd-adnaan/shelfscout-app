@@ -119,7 +119,7 @@ struct ARMappingView: View {
 
     private var routeSceneWithNavigationChrome: some View {
         arSceneContent
-            .navigationTitle("AR Route")
+            .navigationTitle(isAutomatedNavigation ? "ARKit Navigation" : "Manage ARKit Route Maps")
             .navigationBarTitleDisplayMode(.inline)
     }
 
@@ -138,7 +138,7 @@ struct ARMappingView: View {
                         .ignoresSafeArea()
                 }
 
-                if showsMapInspector && hasInspectionContent {
+                if !isAutomatedNavigation && showsMapInspector && hasInspectionContent {
                     VStack {
                         mapInspectorPanel
                             .padding(.horizontal, 16)
@@ -278,6 +278,14 @@ struct ARMappingView: View {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    private var isAutomatedNavigation: Bool {
+        automatedTargetName != nil
+    }
+
+    private var automatedAccent: Color {
+        Color(red: 0.18, green: 0.72, blue: 0.62)
+    }
+
     private func attemptAutomatedNavigationIfNeeded() {
         guard let target = automatedTargetName,
               didResolveAutomation == false else {
@@ -378,7 +386,7 @@ struct ARMappingView: View {
     }
 
     private func bestAutomatedRoute(for target: String, in maps: [SemanticRouteMap]) -> SemanticRouteMap? {
-        let normalizedTarget = target.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let normalizedTarget = normalizedRouteLookupKey(target)
 
         if let launchRouteMapId,
            let byId = maps.first(where: { $0.id == launchRouteMapId }) {
@@ -394,9 +402,28 @@ struct ARMappingView: View {
     }
 
     private func routeContainsTarget(_ route: SemanticRouteMap, normalizedTarget: String) -> Bool {
-        route.targetNames.contains { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedTarget } ||
-        route.nodes.contains { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedTarget } ||
-        route.landmarks.contains { $0.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == normalizedTarget }
+        route.targetNames.contains { normalizedRouteLookupKey($0) == normalizedTarget } ||
+        route.nodes.contains { node in
+            normalizedRouteLookupKey(node.name) == normalizedTarget ||
+            node.aliases.contains { normalizedRouteLookupKey($0) == normalizedTarget }
+        } ||
+        route.landmarks.contains { landmark in
+            normalizedRouteLookupKey(landmark.name) == normalizedTarget ||
+            landmark.aliases.contains { normalizedRouteLookupKey($0) == normalizedTarget }
+        }
+    }
+
+    private func normalizedRouteLookupKey(_ raw: String) -> String {
+        let stripped = raw
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+
+        let withoutArticles = stripped.drop { ["the", "a", "an"].contains($0) }
+        return withoutArticles.joined(separator: " ")
     }
 
     private func resolveAutomation(
@@ -520,36 +547,118 @@ struct ARMappingView: View {
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 
+    @ViewBuilder
     private var routeBottomSheet: some View {
-        SemanticNavigationPanel(
-            navigator: semanticNavigator,
-            mapName: $mapName,
-            arStatusText: statusText,
-            activeARMapName: mappingManager.activeMapName,
-            closestPOI: mappingManager.closestPOI,
-            savedARMaps: mappingManager.savedMaps,
-            selectedARMapID: mappingManager.selectedMapID,
-            canUseARPose: mappingManager.cameraMapPosition != nil && (mappingManager.isMapping || mappingManager.isLocalized),
-            isARSessionActive: mappingManager.sessionMode != .idle,
-            isSavingARMap: mappingManager.isSavingMap,
-            selectARMap: { id in
-                mappingManager.selectedMapID = id
-            },
-            startARMapping: startNewMap,
-            loadARMap: loadSelectedMap,
-            deleteARMap: {
-                confirmDeleteSelectedMap()
-            },
-            saveARMap: { mappingManager.saveMap(named: mapName) },
-            stopARSession: { mappingManager.stopMapping() },
-            beginWalkthrough: beginSemanticWalkthrough,
-            captureStart: captureSemanticStart,
-            captureTurn: captureSemanticTurn,
-            captureLandmark: captureSemanticLandmark,
-            saveWalkthrough: saveSemanticWalkthrough,
-            startNavigation: startSemanticNavigation,
-            snapToRoute: snapSemanticNavigationToRoute
+        if isAutomatedNavigation {
+            automatedNavigationPanel
+        } else {
+            SemanticNavigationPanel(
+                navigator: semanticNavigator,
+                mapName: $mapName,
+                arStatusText: statusText,
+                activeARMapName: mappingManager.activeMapName,
+                closestPOI: mappingManager.closestPOI,
+                savedARMaps: mappingManager.savedMaps,
+                selectedARMapID: mappingManager.selectedMapID,
+                canUseARPose: mappingManager.cameraMapPosition != nil && (mappingManager.isMapping || mappingManager.isLocalized),
+                isARSessionActive: mappingManager.sessionMode != .idle,
+                isSavingARMap: mappingManager.isSavingMap,
+                selectARMap: { id in
+                    mappingManager.selectedMapID = id
+                },
+                startARMapping: startNewMap,
+                loadARMap: loadSelectedMap,
+                deleteARMap: {
+                    confirmDeleteSelectedMap()
+                },
+                saveARMap: { mappingManager.saveMap(named: mapName) },
+                stopARSession: { mappingManager.stopMapping() },
+                beginWalkthrough: beginSemanticWalkthrough,
+                captureStart: captureSemanticStart,
+                captureTurn: captureSemanticTurn,
+                captureLandmark: captureSemanticLandmark,
+                saveWalkthrough: saveSemanticWalkthrough,
+                startNavigation: startSemanticNavigation,
+                snapToRoute: snapSemanticNavigationToRoute
+            )
+        }
+    }
+
+    private var automatedNavigationPanel: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Capsule()
+                .fill(Color.white.opacity(0.34))
+                .frame(width: 38, height: 5)
+                .frame(maxWidth: .infinity)
+
+            HStack(spacing: 10) {
+                Image(systemName: "location.north.line.fill")
+                    .font(.headline.weight(.semibold))
+                    .foregroundColor(automatedAccent)
+                    .frame(width: 30, height: 30)
+                    .background(automatedAccent.opacity(0.16))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("ARKit Navigation")
+                        .font(.title3.weight(.bold))
+                        .foregroundColor(.white)
+                    Text(automatedTargetName.map { "Destination: \($0)" } ?? "Destination selected")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundColor(.white.opacity(0.72))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.8)
+                }
+
+                Spacer(minLength: 0)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text(semanticNavigator.currentInstruction)
+                    .font(.headline.weight(.semibold))
+                    .foregroundColor(.white)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 8) {
+                    Label(statusText, systemImage: mappingManager.isLocalized ? "checkmark.circle.fill" : "viewfinder")
+                        .foregroundColor(mappingManager.isLocalized ? automatedAccent : Color.white.opacity(0.72))
+
+                    if let activeMapName = mappingManager.activeMapName ?? semanticNavigator.activeMap?.name {
+                        Text(activeMapName)
+                            .foregroundColor(.white.opacity(0.58))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.78)
+                    }
+                }
+                .font(.subheadline.weight(.semibold))
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.white.opacity(0.10))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .stroke(automatedAccent.opacity(0.34), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        }
+        .padding(16)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(
+            LinearGradient(
+                colors: [
+                    Color(red: 0.02, green: 0.18, blue: 0.18).opacity(0.96),
+                    Color(red: 0.04, green: 0.32, blue: 0.28).opacity(0.94)
+                ],
+                startPoint: .topLeading,
+                endPoint: .bottomTrailing
+            )
         )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(automatedAccent.opacity(0.34), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .shadow(color: Color.black.opacity(0.24), radius: 20, x: 0, y: 10)
     }
 
     private var idleControls: some View {

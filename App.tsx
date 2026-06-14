@@ -1886,25 +1886,121 @@ function AppInner(): React.JSX.Element {
 
     console.log('🧭 [ARKitNavigation] Native result:', navResult);
 
-    setIsNavigation(false);
-    setIsCameraActive(true);
-
     if (navResult?.success && navResult.reason === 'arrived') {
+      stopContinuousMode('ARKit navigation arrived; starting iOS reaching acquisition', false);
+      setIsReaching(true);
+      setIsProcessing(true);
+      setIsNavigation(false);
+      setIsSpeaking(false);
+
       await speakContinuousSpeechAndWait(
         navResult.message || `Arrived at ${targetName}. Switching to object guidance.`,
         { ignoreAbort: true },
       );
 
-      if (isEmergencyStopped.current) return true;
+      if (isEmergencyStopped.current) {
+        setIsReaching(false);
+        setIsProcessing(false);
+        return true;
+      }
 
-      stopContinuousMode('resetting for ARKit navigation to reaching handoff', false);
-      await new Promise(resolve => setTimeout(resolve, 250));
-      startContinuousMode('reaching', result.loopDelay || NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS);
-      setIsReaching(true);
+      const postureOk = await waitForGoodPostureRef.current('capture');
+      if (!postureOk) {
+        await speakContinuousSpeechAndWait(
+          'Hold the phone straight with the camera facing forward, then ask again.',
+          { ignoreAbort: true },
+        );
+        setIsReaching(false);
+        setIsProcessing(false);
+        setIsCameraActive(true);
+        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        announceTapToStart('Ready.');
+        return true;
+      }
+
+      const shouldPlaySFX = !screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera;
+      if (shouldPlaySFX) {
+        playThinkingStarted();
+      }
+
+      let reachingResult: any;
+      try {
+        const photoPath = await reactivateCameraAndCaptureRef.current({
+          enableShutterSound: false,
+          busyStrategy: 'wait-new',
+        });
+
+        if (!photoPath) {
+          throw new Error('Could not capture a fresh image for object guidance.');
+        }
+
+        const reachingAbortCtrl = new AbortController();
+        abortControllerRef.current = reachingAbortCtrl;
+        reachingResult = await sendToWorkflow(
+          {
+            text: targetName,
+            imageUri: photoPath,
+            imageWidth: lastImageDimensions.current.width,
+            imageHeight: lastImageDimensions.current.height,
+            navigation: false,
+            navigation_pipeline: 'arkit',
+            navigation_ios_preferred: true,
+            reaching_flag: false,
+            reaching_ios: true,
+          },
+          reachingAbortCtrl.signal,
+        );
+      } catch (e: any) {
+        await stopLatencyLoop();
+        await speakContinuousSpeechAndWait(
+          e?.message || `I could not start object guidance for ${targetName}.`,
+          { ignoreAbort: true },
+        );
+        setIsReaching(false);
+        setIsProcessing(false);
+        setIsCameraActive(true);
+        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        announceTapToStart('Ready.');
+        return true;
+      }
+
+      await stopLatencyLoop();
+      await stopLatencyLoop();
       setIsProcessing(false);
-      await runContinuousLoop();
+
+      const reachingIntroPromise = reachingResult?.text
+        ? speakContinuousSpeechAndWait(reachingResult.text, { ignoreAbort: true })
+        : undefined;
+
+      const handled = await handleiOSReaching(
+        {
+          ...reachingResult,
+          reaching_ios: true,
+          object: normalizeTextValue(reachingResult?.object) || targetName,
+        },
+        {
+          startupSilent: !!reachingIntroPromise,
+          introSpeechPromise: reachingIntroPromise,
+        },
+      );
+
+      if (!handled) {
+        await speakContinuousSpeechAndWait(
+          `I could not start ARKit reaching for ${targetName}.`,
+          { ignoreAbort: true },
+        );
+        setIsReaching(false);
+        setIsProcessing(false);
+        setIsCameraActive(true);
+        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        announceTapToStart('Ready.');
+      }
+
       return true;
     }
+
+    setIsNavigation(false);
+    setIsCameraActive(true);
 
     if (navResult.reason === 'ar_unavailable') {
       await speakContinuousSpeechAndWait(
@@ -1939,11 +2035,10 @@ function AppInner(): React.JSX.Element {
     return true;
   }, [
     announceTapToStart,
+    handleiOSReaching,
     resetContinuousSpeechQueue,
     resolveNavigationPipeline,
-    runContinuousLoop,
     speakContinuousSpeechAndWait,
-    startRtabFeed,
     stopRtabFeed,
   ]);
 

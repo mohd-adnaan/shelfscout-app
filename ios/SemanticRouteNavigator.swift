@@ -2625,6 +2625,10 @@ final class SemanticRouteNavigator: ObservableObject {
         var aliases: Set<String> = [lower]
         aliases.insert(lower.replacingOccurrences(of: "_", with: " "))
         aliases.insert(lower.replacingOccurrences(of: "-", with: " "))
+        let withoutLeadingArticles = normalizedLookupKey(lower)
+        if !withoutLeadingArticles.isEmpty {
+            aliases.insert(withoutLeadingArticles)
+        }
         if lower.hasSuffix("s") {
             aliases.insert(String(lower.dropLast()))
         } else {
@@ -2634,9 +2638,17 @@ final class SemanticRouteNavigator: ObservableObject {
     }
 
     private static func matches(_ lhs: String, _ rhs: String) -> Bool {
-        sanitizedSpokenLabel(lhs).localizedCaseInsensitiveCompare(
-            sanitizedSpokenLabel(rhs)
-        ) == .orderedSame
+        normalizedLookupKey(lhs) == normalizedLookupKey(rhs)
+    }
+
+    private static func normalizedLookupKey(_ raw: String) -> String {
+        let tokens = sanitizedSpokenLabel(raw)
+            .lowercased()
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .components(separatedBy: CharacterSet.alphanumerics.inverted)
+            .filter { !$0.isEmpty }
+        return tokens.drop { ["the", "a", "an"].contains($0) }.joined(separator: " ")
     }
 
     private static func sanitizedMap(_ map: SemanticRouteMap) -> SemanticRouteMap {
