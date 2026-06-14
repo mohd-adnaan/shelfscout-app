@@ -66,6 +66,62 @@ const NAV_CONFIG = {
   DEBUG: __DEV__ || true,
 };
 
+const TTS_REPEAT_SUPPRESSION_MS = 10_000;
+
+const normalizeGuidanceText = (text: string): string =>
+  (text || '')
+    .toLowerCase()
+    .replace(/[^a-z0-9.\s-]/g, ' ')
+    .replace(/-/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const guidanceKey = (text: string): string =>
+  normalizeGuidanceText(text)
+    .replace(/\b\d+(?:\.\d+)?\s*(centimeters?|cm|meters?|metres?|m|feet|foot|ft|steps?)\b/g, '<distance>')
+    .replace(/\b(please|now|slowly|carefully|about|approximately|roughly|just)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const guidanceIntent = (text: string): string => {
+  const normalized = normalizeGuidanceText(text);
+  if (/\b(arrived|arrival|destination|reached)\b/.test(normalized)) return 'arrival';
+  if (/\b(hold|upright|straight up|phone|camera sees forward|facing forward)\b/.test(normalized)) return 'orientation';
+  if (/\b(left)\b/.test(normalized)) return 'left';
+  if (/\b(right)\b/.test(normalized)) return 'right';
+  if (/\b(straight|forward|continue|ahead|walk)\b/.test(normalized)) return 'straight';
+  if (/\b(stop|wait|pause|error|failed|unavailable)\b/.test(normalized)) return 'urgent';
+  return 'general';
+};
+
+const guidanceSimilarity = (a: string, b: string): number => {
+  const aTokens = new Set(guidanceKey(a).split(/\s+/).filter(token => token.length > 2 && token !== '<distance>'));
+  const bTokens = new Set(guidanceKey(b).split(/\s+/).filter(token => token.length > 2 && token !== '<distance>'));
+  if (aTokens.size === 0 || bTokens.size === 0) return 0;
+  let shared = 0;
+  aTokens.forEach(token => {
+    if (bTokens.has(token)) shared++;
+  });
+  return shared / Math.max(aTokens.size, bTokens.size);
+};
+
+const isNearDuplicateGuidance = (next: string, previous?: string): boolean => {
+  if (!previous) return false;
+  if (normalizeGuidanceText(next) === normalizeGuidanceText(previous)) return true;
+  if (guidanceKey(next) === guidanceKey(previous)) return true;
+  return guidanceIntent(next) === guidanceIntent(previous) &&
+    guidanceIntent(next) !== 'general' &&
+    guidanceSimilarity(next, previous) >= 0.65;
+};
+
+const isResponsiveGuidanceChange = (next: string, current?: string): boolean => {
+  if (!current || isNearDuplicateGuidance(next, current)) return false;
+  const nextIntent = guidanceIntent(next);
+  const currentIntent = guidanceIntent(current);
+  return ['arrival', 'orientation', 'urgent'].includes(nextIntent) ||
+    (nextIntent !== 'general' && currentIntent !== 'general' && nextIntent !== currentIntent);
+};
+
 // ============================================================================
 // Types
 // ============================================================================
@@ -93,6 +149,11 @@ interface NavigationStats {
   photosCaputred: number;
 }
 
+interface LastQueuedGuidance {
+  text: string;
+  at: number;
+}
+
 // ============================================================================
 // Hook Implementation
 // ============================================================================
@@ -112,7 +173,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     photosCaputred: 0,
   });
 
-  const { isStraightRef } = useDeviceOrientation();
+  const { isStraightRef, orientationSnapshotRef, maxForwardTiltDegrees } = useDeviceOrientation();
 
   // ---- Refs ----
   const isNavigatingRef = useRef(false);
@@ -136,6 +197,8 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
    */
   const ttsQueueRef = useRef<string[]>([]);
   const isSpeakingRef = useRef(false);
+  const currentSpeechTextRef = useRef('');
+  const lastQueuedGuidanceRef = useRef<LastQueuedGuidance | null>(null);
 
   const statsRef = useRef<NavigationStats>({
     cyclesCompleted: 0,
@@ -172,6 +235,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
       const text = ttsQueueRef.current.pop()!;
       ttsQueueRef.current = []; // discard any others that queued while we were processing
 
+      currentSpeechTextRef.current = text;
       log(`🔊 Speaking: "${text.substring(0, 60)}…"`);
       updateCycleState('speaking');
       setLastInstruction(text);
@@ -191,12 +255,54 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     }
 
     isSpeakingRef.current = false;
+    currentSpeechTextRef.current = '';
 
     // Return to 'processing' state indicator so UI reflects capture loop state
     if (isNavigatingRef.current) {
       updateCycleState('processing');
     }
   }, [log, updateCycleState, onInstructionAnnounced]);
+
+  const enqueueGuidanceSpeech = useCallback((text: string, source: string) => {
+    const spoken = (text || '').trim();
+    if (!spoken) return false;
+
+    const now = Date.now();
+    const pending = ttsQueueRef.current;
+    const currentSpeech = currentSpeechTextRef.current;
+    const pendingSpeech = pending.length > 0 ? pending[pending.length - 1] : '';
+    const lastQueued = lastQueuedGuidanceRef.current;
+
+    if (isNearDuplicateGuidance(spoken, currentSpeech)) {
+      log(`🔇 TTS coalesced (${source}) — already speaking near-duplicate: "${spoken.substring(0, 60)}"`);
+      return false;
+    }
+
+    if (isNearDuplicateGuidance(spoken, pendingSpeech)) {
+      log(`🔇 TTS coalesced (${source}) — already pending near-duplicate: "${spoken.substring(0, 60)}"`);
+      return false;
+    }
+
+    if (
+      lastQueued &&
+      now - lastQueued.at < TTS_REPEAT_SUPPRESSION_MS &&
+      isNearDuplicateGuidance(spoken, lastQueued.text)
+    ) {
+      log(`🔇 TTS coalesced (${source}) — recently queued near-duplicate: "${spoken.substring(0, 60)}"`);
+      return false;
+    }
+
+    if (isSpeakingRef.current && isResponsiveGuidanceChange(spoken, currentSpeech)) {
+      log(`⚡ TTS guidance changed (${source}) — keeping newest pending speech: "${spoken.substring(0, 60)}"`);
+    } else {
+      log(`🔊 TTS queued (${source}/${guidanceIntent(spoken)}): "${spoken.substring(0, 60)}"`);
+    }
+
+    ttsQueueRef.current = [spoken];
+    lastQueuedGuidanceRef.current = { text: spoken, at: now };
+    drainTTSQueue();
+    return true;
+  }, [drainTTSQueue, log]);
 
   // ============================================================================
   // SINGLE CAPTURE + SEND  (self-chaining via setTimeout in finally)
@@ -215,12 +321,18 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     }
 
     if (!isStraightRef.current) {
-      log('⚠️ Phone orientation incorrect. Skipping capture cycle.');
+      const tilt = orientationSnapshotRef.current.tiltFromUprightDegrees;
+      log(
+        `⚠️ Phone orientation incorrect. Skipping capture cycle. ` +
+        `tilt=${tilt.toFixed(1)}deg max=${maxForwardTiltDegrees}deg`
+      );
       
       const now = Date.now();
       if (now - lastOrientationWarningTimeRef.current > 5000) {
-        ttsQueueRef.current.push('Please hold your phone straight up, with the camera facing forward.');
-        drainTTSQueue();
+        enqueueGuidanceSpeech(
+          'Hold the phone upright so the camera sees forward.',
+          `posture tilt=${tilt.toFixed(1)}deg`
+        );
         lastOrientationWarningTimeRef.current = now;
       }
       
@@ -275,7 +387,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
       log('📤 POSTing to backend…');
 
       const result = await sendToWorkflow(
-        { text: 'navigation', imageUri: photoPath, navigation: true },
+        { text: 'navigation', imageUri: photoPath || '', navigation: true },
         abort.signal,
       );
 
@@ -296,8 +408,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
 
       // Push to TTS queue and drain (non-blocking)
       if (result.text?.trim()) {
-        ttsQueueRef.current.push(result.text);
-        drainTTSQueue(); // fire-and-forget — does not block the next poll
+        enqueueGuidanceSpeech(result.text, 'backend'); // fire-and-forget — does not block the next poll
       }
     } catch (err: any) {
       if (
@@ -319,7 +430,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
         AccessibilityInfo.announceForAccessibility(
           'Navigation paused due to errors. Retrying shortly.',
         );
-        await new Promise(r => setTimeout(r, NAV_CONFIG.ERROR_RETRY_DELAY));
+        await new Promise<void>(resolve => setTimeout(resolve, NAV_CONFIG.ERROR_RETRY_DELAY));
         consecutiveErrorsRef.current = 0;
       }
     } finally {
@@ -338,7 +449,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
         );
       }
     }
-  }, [cameraRef, drainTTSQueue, updateCycleState, onError, log]);
+  }, [cameraRef, enqueueGuidanceSpeech, updateCycleState, onError, log, maxForwardTiltDegrees]);
 
   // ============================================================================
   // PUBLIC API: startNavigation
@@ -354,7 +465,9 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     isNavigatingRef.current = true;
     isProcessingFrameRef.current = false;
     isSpeakingRef.current = false;
+    currentSpeechTextRef.current = '';
     ttsQueueRef.current = [];
+    lastQueuedGuidanceRef.current = null;
     consecutiveErrorsRef.current = 0;
 
     statsRef.current = {
@@ -368,7 +481,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     setIsNavigating(true);
     updateCycleState('capturing');
     // Brief settle delay (camera/audio)
-    await new Promise(r => setTimeout(r, 500));
+    await new Promise<void>(resolve => setTimeout(resolve, 500));
 
     AccessibilityInfo.announceForAccessibility(
       'Continuous navigation started. Walk slowly and listen for guidance.',
@@ -385,6 +498,8 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     log('🔴 Stopping navigation');
     isNavigatingRef.current = false;
     ttsQueueRef.current = [];
+    currentSpeechTextRef.current = '';
+    lastQueuedGuidanceRef.current = null;
 
     // Cancel any pending next-capture timeout
     if (nextCaptureTimeoutRef.current) {

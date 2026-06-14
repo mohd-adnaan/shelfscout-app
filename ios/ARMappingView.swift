@@ -414,16 +414,43 @@ struct ARMappingView: View {
     }
 
     private func normalizedRouteLookupKey(_ raw: String) -> String {
-        let stripped = raw
+        let tokens = raw
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
+            .replacingOccurrences(of: "doorknob", with: "door knob")
+            .replacingOccurrences(of: "doorhandle", with: "door handle")
             .replacingOccurrences(of: "_", with: " ")
             .replacingOccurrences(of: "-", with: " ")
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
 
-        let withoutArticles = stripped.drop { ["the", "a", "an"].contains($0) }
-        return withoutArticles.joined(separator: " ")
+        let lookupNoise = Set(["room", "rm", "suite", "office"])
+        let withoutArticles = tokens.drop { ["the", "a", "an"].contains($0) }
+        let meaningfulTokens = withoutArticles.filter { lookupNoise.contains($0) == false }
+        return canonicalizedRouteLookupTokens(Array(meaningfulTokens)).joined(separator: " ")
+    }
+
+    private func canonicalizedRouteLookupTokens(_ tokens: [String]) -> [String] {
+        var canonical: [String] = []
+        var index = 0
+        while index < tokens.count {
+            if index + 1 < tokens.count {
+                let pair = "\(tokens[index]) \(tokens[index + 1])"
+                if pair == "door knob" {
+                    canonical.append("doorknob")
+                    index += 2
+                    continue
+                }
+                if pair == "door handle" {
+                    canonical.append("doorhandle")
+                    index += 2
+                    continue
+                }
+            }
+            canonical.append(tokens[index])
+            index += 1
+        }
+        return canonical
     }
 
     private func resolveAutomation(

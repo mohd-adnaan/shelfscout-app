@@ -30,7 +30,7 @@ export const useCamera = () => {
   const device = useCameraDevice('back');
   const { hasPermission, requestPermission } = useCameraPermission();
   const cameraRef = useRef<Camera>(null);
-  const { isStraightRef } = useDeviceOrientation();
+  const { isStraightRef, orientationSnapshotRef, maxForwardTiltDegrees } = useDeviceOrientation();
 
   /**
    * Capture photo with comprehensive error handling
@@ -115,8 +115,12 @@ export const useCamera = () => {
 
       // WCAG 3.3.2: Verify Device Orientation
       if (!isStraightRef.current) {
-        const message = 'Please hold the phone straight up, with the camera facing forward.';
-        console.warn('[Camera] ⚠️ Phone orientation is flat. Prompting user.');
+        const message = 'Hold the phone upright so the camera sees forward.';
+        console.warn(
+          '[Camera] ⚠️ Phone orientation blocked capture.',
+          `tilt=${orientationSnapshotRef.current.tiltFromUprightDegrees.toFixed(1)}deg`,
+          `max=${maxForwardTiltDegrees}deg`,
+        );
         
         AccessibilityService.announceError(message, false);
         Alert.alert(

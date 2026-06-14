@@ -87,6 +87,9 @@ const VOICEOVER_LISTENING_GRACE_MS = 600;
 const POSTURE_WARNING_COOLDOWN_MS = 6000;
 const POSTURE_MAX_WAIT_MS = 6500;
 const POSTURE_POLL_INTERVAL_MS = 250;
+const POSTURE_LOG_THROTTLE_MS = 1500;
+const CONTINUOUS_TTS_REPEAT_SUPPRESSION_MS = 10_000;
+const CONTINUOUS_TTS_DISTANCE_REFRESH_METERS = 3;
 const WEARABLES_PREWARM_RETRY_DELAYS_MS = [1500, 3000, 6000, 10000, 15000, 20000];
 
 // =============================================================================
@@ -105,10 +108,75 @@ const RTAB_FEED_INTERVAL_MS = 500;
 
 let dav2PrewarmStarted = false;
 
+type ContinuousSpeechIntent =
+  | 'arrival'
+  | 'orientation'
+  | 'left'
+  | 'right'
+  | 'uturn'
+  | 'straight'
+  | 'up'
+  | 'down'
+  | 'stop'
+  | 'error'
+  | 'handoff'
+  | 'reaching'
+  | 'distance'
+  | 'general';
+
+interface ContinuousSpeechSignature {
+  normalized: string;
+  comparable: string;
+  intent: ContinuousSpeechIntent;
+  distanceMeters?: number;
+}
+
+interface ContinuousSpeechRecord {
+  text: string;
+  signature: ContinuousSpeechSignature;
+  acceptedAt: number;
+  source: string;
+}
+
+interface ContinuousSpeechEnqueueOptions {
+  source?: string;
+  force?: boolean;
+  allowPreempt?: boolean;
+  ignoreAbort?: boolean;
+}
+
+type EnqueueContinuousSpeech = (
+  text: string,
+  options?: ContinuousSpeechEnqueueOptions,
+) => boolean;
+
 const looksLikeReachingCommand = (text: string): boolean => {
   const normalized = text.toLowerCase();
   return /\b(take|guide|lead|walk|navigate|bring)\s+(me\s+)?to\b/.test(normalized)
     || /\b(reach|grab|get)\b/.test(normalized);
+};
+
+const looksLikeARKitDestinationCommand = (text: string): boolean => {
+  const normalized = text.toLowerCase().trim();
+  if (!normalized) return false;
+
+  if (/\b(take|guide|lead|walk|navigate|bring)\s+(me\s+)?to\b/.test(normalized) ||
+      /\b(go\s+to|find|locate|where\s+is)\b/.test(normalized)) {
+    return true;
+  }
+
+  if (/\b(reach|grab|get|pick|touch|press|read|describe|what|who|how|why|when|scan|look)\b/.test(normalized)) {
+    return false;
+  }
+
+  const words = normalized
+    .replace(/[?.!,]+/g, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
+
+  return words.length > 0 &&
+    words.length <= 5 &&
+    /\b(\d+|room|rm|door\s*knob|doorknob|door\s*handle|stove|sink|fridge|shelf|cabinet|counter|table|chair)\b/.test(normalized);
 };
 
 const inferNavigationTargetFromCommand = (text?: string | null): string => {
@@ -130,6 +198,117 @@ const inferNavigationTargetFromCommand = (text?: string | null): string => {
   }
 
   return '';
+};
+
+const normalizeInstructionText = (text: string): string => {
+  return (text || '')
+    .toLowerCase()
+    .replace(/[’‘]/g, "'")
+    .replace(/[“”]/g, '"')
+    .replace(/[^a-z0-9.'"\s-]/g, ' ')
+    .replace(/-/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+};
+
+const extractDistanceMeters = (normalized: string): number | undefined => {
+  const numeric = normalized.match(/\b(\d+(?:\.\d+)?)\s*(centimeters?|cm|meters?|metres?|m|feet|foot|ft|steps?)\b/);
+  if (!numeric) return undefined;
+
+  const value = Number(numeric[1]);
+  if (!Number.isFinite(value)) return undefined;
+
+  const unit = numeric[2];
+  if (unit === 'cm' || unit.startsWith('centimeter')) return value / 100;
+  if (unit === 'feet' || unit === 'foot' || unit === 'ft') return value * 0.3048;
+  if (unit.startsWith('step')) return value * 0.75;
+  return value;
+};
+
+const extractInstructionIntent = (normalized: string): ContinuousSpeechIntent => {
+  if (/\b(arrived|arrival|destination|you are here|reached)\b/.test(normalized)) return 'arrival';
+  if (/\b(hold|raise|upright|straight up|camera sees forward|facing forward|phone)\b/.test(normalized)) return 'orientation';
+  if (/\b(switching|handoff|starting arkit|route guidance|object guidance)\b/.test(normalized)) return 'handoff';
+  if (/\b(unavailable|not available|could not|cannot|error|failed|try again)\b/.test(normalized)) return 'error';
+  if (/\b(stop|wait|pause|stay)\b/.test(normalized)) return 'stop';
+  if (/\b(u turn|turn around|around)\b/.test(normalized)) return 'uturn';
+  if (/\b(left)\b/.test(normalized)) return 'left';
+  if (/\b(right)\b/.test(normalized)) return 'right';
+  if (/\b(straight|forward|continue|ahead|walk)\b/.test(normalized)) return 'straight';
+  if (/\b(up|raise|tilt up)\b/.test(normalized)) return 'up';
+  if (/\b(down|lower|tilt down)\b/.test(normalized)) return 'down';
+  if (/\b(reaching|hand|object|target)\b/.test(normalized)) return 'reaching';
+  if (extractDistanceMeters(normalized) !== undefined) return 'distance';
+  return 'general';
+};
+
+const buildInstructionSignature = (text: string): ContinuousSpeechSignature => {
+  const normalized = normalizeInstructionText(text);
+  const distanceMeters = extractDistanceMeters(normalized);
+  const comparable = normalized
+    .replace(/\b\d+(?:\.\d+)?\s*(centimeters?|cm|meters?|metres?|m|feet|foot|ft|steps?)\b/g, '<distance>')
+    .replace(/\b(one|two|three|four|five|six|seven|eight|nine|ten)\s+(meters?|metres?|steps?|feet|foot)\b/g, '<distance>')
+    .replace(/\b(please|now|slowly|carefully|about|approximately|roughly|just)\b/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return {
+    normalized,
+    comparable,
+    intent: extractInstructionIntent(normalized),
+    distanceMeters,
+  };
+};
+
+const tokenSimilarity = (a: string, b: string): number => {
+  const aTokens = new Set(a.split(/\s+/).filter(token => token.length > 2 && token !== '<distance>'));
+  const bTokens = new Set(b.split(/\s+/).filter(token => token.length > 2 && token !== '<distance>'));
+  if (aTokens.size === 0 || bTokens.size === 0) return 0;
+
+  let shared = 0;
+  aTokens.forEach(token => {
+    if (bTokens.has(token)) shared++;
+  });
+  return shared / Math.max(aTokens.size, bTokens.size);
+};
+
+const areInstructionsNearDuplicate = (
+  next: ContinuousSpeechSignature,
+  previous?: ContinuousSpeechSignature | null,
+): boolean => {
+  if (!previous) return false;
+  if (next.normalized === previous.normalized) return true;
+
+  const distanceDelta =
+    next.distanceMeters !== undefined && previous.distanceMeters !== undefined
+      ? Math.abs(next.distanceMeters - previous.distanceMeters)
+      : undefined;
+
+  if (next.comparable === previous.comparable) {
+    return distanceDelta === undefined || distanceDelta < CONTINUOUS_TTS_DISTANCE_REFRESH_METERS;
+  }
+
+  const sameIntent = next.intent === previous.intent && next.intent !== 'general';
+  const similarity = tokenSimilarity(next.comparable, previous.comparable);
+
+  if (sameIntent && similarity >= 0.65) {
+    return distanceDelta === undefined || distanceDelta < CONTINUOUS_TTS_DISTANCE_REFRESH_METERS;
+  }
+
+  return similarity >= 0.86;
+};
+
+const isResponsiveSpeechChange = (
+  next: ContinuousSpeechSignature,
+  current?: ContinuousSpeechSignature | null,
+): boolean => {
+  if (!current || areInstructionsNearDuplicate(next, current)) return false;
+
+  if (['arrival', 'orientation', 'stop', 'error', 'handoff'].includes(next.intent)) {
+    return true;
+  }
+
+  return next.intent !== 'general' && current.intent !== 'general' && next.intent !== current.intent;
 };
 
 const prewarmDAv2InBackground = (reason: string) => {
@@ -170,11 +349,17 @@ function AppInner(): React.JSX.Element {
   useEffect(() => { settingsRef.current = settings; }, [settings]);
 
   // ── Posture sensing (orientation + proximity) ───────────────────────────
-  const { isStraightRef, isAvailableRef: orientationAvailableRef } = useDeviceOrientation();
+  const {
+    isStraightRef,
+    isAvailableRef: orientationAvailableRef,
+    orientationSnapshotRef,
+    maxForwardTiltDegrees,
+  } = useDeviceOrientation();
   const { isNearRef, isAvailableRef: proximityAvailableRef } = useProximitySensor(
     Platform.OS === 'ios' && !settings.useWearablesCamera
   );
   const lastPostureWarningRef = useRef(0);
+  const lastPostureLogRef = useRef(0);
 
   // Keep SFX wearables-mode flag in sync with settings
   useEffect(() => {
@@ -208,6 +393,8 @@ function AppInner(): React.JSX.Element {
   const continuousSpeechQueueRef = useRef<string[]>([]);
   const continuousSpeechDrainingRef = useRef(false);
   const continuousSpeechCurrentTextRef = useRef('');
+  const continuousLastAcceptedSpeechRef = useRef<ContinuousSpeechRecord | null>(null);
+  const enqueueContinuousSpeechRef = useRef<EnqueueContinuousSpeech>(() => false);
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
   const prefetchedPhotoRef = useRef<string | null>(null);
   const activeCapturePromiseRef = useRef<Promise<string> | null>(null);
@@ -548,21 +735,45 @@ function AppInner(): React.JSX.Element {
   // ────────────────────────────────────────────────────────────────────────
   const getPostureStatus = useCallback(() => {
     if (settingsRef.current.useWearablesCamera) {
-      return { ok: true, isNear: false, isStraight: true, hasSignal: false };
+      return {
+        ok: true,
+        isNear: false,
+        isStraight: true,
+        hasSignal: false,
+        tiltFromUprightDegrees: 0,
+        maxForwardTiltDegrees,
+      };
     }
 
     const hasOrientation = orientationAvailableRef.current;
     const hasProximity = proximityAvailableRef.current;
 
     if (!hasOrientation && !hasProximity) {
-      return { ok: true, isNear: false, isStraight: true, hasSignal: false };
+      return {
+        ok: true,
+        isNear: false,
+        isStraight: true,
+        hasSignal: false,
+        tiltFromUprightDegrees: 0,
+        maxForwardTiltDegrees,
+      };
     }
 
     const isNear = hasProximity ? isNearRef.current : false;
     const isStraight = hasOrientation ? isStraightRef.current : true;
+    const tiltFromUprightDegrees = hasOrientation
+      ? orientationSnapshotRef.current.tiltFromUprightDegrees
+      : 0;
     const ok = !isNear && isStraight;
 
-    return { ok, isNear, isStraight, hasSignal: true };
+    return {
+      ok,
+      isNear,
+      isStraight,
+      hasSignal: true,
+      tiltFromUprightDegrees,
+      maxForwardTiltDegrees,
+    };
   }, []);
 
   const buildPostureMessage = useCallback((status: {
@@ -570,22 +781,32 @@ function AppInner(): React.JSX.Element {
     isStraight: boolean;
   }): string => {
     if (status.isNear && !status.isStraight) {
-      return 'Move the phone away from your face and hold it straight with the camera facing forward.';
+      return 'Move the phone away from your face and hold it upright so the camera sees forward.';
     }
     if (status.isNear) {
-      return 'Move the phone away from your face and hold it straight with the camera facing forward.';
+      return 'Move the phone away from your face and hold it upright so the camera sees forward.';
     }
     if (!status.isStraight) {
-      return 'Hold the phone straight with the camera facing forward.';
+      return 'Hold the phone upright so the camera sees forward.';
     }
     return '';
   }, []);
 
-  const maybeAnnouncePosture = useCallback(async (_context: 'capture' | 'continuous') => {
+  const maybeAnnouncePosture = useCallback(async (context: 'capture' | 'continuous') => {
     const status = getPostureStatus();
     if (status.ok) return false;
 
     const now = Date.now();
+    const postureDetail =
+      `context=${context} near=${status.isNear} straight=${status.isStraight} ` +
+      `tilt=${status.tiltFromUprightDegrees.toFixed(1)}deg max=${status.maxForwardTiltDegrees}deg`;
+
+    if (now - lastPostureLogRef.current >= POSTURE_LOG_THROTTLE_MS) {
+      console.warn(`📐 [Posture] Blocking ${context}: ${postureDetail}`);
+      debugLogger.logAPI('📐 Posture gate blocked capture', postureDetail);
+      lastPostureLogRef.current = now;
+    }
+
     if (now - lastPostureWarningRef.current < POSTURE_WARNING_COOLDOWN_MS) return false;
 
     const message = buildPostureMessage(status);
@@ -599,11 +820,19 @@ function AppInner(): React.JSX.Element {
     AccessibilityInfo.announceForAccessibility(message);
 
     if (!screenReaderEnabledRef.current) {
-      try {
-        await speachesSentenceChunker.synthesizeSpeechChunked(message);
-      } catch (e: any) {
-        if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
-          console.warn('⚠️ Posture TTS error (non-fatal):', e?.message || e);
+      if (context === 'continuous') {
+        const queued = enqueueContinuousSpeechRef.current(message, {
+          source: 'posture',
+          allowPreempt: true,
+        });
+        console.log(`📐 [Posture] Warning ${queued ? 'queued' : 'coalesced'}: ${postureDetail}`);
+      } else {
+        try {
+          await speachesSentenceChunker.synthesizeSpeechChunked(message);
+        } catch (e: any) {
+          if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+            console.warn('⚠️ Posture TTS error (non-fatal):', e?.message || e);
+          }
         }
       }
     }
@@ -930,6 +1159,7 @@ function AppInner(): React.JSX.Element {
     continuousSpeechQueueRef.current = [];
     continuousSpeechCurrentTextRef.current = '';
     continuousSpeechDrainingRef.current = false;
+    continuousLastAcceptedSpeechRef.current = null;
   }, []);
 
   const drainContinuousSpeechQueue = useCallback(async () => {
@@ -959,6 +1189,7 @@ function AppInner(): React.JSX.Element {
         }
 
         if (
+          continuousTtsGenerationRef.current === drainGeneration &&
           continuousBackendInFlightRef.current &&
           isContinuousModeRunning.current &&
           !continuousModeAbortRef.current &&
@@ -983,29 +1214,112 @@ function AppInner(): React.JSX.Element {
     }
   }, []);
 
-  const enqueueContinuousSpeech = useCallback((text: string) => {
+  const enqueueContinuousSpeech = useCallback((
+    text: string,
+    options?: ContinuousSpeechEnqueueOptions,
+  ): boolean => {
     const spoken = (text || '').trim();
-    if (!spoken || continuousModeAbortRef.current || isEmergencyStopped.current) return;
-
-    const pending = continuousSpeechQueueRef.current;
-    const alreadySpeaking = continuousSpeechDrainingRef.current &&
-      continuousSpeechCurrentTextRef.current === spoken;
-    const alreadyPending = pending.length > 0 && pending[pending.length - 1] === spoken;
-
-    if (alreadySpeaking || alreadyPending) {
-      console.log('🔄 [ContinuousMode] Skipping duplicate queued TTS');
-      return;
+    if (
+      !spoken ||
+      (continuousModeAbortRef.current && options?.ignoreAbort !== true) ||
+      isEmergencyStopped.current
+    ) {
+      return false;
     }
 
-    // Let the current instruction finish, but collapse any unsaid backlog into
-    // the newest backend guidance so speech does not lag behind navigation.
-    continuousSpeechQueueRef.current = [spoken];
+    const source = options?.source || 'backend';
+    const force = options?.force === true;
+    const nextSignature = buildInstructionSignature(spoken);
+    const pending = continuousSpeechQueueRef.current;
+    const currentText = continuousSpeechCurrentTextRef.current;
+    const currentSignature = currentText ? buildInstructionSignature(currentText) : null;
+    const pendingText = pending.length > 0 ? pending[pending.length - 1] : '';
+    const pendingSignature = pendingText ? buildInstructionSignature(pendingText) : null;
+    const lastAccepted = continuousLastAcceptedSpeechRef.current;
+    const now = Date.now();
+
+    const logCoalesced = (reason: string, matchedText?: string) => {
+      const detail =
+        `source=${source} reason=${reason} intent=${nextSignature.intent} ` +
+        `text="${spoken.substring(0, 90)}"` +
+        (matchedText ? ` matched="${matchedText.substring(0, 90)}"` : '');
+      console.log(`🔇 [ContinuousMode/TTS] Coalesced ${reason}: "${spoken.substring(0, 70)}"`);
+      debugLogger.logAPI('🔇 Continuous TTS coalesced', detail);
+    };
+
+    if (!force) {
+      if (
+        continuousSpeechDrainingRef.current &&
+        currentSignature &&
+        areInstructionsNearDuplicate(nextSignature, currentSignature)
+      ) {
+        logCoalesced('already-speaking-near-duplicate', currentText);
+        return false;
+      }
+
+      if (pendingSignature && areInstructionsNearDuplicate(nextSignature, pendingSignature)) {
+        logCoalesced('already-pending-near-duplicate', pendingText);
+        return false;
+      }
+
+      if (
+        lastAccepted &&
+        now - lastAccepted.acceptedAt < CONTINUOUS_TTS_REPEAT_SUPPRESSION_MS &&
+        areInstructionsNearDuplicate(nextSignature, lastAccepted.signature)
+      ) {
+        logCoalesced('recently-accepted-near-duplicate', lastAccepted.text);
+        return false;
+      }
+    }
+
+    const shouldPreempt =
+      options?.allowPreempt !== false &&
+      continuousSpeechDrainingRef.current &&
+      currentSignature &&
+      isResponsiveSpeechChange(nextSignature, currentSignature);
+
+    continuousLastAcceptedSpeechRef.current = {
+      text: spoken,
+      signature: nextSignature,
+      acceptedAt: now,
+      source,
+    };
+
+    if (shouldPreempt) {
+      const detail =
+        `source=${source} from=${currentSignature?.intent || 'none'} to=${nextSignature.intent} ` +
+        `old="${currentText.substring(0, 90)}" new="${spoken.substring(0, 90)}"`;
+      console.log(`⚡ [ContinuousMode/TTS] Preempting speech: ${detail}`);
+      debugLogger.logAPI('⚡ Continuous TTS preempted current guidance', detail);
+
+      continuousTtsGenerationRef.current++;
+      continuousSpeechQueueRef.current = [spoken];
+      continuousSpeechCurrentTextRef.current = '';
+      continuousSpeechDrainingRef.current = false;
+      continuousTtsSpeakingRef.current = false;
+      setIsSpeaking(false);
+    } else {
+      const detail =
+        `source=${source} intent=${nextSignature.intent} ` +
+        `distance=${nextSignature.distanceMeters?.toFixed(1) || 'n/a'} ` +
+        `text="${spoken.substring(0, 90)}"`;
+      console.log(`🔊 [ContinuousMode/TTS] Queued (${source}/${nextSignature.intent}): "${spoken.substring(0, 70)}"`);
+      debugLogger.logAPI('🔊 Continuous TTS queued', detail);
+
+      // Let the current instruction finish, but collapse any unsaid backlog into
+      // the newest backend guidance so speech does not lag behind navigation.
+      continuousSpeechQueueRef.current = [spoken];
+    }
+
     drainContinuousSpeechQueue().catch((e: any) => {
       if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
         console.warn('🔄 [ContinuousMode] TTS queue drain failed:', e?.message);
       }
     });
+    return true;
   }, [drainContinuousSpeechQueue]);
+
+  enqueueContinuousSpeechRef.current = enqueueContinuousSpeech;
 
   const waitForContinuousSpeechQueueIdle = useCallback(async (options?: { ignoreAbort?: boolean }) => {
     while (
@@ -1019,12 +1333,12 @@ function AppInner(): React.JSX.Element {
 
   const speakContinuousSpeechAndWait = useCallback(async (
     text: string,
-    options?: { ignoreAbort?: boolean }
+    options?: { ignoreAbort?: boolean } & ContinuousSpeechEnqueueOptions
   ) => {
     const spoken = (text || '').trim();
     if (!spoken || isEmergencyStopped.current) return;
 
-    enqueueContinuousSpeech(spoken);
+    enqueueContinuousSpeech(spoken, options);
     await waitForContinuousSpeechQueueIdle(options);
   }, [enqueueContinuousSpeech, waitForContinuousSpeechQueueIdle]);
 
@@ -1683,7 +1997,10 @@ function AppInner(): React.JSX.Element {
         // while another instruction is mid-sentence. The speech queue finishes
         // the current utterance and keeps only the newest pending guidance.
         if (result.text && !continuousModeAbortRef.current && !isEmergencyStopped.current) {
-          enqueueContinuousSpeech(result.text);
+          enqueueContinuousSpeech(result.text, {
+            source: loopMode || 'backend',
+            allowPreempt: true,
+          });
         } else if (isNullResponse) {
           // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
           const nullCooldown = fastReachingCycle
@@ -2237,13 +2554,23 @@ function AppInner(): React.JSX.Element {
       finalTranscriptRef.current = '';
 
       // ── iOS ARKit navigation on first response (opt-in setting) ─────────
+      const wantsARKitDestination = looksLikeARKitDestinationCommand(command);
       if (
         Platform.OS === 'ios' &&
         (
           result.navigation === true ||
           result.navigation_ios === true ||
           result.navigation_arkit === true ||
-          result.navigation_pipeline === 'arkit'
+          (
+            result.navigation_pipeline === 'arkit' &&
+            (
+              wantsARKitDestination ||
+              (
+                result.reaching_ios !== true &&
+                result.reaching_flag !== true
+              )
+            )
+          )
         )
       ) {
         const handled = await handleARKitNavigation(result, {
