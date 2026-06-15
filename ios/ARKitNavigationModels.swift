@@ -25,6 +25,9 @@ struct IMUState {
     var isCalibrating: Bool
     var calibrationStepCount: Int
     var bearing: Double
+    var stepStability: Double
+    var headingReliability: Double
+    var pdrUncertaintyMeters: Double
 
     init(
         position: Position = Position(),
@@ -38,7 +41,10 @@ struct IMUState {
         isStepCalibrationValid: Bool = false,
         isCalibrating: Bool = false,
         calibrationStepCount: Int = 0,
-        bearing: Double = 0
+        bearing: Double = 0,
+        stepStability: Double = 0.35,
+        headingReliability: Double = 0.35,
+        pdrUncertaintyMeters: Double = 0.85
     ) {
         self.position = position
         self.stepCount = stepCount
@@ -52,6 +58,9 @@ struct IMUState {
         self.isCalibrating = isCalibrating
         self.calibrationStepCount = calibrationStepCount
         self.bearing = bearing
+        self.stepStability = stepStability
+        self.headingReliability = headingReliability
+        self.pdrUncertaintyMeters = pdrUncertaintyMeters
     }
 }
 

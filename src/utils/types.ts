@@ -26,6 +26,9 @@ export interface WorkflowResponse {
   route_map_id?: string;
   route_map_name?: string;
   navigation_error?: string;
+  local_llm_used?: boolean;
+  llm_provider?: string;
+  llm_fallback_reason?: string;
   reaching_flag: boolean;
   reaching_completed?: boolean;
   

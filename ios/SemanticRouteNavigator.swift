@@ -170,6 +170,9 @@ struct SemanticRouteMap: Identifiable, Codable, Equatable {
     var landmarks: [SemanticRouteLandmark]
     var keyframes: [SemanticRouteKeyframe]?
     var visualFingerprints: [String: ARVisualFingerprint]? = nil
+    var captureQuality: SemanticRouteCaptureQuality? = nil
+    var visualAliasGroups: [SemanticRouteVisualAliasGroup]? = nil
+    var visualSamplesVersion: Int? = nil
     var source: String?
     var notes: String?
 
@@ -207,6 +210,24 @@ enum SemanticNavigationPhase: String {
     }
 }
 
+enum RouteLocalizationStatus: String, Codable, Equatable {
+    case initializing
+    case locked
+    case ambiguous
+    case recovering
+    case lost
+
+    var displayName: String {
+        switch self {
+        case .initializing: return "Initializing"
+        case .locked: return "Route locked"
+        case .ambiguous: return "Route ambiguous"
+        case .recovering: return "Recovering"
+        case .lost: return "Route lost"
+        }
+    }
+}
+
 enum SemanticSpeechPriority {
     case regular
     case priority
@@ -233,6 +254,34 @@ struct SemanticRouteObservation: Equatable {
     var confidence: Double
     var crossTrackError: Double?
     var visualMatchConfidence: Double?
+    var routeStatus: RouteLocalizationStatus = .initializing
+    var beliefConfidence: Double = 0
+    var beliefMargin: Double = 0
+    var uncertaintyMeters: Double = 0
+    var isInstructionSafe: Bool = false
+    var evidenceSummary: String = ""
+}
+
+struct SemanticRouteCaptureQuality: Codable, Equatable {
+    var keyframeCount: Int
+    var visualSampleCount: Int
+    var aliasedVisualSampleCount: Int
+    var routeDistanceMeters: Double
+    var averageKeyframeSpacingMeters: Double?
+    var hasMinimumSpatialEvidence: Bool
+    var hasMinimumVisualEvidence: Bool
+    var warnings: [String]
+
+    var isSufficientForGuidance: Bool {
+        hasMinimumSpatialEvidence && hasMinimumVisualEvidence && aliasedVisualSampleCount <= max(1, visualSampleCount / 3)
+    }
+}
+
+struct SemanticRouteVisualAliasGroup: Identifiable, Codable, Equatable {
+    var id: String
+    var fingerprintIds: [String]
+    var representativeNames: [String]
+    var similarity: Double
 }
 
 struct SemanticRouteRAGContext: Codable, Equatable {
@@ -252,6 +301,8 @@ struct SemanticRouteRAGContext: Codable, Equatable {
     var phase: String
     var instruction: String
     var confidence: Double
+    var routeStatus: String
+    var isInstructionSafe: Bool
     var routeRemainingMeters: Double
     var currentSegment: Segment?
     var nearbyLandmarks: [String]
@@ -274,6 +325,7 @@ final class SemanticRouteNavigator: ObservableObject {
     @Published private(set) var currentInstruction: String = "Capture or load a semantic map."
     @Published private(set) var recoveryReason: String?
     @Published private(set) var lastObservation: SemanticRouteObservation?
+    @Published private(set) var routeLocalizationStatus: RouteLocalizationStatus = .initializing
     @Published private(set) var ragContextJSON: String = "{}"
     @Published private(set) var capturedPointCount: Int = 0
     @Published private(set) var capturedTurnCount: Int = 0
@@ -309,6 +361,9 @@ final class SemanticRouteNavigator: ObservableObject {
     private var pendingRouteAdvance: PendingRouteAdvance?
     private var shouldSpeakLandmarks = true
     private var shouldEnableErrorRecovery = true
+    private var routeEvidenceWindow: [RouteEvidence] = []
+    private var routeBeliefState = RouteBeliefState.empty
+    private var lastRouteUpdatePDRDelta: Double = 0
 
     private let arrivalThresholdMeters = 0.55
     private let destinationProximityMeters = 0.75
@@ -350,6 +405,15 @@ final class SemanticRouteNavigator: ObservableObject {
     private let recoveryCriticalCrossTrackMeters = 1.85
     private let destinationCorridorExtraMeters = 0.55
     private let destinationCorridorMaxMeters = 1.65
+    private let routeBeliefWindowSeconds: TimeInterval = 2.4
+    private let routeBeliefBucketMeters = 0.85
+    private let routeBeliefMinimumLockedConfidence = 0.62
+    private let routeBeliefMinimumInstructionMargin = 0.14
+    private let routeBeliefMaximumInstructionUncertainty = 1.70
+    private let routeBeliefLargeCorrectionSupportMeters = 1.05
+    private let routeBeliefLargeCorrectionMinimumSamples = 3
+    private let routeBeliefLargeCorrectionMinimumDuration: TimeInterval = 0.75
+    private let routeBeliefPhysicalSlackMeters = 0.85
 
     private typealias RouteProjection = (
         alongTrackMeters: Double,
@@ -379,6 +443,50 @@ final class SemanticRouteNavigator: ObservableObject {
         var sampleCount: Int
     }
 
+    private struct RouteEvidence {
+        let stepIndex: Int
+        let progressMeters: Double
+        let confidence: Double
+        let uncertaintyMeters: Double
+        let source: String
+        let capturedAt: Date
+        let visualConfidence: Double?
+        let crossTrackMeters: Double?
+        let summary: String
+    }
+
+    private struct RouteBeliefCandidate {
+        let stepIndex: Int
+        let progressMeters: Double
+        let confidence: Double
+        let uncertaintyMeters: Double
+        let supportCount: Int
+        let sources: Set<String>
+        let summary: String
+    }
+
+    private struct RouteBeliefState {
+        var status: RouteLocalizationStatus
+        var candidates: [RouteBeliefCandidate]
+        var confidence: Double
+        var margin: Double
+        var uncertaintyMeters: Double
+        var isInstructionSafe: Bool
+        var evidenceSummary: String
+        var updatedAt: Date?
+
+        static let empty = RouteBeliefState(
+            status: .initializing,
+            candidates: [],
+            confidence: 0,
+            margin: 0,
+            uncertaintyMeters: 0,
+            isInstructionSafe: false,
+            evidenceSummary: "No route evidence yet.",
+            updatedAt: nil
+        )
+    }
+
     private struct NavigationStart {
         var nodePath: [String]
         var initialProgressMeters: Double
@@ -396,6 +504,8 @@ final class SemanticRouteNavigator: ObservableObject {
         let keyframeID: String?
         let landmarkID: String?
         let landmarkName: String?
+        let fingerprintID: String
+        let isAliased: Bool
         let cue: String?
     }
 
@@ -403,6 +513,7 @@ final class SemanticRouteNavigator: ObservableObject {
         let stepIndex: Int
         let progressMeters: Double
         let fingerprint: ARVisualFingerprint
+        let fingerprintID: String
         let keyframeID: String?
         let landmarkID: String?
         let landmarkName: String?
@@ -955,6 +1066,16 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         map.updatedAt = Date()
         let cleaned = Self.sanitizedMap(map)
+        if let quality = cleaned.captureQuality,
+           !quality.isSufficientForGuidance {
+            currentInstruction = quality.warnings.first ?? "Add more visual route evidence before saving."
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            activeMapDraft = cleaned
+            activeMap = cleaned
+            refreshCaptureMetrics(for: cleaned)
+            rebuildRAGContext()
+            return false
+        }
         upsertMap(cleaned, persist: true)
         activeMap = cleaned
         activeMapDraft = nil
@@ -1057,6 +1178,7 @@ final class SemanticRouteNavigator: ObservableObject {
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
         resetRouteCorrectionGuards()
+        resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = Date().addingTimeInterval(guidanceIntroProtectionSeconds)
         recoveryReason = nil
         phase = .navigating
@@ -1090,6 +1212,7 @@ final class SemanticRouteNavigator: ObservableObject {
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
         resetRouteCorrectionGuards()
+        resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = nil
         capturedPointCount = activeMap?.nodes.count ?? 0
         capturedTurnCount = activeMap?.nodes.filter { $0.kind == .intersection }.count ?? 0
@@ -1137,6 +1260,7 @@ final class SemanticRouteNavigator: ObservableObject {
             timestamp: Date().timeIntervalSinceReferenceDate
         )
         let pdrDelta = pdrDistanceDelta(from: imuState)
+        lastRouteUpdatePDRDelta = pdrDelta
         let expectedHeading = step.edge.bearingDegrees
         let liveHeading = arHeading ?? imuState.bearing
         let headingError = abs(SemanticRouteMath.signedAngleDifference(liveHeading, expectedHeading))
@@ -1144,6 +1268,14 @@ final class SemanticRouteNavigator: ObservableObject {
         let progressScale = max(0, cos(min(headingError, 90) * .pi / 180.0))
         let gatedDelta = headingError > 65 ? pdrDelta * 0.2 : pdrDelta * progressScale
         segmentProgressMeters += max(0, gatedDelta)
+        recordRouteEvidence(
+            stepIndex: currentStepIndex,
+            progressMeters: segmentProgressMeters,
+            confidence: imuState.isMoving ? 0.54 : 0.44,
+            uncertaintyMeters: pdrUncertaintyMeters(imuState: imuState, pdrDelta: pdrDelta, headingError: headingError),
+            source: "pdr_prediction",
+            summary: "PDR"
+        )
 
         var crossTrackError: Double?
         var routeProjection: RouteProjection?
@@ -1154,6 +1286,17 @@ final class SemanticRouteNavigator: ObservableObject {
             let projection = Self.projectDetailed(arPoint, onto: step)
             routeProjection = projection
             crossTrackError = projection.crossTrackMeters
+            if arLocalized {
+                recordRouteEvidence(
+                    stepIndex: currentStepIndex,
+                    progressMeters: projection.alongTrackMeters,
+                    confidence: max(0.28, 0.82 - min(projection.crossTrackMeters / 4.0, 0.42)),
+                    uncertaintyMeters: 0.45 + min(projection.crossTrackMeters, 2.5) * 0.55,
+                    source: "ar_projection",
+                    crossTrackMeters: projection.crossTrackMeters,
+                    summary: "AR"
+                )
+            }
             if arLocalized && projection.crossTrackMeters <= crossTrackRecoveryThreshold {
                 if let correctedProgress = guardedSegmentProgressCorrection(
                     toward: projection.alongTrackMeters,
@@ -1181,6 +1324,22 @@ final class SemanticRouteNavigator: ObservableObject {
             } else if arLocalized {
                 observationConfidence = 0.48
             }
+        }
+
+        if let visualMatch,
+           visualMatch.confidence >= visualRouteMinimumConfidence {
+            recordRouteEvidence(
+                stepIndex: visualMatch.stepIndex,
+                progressMeters: visualMatch.progressMeters,
+                confidence: min(0.96, 0.60 + visualMatch.confidence * 0.32 - (visualMatch.isAliased ? 0.18 : 0)),
+                uncertaintyMeters: visualMatch.isAliased
+                    ? 1.85
+                    : (visualMatch.confidence >= visualRouteSnapConfidence ? 0.85 : 1.35),
+                source: "visual_route",
+                visualConfidence: visualMatch.confidence,
+                summary: visualMatch.landmarkName.map { visualMatch.isAliased ? "Aliased visual \($0)" : "Visual \($0)" }
+                    ?? (visualMatch.isAliased ? "Aliased visual" : "Visual")
+            )
         }
 
         if let visualMatch,
@@ -1224,8 +1383,19 @@ final class SemanticRouteNavigator: ObservableObject {
             source: arPosition == nil ? "pdr" : "ar_pdr",
             confidence: confidence,
             crossTrackError: crossTrackError,
-            visualMatchConfidence: visualMatch?.confidence
+            visualMatchConfidence: visualMatch?.confidence,
+            routeStatus: routeLocalizationStatus,
+            beliefConfidence: routeBeliefState.confidence,
+            beliefMargin: routeBeliefState.margin,
+            uncertaintyMeters: routeBeliefState.uncertaintyMeters,
+            isInstructionSafe: routeBeliefState.isInstructionSafe,
+            evidenceSummary: routeBeliefState.evidenceSummary
         )
+
+        if handleRouteBeliefHoldIfNeeded() {
+            rebuildRAGContext()
+            return
+        }
 
         if advanceFromVisualDecisionPoint(visualMatch, on: step) {
             rebuildRAGContext()
@@ -1327,6 +1497,7 @@ final class SemanticRouteNavigator: ObservableObject {
             phase = .navigating
             recoveryReason = nil
             resetRouteCorrectionGuards()
+            resetRouteBelief(status: .locked)
             updateInstruction(forceSpeech: true)
         } else {
             currentInstruction = "Nearest graph edge is \(Self.sanitizedSpokenLabel(edgeMatch.edge.spokenContext, fallback: "a saved route segment"))."
@@ -1342,7 +1513,13 @@ final class SemanticRouteNavigator: ObservableObject {
             source: arPosition == nil ? "pdr" : "ar",
             confidence: arLocalized ? 0.76 : 0.45,
             crossTrackError: nil,
-            visualMatchConfidence: nil
+            visualMatchConfidence: nil,
+            routeStatus: routeLocalizationStatus,
+            beliefConfidence: routeBeliefState.confidence,
+            beliefMargin: routeBeliefState.margin,
+            uncertaintyMeters: routeBeliefState.uncertaintyMeters,
+            isInstructionSafe: routeBeliefState.isInstructionSafe,
+            evidenceSummary: routeBeliefState.evidenceSummary
         )
     }
 
@@ -1479,9 +1656,13 @@ final class SemanticRouteNavigator: ObservableObject {
             capturedDistanceMeters += currentSegmentDraftMeters
         }
         if phase == .mapping {
-            mappingQualityText = capturedPointCount < 2
-                ? "Need Point A and destination"
-                : String(format: "%d route points, %.1fm", capturedPointCount, capturedDistanceMeters)
+            if let warning = map.captureQuality?.warnings.first {
+                mappingQualityText = warning
+            } else {
+                mappingQualityText = capturedPointCount < 2
+                    ? "Need Point A and destination"
+                    : String(format: "%d route points, %.1fm", capturedPointCount, capturedDistanceMeters)
+            }
         } else {
             mappingQualityText = String(format: "%d points, %.1fm", capturedPointCount, capturedDistanceMeters)
         }
@@ -1530,6 +1711,231 @@ final class SemanticRouteNavigator: ObservableObject {
         map.keyframes = Array(keyframes.suffix(120))
     }
 
+    private func resetRouteBelief(status: RouteLocalizationStatus = .initializing) {
+        routeEvidenceWindow.removeAll()
+        var empty = RouteBeliefState.empty
+        empty.status = status
+        routeBeliefState = empty
+        routeLocalizationStatus = status
+    }
+
+    private func recordRouteEvidence(
+        stepIndex: Int,
+        progressMeters: Double,
+        confidence: Double,
+        uncertaintyMeters: Double,
+        source: String,
+        visualConfidence: Double? = nil,
+        crossTrackMeters: Double? = nil,
+        summary: String
+    ) {
+        guard stepIndex >= 0, stepIndex < routeSteps.count else { return }
+        let step = routeSteps[stepIndex]
+        let evidence = RouteEvidence(
+            stepIndex: stepIndex,
+            progressMeters: min(max(progressMeters, 0), step.edge.distanceMeters),
+            confidence: min(max(confidence, 0), 1),
+            uncertaintyMeters: max(0.20, uncertaintyMeters),
+            source: source,
+            capturedAt: Date(),
+            visualConfidence: visualConfidence,
+            crossTrackMeters: crossTrackMeters,
+            summary: summary
+        )
+        routeEvidenceWindow.append(evidence)
+        refreshRouteBeliefState(now: evidence.capturedAt)
+    }
+
+    private func refreshRouteBeliefState(now: Date) {
+        routeEvidenceWindow.removeAll { now.timeIntervalSince($0.capturedAt) > routeBeliefWindowSeconds }
+        guard !routeEvidenceWindow.isEmpty else {
+            routeBeliefState = RouteBeliefState.empty
+            routeLocalizationStatus = routeBeliefState.status
+            return
+        }
+
+        struct Accumulator {
+            var weightedProgress: Double = 0
+            var confidenceSum: Double = 0
+            var uncertaintySum: Double = 0
+            var supportCount: Int = 0
+            var sources: Set<String> = []
+            var latestSummary: String = ""
+        }
+
+        var accumulators: [String: Accumulator] = [:]
+        for evidence in routeEvidenceWindow {
+            let bucket = Int((evidence.progressMeters / routeBeliefBucketMeters).rounded())
+            let key = "\(evidence.stepIndex):\(bucket)"
+            var accumulator = accumulators[key] ?? Accumulator()
+            accumulator.weightedProgress += evidence.progressMeters * max(evidence.confidence, 0.05)
+            accumulator.confidenceSum += evidence.confidence
+            accumulator.uncertaintySum += evidence.uncertaintyMeters
+            accumulator.supportCount += 1
+            accumulator.sources.insert(evidence.source)
+            accumulator.latestSummary = evidence.summary
+            accumulators[key] = accumulator
+        }
+
+        let candidates = accumulators.compactMap { key, accumulator -> RouteBeliefCandidate? in
+            guard accumulator.supportCount > 0,
+                  let stepID = key.split(separator: ":").first,
+                  let stepIndex = Int(String(stepID)) else {
+                return nil
+            }
+            let averageConfidence = accumulator.confidenceSum / Double(accumulator.supportCount)
+            let supportRatio = Double(accumulator.supportCount) / Double(max(routeEvidenceWindow.count, 1))
+            let diversityBonus = min(0.18, Double(max(0, accumulator.sources.count - 1)) * 0.08)
+            let supportBonus = min(0.16, supportRatio * 0.18)
+            let uncertainty = accumulator.uncertaintySum / Double(accumulator.supportCount) + routeBeliefBucketMeters / 2.0
+            let uncertaintyPenalty = min(0.30, uncertainty / 8.0)
+            let confidence = min(0.98, max(0.05, averageConfidence + diversityBonus + supportBonus - uncertaintyPenalty))
+            let progress = accumulator.weightedProgress / max(accumulator.confidenceSum, 0.05)
+            return RouteBeliefCandidate(
+                stepIndex: stepIndex,
+                progressMeters: progress,
+                confidence: confidence,
+                uncertaintyMeters: uncertainty,
+                supportCount: accumulator.supportCount,
+                sources: accumulator.sources,
+                summary: accumulator.latestSummary
+            )
+        }
+        .sorted { $0.confidence > $1.confidence }
+
+        guard let best = candidates.first else {
+            routeBeliefState = RouteBeliefState.empty
+            routeLocalizationStatus = routeBeliefState.status
+            return
+        }
+
+        let competing = candidates.dropFirst().first { !isSameBeliefPlace($0, best) }
+        let margin = competing.map { best.confidence - $0.confidence } ?? best.confidence
+        let status: RouteLocalizationStatus
+        if best.confidence < 0.34 {
+            status = .lost
+        } else if competing != nil && margin < routeBeliefMinimumInstructionMargin {
+            status = .ambiguous
+        } else if best.uncertaintyMeters > 2.6 {
+            status = .recovering
+        } else if best.confidence >= routeBeliefMinimumLockedConfidence {
+            status = .locked
+        } else {
+            status = .recovering
+        }
+
+        let instructionSafe = status == .locked &&
+            margin >= routeBeliefMinimumInstructionMargin &&
+            best.uncertaintyMeters <= routeBeliefMaximumInstructionUncertainty
+        let competingText = competing.map {
+            String(format: " vs step %d %.1fm", $0.stepIndex + 1, $0.progressMeters)
+        } ?? ""
+        let summary = String(
+            format: "%@ step %d %.1fm %.0f%%%@",
+            best.summary,
+            best.stepIndex + 1,
+            best.progressMeters,
+            best.confidence * 100,
+            competingText
+        )
+
+        routeBeliefState = RouteBeliefState(
+            status: status,
+            candidates: candidates,
+            confidence: best.confidence,
+            margin: margin,
+            uncertaintyMeters: best.uncertaintyMeters,
+            isInstructionSafe: instructionSafe,
+            evidenceSummary: summary,
+            updatedAt: now
+        )
+        routeLocalizationStatus = status
+    }
+
+    private func isSameBeliefPlace(_ lhs: RouteBeliefCandidate, _ rhs: RouteBeliefCandidate) -> Bool {
+        lhs.stepIndex == rhs.stepIndex &&
+            abs(lhs.progressMeters - rhs.progressMeters) <= routeBeliefLargeCorrectionSupportMeters
+    }
+
+    private func pdrUncertaintyMeters(imuState: IMUState, pdrDelta: Double, headingError: Double) -> Double {
+        var uncertainty = max(imuState.pdrUncertaintyMeters, 0.45) + pdrDelta * 0.35
+        if !imuState.isMoving { uncertainty += 0.20 }
+        if headingError > 45 { uncertainty += min(0.85, (headingError - 45) / 90.0) }
+        if !imuState.isStepCalibrationValid { uncertainty += 0.35 }
+        return uncertainty
+    }
+
+    private func routeBeliefSupportsLargeCorrection(
+        stepIndex: Int,
+        observedProgress: Double,
+        source: String,
+        visualConfidence: Double?
+    ) -> Bool {
+        let now = Date()
+        let nearbyEvidence = routeEvidenceWindow.filter { evidence in
+            evidence.stepIndex == stepIndex &&
+                abs(evidence.progressMeters - observedProgress) <= routeBeliefLargeCorrectionSupportMeters &&
+                now.timeIntervalSince(evidence.capturedAt) <= routeBeliefWindowSeconds
+        }
+        guard nearbyEvidence.count >= routeBeliefLargeCorrectionMinimumSamples else { return false }
+
+        let sources = Set(nearbyEvidence.map(\.source))
+        let timestamps = nearbyEvidence.map(\.capturedAt)
+        let duration = (timestamps.max() ?? now).timeIntervalSince(timestamps.min() ?? now)
+        let hasCrossSourceSupport = sources.count >= 2
+        let hasVeryStrongVisual = source == "visual_route" &&
+            (visualConfidence ?? 0) >= visualDecisionImmediateConfidence &&
+            nearbyEvidence.filter { $0.source == source }.count >= routeBeliefLargeCorrectionMinimumSamples + 1
+
+        return duration >= routeBeliefLargeCorrectionMinimumDuration &&
+            (hasCrossSourceSupport || hasVeryStrongVisual)
+    }
+
+    private func markRouteEvidenceConflict(source: String, observedProgress: Double) {
+        routeLocalizationStatus = .ambiguous
+        routeBeliefState.status = .ambiguous
+        routeBeliefState.isInstructionSafe = false
+        routeBeliefState.evidenceSummary = String(
+            format: "%@ proposed %.1fm, but route belief disagrees.",
+            source,
+            observedProgress
+        )
+        recoveryReason = "Route evidence disagrees. Pause and scan slowly."
+    }
+
+    private func handleRouteBeliefHoldIfNeeded() -> Bool {
+        guard shouldEnableErrorRecovery,
+              phase == .navigating || phase == .recovering else {
+            return false
+        }
+
+        guard routeLocalizationStatus == .ambiguous || routeLocalizationStatus == .lost else {
+            if phase == .recovering, routeBeliefState.isInstructionSafe {
+                phase = .navigating
+                recoveryReason = nil
+            }
+            return false
+        }
+
+        let now = Date()
+        let key = "route_belief_\(routeLocalizationStatus.rawValue)"
+        let cueChanged = key != lastRecoveryCueKey
+        let cueAge = lastRecoveryCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+
+        phase = .recovering
+        recoveryReason = routeBeliefState.evidenceSummary
+        currentInstruction = routeLocalizationStatus == .lost
+            ? "Route uncertain. Pause and scan slowly."
+            : "Pause and scan slowly."
+
+        if cueChanged || cueAge >= recoveryCueCooldownSeconds {
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+            lastRecoveryCueAt = now
+            lastRecoveryCueKey = key
+        }
+        return true
+    }
+
     private func pdrDistanceDelta(from imuState: IMUState) -> Double {
         defer {
             lastIMUStepCount = imuState.stepCount
@@ -1558,6 +1964,19 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         if let lastRouteAdvanceAt,
            Date().timeIntervalSince(lastRouteAdvanceAt) < visualRouteAdvanceCooldownSeconds {
+            return false
+        }
+
+        let nearCurrentBelief = visualMatch.stepIndex == currentStepIndex &&
+            abs(visualMatch.progressMeters - segmentProgressMeters) <= routeBeliefLargeCorrectionSupportMeters
+        let supportedByBelief = routeBeliefSupportsLargeCorrection(
+            stepIndex: visualMatch.stepIndex,
+            observedProgress: visualMatch.progressMeters,
+            source: "visual_route",
+            visualConfidence: visualMatch.confidence
+        )
+        guard nearCurrentBelief || supportedByBelief else {
+            markRouteEvidenceConflict(source: "visual_route", observedProgress: visualMatch.progressMeters)
             return false
         }
 
@@ -1683,9 +2102,24 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let strongVisualEvidence = (visualConfidence ?? 0) >= visualDecisionAdvanceConfidence
         let immediateVisualEvidence = (visualConfidence ?? 0) >= visualDecisionImmediateConfidence
-        if immediateVisualEvidence {
+        let physicalForwardLimit = maxImmediateForwardMeters +
+            max(routeBeliefPhysicalSlackMeters, lastRouteUpdatePDRDelta * 1.6 + routeBeliefPhysicalSlackMeters)
+        let beliefSupportsCorrection = routeBeliefSupportsLargeCorrection(
+            stepIndex: currentStepIndex,
+            observedProgress: observed,
+            source: source,
+            visualConfidence: visualConfidence
+        )
+
+        if immediateVisualEvidence && (forwardDelta <= physicalForwardLimit || beliefSupportsCorrection) {
             pendingProgressCorrection = nil
             return stabilizedSegmentProgress(toward: observed, on: step, allowBackward: true)
+        }
+
+        if forwardDelta > physicalForwardLimit && !beliefSupportsCorrection {
+            markRouteEvidenceConflict(source: source, observedProgress: observed)
+            stagePendingProgressCorrection(source: source, observedProgress: observed)
+            return nil
         }
 
         let decisionWindowStart = max(
@@ -2113,7 +2547,14 @@ final class SemanticRouteNavigator: ObservableObject {
         if let visualConfidence = candidate.visualConfidence,
            visualConfidence >= visualRouteSnapConfidence,
            candidate.crossTrackMeters <= max(3.0, recoverySnapThreshold * 2.2) {
-            return true
+            let nearCurrentProgress = candidate.stepIndex == currentStepIndex &&
+                abs(candidate.progressMeters - segmentProgressMeters) <= routeBeliefLargeCorrectionSupportMeters
+            return nearCurrentProgress || routeBeliefSupportsLargeCorrection(
+                stepIndex: candidate.stepIndex,
+                observedProgress: candidate.progressMeters,
+                source: "visual_route",
+                visualConfidence: visualConfidence
+            )
         }
         if headingBad && !crossTrackBad {
             return candidate.crossTrackMeters <= 0.75 && candidate.headingError <= 75
@@ -2155,6 +2596,7 @@ final class SemanticRouteNavigator: ObservableObject {
         resetRouteCorrectionGuards()
         guard currentStepIndex < routeSteps.count - 1 else {
             phase = .arrived
+            resetRouteBelief(status: .locked)
             segmentProgressMeters = activeStep?.edge.distanceMeters ?? segmentProgressMeters
             segmentRemainingMeters = 0
             totalRemainingMeters = 0
@@ -2173,6 +2615,7 @@ final class SemanticRouteNavigator: ObservableObject {
             ? nearbyLandmarkCue(on: current, after: max(segmentProgressMeters, current.edge.distanceMeters - 0.75))
             : nil
         currentStepIndex += 1
+        resetRouteBelief(status: .initializing)
         segmentProgressMeters = 0
         segmentRemainingMeters = next.edge.distanceMeters
         lastAnnouncedRemainingMeter = nil
@@ -2289,6 +2732,8 @@ final class SemanticRouteNavigator: ObservableObject {
             phase: phase.displayName,
             instruction: currentInstruction,
             confidence: confidence,
+            routeStatus: routeLocalizationStatus.displayName,
+            isInstructionSafe: routeBeliefState.isInstructionSafe,
             routeRemainingMeters: totalRemainingMeters,
             currentSegment: segment,
             nearbyLandmarks: nearby,
@@ -2296,6 +2741,7 @@ final class SemanticRouteNavigator: ObservableObject {
             hardRules: [
                 "Do not invent distances, turns, targets, hazards, or landmarks.",
                 "Only verbalize the provided deterministic route state.",
+                "If isInstructionSafe is false, do not speak normal walking guidance.",
                 "When phase is Recovering, tell the user to pause and relocalize before walking."
             ]
         )
@@ -2408,7 +2854,8 @@ final class SemanticRouteNavigator: ObservableObject {
         let matches = visualRouteCandidates(in: map, fingerprints: fingerprints)
             .compactMap { candidate -> VisualRouteMatch? in
                 let similarity = frameFingerprinter.similarity(liveFingerprint, candidate.fingerprint)
-                let confidence = visualConfidence(from: similarity)
+                let isAliased = isVisualFingerprintAliased(candidate.fingerprintID, in: map)
+                let confidence = max(0, visualConfidence(from: similarity) - (isAliased ? 0.18 : 0))
                 guard confidence >= visualRouteMinimumConfidence else { return nil }
                 return VisualRouteMatch(
                     stepIndex: candidate.stepIndex,
@@ -2417,6 +2864,8 @@ final class SemanticRouteNavigator: ObservableObject {
                     keyframeID: candidate.keyframeID,
                     landmarkID: candidate.landmarkID,
                     landmarkName: candidate.landmarkName,
+                    fingerprintID: candidate.fingerprintID,
+                    isAliased: isAliased,
                     cue: candidate.cue
                 )
             }
@@ -2500,6 +2949,7 @@ final class SemanticRouteNavigator: ObservableObject {
                         stepIndex: stepIndex,
                         progressMeters: progress,
                         fingerprint: fingerprint,
+                        fingerprintID: fingerprintID,
                         keyframeID: keyframe.id,
                         landmarkID: nil,
                         landmarkName: nil,
@@ -2529,6 +2979,7 @@ final class SemanticRouteNavigator: ObservableObject {
                             stepIndex: stepIndex,
                             progressMeters: min(max(progress, 0), step.edge.distanceMeters),
                             fingerprint: fingerprint,
+                            fingerprintID: fingerprintID,
                             keyframeID: nil,
                             landmarkID: landmark.id,
                             landmarkName: name,
@@ -2545,6 +2996,12 @@ final class SemanticRouteNavigator: ObservableObject {
     private func visualConfidence(from similarity: Float) -> Double {
         let confidence = (Double(similarity) - 0.62) / 0.26
         return min(max(confidence, 0), 1)
+    }
+
+    private func isVisualFingerprintAliased(_ fingerprintID: String, in map: SemanticRouteMap) -> Bool {
+        (map.visualAliasGroups ?? []).contains { group in
+            group.fingerprintIds.contains(fingerprintID)
+        }
     }
 
     private func announceVisualLandmarkIfNeeded(_ visualMatch: VisualRouteMatch?) {
@@ -3206,6 +3663,99 @@ final class SemanticRouteNavigator: ObservableObject {
         return canonical
     }
 
+    private static func visualAliasGroups(in map: SemanticRouteMap) -> [SemanticRouteVisualAliasGroup] {
+        guard let fingerprints = map.visualFingerprints, fingerprints.count >= 2 else { return [] }
+        let fingerprinter = ARFrameFingerprinter()
+        let ordered = fingerprints.keys.sorted()
+        var groups: [SemanticRouteVisualAliasGroup] = []
+
+        for leftIndex in 0..<(ordered.count - 1) {
+            for rightIndex in (leftIndex + 1)..<ordered.count {
+                let leftID = ordered[leftIndex]
+                let rightID = ordered[rightIndex]
+                guard let left = fingerprints[leftID],
+                      let right = fingerprints[rightID] else {
+                    continue
+                }
+                let similarity = fingerprinter.similarity(left, right)
+                guard similarity >= 0.88 else { continue }
+                let names = [
+                    representativeName(forFingerprintID: leftID, in: map),
+                    representativeName(forFingerprintID: rightID, in: map)
+                ]
+                .compactMap { sanitizedSpokenLabel($0).nilIfBlank }
+                groups.append(
+                    SemanticRouteVisualAliasGroup(
+                        id: "\(leftID)__\(rightID)",
+                        fingerprintIds: [leftID, rightID],
+                        representativeNames: Array(Set(names)).sorted(),
+                        similarity: Double(similarity)
+                    )
+                )
+            }
+        }
+
+        return groups
+    }
+
+    private static func representativeName(forFingerprintID fingerprintID: String, in map: SemanticRouteMap) -> String? {
+        if let keyframe = map.keyframes?.first(where: { $0.visualFingerprintId == fingerprintID }) {
+            if let edgeID = keyframe.segmentID,
+               let edge = map.edges.first(where: { $0.id == edgeID }),
+               let from = map.nodes.first(where: { $0.id == edge.fromNodeID }),
+               let to = map.nodes.first(where: { $0.id == edge.toNodeID }) {
+                return "\(from.name) to \(to.name)"
+            }
+            return String(format: "keyframe %.1fm", keyframe.distanceFromSegmentStart)
+        }
+        if let landmark = map.landmarks.first(where: { ($0.visualFingerprintIds ?? []).contains(fingerprintID) }) {
+            return landmark.name
+        }
+        return nil
+    }
+
+    private static func captureQuality(for map: SemanticRouteMap, aliasGroups: [SemanticRouteVisualAliasGroup]) -> SemanticRouteCaptureQuality {
+        let keyframeCount = map.keyframes?.count ?? 0
+        let visualSampleCount = map.visualFingerprints?.count ?? 0
+        let routeDistance = map.edges.reduce(0) { $0 + $1.distanceMeters }
+        let averageSpacing = keyframeCount > 1 ? routeDistance / Double(max(keyframeCount - 1, 1)) : nil
+        let aliasedIDs = Set(aliasGroups.flatMap(\.fingerprintIds))
+        let minimumVisualSamples = min(6, max(2, map.edges.count + 1))
+        let hasMinimumSpatialEvidence = map.nodes.contains { $0.kind == .entrance } &&
+            map.nodes.contains { $0.kind == .destination } &&
+            !map.edges.isEmpty &&
+            routeDistance >= 0.75
+        let hasMinimumVisualEvidence = visualSampleCount >= minimumVisualSamples && keyframeCount >= max(2, map.edges.count)
+
+        var warnings: [String] = []
+        if !hasMinimumSpatialEvidence {
+            warnings.append("Capture a start, destination, and measured route segment.")
+        }
+        if keyframeCount < max(2, map.edges.count) {
+            warnings.append("Walk the route while mapping so visual keyframes are sampled.")
+        }
+        if visualSampleCount < minimumVisualSamples {
+            warnings.append("Add more visual samples from multiple viewpoints.")
+        }
+        if let averageSpacing, averageSpacing > 1.4 {
+            warnings.append("Keyframes are sparse; walk more slowly or rescan the route.")
+        }
+        if aliasedIDs.count > max(1, visualSampleCount / 3) {
+            warnings.append("Several samples look similar; add distinctive landmarks or more viewpoints.")
+        }
+
+        return SemanticRouteCaptureQuality(
+            keyframeCount: keyframeCount,
+            visualSampleCount: visualSampleCount,
+            aliasedVisualSampleCount: aliasedIDs.count,
+            routeDistanceMeters: routeDistance,
+            averageKeyframeSpacingMeters: averageSpacing,
+            hasMinimumSpatialEvidence: hasMinimumSpatialEvidence,
+            hasMinimumVisualEvidence: hasMinimumVisualEvidence,
+            warnings: warnings
+        )
+    }
+
     private static func sanitizedMap(_ map: SemanticRouteMap) -> SemanticRouteMap {
         var cleaned = map
         let storedFingerprints = map.visualFingerprints ?? [:]
@@ -3255,6 +3805,10 @@ final class SemanticRouteNavigator: ObservableObject {
             storedFingerprints[id].map { (id, $0) }
         })
         cleaned.visualFingerprints = referencedFingerprints.isEmpty ? nil : referencedFingerprints
+        let aliasGroups = visualAliasGroups(in: cleaned)
+        cleaned.visualAliasGroups = aliasGroups.isEmpty ? nil : aliasGroups
+        cleaned.captureQuality = captureQuality(for: cleaned, aliasGroups: aliasGroups)
+        cleaned.visualSamplesVersion = 1
         return cleaned
     }
 

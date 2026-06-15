@@ -2,6 +2,9 @@ import ARKit
 import React
 import SwiftUI
 import UIKit
+#if canImport(FoundationModels)
+import FoundationModels
+#endif
 
 @objc(ARKitNavigationModule)
 final class ARKitNavigationModule: NSObject {
@@ -234,6 +237,214 @@ final class ARKitNavigationModule: NSObject {
             return topViewController(base: presented)
         }
         return base
+    }
+}
+
+@objc(OnDeviceLLMModule)
+final class OnDeviceLLMModule: NSObject {
+    @objc
+    static func requiresMainQueueSetup() -> Bool {
+        false
+    }
+
+    @objc(isAvailable:rejecter:)
+    func isAvailable(
+        _ resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        resolve(availabilityDictionary())
+    }
+
+    @objc(classifyIntent:resolver:rejecter:)
+    func classifyIntent(
+        _ payload: NSDictionary,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        let text = sanitized(payload["text"] as? String)
+        guard !text.isEmpty else {
+            resolve(fallbackDictionary(reason: "empty_text"))
+            return
+        }
+        runTask(
+            prompt: """
+            You classify a blind navigation assistant request. Return strict JSON only:
+            {"intent":"navigation|reaching|scene|stop|unknown","target":string|null,"needsImage":boolean,"confidence":number}
+            Do not provide navigation distances or turns. User text: \(jsonString(text))
+            """,
+            fallbackReason: "foundation_models_unavailable",
+            resolve: resolve
+        )
+    }
+
+    @objc(detectTurnEnd:resolver:rejecter:)
+    func detectTurnEnd(
+        _ payload: NSDictionary,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        let transcript = sanitized(payload["transcript"] as? String)
+        guard !transcript.isEmpty else {
+            resolve(fallbackDictionary(reason: "empty_transcript"))
+            return
+        }
+        let silenceDurationMs = number(payload["silenceDurationMs"]) ?? 0
+        let silenceThresholdMs = number(payload["silenceThresholdMs"]) ?? 1500
+        runTask(
+            prompt: """
+            You are an end-of-utterance detector. Return strict JSON only:
+            {"shouldAutoSubmit":boolean,"confidence":number,"reason":string}
+            Consider silence >= threshold likely complete unless the transcript is clearly unfinished.
+            Input: {"transcript":\(jsonString(transcript)),"silenceDurationMs":\(Int(silenceDurationMs)),"silenceThresholdMs":\(Int(silenceThresholdMs))}
+            """,
+            fallbackReason: "foundation_models_unavailable",
+            resolve: resolve
+        )
+    }
+
+    @objc(rewriteGuidance:resolver:rejecter:)
+    func rewriteGuidance(
+        _ payload: NSDictionary,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        let instruction = sanitized(payload["instruction"] as? String)
+        let routeStatus = sanitized(payload["routeStatus"] as? String)
+        let isInstructionSafe = (payload["isInstructionSafe"] as? NSNumber)?.boolValue ?? false
+        guard !instruction.isEmpty else {
+            resolve(fallbackDictionary(reason: "empty_instruction"))
+            return
+        }
+        runTask(
+            prompt: """
+            Rewrite the provided deterministic route instruction for speech. Return strict JSON only:
+            {"text":string,"confidence":number}
+            Hard rules: do not invent distances, turns, landmarks, objects, hazards, or arrival.
+            If isInstructionSafe is false, tell the user to pause and scan slowly.
+            Input: {"instruction":\(jsonString(instruction)),"routeStatus":\(jsonString(routeStatus)),"isInstructionSafe":\(isInstructionSafe)}
+            """,
+            fallbackReason: "foundation_models_unavailable",
+            resolve: resolve
+        )
+    }
+
+    private func runTask(
+        prompt: String,
+        fallbackReason: String,
+        resolve: @escaping RCTPromiseResolveBlock
+    ) {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            Task {
+                do {
+                    let output = try await runFoundationModel(prompt: prompt)
+                    let json = extractJSONObject(from: output) ?? output
+                    let confidence = parsedConfidence(from: json) ?? 0.72
+                    resolve([
+                        "available": true,
+                        "usedProvider": "apple_foundation_models",
+                        "confidence": confidence,
+                        "needsBackend": false,
+                        "json": json,
+                        "rawText": output
+                    ])
+                } catch {
+                    resolve(self.fallbackDictionary(reason: error.localizedDescription))
+                }
+            }
+            return
+        }
+        #endif
+        resolve(fallbackDictionary(reason: fallbackReason))
+    }
+
+    #if canImport(FoundationModels)
+    @available(iOS 26.0, *)
+    private func runFoundationModel(prompt: String) async throws -> String {
+        let model = SystemLanguageModel.default
+        switch model.availability {
+        case .available:
+            break
+        default:
+            throw NSError(
+                domain: "OnDeviceLLMModule",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "Apple Foundation Models are not available on this device."]
+            )
+        }
+
+        let session = LanguageModelSession(model: model)
+        let response = try await session.respond(to: prompt)
+        return String(describing: response.content)
+    }
+    #endif
+
+    private func availabilityDictionary() -> [String: Any] {
+        #if canImport(FoundationModels)
+        if #available(iOS 26.0, *) {
+            let model = SystemLanguageModel.default
+            if case .available = model.availability {
+                return [
+                    "available": true,
+                    "usedProvider": "apple_foundation_models",
+                    "confidence": 1,
+                    "needsBackend": false
+                ]
+            }
+        }
+        #endif
+        return fallbackDictionary(reason: "foundation_models_unavailable")
+    }
+
+    private func fallbackDictionary(reason: String) -> [String: Any] {
+        [
+            "available": false,
+            "usedProvider": "none",
+            "confidence": 0,
+            "needsBackend": true,
+            "fallbackReason": reason
+        ]
+    }
+
+    private func sanitized(_ value: String?) -> String {
+        (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func number(_ value: Any?) -> Double? {
+        if let number = value as? NSNumber { return number.doubleValue }
+        if let string = value as? String { return Double(string) }
+        return nil
+    }
+
+    private func jsonString(_ value: String) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let encoded = String(data: data, encoding: .utf8) else {
+            return "\"\""
+        }
+        return encoded
+    }
+
+    private func extractJSONObject(from text: String) -> String? {
+        guard let start = text.firstIndex(of: "{"),
+              let end = text.lastIndex(of: "}"),
+              start < end else {
+            return nil
+        }
+        return String(text[start...end])
+    }
+
+    private func parsedConfidence(from json: String) -> Double? {
+        guard let data = json.data(using: .utf8),
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            return nil
+        }
+        if let value = object["confidence"] as? NSNumber {
+            return min(max(value.doubleValue, 0), 1)
+        }
+        if let value = object["confidence"] as? Double {
+            return min(max(value, 0), 1)
+        }
+        return nil
     }
 }
 

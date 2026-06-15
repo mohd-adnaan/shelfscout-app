@@ -48,4 +48,18 @@ describe('parseWorkflowResponse', () => {
     expect(parsed.object).toBe('crave cereal');
     expect(parsed.loopDelay).toBe(2500);
   });
+
+  it('preserves local LLM observability fields', () => {
+    const parsed = parseWorkflowResponse({
+      response: null,
+      navigation_pipeline: 'arkit',
+      local_llm_used: 'true',
+      llm_provider: 'apple_foundation_models',
+      llm_fallback_reason: 'foundation_models_unavailable',
+    });
+
+    expect(parsed.local_llm_used).toBe(true);
+    expect(parsed.llm_provider).toBe('apple_foundation_models');
+    expect(parsed.llm_fallback_reason).toBe('foundation_models_unavailable');
+  });
 });

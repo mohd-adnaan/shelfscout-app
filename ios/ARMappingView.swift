@@ -648,8 +648,8 @@ struct ARMappingView: View {
                     .fixedSize(horizontal: false, vertical: true)
 
                 HStack(spacing: 8) {
-                    Label(statusText, systemImage: mappingManager.isLocalized ? "checkmark.circle.fill" : "viewfinder")
-                        .foregroundColor(mappingManager.isLocalized ? automatedAccent : Color.white.opacity(0.72))
+                    Label(routeAwareStatusText, systemImage: routeAwareStatusIcon)
+                        .foregroundColor(routeAwareStatusTint)
 
                     if let activeMapName = mappingManager.activeMapName ?? semanticNavigator.activeMap?.name {
                         Text(activeMapName)
@@ -1279,6 +1279,37 @@ struct ARMappingView: View {
             return "Map quality good"
         @unknown default:
             return "Tracking"
+        }
+    }
+
+    private var routeAwareStatusText: String {
+        guard semanticNavigator.phase == .navigating || semanticNavigator.phase == .recovering else {
+            return statusText
+        }
+        return "\(statusText) · \(semanticNavigator.routeLocalizationStatus.displayName)"
+    }
+
+    private var routeAwareStatusIcon: String {
+        switch semanticNavigator.routeLocalizationStatus {
+        case .locked:
+            return mappingManager.isLocalized ? "checkmark.circle.fill" : "location.circle"
+        case .ambiguous, .recovering:
+            return "exclamationmark.triangle.fill"
+        case .lost:
+            return "viewfinder.circle"
+        case .initializing:
+            return "viewfinder"
+        }
+    }
+
+    private var routeAwareStatusTint: Color {
+        switch semanticNavigator.routeLocalizationStatus {
+        case .locked:
+            return automatedAccent
+        case .ambiguous, .recovering, .lost:
+            return Color(red: 0.98, green: 0.68, blue: 0.34)
+        case .initializing:
+            return mappingManager.isLocalized ? automatedAccent : Color.white.opacity(0.72)
         }
     }
 }

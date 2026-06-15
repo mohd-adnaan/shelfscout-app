@@ -338,6 +338,9 @@ class IMUSensorManager: ObservableObject {
             "currentStepLength": "\(String(format: "%.2f", currentStepLength))m",
             "dynamicWindowSize": dynamicWindowSize,
             "filterQuality": imuState.filterQuality,
+            "stepStability": String(format: "%.2f", imuState.stepStability),
+            "headingReliability": String(format: "%.2f", imuState.headingReliability),
+            "pdrUncertaintyMeters": String(format: "%.2f", imuState.pdrUncertaintyMeters),
             "detectedPeaks": detectedPeaks.count,
             "totalSamples": totalSamples
         ]
@@ -701,6 +704,33 @@ class IMUSensorManager: ObservableObject {
         } else {
             filterQuality = "Initializing"
         }
+
+        let stepStability: Double
+        if recentStepPeriods.count >= 3 {
+            let avgPeriod = recentStepPeriods.reduce(0, +) / Double(recentStepPeriods.count)
+            let stdPeriod = calculateStd(recentStepPeriods, mean: avgPeriod)
+            stepStability = max(0.10, min(1.0, 1.0 - stdPeriod / 0.35))
+        } else if stepCount > 0 {
+            stepStability = 0.55
+        } else {
+            stepStability = isMoving ? 0.35 : 0.45
+        }
+
+        let headingReliability: Double
+        if !initialBearingSet {
+            headingReliability = 0.20
+        } else if currentSegmentId >= 0 && currentSegmentId < pathBearings.count {
+            headingReliability = min(0.95, 0.68 + Double(min(bearingCorrectionCount, 8)) * 0.03)
+        } else {
+            headingReliability = 0.58
+        }
+
+        let calibrationPenalty = stepFactorCalibration.isCalibrationValid() ? 0.0 : 0.30
+        let motionPenalty = isMoving ? 0.0 : 0.20
+        let pdrUncertaintyMeters = max(
+            0.35,
+            0.45 + (1.0 - stepStability) * 0.75 + (1.0 - headingReliability) * 0.35 + calibrationPenalty + motionPenalty
+        )
         
         // Capture all values locally (safe from any thread since these are private vars)
         let newState = IMUState(
@@ -715,7 +745,10 @@ class IMUSensorManager: ObservableObject {
             isStepCalibrationValid: stepFactorCalibration.isCalibrationValid(),
             isCalibrating: stepFactorCalibration.isCalibrating,
             calibrationStepCount: stepFactorCalibration.getCalibrationStepCount(),
-            bearing: currentBearing
+            bearing: currentBearing,
+            stepStability: stepStability,
+            headingReliability: headingReliability,
+            pdrUncertaintyMeters: pdrUncertaintyMeters
         )
         
         // FIX: Always dispatch @Published write to main thread.

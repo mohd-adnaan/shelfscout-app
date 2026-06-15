@@ -11,6 +11,7 @@ import { WORKFLOW_URL, SMART_GUIDANCE_URL, CONFIG, NAVIGATION_CONFIG } from '../
 import { WorkflowRequest, WorkflowResponse, ContinuousModeState } from '../utils/types';
 import { AccessibilityService } from './AccessibilityService';
 import { debugLogger } from './DebugLogger';
+import { llmRouter } from './LLMRouter';
 
 // =============================================================================
 // iOS ARKit Native Module Bridge
@@ -259,6 +260,41 @@ export const sendToWorkflow = async (
       throw new Error(message);
     }
 
+    const localIntent = request.text?.trim()
+      ? await llmRouter.classifyIntent({
+        text: request.text,
+        hasImage: Boolean(request.imageUri),
+      }).catch((error) => {
+        console.warn('[Workflow] Local LLM intent failed:', error?.message || error);
+        return null;
+      })
+      : null;
+
+    if (
+      Platform.OS === 'ios' &&
+      !request.imageUri &&
+      !isContinuousIteration &&
+      localIntent?.json?.intent === 'navigation' &&
+      localIntent.json.target &&
+      !localIntent.needsBackend &&
+      localIntent.confidence >= 0.76
+    ) {
+      return {
+        text: '',
+        navigation: true,
+        navigation_ios: true,
+        navigation_arkit: true,
+        navigation_pipeline: 'arkit',
+        navigation_target: localIntent.json.target,
+        reaching_flag: false,
+        reaching_ios: false,
+        loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
+        session_id: SESSION_ID,
+        local_llm_used: true,
+        llm_provider: localIntent.usedProvider,
+      };
+    }
+
     // ========================================================================
     // Prepare FormData
     // ========================================================================
@@ -282,6 +318,16 @@ export const sendToWorkflow = async (
     formData.append('request_id', `mobile-${Date.now()}`);
     formData.append('session_id', SESSION_ID);
     formData.append('continuousMode', isContinuousIteration ? 'true' : 'false');
+    if (localIntent) {
+      formData.append('local_llm_used', localIntent.needsBackend ? 'false' : 'true');
+      formData.append('llm_provider', localIntent.usedProvider);
+      if (localIntent.fallbackReason) {
+        formData.append('llm_fallback_reason', localIntent.fallbackReason);
+      }
+      if (localIntent.json) {
+        formData.append('local_intent_json', JSON.stringify(localIntent.json));
+      }
+    }
 
     // ── mode field — n8n Redis expression references $json.body.mode ────
     // Derive from the three-flag system so the backend always has it.
@@ -407,6 +453,8 @@ export const sendToWorkflow = async (
       navigation_pipeline: parsedResponse.navigation_pipeline,
       navigation_target: parsedResponse.navigation_target,
       route_map_id: parsedResponse.route_map_id,
+      local_llm_used: parsedResponse.local_llm_used,
+      llm_provider: parsedResponse.llm_provider,
       reaching_flag: parsedResponse.reaching_flag,
       reaching_ios: parsedResponse.reaching_ios,
       bbox: !!parsedResponse.bbox,
@@ -952,6 +1000,29 @@ export function parseWorkflowResponse(
       ]),
     ) || undefined;
 
+  const local_llm_used = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.local_llm_used) === true ||
+    parseBoolean(payload.localLlmUsed) === true
+  );
+
+  const llm_provider =
+    pickStringByKeyPriority([
+      'llm_provider',
+      'llmProvider',
+      'local_llm_provider',
+      'localLlmProvider',
+    ]) || undefined;
+
+  const llm_fallback_reason =
+    normalizeBackendString(
+      pickStringByKeyPriority([
+        'llm_fallback_reason',
+        'llmFallbackReason',
+        'local_llm_fallback_reason',
+        'localLlmFallbackReason',
+      ]),
+    ) || undefined;
+
   const annotatedImageRaw = normalizeBackendString(
     pickString(['annotated_image', 'annotatedImage', 'annotated_image_base64', 'annotatedImageBase64']),
   );
@@ -982,6 +1053,9 @@ export function parseWorkflowResponse(
     navigation_pipeline,
     navigation_target,
     route_map_id,
+    local_llm_used,
+    llm_provider,
+    llm_fallback_reason,
     reaching_flag,
     reaching_ios,
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
@@ -1002,6 +1076,9 @@ export function parseWorkflowResponse(
     route_map_id,
     route_map_name,
     navigation_error,
+    local_llm_used,
+    llm_provider,
+    llm_fallback_reason,
     reaching_flag,
     reaching_ios,
     bbox,

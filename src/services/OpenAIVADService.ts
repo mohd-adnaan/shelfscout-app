@@ -1,4 +1,5 @@
 // src/services/OpenAIVADService.ts
+import { llmRouter } from './LLMRouter';
 
 /**
  * OpenAI-backed end-of-utterance detector.
@@ -59,7 +60,28 @@ class OpenAIVADService {
       };
     }
 
+    const localDecision = await llmRouter.detectTurnEnd({
+      transcript,
+      silenceDurationMs: input.silenceDurationMs,
+      silenceThresholdMs: input.silenceThresholdMs,
+    });
+
+    if (!localDecision.needsBackend && localDecision.json) {
+      return {
+        shouldAutoSubmit: Boolean(localDecision.json.shouldAutoSubmit),
+        confidence: localDecision.confidence,
+        reason: `${localDecision.usedProvider}: ${localDecision.json.reason}`,
+      };
+    }
+
     if (!this.isConfigured()) {
+      if (localDecision.json) {
+        return {
+          shouldAutoSubmit: Boolean(localDecision.json.shouldAutoSubmit),
+          confidence: localDecision.confidence,
+          reason: `${localDecision.usedProvider}: ${localDecision.json.reason}`,
+        };
+      }
       throw new Error('OpenAI API key not configured');
     }
 
