@@ -8,6 +8,7 @@
     "lint": "eslint .",
     "start": "react-native start",
     "test": "jest",
+    "test:mobile-orchestrator": "jest __tests__/MobileOrchestrator.test.ts __tests__/WorkflowService.test.ts __tests__/LLMRouter.test.ts __tests__/OnDeviceLLMModule.test.ts --runInBand",
     "postinstall": "patch-package"
   },
   "dependencies": {

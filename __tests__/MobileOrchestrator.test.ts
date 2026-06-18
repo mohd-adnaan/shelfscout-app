@@ -110,6 +110,38 @@ describe('MobileOrchestrator', () => {
     expect(result.intent_provider).toBe('heuristic');
   });
 
+  it('falls back to backend for text-only requests when local intent is not actionable', async () => {
+    const { mobileOrchestrator } = loadOrchestrator();
+
+    const result = await mobileOrchestrator.process(
+      {
+        text: 'hello there',
+        imageUri: '',
+      },
+      undefined,
+      {
+        backendWorkflowProvider,
+        getSessionId: () => 'session-vague',
+      },
+    );
+
+    expect(backendWorkflowProvider).toHaveBeenCalledTimes(1);
+    const delegatedRequest = backendWorkflowProvider.mock.calls[0][0];
+    expect(delegatedRequest.local_orchestrator_used).toBe(true);
+    expect(delegatedRequest.local_llm_used).toBe(false);
+    expect(delegatedRequest.apple_fm_available).toBe(false);
+    expect(delegatedRequest.apple_fm_unavailable_reason).toBe('on_device_llm_not_linked');
+    expect(delegatedRequest.llm_fallback_reason).toBe('low_confidence_intent');
+    expect(delegatedRequest.provider_trace.some((entry: any) =>
+      entry.provider === 'backend_workflow' &&
+      entry.diagnostics?.delegatedTo === 'backend_workflow',
+    )).toBe(true);
+    expect(result.text).toBe('Remote answer.');
+    expect(result.local_orchestrator_used).toBe(true);
+    expect(result.local_llm_used).toBe(false);
+    expect(result.apple_fm_unavailable_reason).toBe('on_device_llm_not_linked');
+  });
+
   it('surfaces exact Apple Foundation Models unavailable reasons', async () => {
     const { mobileOrchestrator } = loadOrchestrator({
       OnDeviceLLMModule: {
