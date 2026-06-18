@@ -444,7 +444,7 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
       console.log('🎤 [WakeWord] Audio session configured:', JSON.stringify(audioResult));
 
       // Small delay to let audio session settle after category switch
-      await new Promise(r => setTimeout(r, 350));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 350));
 
       // Re-register OUR listeners right before Voice.start()
       Voice.onSpeechStart = handleSpeechStartRef.current;
@@ -746,12 +746,12 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
 
     if (enabledRef.current) {
       // Small delay to let TTS audio session fully release
-      await new Promise(r => setTimeout(r, 500));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
 
       // Re-assert the selected recording session before restarting Voice.
       // TTS playback switches the session back to Playback mode.
       await configureBluetoothRecordingSession(microphoneSourceRef.current);
-      await new Promise(r => setTimeout(r, 200));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 200));
 
       await startRecognition();
     }

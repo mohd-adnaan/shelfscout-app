@@ -47,7 +47,7 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
   // Auto-submit state
   const hasAutoSubmittedRef = useRef(false);
   const isManualStopRef = useRef(false);
-  const silenceTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const lastSpeechTimeRef = useRef<number>(0);
 
   // ============================================================================
@@ -268,7 +268,7 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
           await Voice.stop().catch(() => {});
           await Voice.cancel().catch(() => {});
           
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
           
           await Voice.start('en-US');
           setIsListening(true);

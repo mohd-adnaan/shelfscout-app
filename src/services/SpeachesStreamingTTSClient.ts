@@ -206,7 +206,7 @@ class SpeachesStreamingTTSClient {
           }
         } else {
           // Wait for more chunks
-          await new Promise(resolve => setTimeout(resolve, 50));
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 50));
         }
       }
 
@@ -284,12 +284,12 @@ class SpeachesStreamingTTSClient {
   private async waitForQueueToFinish(): Promise<void> {
     // Wait for processing to start
     while (!this.isProcessing && !this.isStopped) {
-      await new Promise(resolve => setTimeout(resolve, 50));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 50));
     }
 
     // Wait for all chunks to be played
     while ((this.currentIndex < this.audioQueue.length || this.isProcessing) && !this.isStopped) {
-      await new Promise(resolve => setTimeout(resolve, 100));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
     }
   }
 

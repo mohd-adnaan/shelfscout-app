@@ -109,7 +109,7 @@ class SpeachesSentenceChunker {
 
         // Small natural gap between chunks
         if (i < chunks.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 100));
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
         }
       }
 

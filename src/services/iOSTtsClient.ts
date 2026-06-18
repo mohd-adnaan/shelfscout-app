@@ -313,18 +313,17 @@ class IOSTtsClient {
       //
       // iosVoiceId is a fallback — if setDefaultVoice() failed during
       // init, this ensures the voice is still applied per-utterance.
-      const speakOptions: Record<string, any> = {
+      const speakOptions = {
         rate: this._speechRate,
-      };
+        ...(this._selectedVoice ? { iosVoiceId: this._selectedVoice } : {}),
+      } as Parameters<typeof Tts.speak>[1];
 
-      if (this._selectedVoice) {
-        speakOptions.iosVoiceId = this._selectedVoice;
-      }
-
-      Tts.speak(trimmed, speakOptions).catch((err: any) => {
+      try {
+        Tts.speak(trimmed, speakOptions);
+      } catch (err: any) {
         console.error('❌ Tts.speak() error:', err);
         this._resolvePending();
-      });
+      }
     });
   }
 

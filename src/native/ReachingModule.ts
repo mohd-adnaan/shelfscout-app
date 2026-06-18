@@ -63,6 +63,8 @@ export interface ReachingModuleInterface {
   /**
    * Get current reaching state
    */
+  getState(): Promise<ReachingState>;
+
   /**
    * Pre-warm the DepthAnythingV2 model on iOS to avoid loading delay when session starts
    */

@@ -127,7 +127,7 @@ export class RMSVoiceActivityDetector {
   // Timing
   private lastSpeechTimestamp: number = 0;
   private silenceStartTime: number = 0;
-  private silenceTimer: NodeJS.Timeout | null = null;
+  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
   
   // Callbacks
   private onSpeechStart?: () => void;

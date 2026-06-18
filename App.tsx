@@ -615,42 +615,6 @@ function AppInner(): React.JSX.Element {
     return () => clearTimeout(timer);
   }, []);
 
-  // ── Sync transcript ref ────────────────────────────────────────────────────
-  useEffect(() => {
-    if (transcript) finalTranscriptRef.current = transcript;
-  }, [transcript]);
-
-  // ── Disable camera during voice recognition ────────────────────────────────
-  useEffect(() => {
-    if (isListening) {
-      console.log('📷 Disabling camera (voice recognition active)');
-      setIsCameraActive(false);
-    }
-  }, [isListening]);
-
-  // ── Pulse animation ────────────────────────────────────────────────────────
-  useEffect(() => {
-    if ((isListening || isNavigation) && !reduceMotionEnabled) {
-      Animated.loop(
-        Animated.sequence([
-          Animated.parallel([
-            Animated.timing(pulseAnim, { toValue: 1.3, duration: 1000, useNativeDriver: true }),
-            Animated.timing(opacityAnim, { toValue: 0.8, duration: 1000, useNativeDriver: true }),
-          ]),
-          Animated.parallel([
-            Animated.timing(pulseAnim, { toValue: 1, duration: 1000, useNativeDriver: true }),
-            Animated.timing(opacityAnim, { toValue: 0.3, duration: 1000, useNativeDriver: true }),
-          ]),
-        ])
-      ).start();
-    } else {
-      Animated.parallel([
-        Animated.timing(pulseAnim, { toValue: 1, duration: 300, useNativeDriver: true }),
-        Animated.timing(opacityAnim, { toValue: 0.3, duration: 300, useNativeDriver: true }),
-      ]).start();
-    }
-  }, [isListening, isNavigation, reduceMotionEnabled]);
-
   // ============================================================================
   // Camera capture helper
   // ============================================================================
@@ -857,7 +821,7 @@ function AppInner(): React.JSX.Element {
 
     const start = Date.now();
     while (Date.now() - start < POSTURE_MAX_WAIT_MS) {
-      await new Promise(resolve => setTimeout(resolve, POSTURE_POLL_INTERVAL_MS));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), POSTURE_POLL_INTERVAL_MS));
       if (getPostureStatus().ok) return true;
     }
 
@@ -929,7 +893,7 @@ function AppInner(): React.JSX.Element {
           }
         }
 
-        await new Promise(resolve => setTimeout(resolve, CAMERA_REACTIVATION_DELAY_MS));
+        await new Promise<void>(resolve => setTimeout(() => resolve(), CAMERA_REACTIVATION_DELAY_MS));
 
         if (!cameraRef.current) {
           console.error('❌ Camera ref not available after reactivation');
@@ -977,7 +941,7 @@ function AppInner(): React.JSX.Element {
           return fixedImage.uri;
         } catch (error) {
           console.error('❌ Photo capture failed, retrying:', error);
-          await new Promise(resolve => setTimeout(resolve, 500));
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
           try {
             if (useSystemShutterSound) {
               await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
@@ -1430,7 +1394,7 @@ function AppInner(): React.JSX.Element {
 
     setIsCameraActive(false);
     setIsReaching(true);
-    await new Promise(resolve => setTimeout(resolve, 500));
+    await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
 
     try {
       const { ReachingModule } = NativeModules;
@@ -1584,7 +1548,7 @@ function AppInner(): React.JSX.Element {
         if (!settingsRef.current.useWearablesCamera) {
           const postureOk = await waitForGoodPosture('continuous');
           if (!postureOk) {
-            await new Promise(r => setTimeout(r, Math.max(300, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN)));
+            await new Promise<void>(resolve => setTimeout(() => resolve(), Math.max(300, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN)));
             continue;
           }
         }
@@ -1645,7 +1609,7 @@ function AppInner(): React.JSX.Element {
           photoPath = await reactivateCameraAndCaptureRef.current({ enableShutterSound: false });
           if (!photoPath) {
             console.warn('🔄 [Reaching] Still no image — skipping cycle, will retry');
-            await new Promise(r => setTimeout(r, SMART_GUIDANCE_MIN_CYCLE_MS));
+            await new Promise<void>(resolve => setTimeout(() => resolve(), SMART_GUIDANCE_MIN_CYCLE_MS));
             continue;
           }
         }
@@ -1879,7 +1843,7 @@ function AppInner(): React.JSX.Element {
           announceIfNoVoiceOver('Arrived. Switching to object guidance.');
 
           // Cooldown before next capture (give user a moment to stabilize camera after arrival).
-          await new Promise(r => setTimeout(r, Math.max(1200, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN)));
+          await new Promise<void>(resolve => setTimeout(() => resolve(), Math.max(1200, PREFETCH_CONFIG.MIN_CYCLE_COOLDOWN)));
           continue; // ★ next iteration runs with loopMode='reaching'
         }
 
@@ -2031,7 +1995,7 @@ function AppInner(): React.JSX.Element {
             ? SMART_GUIDANCE_MIN_CYCLE_MS
             : 500;
           console.log(`🔄 ⏭️ Null fast-poll — waiting ${nullCooldown}ms before next cycle`);
-          await new Promise(resolve => setTimeout(resolve, nullCooldown));
+          await new Promise<void>(resolve => setTimeout(() => resolve(), nullCooldown));
         }
 
         // Brief cooldown before next capture — gives JS thread a breath and
@@ -2044,7 +2008,7 @@ function AppInner(): React.JSX.Element {
           const elapsed = Date.now() - cycleStart;
           const cooldown = Math.max(0, minCycleMs - elapsed);
           if (cooldown > 0) {
-            await new Promise(r => setTimeout(r, cooldown));
+            await new Promise<void>(resolve => setTimeout(() => resolve(), cooldown));
           }
         }
 
@@ -2553,7 +2517,7 @@ function AppInner(): React.JSX.Element {
         // Without this, VoiceOver and AVSpeechSynthesizer both speak at
         // once, creating the double-voice/echo effect.
         if (screenReaderEnabledRef.current) {
-          await new Promise(resolve => setTimeout(resolve, 600));
+          await new Promise<void>(resolve => setTimeout(() => resolve(), 600));
         }
 
         introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
@@ -2637,7 +2601,7 @@ function AppInner(): React.JSX.Element {
         setIsReaching(reachingActive);
 
         stopContinuousMode('resetting for new loop', false);
-        await new Promise(resolve => setTimeout(resolve, 100));
+        await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
         startContinuousMode(mode, result.loopDelay);
 
         await runContinuousLoop();
@@ -2712,7 +2676,7 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   // Handle Auto-Submit (silence detection)
   // ============================================================================
-  const handleAutoSubmit = useCallback(async (passedTranscript: string) => {
+  const handleAutoSubmit = useCallback(async (passedTranscript?: string) => {
     console.log('🎯 Auto-submit triggered by silence detection');
 
     if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) {
@@ -2781,7 +2745,7 @@ function AppInner(): React.JSX.Element {
     try {
       try { await cancelSTT(); } catch { }
 
-      await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), AUDIO_SESSION_RELEASE_DELAY_MS));
 
       if (isEmergencyStopped.current) {
         setIsProcessing(false);
@@ -2857,6 +2821,42 @@ function AppInner(): React.JSX.Element {
     // Disable this hook to prevent listener conflicts.
     disabled: settings.useWearablesCamera,
   });
+
+  // ── Sync transcript ref ────────────────────────────────────────────────────
+  useEffect(() => {
+    if (transcript) finalTranscriptRef.current = transcript;
+  }, [transcript]);
+
+  // ── Disable camera during voice recognition ────────────────────────────────
+  useEffect(() => {
+    if (isListening) {
+      console.log('📷 Disabling camera (voice recognition active)');
+      setIsCameraActive(false);
+    }
+  }, [isListening]);
+
+  // ── Pulse animation ────────────────────────────────────────────────────────
+  useEffect(() => {
+    if ((isListening || isNavigation) && !reduceMotionEnabled) {
+      Animated.loop(
+        Animated.sequence([
+          Animated.parallel([
+            Animated.timing(pulseAnim, { toValue: 1.3, duration: 1000, useNativeDriver: true }),
+            Animated.timing(opacityAnim, { toValue: 0.8, duration: 1000, useNativeDriver: true }),
+          ]),
+          Animated.parallel([
+            Animated.timing(pulseAnim, { toValue: 1, duration: 1000, useNativeDriver: true }),
+            Animated.timing(opacityAnim, { toValue: 0.3, duration: 1000, useNativeDriver: true }),
+          ]),
+        ])
+      ).start();
+    } else {
+      Animated.parallel([
+        Animated.timing(pulseAnim, { toValue: 1, duration: 300, useNativeDriver: true }),
+        Animated.timing(opacityAnim, { toValue: 0.3, duration: 300, useNativeDriver: true }),
+      ]).start();
+    }
+  }, [isListening, isNavigation, reduceMotionEnabled]);
 
   // ============================================================================
   // Wake Word STT hook (glasses mic — used when IN glasses mode)
@@ -2990,7 +2990,7 @@ function AppInner(): React.JSX.Element {
       // The delay below is still useful: it gives VoiceOver time to finish
       // reading whatever label change just happened before we open the mic,
       // so the recogniser doesn't capture VoiceOver's own speech.
-      await new Promise(resolve => setTimeout(resolve, VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS));
     }
 
     try {
@@ -3030,7 +3030,7 @@ function AppInner(): React.JSX.Element {
 
       // Delay to let audio session reconfigure after category switch
       if (!screenReaderEnabled) {
-        await new Promise(resolve => setTimeout(resolve, 350));
+        await new Promise<void>(resolve => setTimeout(() => resolve(), 350));
       }
 
       // ── Start STT with a short VoiceOver grace window ─────────────────
@@ -3078,7 +3078,7 @@ function AppInner(): React.JSX.Element {
       }
 
       isCapturingPhotoRef.current = true;
-      await new Promise(resolve => setTimeout(resolve, AUDIO_SESSION_RELEASE_DELAY_MS));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), AUDIO_SESSION_RELEASE_DELAY_MS));
       if (isEmergencyStopped.current) { isCapturingPhotoRef.current = false; return; }
 
       let photoPath = '';
@@ -3139,7 +3139,7 @@ function AppInner(): React.JSX.Element {
     // Pause wake word listening during emergency stop
     try { await wakeWordPauseRef.current?.(); } catch { }
 
-    await new Promise(resolve => setTimeout(resolve, 300));
+    await new Promise<void>(resolve => setTimeout(() => resolve(), 300));
 
     setIsProcessing(false);
     setIsSpeaking(false);
@@ -3387,7 +3387,7 @@ function AppInner(): React.JSX.Element {
           <StatusBar barStyle="light-content" backgroundColor="#000" />
 
           {/* Camera */}
-          {!settings.useWearablesCamera && (
+          {!settings.useWearablesCamera && device && (
             <Camera
               ref={cameraRef}
               style={StyleSheet.absoluteFill}
@@ -3423,13 +3423,14 @@ function AppInner(): React.JSX.Element {
           {/* ── Settings Gear Button (top-right) ── */}
           <TouchableOpacity
             style={styles.settingsGearButton}
-            onPress={() => setShowSettings(true)}
+            onPress={(event) => {
+              event.stopPropagation();
+              setShowSettings(true);
+            }}
             accessible={true}
             accessibilityRole="button"
             accessibilityLabel="Open settings"
             accessibilityHint="Double tap to open settings for voice speed and reaching pipeline"
-            // Prevent the gear tap from also firing handleScreenTap
-            onStartShouldSetResponder={() => true}
           >
             <Text style={styles.settingsGear} accessible={false}>⚙</Text>
           </TouchableOpacity>

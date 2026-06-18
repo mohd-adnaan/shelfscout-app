@@ -135,7 +135,6 @@ export const useCamera = () => {
       console.log('[Camera] Capturing photo...');
       
       const photo = await cameraRef.current.takePhoto({
-        qualityPrioritization: 'balanced',
         flash: 'off',
       });
 

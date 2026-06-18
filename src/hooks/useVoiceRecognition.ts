@@ -160,7 +160,7 @@ export const useVoiceRecognition = () => {
             isRecognizingRef.current = false;
             
             // Small delay to ensure cleanup
-            await new Promise(resolve => setTimeout(resolve, 100));
+            await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
           } catch (cancelError: any) {
             console.warn('[Voice] Cancel error (continuing):', cancelError);
           }
@@ -187,7 +187,7 @@ export const useVoiceRecognition = () => {
             try {
               // Try to recover
               await Voice.cancel();
-              await new Promise(resolve => setTimeout(resolve, 200));
+              await new Promise<void>(resolve => setTimeout(() => resolve(), 200));
               await Voice.start('en-US');
               
               console.log('[Voice] ✅ Recovery successful');

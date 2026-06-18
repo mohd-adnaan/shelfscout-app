@@ -6,6 +6,8 @@ const { ProximitySensorModule } = NativeModules as {
   ProximitySensorModule?: {
     start?: () => void;
     stop?: () => void;
+    addListener: (eventName: string) => void;
+    removeListeners: (count: number) => void;
   };
 };
 

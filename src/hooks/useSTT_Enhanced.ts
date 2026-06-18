@@ -37,6 +37,8 @@ interface UseSTTOptions {
   silenceThreshold?: number;
   /** Enable OpenAI VAD validation (default: true) */
   enableOpenAIVAD?: boolean;
+  /** Legacy option kept for callers from the previous STT hook. */
+  enableRMSVAD?: boolean;
   /** Minimum confidence required from OpenAI VAD (default: 0.55) */
   openAIVADMinConfidence?: number;
   /**
