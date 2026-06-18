@@ -3,6 +3,20 @@ export interface WorkflowRequest {
   imageUri: string;
   imageWidth?: number;   
   imageHeight?: number;
+  cameraIntrinsics?: {
+    schema?: string;
+    source?: string;
+    orientation?: string;
+    image_width?: number;
+    image_height?: number;
+    fx?: number;
+    fy?: number;
+    cx?: number;
+    cy?: number;
+    K?: number[][];
+    K_row_major?: number[];
+    raw_capture?: unknown;
+  };
   navigation?: boolean;
   navigation_pipeline?: 'rtab' | 'arkit';
   navigation_ios_preferred?: boolean;
@@ -12,6 +26,18 @@ export interface WorkflowRequest {
   // Backend uses this to reinitialize Melody's tracker container so it
   // doesn't stay locked on a stale target from the previous session.
   session_start?: boolean;
+
+  // Local orchestration observability. These are optional because older
+  // backend contracts do not require them.
+  local_orchestrator_used?: boolean;
+  local_llm_used?: boolean;
+  llm_provider?: string;
+  llm_fallback_reason?: string;
+  intent_provider?: string;
+  local_intent_json?: unknown;
+  apple_fm_available?: boolean;
+  apple_fm_unavailable_reason?: string;
+  provider_trace?: ProviderTraceEntry[];
 }
 
 export interface WorkflowResponse {
@@ -26,6 +52,11 @@ export interface WorkflowResponse {
   route_map_id?: string;
   route_map_name?: string;
   navigation_error?: string;
+  local_orchestrator_used?: boolean;
+  intent_provider?: string;
+  provider_trace?: ProviderTraceEntry[];
+  apple_fm_available?: boolean;
+  apple_fm_unavailable_reason?: string;
   local_llm_used?: boolean;
   llm_provider?: string;
   llm_fallback_reason?: string;
@@ -55,6 +86,25 @@ export interface WorkflowResponse {
   // Loop control
   loopDelay: number;
   session_id?: string;
+}
+
+export interface ProviderTraceEntry {
+  provider: string;
+  ok: boolean;
+  confidence?: number;
+  needsRemote?: boolean;
+  fallbackReason?: string;
+  diagnostics?: Record<string, unknown>;
+}
+
+export interface ProviderResult<T = unknown> {
+  ok: boolean;
+  provider: string;
+  confidence: number;
+  data?: T;
+  needsRemote: boolean;
+  fallbackReason?: string;
+  diagnostics?: Record<string, unknown>;
 }
 
 export interface CameraPhoto {

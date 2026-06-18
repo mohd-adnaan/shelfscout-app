@@ -8,10 +8,15 @@
 import axios, { AxiosError } from 'axios';
 import { Platform, Alert, NativeModules } from 'react-native';
 import { WORKFLOW_URL, SMART_GUIDANCE_URL, CONFIG, NAVIGATION_CONFIG } from '../utils/constants';
-import { WorkflowRequest, WorkflowResponse, ContinuousModeState } from '../utils/types';
+import {
+  ContinuousModeState,
+  ProviderTraceEntry,
+  WorkflowRequest,
+  WorkflowResponse,
+} from '../utils/types';
 import { AccessibilityService } from './AccessibilityService';
 import { debugLogger } from './DebugLogger';
-import { llmRouter } from './LLMRouter';
+import { mobileOrchestrator } from './MobileOrchestrator';
 
 // =============================================================================
 // iOS ARKit Native Module Bridge
@@ -131,6 +136,9 @@ let isNewSession = true;
 export const resetSessionId = (): string => {
   SESSION_ID = generateSessionId();
   isNewSession = true;
+  mobileOrchestrator.resetSession(SESSION_ID).catch((error) => {
+    console.warn('[Workflow] Failed to reset local orchestrator session:', error);
+  });
   console.log('🔄 [Workflow] Session RESET:', SESSION_ID);
   return SESSION_ID;
 };
@@ -242,7 +250,7 @@ export const shouldPreventInfiniteLoop = (_minIntervalMs?: number): boolean => {
 // MAIN WORKFLOW FUNCTION
 // =============================================================================
 
-export const sendToWorkflow = async (
+const sendToBackendWorkflow = async (
   request: WorkflowRequest,
   signal?: AbortSignal
 ): Promise<WorkflowResponse> => {
@@ -260,45 +268,28 @@ export const sendToWorkflow = async (
       throw new Error(message);
     }
 
-    const localIntent = request.text?.trim()
-      ? await llmRouter.classifyIntent({
-        text: request.text,
-        hasImage: Boolean(request.imageUri),
-      }).catch((error) => {
-        console.warn('[Workflow] Local LLM intent failed:', error?.message || error);
-        return null;
-      })
-      : null;
-
-    if (
-      Platform.OS === 'ios' &&
-      !request.imageUri &&
-      !isContinuousIteration &&
-      localIntent?.json?.intent === 'navigation' &&
-      localIntent.json.target &&
-      !localIntent.needsBackend &&
-      localIntent.confidence >= 0.76
-    ) {
-      return {
-        text: '',
-        navigation: true,
-        navigation_ios: true,
-        navigation_arkit: true,
-        navigation_pipeline: 'arkit',
-        navigation_target: localIntent.json.target,
-        reaching_flag: false,
-        reaching_ios: false,
-        loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
-        session_id: SESSION_ID,
-        local_llm_used: true,
-        llm_provider: localIntent.usedProvider,
-      };
-    }
-
     // ========================================================================
     // Prepare FormData
     // ========================================================================
     const formData = new FormData();
+
+    const appendBoolean = (key: string, value: boolean | undefined) => {
+      if (typeof value === 'boolean') {
+        formData.append(key, value ? 'true' : 'false');
+      }
+    };
+
+    const appendString = (key: string, value: string | undefined) => {
+      if (typeof value === 'string' && value.trim()) {
+        formData.append(key, value);
+      }
+    };
+
+    const appendJson = (key: string, value: unknown) => {
+      if (value !== undefined && value !== null) {
+        formData.append(key, JSON.stringify(value));
+      }
+    };
 
     formData.append('transcript', request.text || '');
 
@@ -318,16 +309,15 @@ export const sendToWorkflow = async (
     formData.append('request_id', `mobile-${Date.now()}`);
     formData.append('session_id', SESSION_ID);
     formData.append('continuousMode', isContinuousIteration ? 'true' : 'false');
-    if (localIntent) {
-      formData.append('local_llm_used', localIntent.needsBackend ? 'false' : 'true');
-      formData.append('llm_provider', localIntent.usedProvider);
-      if (localIntent.fallbackReason) {
-        formData.append('llm_fallback_reason', localIntent.fallbackReason);
-      }
-      if (localIntent.json) {
-        formData.append('local_intent_json', JSON.stringify(localIntent.json));
-      }
-    }
+    appendBoolean('local_orchestrator_used', request.local_orchestrator_used);
+    appendBoolean('local_llm_used', request.local_llm_used);
+    appendBoolean('apple_fm_available', request.apple_fm_available);
+    appendString('llm_provider', request.llm_provider);
+    appendString('llm_fallback_reason', request.llm_fallback_reason);
+    appendString('intent_provider', request.intent_provider);
+    appendString('apple_fm_unavailable_reason', request.apple_fm_unavailable_reason);
+    appendJson('local_intent_json', request.local_intent_json);
+    appendJson('provider_trace', request.provider_trace);
 
     // ── mode field — n8n Redis expression references $json.body.mode ────
     // Derive from the three-flag system so the backend always has it.
@@ -360,6 +350,20 @@ export const sendToWorkflow = async (
     // encounters undefined for $json.body.imageWidth / imageHeight ──────
     formData.append('imageWidth', String(request.imageWidth ?? 0));
     formData.append('imageHeight', String(request.imageHeight ?? 0));
+    appendJson('camera_intrinsics', request.cameraIntrinsics);
+    appendJson('camera_intrinsics_json', request.cameraIntrinsics);
+    appendJson('K', request.cameraIntrinsics?.K);
+    appendJson('camera_intrinsic_matrix', request.cameraIntrinsics?.K);
+    if (request.cameraIntrinsics) {
+      appendString('fx', request.cameraIntrinsics.fx != null ? String(request.cameraIntrinsics.fx) : undefined);
+      appendString('fy', request.cameraIntrinsics.fy != null ? String(request.cameraIntrinsics.fy) : undefined);
+      appendString('cx', request.cameraIntrinsics.cx != null ? String(request.cameraIntrinsics.cx) : undefined);
+      appendString('cy', request.cameraIntrinsics.cy != null ? String(request.cameraIntrinsics.cy) : undefined);
+      appendString('camera_fx', request.cameraIntrinsics.fx != null ? String(request.cameraIntrinsics.fx) : undefined);
+      appendString('camera_fy', request.cameraIntrinsics.fy != null ? String(request.cameraIntrinsics.fy) : undefined);
+      appendString('camera_cx', request.cameraIntrinsics.cx != null ? String(request.cameraIntrinsics.cx) : undefined);
+      appendString('camera_cy', request.cameraIntrinsics.cy != null ? String(request.cameraIntrinsics.cy) : undefined);
+    }
 
     // Add image if provided
     if (request.imageUri) {
@@ -453,8 +457,11 @@ export const sendToWorkflow = async (
       navigation_pipeline: parsedResponse.navigation_pipeline,
       navigation_target: parsedResponse.navigation_target,
       route_map_id: parsedResponse.route_map_id,
+      local_orchestrator_used: parsedResponse.local_orchestrator_used,
       local_llm_used: parsedResponse.local_llm_used,
       llm_provider: parsedResponse.llm_provider,
+      intent_provider: parsedResponse.intent_provider,
+      apple_fm_available: parsedResponse.apple_fm_available,
       reaching_flag: parsedResponse.reaching_flag,
       reaching_ios: parsedResponse.reaching_ios,
       bbox: !!parsedResponse.bbox,
@@ -539,6 +546,16 @@ export const sendToWorkflow = async (
     throw new Error(userMessage);
   }
 };
+
+export const sendToWorkflow = async (
+  request: WorkflowRequest,
+  signal?: AbortSignal
+): Promise<WorkflowResponse> => (
+  mobileOrchestrator.process(request, signal, {
+    backendWorkflowProvider: sendToBackendWorkflow,
+    getSessionId,
+  })
+);
 
 // =============================================================================
 // SMART GUIDANCE (tracker-driven reaching)
@@ -826,6 +843,57 @@ export function parseWorkflowResponse(
     return undefined;
   };
 
+  const parseProviderTraceValue = (value: any): ProviderTraceEntry[] | undefined => {
+    if (!value) return undefined;
+
+    if (typeof value === 'string') {
+      try {
+        return parseProviderTraceValue(JSON.parse(value));
+      } catch (e) {
+        return undefined;
+      }
+    }
+
+    if (!Array.isArray(value)) return undefined;
+
+    const trace = value
+      .filter((entry: any) => entry && typeof entry === 'object')
+      .map((entry: any) => {
+        const confidence = typeof entry.confidence === 'number'
+          ? entry.confidence
+          : typeof entry.confidence === 'string'
+            ? Number(entry.confidence)
+            : undefined;
+
+        return {
+          provider: typeof entry.provider === 'string' ? entry.provider : 'unknown',
+          ok: parseBoolean(entry.ok) ?? false,
+          confidence: Number.isFinite(confidence) ? confidence : undefined,
+          needsRemote: parseBoolean(entry.needsRemote ?? entry.needs_remote) ?? undefined,
+          fallbackReason:
+            typeof entry.fallbackReason === 'string'
+              ? entry.fallbackReason
+              : typeof entry.fallback_reason === 'string'
+                ? entry.fallback_reason
+                : undefined,
+          diagnostics:
+            entry.diagnostics && typeof entry.diagnostics === 'object'
+              ? entry.diagnostics
+              : undefined,
+        };
+      });
+
+    return trace.length > 0 ? trace : undefined;
+  };
+
+  const pickProviderTrace = (): ProviderTraceEntry[] | undefined => {
+    for (const payload of orderedPayloads) {
+      const trace = parseProviderTraceValue(payload.provider_trace ?? payload.providerTrace);
+      if (trace) return trace;
+    }
+    return undefined;
+  };
+
   // ─── Normalize values that come from the n8n backend ─────────────────────
   // Mansi's standard reaching path writes `hand_direction` to Redis via
   // JSON.stringify(...). That means populated values arrive at the app
@@ -1005,12 +1073,25 @@ export function parseWorkflowResponse(
     parseBoolean(payload.localLlmUsed) === true
   );
 
+  const local_orchestrator_used = normalizedPayloads.some((payload) =>
+    parseBoolean(payload.local_orchestrator_used) === true ||
+    parseBoolean(payload.localOrchestratorUsed) === true
+  );
+
   const llm_provider =
     pickStringByKeyPriority([
       'llm_provider',
       'llmProvider',
       'local_llm_provider',
       'localLlmProvider',
+    ]) || undefined;
+
+  const intent_provider =
+    pickStringByKeyPriority([
+      'intent_provider',
+      'intentProvider',
+      'local_intent_provider',
+      'localIntentProvider',
     ]) || undefined;
 
   const llm_fallback_reason =
@@ -1022,6 +1103,26 @@ export function parseWorkflowResponse(
         'localLlmFallbackReason',
       ]),
     ) || undefined;
+
+  const apple_fm_available = (() => {
+    for (const payload of orderedPayloads) {
+      const parsed = parseBoolean(payload.apple_fm_available ?? payload.appleFmAvailable);
+      if (parsed !== null) return parsed;
+    }
+    return undefined;
+  })();
+
+  const apple_fm_unavailable_reason =
+    normalizeBackendString(
+      pickStringByKeyPriority([
+        'apple_fm_unavailable_reason',
+        'appleFmUnavailableReason',
+        'foundation_models_unavailable_reason',
+        'foundationModelsUnavailableReason',
+      ]),
+    ) || undefined;
+
+  const provider_trace = pickProviderTrace();
 
   const annotatedImageRaw = normalizeBackendString(
     pickString(['annotated_image', 'annotatedImage', 'annotated_image_base64', 'annotatedImageBase64']),
@@ -1053,9 +1154,13 @@ export function parseWorkflowResponse(
     navigation_pipeline,
     navigation_target,
     route_map_id,
+    local_orchestrator_used,
     local_llm_used,
     llm_provider,
+    intent_provider,
     llm_fallback_reason,
+    apple_fm_available,
+    apple_fm_unavailable_reason,
     reaching_flag,
     reaching_ios,
     bbox: bbox ? `[${bbox.join(', ')}]` : 'none',
@@ -1076,6 +1181,11 @@ export function parseWorkflowResponse(
     route_map_id,
     route_map_name,
     navigation_error,
+    local_orchestrator_used,
+    intent_provider,
+    provider_trace,
+    apple_fm_available,
+    apple_fm_unavailable_reason,
     local_llm_used,
     llm_provider,
     llm_fallback_reason,

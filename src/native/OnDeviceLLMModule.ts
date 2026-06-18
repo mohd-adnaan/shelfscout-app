@@ -10,6 +10,8 @@ export interface LocalLLMNativeResult {
   json?: string;
   rawText?: string;
   fallbackReason?: string;
+  appleFmAvailable?: boolean;
+  appleFmUnavailableReason?: string;
 }
 
 interface NativeOnDeviceLLMModule {
@@ -37,6 +39,10 @@ const unavailable: NativeOnDeviceLLMModule = {
       confidence: 0,
       needsBackend: true,
       fallbackReason: Platform.OS === 'ios'
+        ? 'on_device_llm_not_linked'
+        : 'on_device_llm_ios_only',
+      appleFmAvailable: false,
+      appleFmUnavailableReason: Platform.OS === 'ios'
         ? 'on_device_llm_not_linked'
         : 'on_device_llm_ios_only',
     };

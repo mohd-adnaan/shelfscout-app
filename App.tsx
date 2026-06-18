@@ -65,6 +65,10 @@ import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
 import { NAVIGATION_CONFIG, DETECTION_URL, ACQUISITION_URL } from './src/utils/constants';
 import { fixImageOrientation } from './src/services/fixImageOrientation';
+import {
+  CameraIntrinsicsPayload,
+  cameraIntrinsicsForUploadedImage,
+} from './src/services/CameraIntrinsics';
 import { SettingsProvider, useSettings } from './src/context/SettingsContext';
 import SettingsScreen from './src/screens/SettingsScreen';
 import { debugLogger } from './src/services/DebugLogger';
@@ -396,6 +400,7 @@ function AppInner(): React.JSX.Element {
   const continuousLastAcceptedSpeechRef = useRef<ContinuousSpeechRecord | null>(null);
   const enqueueContinuousSpeechRef = useRef<EnqueueContinuousSpeech>(() => false);
   const lastImageDimensions = useRef<{ width: number; height: number }>({ width: 0, height: 0 });
+  const lastCameraIntrinsics = useRef<CameraIntrinsicsPayload | undefined>(undefined);
   const prefetchedPhotoRef = useRef<string | null>(null);
   const activeCapturePromiseRef = useRef<Promise<string> | null>(null);
   const wearablesPrewarmAttemptedRef = useRef(false);
@@ -916,6 +921,7 @@ function AppInner(): React.JSX.Element {
           try {
             const wearablesPhoto = await wearablesCamera.capturePhoto();
             lastImageDimensions.current = { width: 0, height: 0 };
+            lastCameraIntrinsics.current = undefined;
             return wearablesPhoto;
           } catch (error) {
             console.error('❌ Wearables capture failed:', error);
@@ -953,6 +959,19 @@ function AppInner(): React.JSX.Element {
             width: fixedImage.width || 0,
             height: fixedImage.height || 0,
           };
+          lastCameraIntrinsics.current = cameraIntrinsicsForUploadedImage(
+            (photo as any).cameraCalibrationData,
+            lastImageDimensions.current,
+          );
+          if (lastCameraIntrinsics.current) {
+            console.log(
+              '📐 Camera intrinsics:',
+              `fx=${lastCameraIntrinsics.current.fx.toFixed(1)}`,
+              `fy=${lastCameraIntrinsics.current.fy.toFixed(1)}`,
+              `cx=${lastCameraIntrinsics.current.cx.toFixed(1)}`,
+              `cy=${lastCameraIntrinsics.current.cy.toFixed(1)}`,
+            );
+          }
           console.log('✅ Photo captured & fixed:', fixedImage.uri,
             `(${fixedImage.width}×${fixedImage.height})`);
           return fixedImage.uri;
@@ -976,6 +995,10 @@ function AppInner(): React.JSX.Element {
             const retry = await cameraRef.current.takePhoto({
               enableShutterSound: useSystemShutterSound,
             });
+            lastCameraIntrinsics.current = cameraIntrinsicsForUploadedImage(
+              (retry as any).cameraCalibrationData,
+              { width: retry.width, height: retry.height },
+            );
             return retry.path;
           } catch (e) {
             console.error('❌ Retry also failed:', e);
@@ -1744,6 +1767,7 @@ function AppInner(): React.JSX.Element {
               imageUri: photoPath || '',
               imageWidth: lastImageDimensions.current.width,
               imageHeight: lastImageDimensions.current.height,
+              cameraIntrinsics: lastCameraIntrinsics.current,
               navigation: loopMode === 'navigation',
               navigation_pipeline: settingsRef.current.navigationPipeline,
               navigation_ios_preferred: Platform.OS === 'ios' && settingsRef.current.navigationPipeline === 'arkit',
@@ -2259,6 +2283,7 @@ function AppInner(): React.JSX.Element {
             imageUri: photoPath,
             imageWidth: lastImageDimensions.current.width,
             imageHeight: lastImageDimensions.current.height,
+            cameraIntrinsics: lastCameraIntrinsics.current,
             navigation: false,
             navigation_pipeline: 'arkit',
             navigation_ios_preferred: true,
@@ -2484,6 +2509,7 @@ function AppInner(): React.JSX.Element {
           imageUri: photoPath || '',
           imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,
+          cameraIntrinsics: lastCameraIntrinsics.current,
           navigation: false,
           navigation_pipeline: settingsRef.current.navigationPipeline,
           navigation_ios_preferred: Platform.OS === 'ios' && settingsRef.current.navigationPipeline === 'arkit',

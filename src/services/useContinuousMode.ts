@@ -36,6 +36,7 @@ import { sendToWorkflow } from '../services/WorkflowService';
 import { speachesSentenceChunker } from '../services/SpeachesSentenceChunker';
 import { audioFeedback } from '../services/AudioFeedbackService';
 import { useDeviceOrientation } from '../hooks/useDeviceOrientation';
+import { cameraIntrinsicsForUploadedImage } from './CameraIntrinsics';
 
 // ============================================================================
 // Configuration
@@ -349,6 +350,9 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     updateCycleState('capturing');
 
     let photoPath: string | null = null;
+    let photoWidth = 0;
+    let photoHeight = 0;
+    let cameraIntrinsics: ReturnType<typeof cameraIntrinsicsForUploadedImage>;
 
     // ── Capture ──────────────────────────────────────────────────────────────
     try {
@@ -363,6 +367,12 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
         enableShutterSound: false,
       });
       photoPath = photo.path;
+      photoWidth = photo.width || 0;
+      photoHeight = photo.height || 0;
+      cameraIntrinsics = cameraIntrinsicsForUploadedImage(
+        (photo as any).cameraCalibrationData,
+        { width: photoWidth, height: photoHeight },
+      );
       statsRef.current.photosCaputred++;
       log(`📸 Captured: ${photoPath}`);
     } catch (err) {
@@ -387,7 +397,14 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
       log('📤 POSTing to backend…');
 
       const result = await sendToWorkflow(
-        { text: 'navigation', imageUri: photoPath || '', navigation: true },
+        {
+          text: 'navigation',
+          imageUri: photoPath || '',
+          imageWidth: photoWidth,
+          imageHeight: photoHeight,
+          cameraIntrinsics,
+          navigation: true,
+        },
         abort.signal,
       );
 

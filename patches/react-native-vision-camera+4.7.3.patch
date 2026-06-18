@@ -1,0 +1,107 @@
+diff --git a/node_modules/react-native-vision-camera/ios/Core/CameraSession+Photo.swift b/node_modules/react-native-vision-camera/ios/Core/CameraSession+Photo.swift
+index c19c7a1..b9a2f43 100644
+--- a/node_modules/react-native-vision-camera/ios/Core/CameraSession+Photo.swift
++++ b/node_modules/react-native-vision-camera/ios/Core/CameraSession+Photo.swift
+@@ -50,6 +50,9 @@ extension CameraSession {
+ 
+       // depth data
+       photoSettings.isDepthDataDeliveryEnabled = photoOutput.isDepthDataDeliveryEnabled
++      if photoOutput.isCameraCalibrationDataDeliverySupported {
++        photoSettings.isCameraCalibrationDataDeliveryEnabled = true
++      }
+       if #available(iOS 12.0, *) {
+         photoSettings.isPortraitEffectsMatteDeliveryEnabled = photoOutput.isPortraitEffectsMatteDeliveryEnabled
+       }
+diff --git a/node_modules/react-native-vision-camera/ios/Core/PhotoCaptureDelegate.swift b/node_modules/react-native-vision-camera/ios/Core/PhotoCaptureDelegate.swift
+index 308de72..c5de227 100644
+--- a/node_modules/react-native-vision-camera/ios/Core/PhotoCaptureDelegate.swift
++++ b/node_modules/react-native-vision-camera/ios/Core/PhotoCaptureDelegate.swift
+@@ -64,6 +64,35 @@ final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
+       let cgOrientation = CGImagePropertyOrientation(rawValue: exifOrientation) ?? CGImagePropertyOrientation.up
+       let orientation = getOrientation(forExifOrientation: cgOrientation)
+       let isMirrored = getIsMirrored(forExifOrientation: cgOrientation)
++      var cameraCalibrationData: [String: Any]? = nil
++      if let calibration = photo.cameraCalibrationData {
++        let k = calibration.intrinsicMatrix
++        let referenceDimensions = calibration.intrinsicMatrixReferenceDimensions
++        let fx = Double(k.columns.0.x)
++        let fy = Double(k.columns.1.y)
++        let cx = Double(k.columns.2.x)
++        let cy = Double(k.columns.2.y)
++        cameraCalibrationData = [
++          "source": "AVCapturePhoto.cameraCalibrationData",
++          "referenceDimensions": [
++            "width": Double(referenceDimensions.width),
++            "height": Double(referenceDimensions.height),
++          ],
++          "fx": fx,
++          "fy": fy,
++          "cx": cx,
++          "cy": cy,
++          "K": [
++            [fx, 0.0, cx],
++            [0.0, fy, cy],
++            [0.0, 0.0, 1.0],
++          ],
++          "K_row_major": [fx, 0.0, cx, 0.0, fy, cy, 0.0, 0.0, 1.0],
++        ]
++      }
+ 
+       promise.resolve([
+         "path": path.absoluteString,
+@@ -74,6 +103,7 @@ final class PhotoCaptureDelegate: NSObject, AVCapturePhotoCaptureDelegate {
+         "isMirrored": isMirrored,
+         "isRawPhoto": photo.isRawPhoto,
+         "metadata": photo.metadata,
++        "cameraCalibrationData": cameraCalibrationData as Any,
+         "thumbnail": photo.embeddedThumbnailPhotoFormat as Any,
+       ])
+     } catch let error as CameraError {
+diff --git a/node_modules/react-native-vision-camera/src/types/PhotoFile.ts b/node_modules/react-native-vision-camera/src/types/PhotoFile.ts
+index 8e6fd5e..c6afc89 100644
+--- a/node_modules/react-native-vision-camera/src/types/PhotoFile.ts
++++ b/node_modules/react-native-vision-camera/src/types/PhotoFile.ts
+@@ -64,6 +64,19 @@ export interface PhotoFile extends TemporaryFile {
+    */
+   isMirrored: boolean
+   thumbnail?: Record<string, unknown>
++  cameraCalibrationData?: {
++    source: string
++    referenceDimensions: {
++      width: number
++      height: number
++    }
++    fx: number
++    fy: number
++    cx: number
++    cy: number
++    K: number[][]
++    K_row_major: number[]
++  }
+   /**
+    * Metadata information describing the captured image. (iOS only)
+    *
+diff --git a/node_modules/react-native-vision-camera/lib/typescript/types/PhotoFile.d.ts b/node_modules/react-native-vision-camera/lib/typescript/types/PhotoFile.d.ts
+index 4f3e7f9..4c295a2 100644
+--- a/node_modules/react-native-vision-camera/lib/typescript/types/PhotoFile.d.ts
++++ b/node_modules/react-native-vision-camera/lib/typescript/types/PhotoFile.d.ts
+@@ -63,6 +63,19 @@ export interface PhotoFile extends TemporaryFile {
+      */
+     isMirrored: boolean;
+     thumbnail?: Record<string, unknown>;
++    cameraCalibrationData?: {
++        source: string;
++        referenceDimensions: {
++            width: number;
++            height: number;
++        };
++        fx: number;
++        fy: number;
++        cx: number;
++        cy: number;
++        K: number[][];
++        K_row_major: number[];
++    };
+     /**
+      * Metadata information describing the captured image. (iOS only)
+      *

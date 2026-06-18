@@ -1,3 +1,9 @@
+jest.mock('@react-native-async-storage/async-storage', () => ({
+  getItem: jest.fn().mockResolvedValue(null),
+  setItem: jest.fn().mockResolvedValue(undefined),
+  removeItem: jest.fn().mockResolvedValue(undefined),
+}));
+
 import { parseWorkflowResponse } from '../src/services/WorkflowService';
 
 describe('parseWorkflowResponse', () => {
@@ -53,13 +59,29 @@ describe('parseWorkflowResponse', () => {
     const parsed = parseWorkflowResponse({
       response: null,
       navigation_pipeline: 'arkit',
+      local_orchestrator_used: 'true',
       local_llm_used: 'true',
       llm_provider: 'apple_foundation_models',
+      intent_provider: 'apple_foundation_models',
       llm_fallback_reason: 'foundation_models_unavailable',
+      apple_fm_available: 'false',
+      apple_fm_unavailable_reason: 'foundation_models_model_not_ready',
+      provider_trace: JSON.stringify([
+        {
+          provider: 'apple_foundation_models',
+          ok: false,
+          fallbackReason: 'foundation_models_model_not_ready',
+        },
+      ]),
     });
 
+    expect(parsed.local_orchestrator_used).toBe(true);
     expect(parsed.local_llm_used).toBe(true);
     expect(parsed.llm_provider).toBe('apple_foundation_models');
+    expect(parsed.intent_provider).toBe('apple_foundation_models');
     expect(parsed.llm_fallback_reason).toBe('foundation_models_unavailable');
+    expect(parsed.apple_fm_available).toBe(false);
+    expect(parsed.apple_fm_unavailable_reason).toBe('foundation_models_model_not_ready');
+    expect(parsed.provider_trace?.[0]?.provider).toBe('apple_foundation_models');
   });
 });

@@ -473,6 +473,7 @@ extension ReachingViewController {
     appendField("continuousMode", "true")
     appendField("imageWidth", imageWidth)
     appendField("imageHeight", imageHeight)
+    appendCameraIntrinsicsFields(appendField, frame: frame, outputImageSize: newSize)
     appendField("object", objectName)
     appendField("mode", mode.rawValue)
     appendField("reaching_ios", "true")

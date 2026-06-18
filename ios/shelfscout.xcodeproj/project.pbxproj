@@ -14,6 +14,7 @@
 		5F20C32D2FBB6DD10066A43D /* DepthAnythingV2SmallF16.mlpackage in Sources */ = {isa = PBXBuildFile; fileRef = 5F20C32A2FBB6DD10066A43D /* DepthAnythingV2SmallF16.mlpackage */; };
 		5F20C32F2FBB6E630066A43D /* Reachingviewcontroller+depthanythingv2.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F20C32E2FBB6E5F0066A43D /* Reachingviewcontroller+depthanythingv2.swift */; };
 		5F2669B42FBD557C007C1473 /* Reachingviewcontroller+placeandhold.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F2669B32FBD5578007C1473 /* Reachingviewcontroller+placeandhold.swift */; };
+		5F2669D02FCDD001007C1473 /* Reachingviewcontroller+cameraIntrinsics.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F2669CF2FCDD001007C1473 /* Reachingviewcontroller+cameraIntrinsics.swift */; };
 		5F359D612F48B656000E7BB8 /* jbl_latency_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */; };
 		5F359D622F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5D2F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 */; };
 		5F359D632F48B656000E7BB8 /* jbl_begin_sae.caf in Resources */ = {isa = PBXBuildFile; fileRef = 5F359D5B2F48B656000E7BB8 /* jbl_begin_sae.caf */; };
@@ -67,6 +68,7 @@
 		5F20C32A2FBB6DD10066A43D /* DepthAnythingV2SmallF16.mlpackage */ = {isa = PBXFileReference; lastKnownFileType = folder.mlpackage; path = DepthAnythingV2SmallF16.mlpackage; sourceTree = "<group>"; };
 		5F20C32E2FBB6E5F0066A43D /* Reachingviewcontroller+depthanythingv2.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+depthanythingv2.swift"; sourceTree = "<group>"; };
 		5F2669B32FBD5578007C1473 /* Reachingviewcontroller+placeandhold.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+placeandhold.swift"; sourceTree = "<group>"; };
+		5F2669CF2FCDD001007C1473 /* Reachingviewcontroller+cameraIntrinsics.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+cameraIntrinsics.swift"; sourceTree = "<group>"; };
 		5F359D5B2F48B656000E7BB8 /* jbl_begin_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_begin_sae.caf; sourceTree = "<group>"; };
 		5F359D5C2F48B656000E7BB8 /* jbl_latency_sae.caf */ = {isa = PBXFileReference; lastKnownFileType = file; path = jbl_latency_sae.caf; sourceTree = "<group>"; };
 		5F359D5D2F48B656000E7BB8 /* jbl_stopped_ios_sae.mp3 */ = {isa = PBXFileReference; lastKnownFileType = audio.mp3; path = jbl_stopped_ios_sae.mp3; sourceTree = "<group>"; };
@@ -132,6 +134,7 @@
 			isa = PBXGroup;
 			children = (
 				5F2669B32FBD5578007C1473 /* Reachingviewcontroller+placeandhold.swift */,
+				5F2669CF2FCDD001007C1473 /* Reachingviewcontroller+cameraIntrinsics.swift */,
 				5F20C32E2FBB6E5F0066A43D /* Reachingviewcontroller+depthanythingv2.swift */,
 				5F00AC122FB9899B008C5923 /* WearablesCameraModule.swift */,
 				5F9A0A002F00000200000001 /* ProximitySensorModule.swift */,
@@ -434,6 +437,7 @@
 				761780ED2CA45674006654EE /* AppDelegate.swift in Sources */,
 				5FD1F2013C00000200000001 /* SceneDelegate.swift in Sources */,
 				5F2669B42FBD557C007C1473 /* Reachingviewcontroller+placeandhold.swift in Sources */,
+				5F2669D02FCDD001007C1473 /* Reachingviewcontroller+cameraIntrinsics.swift in Sources */,
 				5F3C03852F3A945F001B0A13 /* Imageorientationfixer.swift in Sources */,
 				5F20C32F2FBB6E630066A43D /* Reachingviewcontroller+depthanythingv2.swift in Sources */,
 			);

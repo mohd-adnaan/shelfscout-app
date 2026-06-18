@@ -306,11 +306,11 @@ extension ReachingViewController {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.timeoutInterval = 30  // Qwen on CPU can take 10–25s
 
-    let body: [String: Any] = [
+    let body = bodyAddingCameraIntrinsics([
       "image": base64Str,
       "object": objectName,
       "score_threshold": 0.1
-    ]
+    ], frame: frame, outputImageSize: resized.size)
     guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
       isTrackerReseeding = false
       return
@@ -521,11 +521,11 @@ extension ReachingViewController {
     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
     request.timeoutInterval = initialReseedTimeoutSec
 
-    let body: [String: Any] = [
+    let body = bodyAddingCameraIntrinsics([
       "image": base64Str,
       "object": objectName,
       "score_threshold": 0.1
-    ]
+    ], frame: frame, outputImageSize: resized.size)
     guard let bodyData = try? JSONSerialization.data(withJSONObject: body) else {
       initialReseedStatus = .failed
       detectionFrameCameraTransform = nil

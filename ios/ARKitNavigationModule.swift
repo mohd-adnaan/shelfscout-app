@@ -346,7 +346,8 @@ final class OnDeviceLLMModule: NSObject {
                         "confidence": confidence,
                         "needsBackend": false,
                         "json": json,
-                        "rawText": output
+                        "rawText": output,
+                        "appleFmAvailable": true
                     ])
                 } catch {
                     resolve(self.fallbackDictionary(reason: error.localizedDescription))
@@ -362,14 +363,11 @@ final class OnDeviceLLMModule: NSObject {
     @available(iOS 26.0, *)
     private func runFoundationModel(prompt: String) async throws -> String {
         let model = SystemLanguageModel.default
-        switch model.availability {
-        case .available:
-            break
-        default:
+        if let reason = foundationModelUnavailableReason(model.availability) {
             throw NSError(
                 domain: "OnDeviceLLMModule",
                 code: 1,
-                userInfo: [NSLocalizedDescriptionKey: "Apple Foundation Models are not available on this device."]
+                userInfo: [NSLocalizedDescriptionKey: reason]
             )
         }
 
@@ -383,17 +381,22 @@ final class OnDeviceLLMModule: NSObject {
         #if canImport(FoundationModels)
         if #available(iOS 26.0, *) {
             let model = SystemLanguageModel.default
-            if case .available = model.availability {
+            if let reason = foundationModelUnavailableReason(model.availability) {
+                return fallbackDictionary(reason: reason)
+            } else {
                 return [
                     "available": true,
                     "usedProvider": "apple_foundation_models",
                     "confidence": 1,
-                    "needsBackend": false
+                    "needsBackend": false,
+                    "appleFmAvailable": true
                 ]
             }
         }
+        return fallbackDictionary(reason: "foundation_models_requires_ios_26")
+        #else
+        return fallbackDictionary(reason: "foundation_models_framework_not_linked")
         #endif
-        return fallbackDictionary(reason: "foundation_models_unavailable")
     }
 
     private func fallbackDictionary(reason: String) -> [String: Any] {
@@ -402,9 +405,36 @@ final class OnDeviceLLMModule: NSObject {
             "usedProvider": "none",
             "confidence": 0,
             "needsBackend": true,
-            "fallbackReason": reason
+            "fallbackReason": reason,
+            "appleFmAvailable": false,
+            "appleFmUnavailableReason": reason
         ]
     }
+
+    #if canImport(FoundationModels)
+    @available(iOS 26.0, *)
+    private func foundationModelUnavailableReason(
+        _ availability: SystemLanguageModel.Availability
+    ) -> String? {
+        switch availability {
+        case .available:
+            return nil
+        case .unavailable(let reason):
+            switch reason {
+            case .deviceNotEligible:
+                return "foundation_models_device_not_eligible"
+            case .appleIntelligenceNotEnabled:
+                return "foundation_models_apple_intelligence_not_enabled"
+            case .modelNotReady:
+                return "foundation_models_model_not_ready"
+            @unknown default:
+                return "foundation_models_unavailable_unknown"
+            }
+        @unknown default:
+            return "foundation_models_unavailable_unknown"
+        }
+    }
+    #endif
 
     private func sanitized(_ value: String?) -> String {
         (value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
