@@ -364,6 +364,9 @@ final class SemanticRouteNavigator: ObservableObject {
     private var routeEvidenceWindow: [RouteEvidence] = []
     private var routeBeliefState = RouteBeliefState.empty
     private var lastRouteUpdatePDRDelta: Double = 0
+    private var lastPDRDeltaWasCapped = false
+    private var lastHeadingAlignmentCueAt: Date?
+    private var lastHeadingAlignmentCueKey: String?
 
     private let arrivalThresholdMeters = 0.55
     private let destinationProximityMeters = 0.75
@@ -397,10 +400,16 @@ final class SemanticRouteNavigator: ObservableObject {
     private let decisionAdvanceRequiredSamples = 2
     private let routeAdvanceMaxUnconfirmedRemainingMeters = 1.20
     private let routeStartHeadingPenaltyMeters = 1.25
+    private let routeStartAlignmentThresholdDegrees = 40.0
+    private let routeTurnAlignmentThresholdDegrees = 55.0
+    private let routeAlignmentProgressWindowMeters = 1.10
+    private let routeAlignmentCueCooldownSeconds: TimeInterval = 1.4
+    private let maxPDRDeltaPerUpdateMeters = 1.20
     private let offAxisProgressExtraMeters = 1.25
     private let offAxisProgressMaxMeters = 3.4
     private let backwardProgressCorrectionMaxMeters = 1.15
     private let backwardRecoveryDriftMeters = 0.55
+    private let immediateBackwardRecoveryDriftMeters = 0.75
     private let recoveryAdvisoryCrossTrackMeters = 1.05
     private let recoveryCriticalCrossTrackMeters = 1.85
     private let destinationCorridorExtraMeters = 0.55
@@ -1177,6 +1186,9 @@ final class SemanticRouteNavigator: ObservableObject {
         lastVisualRouteMatch = nil
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
+        lastPDRDeltaWasCapped = false
+        lastHeadingAlignmentCueAt = nil
+        lastHeadingAlignmentCueKey = nil
         resetRouteCorrectionGuards()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = Date().addingTimeInterval(guidanceIntroProtectionSeconds)
@@ -1184,7 +1196,13 @@ final class SemanticRouteNavigator: ObservableObject {
         phase = .navigating
         updateInstruction(forceSpeech: false)
         let startName = Self.sanitizedSpokenLabel(steps.first?.from.name, fallback: "your current location")
-        let firstInstruction = currentInstruction
+        var firstInstruction = currentInstruction
+        if let headingCue = initialHeadingAlignmentInstruction(
+            on: steps[0],
+            liveHeading: arHeading ?? imuState.bearing
+        ) {
+            firstInstruction = "\(headingCue) Then \(firstInstruction.lowercased())"
+        }
         currentInstruction = "Starting at \(startName). \(firstInstruction)"
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
         rebuildRAGContext()
@@ -1202,6 +1220,7 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryReason = nil
         lastIMUStepCount = nil
         lastIMUPosition = nil
+        lastPDRDeltaWasCapped = false
         lastAnnouncedRemainingMeter = nil
         lastAnnouncedLandmarkID = nil
         announcedLandmarkIDs.removeAll()
@@ -1211,6 +1230,8 @@ final class SemanticRouteNavigator: ObservableObject {
         lastVisualRouteMatch = nil
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
+        lastHeadingAlignmentCueAt = nil
+        lastHeadingAlignmentCueKey = nil
         resetRouteCorrectionGuards()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = nil
@@ -1271,10 +1292,10 @@ final class SemanticRouteNavigator: ObservableObject {
         recordRouteEvidence(
             stepIndex: currentStepIndex,
             progressMeters: segmentProgressMeters,
-            confidence: imuState.isMoving ? 0.54 : 0.44,
+            confidence: lastPDRDeltaWasCapped ? 0.36 : (imuState.isMoving ? 0.54 : 0.44),
             uncertaintyMeters: pdrUncertaintyMeters(imuState: imuState, pdrDelta: pdrDelta, headingError: headingError),
             source: "pdr_prediction",
-            summary: "PDR"
+            summary: lastPDRDeltaWasCapped ? "PDR capped" : "PDR"
         )
 
         var crossTrackError: Double?
@@ -1393,6 +1414,15 @@ final class SemanticRouteNavigator: ObservableObject {
         )
 
         if handleRouteBeliefHoldIfNeeded() {
+            rebuildRAGContext()
+            return
+        }
+
+        if issueHeadingAlignmentCueIfNeeded(
+            on: step,
+            liveHeading: liveHeading,
+            headingError: headingError
+        ) {
             rebuildRAGContext()
             return
         }
@@ -1859,6 +1889,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private func pdrUncertaintyMeters(imuState: IMUState, pdrDelta: Double, headingError: Double) -> Double {
         var uncertainty = max(imuState.pdrUncertaintyMeters, 0.45) + pdrDelta * 0.35
+        if lastPDRDeltaWasCapped { uncertainty += 1.10 }
         if !imuState.isMoving { uncertainty += 0.20 }
         if headingError > 45 { uncertainty += min(0.85, (headingError - 45) / 90.0) }
         if !imuState.isStepCalibrationValid { uncertainty += 0.35 }
@@ -1937,6 +1968,7 @@ final class SemanticRouteNavigator: ObservableObject {
     }
 
     private func pdrDistanceDelta(from imuState: IMUState) -> Double {
+        lastPDRDeltaWasCapped = false
         defer {
             lastIMUStepCount = imuState.stepCount
             lastIMUPosition = imuState.position
@@ -1945,13 +1977,66 @@ final class SemanticRouteNavigator: ObservableObject {
         if let lastStep = lastIMUStepCount {
             let stepDelta = max(0, imuState.stepCount - lastStep)
             if stepDelta > 0 {
-                return Double(stepDelta) * max(imuState.currentStepLength, 0.35)
+                let rawDelta = Double(stepDelta) * max(imuState.currentStepLength, 0.35)
+                if rawDelta > maxPDRDeltaPerUpdateMeters {
+                    lastPDRDeltaWasCapped = true
+                    return maxPDRDeltaPerUpdateMeters
+                }
+                return rawDelta
             }
         }
 
         guard let previous = lastIMUPosition else { return 0 }
         let delta = hypot(imuState.position.x - previous.x, imuState.position.y - previous.y)
-        return delta.isFinite ? min(max(delta, 0), 1.2) : 0
+        guard delta.isFinite else { return 0 }
+        let boundedDelta = max(delta, 0)
+        if boundedDelta > maxPDRDeltaPerUpdateMeters {
+            lastPDRDeltaWasCapped = true
+            return maxPDRDeltaPerUpdateMeters
+        }
+        return boundedDelta
+    }
+
+    private func initialHeadingAlignmentInstruction(
+        on step: SemanticRouteStep,
+        liveHeading: Double
+    ) -> String? {
+        let headingError = abs(SemanticRouteMath.signedAngleDifference(liveHeading, step.edge.bearingDegrees))
+        guard headingError >= routeStartAlignmentThresholdDegrees else { return nil }
+        return Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees)
+    }
+
+    private func issueHeadingAlignmentCueIfNeeded(
+        on step: SemanticRouteStep,
+        liveHeading: Double,
+        headingError: Double
+    ) -> Bool {
+        guard phase == .navigating else { return false }
+        guard headingError >= routeTurnAlignmentThresholdDegrees else { return false }
+
+        let recentlyAdvanced = lastRouteAdvanceAt.map {
+            Date().timeIntervalSince($0) <= visualRouteAdvanceCooldownSeconds
+        } ?? false
+        let nearStepStart = segmentProgressMeters <= routeAlignmentProgressWindowMeters
+        guard nearStepStart || recentlyAdvanced else { return false }
+
+        let instruction = Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees)
+        let key = "align_\(Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees).key)_\(currentStepIndex)"
+        let now = Date()
+        let cueChanged = key != lastHeadingAlignmentCueKey
+        let cueAge = lastHeadingAlignmentCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+
+        currentInstruction = instruction
+        confidence = min(confidence, 0.48)
+        recoveryReason = nil
+        guidanceIntroProtectedUntil = nil
+
+        if cueChanged || cueAge >= routeAlignmentCueCooldownSeconds {
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+            lastHeadingAlignmentCueAt = now
+            lastHeadingAlignmentCueKey = key
+        }
+        return true
     }
 
     private func advanceFromVisualDecisionPoint(
@@ -2307,12 +2392,13 @@ final class SemanticRouteNavigator: ObservableObject {
         let shortSegment = stepDistance > 0 && stepDistance < 2.0
         let nearDecisionPoint = segmentProgressMeters < 0.7 || segmentRemainingMeters < 1.0
         let awayFromDecisionPoint = segmentProgressMeters > 1.2 && segmentRemainingMeters > 1.4
+        let clearBackwardDrift = backwardDriftMeters >= immediateBackwardRecoveryDriftMeters
         let crossTrackBad = arLocalized && !nearDecisionPoint && observedCrossTrack > crossTrackLimit
         let backwardBad = arLocalized &&
             isMoving &&
-            !nearDecisionPoint &&
             stepDistance > 1.4 &&
-            backwardDriftMeters >= backwardRecoveryDriftMeters
+            backwardDriftMeters >= backwardRecoveryDriftMeters &&
+            (!nearDecisionPoint || clearBackwardDrift)
         let headingBad = arLocalized && !shortSegment && awayFromDecisionPoint && headingError > headingRecoveryThreshold
         let lowConfidenceBad = isMoving && !shortSegment && !nearDecisionPoint && confidence < 0.30
         let localizationBad = !arLocalized && isMoving && !nearDecisionPoint && segmentProgressMeters > 1.2
@@ -2531,6 +2617,9 @@ final class SemanticRouteNavigator: ObservableObject {
         localizationBad: Bool
     ) -> Bool {
         let hasStrongVisualEvidence = (candidate.visualConfidence ?? 0) >= visualDecisionAdvanceConfidence
+        if backwardBad && !hasStrongVisualEvidence {
+            return false
+        }
         if localizationBad {
             return hasStrongVisualEvidence &&
                 candidate.stepIndex >= currentStepIndex &&
@@ -3571,6 +3660,20 @@ final class SemanticRouteNavigator: ObservableObject {
         return ("Turn around.", "around")
     }
 
+    private static func routeAlignmentInstruction(from heading: Double, to targetBearing: Double) -> String {
+        let command = relativeTurnCommand(from: heading, to: targetBearing)
+        switch command.key {
+        case "right":
+            return "Turn right to face the route."
+        case "left":
+            return "Turn left to face the route."
+        case "around":
+            return "Turn around to face the route."
+        default:
+            return "Face the route."
+        }
+    }
+
     private static func turnInstruction(from currentBearing: Double, to nextBearing: Double) -> String {
         let diff = SemanticRouteMath.signedAngleDifference(nextBearing, currentBearing)
         let magnitude = abs(diff)
@@ -3880,6 +3983,49 @@ final class SemanticRouteNavigator: ObservableObject {
         return formatter.string(from: Date())
     }
 }
+
+#if DEBUG
+extension SemanticRouteNavigator {
+    func replaceMapsForTesting(_ maps: [SemanticRouteMap], activeMapID: String? = nil) {
+        stopNavigation(resetInstruction: false)
+        let cleaned = maps.map(Self.sanitizedMap)
+        self.maps = cleaned
+        activeMap = activeMapID.flatMap { id in cleaned.first { $0.id == id } } ?? cleaned.first
+        activeMapDraft = nil
+        phase = activeMap == nil ? .idle : .ready
+        targetName = ""
+        currentInstruction = activeMap == nil ? "Capture or load a semantic map." : "Semantic map ready."
+        if let activeMap {
+            refreshCaptureMetrics(for: activeMap)
+        }
+        rebuildRAGContext()
+    }
+
+    func setRouteProgressForTesting(
+        stepIndex: Int,
+        progressMeters: Double,
+        markRecentAdvance: Bool = false
+    ) {
+        guard stepIndex >= 0, stepIndex < routeSteps.count else { return }
+        currentStepIndex = stepIndex
+        let step = routeSteps[stepIndex]
+        segmentProgressMeters = min(max(progressMeters, 0), step.edge.distanceMeters)
+        segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
+        if phase != .navigating {
+            phase = .navigating
+        }
+        if markRecentAdvance {
+            lastRouteAdvanceAt = Date()
+        }
+        resetRouteCorrectionGuards()
+        rebuildRAGContext()
+    }
+
+    func expireRecoveryHoldForTesting() {
+        recoveryStartedAt = Date().addingTimeInterval(-(recoveryHoldSeconds + 0.1))
+    }
+}
+#endif
 
 private enum SemanticRouteMath {
     static func normalizedDegrees(_ degrees: Double) -> Double {
