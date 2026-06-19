@@ -1418,7 +1418,9 @@ function AppInner(): React.JSX.Element {
             ? 'Reaching complete.'
             : reachingResult?.success
               ? `${targetName} reached!`
-              : 'Reaching guidance ended.';
+              : reachingResult?.reason === 'spatial_relocalization_timeout'
+                ? 'I could not match the saved map here. Move closer to the mapped shelf and try again.'
+                : 'Reaching guidance ended.';
           AccessibilityInfo.announceForAccessibility(msg);
         } else {
           console.warn('⚠️ startSpatialTargetReaching not available — native module not linked');
@@ -1428,7 +1430,13 @@ function AppInner(): React.JSX.Element {
         }
       } catch (e: any) {
         console.error('❌ [SpatialTarget] Native module error:', e);
-        AccessibilityInfo.announceForAccessibility(`Reaching error: ${e.message || 'Unknown error'}`);
+        const code = e?.code || e?.name;
+        const message = code === 'TARGET_NOT_IN_MAP'
+          ? `${targetName} is not pinned in the saved AR map. Add it as a POI and save the map first.`
+          : code === 'MAP_NOT_FOUND'
+            ? 'The saved AR map for this target was not found on this device.'
+            : `Reaching error: ${e.message || 'Unknown error'}`;
+        AccessibilityInfo.announceForAccessibility(message);
       }
 
       resetSessionId();

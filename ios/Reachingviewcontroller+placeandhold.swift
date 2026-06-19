@@ -44,10 +44,27 @@ extension ReachingViewController {
     guard let target = spatialTargetWorldPosition else { return }
     guard arFrameCount >= 5 else { return }
 
+    let now = ProcessInfo.processInfo.systemUptime
+    if spatialTargetPlacementStartedAt <= 0 {
+      spatialTargetPlacementStartedAt = now
+    }
+
+    let elapsed = now - spatialTargetPlacementStartedAt
+    if elapsed > spatialTargetPlacementTimeoutSec {
+      NSLog("◎ [SpatialTarget] ❌ Relocalization timed out after %.1fs for %@ on map %@",
+            elapsed, objectName, spatialTargetMapName ?? "unknown")
+      if guidanceAudioEnabled {
+        say("I could not relocalize to the saved map. Try scanning this area again, then retry.")
+      }
+      finishWith(success: false, reason: "spatial_relocalization_timeout")
+      return
+    }
+
     switch frame.camera.trackingState {
     case .normal:
       break
     default:
+      speakSpatialTargetRelocalizationCueIfNeeded()
       if arFrameCount % 30 == 0 {
         NSLog("◎ [SpatialTarget] Waiting for ARKit relocalization before placing %@",
               objectName)
@@ -60,6 +77,7 @@ extension ReachingViewController {
     let offset = target - camPos
     let depth = simd_length(offset)
     guard depth >= 0.10 && depth <= 12.0 else {
+      speakSpatialTargetRelocalizationCueIfNeeded()
       if arFrameCount % 30 == 0 {
         NSLog("◎ [SpatialTarget] Target %@ has implausible map distance %.2fm; waiting",
               objectName, depth)
@@ -86,6 +104,15 @@ extension ReachingViewController {
 
     NSLog("◎ [SpatialTarget] ✅ Map target %@ locked at (%.3f,%.3f,%.3f), distance %.2fm",
           objectName, target.x, target.y, target.z, depth)
+  }
+
+  private func speakSpatialTargetRelocalizationCueIfNeeded() {
+    guard guidanceAudioEnabled,
+          spatialTargetRelocalizationCueSpoken == false else {
+      return
+    }
+    spatialTargetRelocalizationCueSpoken = true
+    say("Finding the saved map. Move the phone slowly and point toward the mapped shelf.")
   }
 
   private func placeAndHoldInitialBboxReady(_ frame: ARFrame) -> Bool {

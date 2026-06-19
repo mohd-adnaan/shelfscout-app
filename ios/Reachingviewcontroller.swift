@@ -160,6 +160,9 @@ class ReachingViewController: UIViewController {
   // Absolute time the AR session started (set in startARSession). Used by
   // the prototype's placement deadline.
   var sessionStartTime: TimeInterval = 0
+  var spatialTargetPlacementStartedAt: TimeInterval = 0
+  var spatialTargetRelocalizationCueSpoken = false
+  let spatialTargetPlacementTimeoutSec: TimeInterval = 18.0
   var handIsCloseEnoughInDepth = false
   /// Hand-free: lock anchor after first ARKit refinement converges.
   /// Re-detection still runs (for logging) but CANNOT move the anchor.
