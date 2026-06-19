@@ -219,7 +219,7 @@ interface SettingsScreenProps {
 export default function SettingsScreen({ onClose }: SettingsScreenProps) {
   const {
     settings,
-    updatePreferAlternativeReaching,
+    updateReachingPipeline,
     updateNavigationPipeline,
     updateUseWearablesCamera,
     updateWearablesMicrophoneSource,
@@ -236,13 +236,18 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
 
   // ── Reaching toggle ───────────────────────────────────────────────────────
 
-  const handleReachingToggle = useCallback(
-    async (value: boolean) => {
-      await updatePreferAlternativeReaching(value);
-      const label = value ? 'Standard pipeline enabled.' : 'ARKit pipeline enabled.';
+  const handleReachingPipelineChange = useCallback(
+    async (pipeline: 'visionBox' | 'spatialTarget' | 'standard') => {
+      await updateReachingPipeline(pipeline);
+      const label =
+        pipeline === 'spatialTarget'
+          ? 'Spatial Target reaching enabled.'
+          : pipeline === 'visionBox'
+            ? 'Vision Box reaching enabled.'
+            : 'Standard pipeline enabled.';
       AccessibilityInfo.announceForAccessibility(label);
     },
-    [updatePreferAlternativeReaching],
+    [updateReachingPipeline],
   );
 
   // ── Navigation toggle ─────────────────────────────────────────────────────
@@ -560,55 +565,92 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             <View
               style={[
                 styles.pipelineBadge,
-                settings.preferAlternativeReaching
+                settings.reachingPipeline === 'standard'
                   ? styles.badgeStandard
                   : styles.badgeArkit,
               ]}
             >
               <Text style={styles.pipelineBadgeText}>
-                {settings.preferAlternativeReaching
-                  ? '⚙  Standard Pipeline'
-                  : '✦  ARKit  (default)'}
+                {settings.reachingPipeline === 'spatialTarget'
+                  ? 'Spatial Target'
+                  : settings.reachingPipeline === 'standard'
+                    ? 'Standard Pipeline'
+                    : 'Vision Box'}
               </Text>
             </View>
           </View>
 
           <Text style={styles.settingDescription}>
-            Choose the guidance engine. <Text style={styles.emphasisText}>ARKit</Text> is recommended on iPhone.
+            Choose the reaching engine. <Text style={styles.emphasisText}>Spatial Target</Text> avoids backend bounding boxes after ARKit map arrival.
           </Text>
 
-          {/* Toggle row */}
-          <View style={styles.settingRow}>
-            <View style={styles.settingLabelBlock}>
-              <Text style={styles.settingLabel}>Standard Pipeline</Text>
-              <Text style={styles.settingSubLabel}>
-                {settings.preferAlternativeReaching
-                  ? 'Standard reaching active'
-                  : 'ARKit reaching active'}
-              </Text>
-            </View>
-            <Switch
-              value={settings.preferAlternativeReaching}
-              onValueChange={handleReachingToggle}
-              trackColor={{ false: C.border, true: C.warning }}
-              thumbColor={
-                settings.preferAlternativeReaching ? C.warning : C.sliderThumb
-              }
-              ios_backgroundColor={C.border}
+          <View style={styles.comparisonRow}>
+            <TouchableOpacity
+              style={[
+                styles.pipelineOption,
+                settings.reachingPipeline === 'spatialTarget' && styles.pipelineOptionActive,
+              ]}
               accessible={true}
-              accessibilityRole="switch"
-              accessibilityLabel="Use Standard Reaching Pipeline"
-              accessibilityHint={
-                settings.preferAlternativeReaching
-                  ? 'Double tap to switch to ARKit.'
-                  : 'Double tap to switch to Standard.'
-              }
-              accessibilityValue={{
-                text: settings.preferAlternativeReaching
-                  ? 'Standard pipeline active'
-                  : 'ARKit pipeline active',
-              }}
-            />
+              accessibilityRole="button"
+              accessibilityLabel={`Spatial Target reaching${settings.reachingPipeline === 'spatialTarget' ? ', currently selected' : ''}`}
+              accessibilityHint="Double tap to select"
+              onPress={() => handleReachingPipelineChange('spatialTarget')}
+            >
+              <Text style={styles.pipelineOptionIcon}>◎</Text>
+              <Text style={styles.pipelineOptionName}>Spatial Target</Text>
+              <Text style={styles.pipelineOptionDesc}>
+                Map target{'\n'}on device
+              </Text>
+              {settings.reachingPipeline === 'spatialTarget' && (
+                <View style={styles.activeDot} />
+              )}
+            </TouchableOpacity>
+
+            <View style={styles.pipelineDivider} />
+
+            <TouchableOpacity
+              style={[
+                styles.pipelineOption,
+                settings.reachingPipeline === 'visionBox' && styles.pipelineOptionActive,
+              ]}
+              accessible={true}
+              accessibilityRole="button"
+              accessibilityLabel={`Vision Box reaching${settings.reachingPipeline === 'visionBox' ? ', currently selected' : ''}`}
+              accessibilityHint="Double tap to select"
+              onPress={() => handleReachingPipelineChange('visionBox')}
+            >
+              <Text style={styles.pipelineOptionIcon}>□</Text>
+              <Text style={styles.pipelineOptionName}>Vision Box</Text>
+              <Text style={styles.pipelineOptionDesc}>
+                Backend box{'\n'}ARKit depth
+              </Text>
+              {settings.reachingPipeline === 'visionBox' && (
+                <View style={styles.activeDot} />
+              )}
+            </TouchableOpacity>
+
+            <View style={styles.pipelineDivider} />
+
+            <TouchableOpacity
+              style={[
+                styles.pipelineOption,
+                settings.reachingPipeline === 'standard' && styles.pipelineOptionActiveAlt,
+              ]}
+              accessible={true}
+              accessibilityRole="button"
+              accessibilityLabel={`Standard reaching${settings.reachingPipeline === 'standard' ? ', currently selected' : ''}`}
+              accessibilityHint="Double tap to select"
+              onPress={() => handleReachingPipelineChange('standard')}
+            >
+              <Text style={styles.pipelineOptionIcon}>↻</Text>
+              <Text style={styles.pipelineOptionName}>Standard</Text>
+              <Text style={styles.pipelineOptionDesc}>
+                Existing{'\n'}loop
+              </Text>
+              {settings.reachingPipeline === 'standard' && (
+                <View style={[styles.activeDot, { backgroundColor: C.warning }]} />
+              )}
+            </TouchableOpacity>
           </View>
 
         </Section>
@@ -723,7 +765,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         {/* ══════════════════════════════════════════
             SECTION 1.5 — Reaching Mode (Hand-free vs With Hand)
         ══════════════════════════════════════════ */}
-        {Platform.OS === 'ios' && !settings.preferAlternativeReaching && (
+        {Platform.OS === 'ios' && settings.reachingPipeline !== 'standard' && (
           <Section title="Reaching Mode">
             <Text style={styles.settingDescription}>
               Choose how guidance works: <Text style={styles.emphasisText}>Hands-free</Text> or <Text style={styles.emphasisText}>With hand</Text>.
@@ -818,7 +860,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         {/* ══════════════════════════════════════════
             SECTION 1.6 — Distance Unit
         ══════════════════════════════════════════ */}
-        {Platform.OS === 'ios' && !settings.preferAlternativeReaching && (
+        {Platform.OS === 'ios' && settings.reachingPipeline !== 'standard' && (
           <Section title="Distance Feedback">
             <Text style={styles.settingDescription}>
               Choose how distance is spoken during guidance.

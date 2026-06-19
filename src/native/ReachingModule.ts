@@ -35,6 +35,26 @@ export interface ReachingConfig {
   startupSilent?: boolean;
 }
 
+export interface SpatialTargetReachingConfig {
+  /** Saved AR map target or object name. Used for speech and future POI lookup. */
+  targetName: string;
+  /** Optional saved route map metadata for map-target relocalization. */
+  routeMapId?: string;
+  routeMapName?: string;
+  /** Optional normalized on-screen seed region. Defaults to a centered target. */
+  targetRegion?: [number, number, number, number];
+  /** Reaching mode: 'handFree' (default) or 'withHand' */
+  mode?: 'handFree' | 'withHand';
+  /** Workflow session ID forwarded to native logs/validation. */
+  sessionId?: string;
+  /** Start AR session silently; JS will enable guidance audio later */
+  startupSilent?: boolean;
+  /** iOS TTS speech rate */
+  ttsRate?: number;
+  /** Distance unit for spoken guidance */
+  distanceUnit?: 'steps' | 'cm';
+}
+
 export type ReachingState = 'idle' | 'tracking' | 'locked' | 'reached' | 'lost';
 
 export interface ReachingModuleInterface {
@@ -43,6 +63,13 @@ export interface ReachingModuleInterface {
    * Presents fullscreen ARKit view with audio guidance
    */
   startReaching(config: ReachingConfig): Promise<void>;
+
+  /**
+   * Start backend-bbox-free reaching for a saved/spatial target.
+   * This seeds native AR placement from an on-device target region and leaves
+   * map-anchor relocalization behind a separate API from backend bbox reaching.
+   */
+  startSpatialTargetReaching(config: SpatialTargetReachingConfig): Promise<void>;
   
   /**
    * Stop reaching mode and dismiss ARKit view
@@ -104,6 +131,10 @@ const AndroidStub: ReachingModuleInterface = {
   startReaching: async () => {
     console.warn('[ReachingModule] iOS-only feature. Use reaching_flag for Android.');
     throw new Error('Reaching module is only available on iOS. Use reaching_flag workflow for Android.');
+  },
+  startSpatialTargetReaching: async () => {
+    console.warn('[ReachingModule] spatial target reaching is iOS-only.');
+    throw new Error('Spatial target reaching is only available on iOS.');
   },
   stopReaching: async () => {
     console.log('[ReachingModule] stopReaching called on Android (no-op)');
@@ -211,6 +242,32 @@ export const startReachingMode = async (config: ReachingConfig): Promise<boolean
 };
 
 /**
+ * Safely start backend-bbox-free spatial target reaching.
+ */
+export const startSpatialTargetReachingMode = async (
+  config: SpatialTargetReachingConfig,
+): Promise<boolean> => {
+  if (Platform.OS !== 'ios') {
+    console.warn('[ReachingModule] Cannot start spatial target reaching on non-iOS platform');
+    return false;
+  }
+
+  try {
+    const available = await ReachingBridge.isAvailable();
+    if (!available) {
+      console.warn('[ReachingModule] ARKit not available on this device');
+      return false;
+    }
+
+    await ReachingBridge.startSpatialTargetReaching(config);
+    return true;
+  } catch (error) {
+    console.error('[ReachingModule] Failed to start spatial target reaching:', error);
+    return false;
+  }
+};
+
+/**
  * Safely stop reaching mode
  */
 export const stopReachingMode = async (): Promise<void> => {
@@ -234,5 +291,6 @@ export default {
   ReachingEvents,
   isIOSReachingAvailable,
   startReachingMode,
+  startSpatialTargetReachingMode,
   stopReachingMode,
 };

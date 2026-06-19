@@ -91,6 +91,80 @@ class ReachingModule: NSObject {
     } else { rejecter("CAM", "Camera not authorized", nil) }
   }
 
+  @objc func startSpatialTargetReaching(
+    _ params: NSDictionary,
+    resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    NSLog("◎ [ReachingModule] startSpatialTargetReaching params: %@", params)
+
+    let targetName = ((params["targetName"] as? String) ?? "target")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !targetName.isEmpty else {
+      rejecter("BAD_TARGET", "targetName is required for spatial target reaching", nil)
+      return
+    }
+
+    var targetRegion: [CGFloat] = [0.42, 0.38, 0.58, 0.62]
+    if let raw = params["targetRegion"] {
+      var parsed: [CGFloat] = []
+      if let arr = raw as? [NSNumber] {
+        parsed = arr.map { CGFloat($0.doubleValue) }
+      } else if let arr = raw as? [Any] {
+        parsed = arr.compactMap { v -> CGFloat? in
+          if let n = v as? NSNumber { return CGFloat(n.doubleValue) }
+          if let s = v as? String, let d = Double(s) { return CGFloat(d) }
+          return nil
+        }
+      }
+      if parsed.count == 4 {
+        targetRegion = parsed.map { min(max($0, 0), 1) }
+      }
+    }
+
+    let modeStr = (params["mode"] as? String) ?? "handFree"
+    let mode: ReachingViewController.ReachingMode = modeStr == "withHand" ? .withHand : .handFree
+    let ttsRate: Float = (params["ttsRate"] as? NSNumber)?.floatValue ?? 0.5
+    let distanceUnit = (params["distanceUnit"] as? String) ?? "steps"
+    let startupSilent = (params["startupSilent"] as? Bool) ?? false
+    let sessionId = params["sessionId"] as? String
+    let routeMapName = params["routeMapName"] as? String
+
+    NSLog(
+      "◎ [ReachingModule] Spatial target=%@ map=%@ region=[%.2f,%.2f,%.2f,%.2f] mode=%@",
+      targetName,
+      routeMapName ?? "current",
+      targetRegion[0], targetRegion[1], targetRegion[2], targetRegion[3],
+      mode.rawValue
+    )
+
+    let status = AVCaptureDevice.authorizationStatus(for: .video)
+    let launch = { [weak self] in
+      self?.presentReachingVC(
+        bbox: targetRegion,
+        objectName: targetName,
+        depth: nil,
+        imageW: 1,
+        imageH: 1,
+        detectionUrl: nil,
+        acquisitionUrl: nil,
+        sessionId: sessionId,
+        mode: mode,
+        startupSilent: startupSilent,
+        ttsRate: ttsRate,
+        distanceUnit: distanceUnit,
+        resolver: resolver,
+        rejecter: rejecter
+      )
+    }
+    if status == .authorized { launch() }
+    else if status == .notDetermined {
+      AVCaptureDevice.requestAccess(for: .video) { ok in
+        if ok { launch() } else { rejecter("CAM", "Camera denied", nil) }
+      }
+    } else { rejecter("CAM", "Camera not authorized", nil) }
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Update Bbox (called from RN during progressive re-detection)
   // ═══════════════════════════════════════════════════════════════════════════

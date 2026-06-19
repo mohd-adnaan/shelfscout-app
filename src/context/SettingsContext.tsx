@@ -19,11 +19,14 @@ import { iOSTts } from '../services/iOSTtsClient';
 
 export type WearablesMicrophoneSource = 'wearables' | 'phone';
 export type NavigationPipeline = 'rtab' | 'arkit';
+export type ReachingPipeline = 'visionBox' | 'spatialTarget' | 'standard';
 
 export interface AppSettings {
   /** Indoor route navigation engine. Defaults to RTAB for compatibility. */
   navigationPipeline: NavigationPipeline;
-  /** When true, ignore reaching_ios → use the generic "reaching" pipeline */
+  /** Reaching guidance engine. spatialTarget is backend-bbox-free on iOS. */
+  reachingPipeline: ReachingPipeline;
+  /** @deprecated use reachingPipeline === 'standard'. Kept for saved-settings migration. */
   preferAlternativeReaching: boolean;
   /** When true, use Meta Ray-Ban camera feed instead of phone camera */
   useWearablesCamera: boolean;
@@ -45,6 +48,7 @@ interface SettingsContextValue {
   settings: AppSettings;
   isLoaded: boolean;
   updatePreferAlternativeReaching: (value: boolean) => Promise<void>;
+  updateReachingPipeline: (pipeline: ReachingPipeline) => Promise<void>;
   updateUseWearablesCamera: (value: boolean) => Promise<void>;
   updateNavigationPipeline: (pipeline: NavigationPipeline) => Promise<void>;
   updateWearablesMicrophoneSource: (source: WearablesMicrophoneSource) => Promise<void>;
@@ -55,12 +59,12 @@ interface SettingsContextValue {
   updateEnableAcquisitionAutoExit: (value: boolean) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
-   * Returns 'arkit' | 'standard' | 'none'.
+   * Returns 'spatialTarget' | 'arkit' | 'standard' | 'none'.
    */
   resolveReachingPipeline: (flags: {
     reaching_ios?: boolean;
     reaching?: boolean;
-  }) => 'arkit' | 'standard' | 'none';
+  }) => ReachingPipeline | 'arkit' | 'none';
   /**
    * Given backend navigation flags, decide which navigation pipeline to use.
    * Returns 'arkit' only when user opted in and the platform can present ARKit.
@@ -79,6 +83,7 @@ interface SettingsContextValue {
 
 const DEFAULT_SETTINGS: AppSettings = {
   navigationPipeline: 'rtab',
+  reachingPipeline: 'visionBox',
   preferAlternativeReaching: false,
   useWearablesCamera: false,
   wearablesMicrophoneSource: 'wearables',
@@ -112,7 +117,15 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
         const raw = await AsyncStorage.getItem(STORAGE_KEY);
         if (raw) {
           const saved: Partial<AppSettings> = JSON.parse(raw);
-          const merged: AppSettings = { ...DEFAULT_SETTINGS, ...saved };
+          const migratedReachingPipeline: ReachingPipeline =
+            saved.reachingPipeline ||
+            (saved.preferAlternativeReaching ? 'standard' : DEFAULT_SETTINGS.reachingPipeline);
+          const merged: AppSettings = {
+            ...DEFAULT_SETTINGS,
+            ...saved,
+            reachingPipeline: migratedReachingPipeline,
+            preferAlternativeReaching: migratedReachingPipeline === 'standard',
+          };
           setSettings(merged);
 
           // ✅ Apply saved rate through singleton (per-utterance approach)
@@ -141,12 +154,30 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
 
   const updatePreferAlternativeReaching = useCallback(
     async (value: boolean) => {
-      const next = { ...settings, preferAlternativeReaching: value };
+      const next = {
+        ...settings,
+        preferAlternativeReaching: value,
+        reachingPipeline: value ? 'standard' as ReachingPipeline : 'visionBox' as ReachingPipeline,
+      };
       setSettings(next);
       await persist(next);
       console.log(
-        `[Settings] Reaching pipeline → ${value ? 'Standard (reaching)' : 'ARKit (reaching_ios)'}`,
+        `[Settings] Reaching pipeline → ${value ? 'Standard (reaching)' : 'Vision Box (reaching_ios)'}`,
       );
+    },
+    [settings, persist],
+  );
+
+  const updateReachingPipeline = useCallback(
+    async (pipeline: ReachingPipeline) => {
+      const next = {
+        ...settings,
+        reachingPipeline: pipeline,
+        preferAlternativeReaching: pipeline === 'standard',
+      };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Reaching pipeline → ${pipeline}`);
     },
     [settings, persist],
   );
@@ -239,15 +270,17 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   // ── Pipeline resolver ─────────────────────────────────────────────────────
 
   const resolveReachingPipeline = useCallback(
-    (flags: { reaching_ios?: boolean; reaching?: boolean }): 'arkit' | 'standard' | 'none' => {
+    (flags: { reaching_ios?: boolean; reaching?: boolean }): ReachingPipeline | 'arkit' | 'none' => {
       const { reaching_ios, reaching } = flags;
 
-      // User explicitly chose the alternative pipeline
-      if (settings.preferAlternativeReaching) {
+      if (settings.reachingPipeline === 'standard') {
         return reaching ? 'standard' : 'none';
       }
 
-      // Default: prefer ARKit when available on iOS
+      if (settings.reachingPipeline === 'spatialTarget' && reaching_ios && Platform.OS === 'ios') {
+        return 'spatialTarget';
+      }
+
       if (reaching_ios && Platform.OS === 'ios') {
         return 'arkit';
       }
@@ -256,7 +289,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       }
       return 'none';
     },
-    [settings.preferAlternativeReaching],
+    [settings.reachingPipeline],
   );
 
   const resolveNavigationPipeline = useCallback(
@@ -294,6 +327,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     settings,
     isLoaded,
     updatePreferAlternativeReaching,
+    updateReachingPipeline,
     updateUseWearablesCamera,
     updateNavigationPipeline,
     updateWearablesMicrophoneSource,

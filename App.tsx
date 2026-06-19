@@ -1347,10 +1347,96 @@ function AppInner(): React.JSX.Element {
       reaching: result.reaching_flag,
     });
 
-    if (pipeline !== 'arkit') {
+    if (pipeline !== 'arkit' && pipeline !== 'spatialTarget') {
       // User prefers standard pipeline or ARKit not available
       console.log(`🎯 [Reaching] Skipping ARKit — pipeline resolved to: ${pipeline}`);
       return false;
+    }
+
+    if (pipeline === 'spatialTarget') {
+      const targetName =
+        normalizeTextValue(result.object) ||
+        normalizeTextValue(result.navigation_target) ||
+        normalizeTextValue(result.targetName) ||
+        rtabLastObjectRef.current ||
+        'target';
+
+      console.log('◎ [SpatialTarget] Launching native reaching for:', targetName);
+      prewarmDAv2InBackground('spatial target reaching');
+
+      AccessibilityInfo.announceForAccessibility(
+        `Guiding you to ${targetName}. Follow the audio beeps. Tap anywhere when you have it.`
+      );
+
+      setIsCameraActive(false);
+      setIsReaching(true);
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
+
+      try {
+        const { ReachingModule } = NativeModules;
+        if (ReachingModule?.startSpatialTargetReaching) {
+          const reachingPromise = ReachingModule.startSpatialTargetReaching({
+            targetName,
+            routeMapId: normalizeTextValue(result.route_map_id) || undefined,
+            routeMapName: normalizeTextValue(result.route_map_name) || undefined,
+            sessionId: getSessionId(),
+            mode: settingsRef.current.reachingMode,
+            startupSilent: options?.startupSilent === true,
+            ttsRate: settingsRef.current.ttsRate,
+            distanceUnit: settingsRef.current.distanceUnit,
+          });
+
+          if (options?.introSpeechPromise) {
+            try {
+              await options.introSpeechPromise;
+            } catch (e: any) {
+              console.warn('⚠️ [SpatialTarget] Intro TTS ended with warning:', e?.message || e);
+            }
+
+            if (ReachingModule?.enableGuidanceAudio) {
+              try {
+                await ReachingModule.enableGuidanceAudio();
+                console.log('🔊 [SpatialTarget] Guidance audio enabled after intro TTS');
+              } catch (e: any) {
+                console.warn('⚠️ [SpatialTarget] Could not enable guidance audio:', e?.message || e);
+              }
+            }
+          }
+
+          const reachingResult = await reachingPromise;
+          console.log('✅ [SpatialTarget] Native result:', reachingResult);
+
+          if (
+            (reachingResult?.reason === 'user_confirmed' || reachingResult?.reason === 'user_cancelled') &&
+            !screenReaderEnabledRef.current
+          ) {
+            await playStopReachingSound();
+          }
+
+          const msg = reachingResult?.reason === 'user_confirmed'
+            ? 'Reaching complete.'
+            : reachingResult?.success
+              ? `${targetName} reached!`
+              : 'Reaching guidance ended.';
+          AccessibilityInfo.announceForAccessibility(msg);
+        } else {
+          console.warn('⚠️ startSpatialTargetReaching not available — native module not linked');
+          AccessibilityInfo.announceForAccessibility(
+            'Spatial Target reaching is not available. Please rebuild the app.'
+          );
+        }
+      } catch (e: any) {
+        console.error('❌ [SpatialTarget] Native module error:', e);
+        AccessibilityInfo.announceForAccessibility(`Reaching error: ${e.message || 'Unknown error'}`);
+      }
+
+      resetSessionId();
+      setIsReaching(false);
+      setIsCameraActive(true);
+      setIsProcessing(false);
+      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      announceTapToStart('Ready.');
+      return true;
     }
 
     // ── Parse bbox ────────────────────────────────────────────────────────
@@ -1735,8 +1821,8 @@ function AppInner(): React.JSX.Element {
               navigation: loopMode === 'navigation',
               navigation_pipeline: settingsRef.current.navigationPipeline,
               navigation_ios_preferred: Platform.OS === 'ios' && settingsRef.current.navigationPipeline === 'arkit',
-              reaching_flag: loopMode === 'reaching' && (Platform.OS !== 'ios' || settingsRef.current.preferAlternativeReaching),
-              reaching_ios: loopMode === 'reaching' && Platform.OS === 'ios' && !settingsRef.current.preferAlternativeReaching,
+              reaching_flag: loopMode === 'reaching' && (Platform.OS !== 'ios' || settingsRef.current.reachingPipeline === 'standard'),
+              reaching_ios: loopMode === 'reaching' && Platform.OS === 'ios' && settingsRef.current.reachingPipeline !== 'standard',
             },
             abortCtrl.signal
           );
@@ -2206,6 +2292,35 @@ function AppInner(): React.JSX.Element {
       if (isEmergencyStopped.current) {
         setIsReaching(false);
         setIsProcessing(false);
+        return true;
+      }
+
+      if (settingsRef.current.reachingPipeline === 'spatialTarget') {
+        const handled = await handleiOSReaching(
+          {
+            text: '',
+            reaching_ios: true,
+            reaching_flag: false,
+            object: targetName,
+            navigation_target: targetName,
+            route_map_id: result.route_map_id,
+            route_map_name: result.route_map_name || navResult.routeName,
+          },
+          { startupSilent: false },
+        );
+
+        if (!handled) {
+          await speakContinuousSpeechAndWait(
+            `I could not start Spatial Target reaching for ${targetName}.`,
+            { ignoreAbort: true },
+          );
+          setIsReaching(false);
+          setIsProcessing(false);
+          setIsCameraActive(true);
+          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          announceTapToStart('Ready.');
+        }
+
         return true;
       }
 
