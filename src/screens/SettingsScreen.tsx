@@ -8,7 +8,6 @@ import {
   Switch,
   TouchableOpacity,
   ScrollView,
-  AccessibilityInfo,
   Alert,
   Platform,
   Animated,
@@ -245,7 +244,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
           : pipeline === 'visionBox'
             ? 'Vision Box reaching enabled.'
             : 'Standard pipeline enabled.';
-      AccessibilityInfo.announceForAccessibility(label);
+      await speechOutput.announce(label);
     },
     [updateReachingPipeline],
   );
@@ -256,7 +255,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     async (useARKit: boolean) => {
       const nextPipeline = useARKit ? 'arkit' : 'rtab';
       await updateNavigationPipeline(nextPipeline);
-      AccessibilityInfo.announceForAccessibility(
+      await speechOutput.announce(
         useARKit
           ? 'ARKit on-device navigation enabled.'
           : 'Rtab RTAB navigation enabled.',
@@ -313,7 +312,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       const label = value
         ? 'Auto-exit enabled.'
         : 'Auto-exit disabled. Manual exit only.';
-      AccessibilityInfo.announceForAccessibility(label);
+      await speechOutput.announce(label);
     },
     [updateEnableAcquisitionAutoExit],
   );
@@ -326,7 +325,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       const label = useGlassesMic
         ? 'Meta Ray-Ban microphone selected for Hey ShelfScout.'
         : 'iPhone microphone selected for Hey ShelfScout.';
-      AccessibilityInfo.announceForAccessibility(label);
+      await speechOutput.announce(label);
     },
     [updateWearablesMicrophoneSource],
   );
@@ -389,7 +388,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
               const msg =
                 preWarmErr?.message ||
                 'Could not start the glasses camera stream.';
-              AccessibilityInfo.announceForAccessibility(msg);
+              await speechOutput.announce(msg);
               Alert.alert('Glasses Camera', msg, [{ text: 'OK', style: 'default' }]);
               // Don't auto-revert the toggle — capturePhoto will retry on next tap
               // and the user might fix the issue (open Meta AI, grant perm) in between.
@@ -399,7 +398,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             const message =
               error?.message ||
               'Unable to start glasses registration. Open the Meta AI app and try again.';
-            AccessibilityInfo.announceForAccessibility(message);
+            await speechOutput.announce(message);
             Alert.alert('Glasses Registration', message, [{ text: 'OK', style: 'default' }]);
           }
 
@@ -409,7 +408,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         const label = value
           ? 'Meta Ray-Ban camera enabled. Make sure the Meta AI app is open in the background and ShelfScout has camera permission for your glasses.'
           : 'Phone camera enabled.';
-        AccessibilityInfo.announceForAccessibility(label);
+        await speechOutput.announce(label);
       } finally {
         wearablesTransitioningRef.current = false;
       }
@@ -436,7 +435,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       const screenReaderEnabled = await speechOutput.isScreenReaderEnabled();
 
       if (screenReaderEnabled) {
-        AccessibilityInfo.announceForAccessibility(label);
+        await speechOutput.announce(label);
         return;
       }
 
@@ -445,7 +444,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         await speechOutput.speak(`Voice speed set to ${rateLabel(v)}.`);
       }
 
-      AccessibilityInfo.announceForAccessibility(label);
+      await speechOutput.announce(label);
     },
     [updateTtsRate],
   );
@@ -789,7 +788,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessibilityHint="Double tap to select"
                 onPress={async () => {
                   await updateReachingMode('handFree');
-                  AccessibilityInfo.announceForAccessibility('Hands-free mode enabled.');
+                  await speechOutput.announce('Hands-free mode enabled.');
                 }}
               >
                 <Text style={styles.pipelineOptionIcon}>📱</Text>
@@ -815,7 +814,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessibilityHint="Double tap to select"
                 onPress={async () => {
                   await updateReachingMode('withHand');
-                  AccessibilityInfo.announceForAccessibility('With hand mode enabled.');
+                  await speechOutput.announce('With hand mode enabled.');
                 }}
               >
                 <Text style={styles.pipelineOptionIcon}>✋</Text>
@@ -883,7 +882,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessibilityHint="Double tap to select"
                 onPress={async () => {
                   await updateDistanceUnit('steps');
-                  AccessibilityInfo.announceForAccessibility('Distance set to steps.');
+                  await speechOutput.announce('Distance set to steps.');
                 }}
               >
                 <Text style={styles.pipelineOptionIcon}>👣</Text>
@@ -909,7 +908,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 accessibilityHint="Double tap to select"
                 onPress={async () => {
                   await updateDistanceUnit('cm');
-                  AccessibilityInfo.announceForAccessibility('Distance set to centimeters.');
+                  await speechOutput.announce('Distance set to centimeters.');
                 }}
               >
                 <Text style={styles.pipelineOptionIcon}>📏</Text>

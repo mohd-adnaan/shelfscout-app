@@ -23,6 +23,7 @@
  */
 
 import { AccessibilityInfo, Platform } from 'react-native';
+import { speechOutput } from './SpeechOutputService';
 
 class AccessibilityServiceClass {
   private screenReaderEnabled: boolean = false;
@@ -93,10 +94,10 @@ class AccessibilityServiceClass {
 
     if (delay > 0) {
       setTimeout(() => {
-        AccessibilityInfo.announceForAccessibility(message);
+        speechOutput.announce(message);
       }, delay);
     } else {
-      AccessibilityInfo.announceForAccessibility(message);
+      speechOutput.announce(message);
     }
 
     console.log(`♿ Announced (${priority}):`, message);

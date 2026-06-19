@@ -43,4 +43,14 @@ describe('SpeechOutputService', () => {
     expect(announceSpy).not.toHaveBeenCalled();
     expect(speakSpy).toHaveBeenCalledWith('Proceed to the shelf');
   });
+
+  it('suppresses duplicate announcements inside the dedupe window', async () => {
+    await speechOutput.announce('Navigation started', { dedupeWindowMs: 5000 });
+    const announcedAgain = await speechOutput.announce('Navigation started', {
+      dedupeWindowMs: 5000,
+    });
+
+    expect(announcedAgain).toBe(false);
+    expect(announceSpy).toHaveBeenCalledTimes(1);
+  });
 });
