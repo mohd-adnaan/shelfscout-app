@@ -23,7 +23,9 @@ export interface ARKitNavigationResult {
   success: boolean;
   reason: ARKitNavigationReason;
   targetName?: string;
+  routeMapId?: string;
   routeName?: string;
+  targetWorldPosition?: { x: number; y: number; z: number } | [number, number, number];
   message?: string;
 }
 

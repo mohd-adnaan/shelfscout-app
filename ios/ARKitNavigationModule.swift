@@ -75,7 +75,9 @@ final class ARKitNavigationModule: NSObject {
                     success: false,
                     reason: "ar_unavailable",
                     targetName: config["targetName"] as? String,
+                    routeMapId: nil,
                     routeName: nil,
+                    targetWorldPosition: nil,
                     message: "ARKit world tracking is not available on this device."
                 ).dictionary())
                 return
@@ -88,7 +90,9 @@ final class ARKitNavigationModule: NSObject {
                     success: false,
                     reason: "target_not_found",
                     targetName: nil,
+                    routeMapId: nil,
                     routeName: nil,
+                    targetWorldPosition: nil,
                     message: "No navigation target was provided."
                 ).dictionary())
                 return
@@ -99,7 +103,9 @@ final class ARKitNavigationModule: NSObject {
                     success: false,
                     reason: "error",
                     targetName: targetName,
+                    routeMapId: nil,
                     routeName: nil,
+                    targetWorldPosition: nil,
                     message: "ARKit navigation is already running."
                 ).dictionary())
                 return
@@ -110,7 +116,9 @@ final class ARKitNavigationModule: NSObject {
                     success: false,
                     reason: "error",
                     targetName: targetName,
+                    routeMapId: nil,
                     routeName: nil,
+                    targetWorldPosition: nil,
                     message: "Could not open ARKit navigation."
                 ).dictionary())
                 return
@@ -137,7 +145,9 @@ final class ARKitNavigationModule: NSObject {
                         success: false,
                         reason: "cancelled",
                         targetName: targetName,
+                        routeMapId: routeMapId,
                         routeName: routeMapName,
+                        targetWorldPosition: nil,
                         message: "ARKit navigation cancelled."
                     ))
                 },
@@ -203,7 +213,9 @@ final class ARKitNavigationModule: NSObject {
                         success: false,
                         reason: "cancelled",
                         targetName: targetName,
+                        routeMapId: nil,
                         routeName: nil,
+                        targetWorldPosition: nil,
                         message: "ARKit navigation cancelled."
                     ).dictionary())
                 }
@@ -213,7 +225,9 @@ final class ARKitNavigationModule: NSObject {
                 success: false,
                 reason: "cancelled",
                 targetName: targetName,
+                routeMapId: nil,
                 routeName: nil,
+                targetWorldPosition: nil,
                 message: "ARKit navigation cancelled."
             ).dictionary())
         }

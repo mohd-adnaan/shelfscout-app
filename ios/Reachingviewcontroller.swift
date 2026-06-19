@@ -124,6 +124,9 @@ class ReachingViewController: UIViewController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   let detectionUrl: String?
+  let initialWorldMap: ARWorldMap?
+  let spatialTargetWorldPosition: simd_float3?
+  let spatialTargetMapName: String?
   var bboxUpdateCount = 0
   var redetectTimer: Timer?
   let redetectInterval: TimeInterval = 8.0   // seconds between re-detections (Qwen takes ~10-20s)
@@ -449,6 +452,9 @@ class ReachingViewController: UIViewController {
        detectionUrl: String? = nil,
        acquisitionUrl: String? = nil,
       sessionId: String? = nil,
+       initialWorldMap: ARWorldMap? = nil,
+       spatialTargetWorldPosition: simd_float3? = nil,
+       spatialTargetMapName: String? = nil,
        mode: ReachingMode = .handFree,
       startupSilent: Bool = false,
        ttsRate: Float = 0.5,
@@ -460,6 +466,9 @@ class ReachingViewController: UIViewController {
     self.imageWidth   = imageWidth
     self.imageHeight  = imageHeight
     self.detectionUrl = detectionUrl
+    self.initialWorldMap = initialWorldMap
+    self.spatialTargetWorldPosition = spatialTargetWorldPosition
+    self.spatialTargetMapName = spatialTargetMapName
     self.acquisitionUrl = acquisitionUrl
     let cleanedSessionId = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.sessionId = cleanedSessionId.isEmpty ? UUID().uuidString : cleanedSessionId

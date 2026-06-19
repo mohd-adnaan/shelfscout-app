@@ -1,4 +1,5 @@
 import Foundation
+import simd
 
 struct Position: Equatable {
     var x: Double
@@ -119,7 +120,9 @@ struct ARKitNavigationNativeResult {
     let success: Bool
     let reason: String
     let targetName: String?
+    let routeMapId: String?
     let routeName: String?
+    let targetWorldPosition: simd_float3?
     let message: String?
 
     func dictionary() -> [String: Any] {
@@ -128,7 +131,15 @@ struct ARKitNavigationNativeResult {
             "reason": reason
         ]
         if let targetName { output["targetName"] = targetName }
+        if let routeMapId { output["routeMapId"] = routeMapId }
         if let routeName { output["routeName"] = routeName }
+        if let targetWorldPosition {
+            output["targetWorldPosition"] = [
+                "x": targetWorldPosition.x,
+                "y": targetWorldPosition.y,
+                "z": targetWorldPosition.z
+            ]
+        }
         if let message { output["message"] = message }
         return output
     }

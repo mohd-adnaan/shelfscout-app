@@ -51,6 +51,8 @@ export interface WorkflowResponse {
   navigation_target?: string;
   route_map_id?: string;
   route_map_name?: string;
+  targetWorldPosition?: { x: number; y: number; z: number } | [number, number, number];
+  target_world_position?: { x: number; y: number; z: number } | [number, number, number];
   navigation_error?: string;
   local_orchestrator_used?: boolean;
   intent_provider?: string;

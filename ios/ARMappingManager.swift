@@ -1810,7 +1810,7 @@ struct ARStoredMapMetadata: Codable, Equatable {
     var pois: [ARStoredPOI]
 }
 
-private final class ARMapStore {
+final class ARMapStore {
     private static let legacyMapID = "legacy-building-map"
     private let fileManager = FileManager.default
     private let metadataExtension = "json"

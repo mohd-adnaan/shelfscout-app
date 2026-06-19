@@ -41,6 +41,8 @@ export interface SpatialTargetReachingConfig {
   /** Optional saved route map metadata for map-target relocalization. */
   routeMapId?: string;
   routeMapName?: string;
+  /** Optional target position in the saved ARWorldMap coordinate space. */
+  targetWorldPosition?: { x: number; y: number; z: number } | [number, number, number];
   /** Optional normalized on-screen seed region. Defaults to a centered target. */
   targetRegion?: [number, number, number, number];
   /** Reaching mode: 'handFree' (default) or 'withHand' */

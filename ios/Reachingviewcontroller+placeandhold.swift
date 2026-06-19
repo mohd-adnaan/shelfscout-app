@@ -18,6 +18,10 @@ extension ReachingViewController {
   func handlePlaceAndHoldFrame(_ frame: ARFrame) -> Bool {
     guard placeAndHoldPrototype else { return false }
     if !anchorPlaced {
+      if spatialTargetWorldPosition != nil {
+        attemptSpatialTargetPlacement(frame)
+        return true
+      }
       guard placeAndHoldInitialBboxReady(frame) else { return true }
       attemptPlaceAndHold(frame)
       return true
@@ -34,6 +38,57 @@ extension ReachingViewController {
 
     processARFrameHandFree(frame)
     return true
+  }
+
+  private func attemptSpatialTargetPlacement(_ frame: ARFrame) {
+    guard let target = spatialTargetWorldPosition else { return }
+    guard arFrameCount >= 5 else { return }
+
+    switch frame.camera.trackingState {
+    case .normal:
+      break
+    default:
+      if arFrameCount % 30 == 0 {
+        NSLog("◎ [SpatialTarget] Waiting for ARKit relocalization before placing %@",
+              objectName)
+      }
+      return
+    }
+
+    let camera = frame.camera
+    let camPos = simd_make_float3(camera.transform.columns.3)
+    let offset = target - camPos
+    let depth = simd_length(offset)
+    guard depth >= 0.10 && depth <= 12.0 else {
+      if arFrameCount % 30 == 0 {
+        NSLog("◎ [SpatialTarget] Target %@ has implausible map distance %.2fm; waiting",
+              objectName, depth)
+      }
+      return
+    }
+
+    placementRayOrigin = camPos
+    placementRayDir = simd_normalize(offset)
+    placementHorizScale = 1.0
+    dav2RefineState = .done
+    dav2RequestInFlight = false
+    placeAndHoldDepthLocked = true
+
+    finalizePlacement(
+      worldPos: target,
+      depth: depth,
+      camera: camera,
+      horizScale: 1.0,
+      source: "saved map POI \(spatialTargetMapName ?? "unknown map")",
+      frame: frame
+    )
+    placeAndHoldDepthLocked = true
+
+    NSLog("◎ [SpatialTarget] ✅ Map target %@ locked at (%.3f,%.3f,%.3f), distance %.2fm",
+          objectName, target.x, target.y, target.z, depth)
+    if guidanceAudioEnabled {
+      say("Map target locked.")
+    }
   }
 
   private func placeAndHoldInitialBboxReady(_ frame: ARFrame) -> Bool {

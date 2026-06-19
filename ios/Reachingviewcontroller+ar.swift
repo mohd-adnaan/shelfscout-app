@@ -26,6 +26,8 @@ extension ReachingViewController {
 
   func startAR() {
     let config = ARWorldTrackingConfiguration()
+    config.initialWorldMap = initialWorldMap
+    config.worldAlignment = .gravityAndHeading
     config.planeDetection = [.horizontal, .vertical]
 
     if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
@@ -49,8 +51,13 @@ extension ReachingViewController {
     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
     startBeepLoop()
     startRedetectionLoop()
-    NSLog("📷 [ReachingVC] AR session started — mode=%@ hasLiDAR=%@",
-          mode.rawValue, hasLiDAR ? "YES" : "NO")
+    if initialWorldMap != nil {
+      NSLog("📷 [ReachingVC] AR session started with saved world map %@ — mode=%@ hasLiDAR=%@",
+            spatialTargetMapName ?? "unknown", mode.rawValue, hasLiDAR ? "YES" : "NO")
+    } else {
+      NSLog("📷 [ReachingVC] AR session started — mode=%@ hasLiDAR=%@",
+            mode.rawValue, hasLiDAR ? "YES" : "NO")
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

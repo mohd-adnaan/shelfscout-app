@@ -5,6 +5,7 @@ import Foundation
 import AVFoundation
 import AudioToolbox
 import UIKit
+import ARKit
 
 @objc(ReachingModule)
 class ReachingModule: NSObject {
@@ -128,12 +129,38 @@ class ReachingModule: NSObject {
     let distanceUnit = (params["distanceUnit"] as? String) ?? "steps"
     let startupSilent = (params["startupSilent"] as? Bool) ?? false
     let sessionId = params["sessionId"] as? String
+    let routeMapId = (params["routeMapId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let routeMapName = params["routeMapName"] as? String
+    let explicitTargetWorldPosition = Self.parseWorldPosition(params["targetWorldPosition"])
+
+    var resolvedWorldMap: ARWorldMap?
+    var resolvedTargetPosition: simd_float3? = explicitTargetWorldPosition
+    var resolvedMapName: String? = routeMapName
+
+    do {
+      if resolvedTargetPosition == nil || resolvedWorldMap == nil {
+        let mapContext = try Self.resolveMapTarget(
+          targetName: targetName,
+          routeMapId: routeMapId,
+          routeMapName: routeMapName
+        )
+        resolvedWorldMap = mapContext.worldMap
+        resolvedTargetPosition = resolvedTargetPosition ?? mapContext.targetPosition
+        resolvedMapName = mapContext.mapName
+      }
+    } catch {
+      if routeMapId?.isEmpty == false || (routeMapName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) {
+        rejecter("TARGET_NOT_IN_MAP", error.localizedDescription, error)
+        return
+      }
+      NSLog("◎ [ReachingModule] Spatial target map lookup skipped/fallback: %@", error.localizedDescription)
+    }
 
     NSLog(
-      "◎ [ReachingModule] Spatial target=%@ map=%@ region=[%.2f,%.2f,%.2f,%.2f] mode=%@",
+      "◎ [ReachingModule] Spatial target=%@ map=%@ world=%@ region=[%.2f,%.2f,%.2f,%.2f] mode=%@",
       targetName,
-      routeMapName ?? "current",
+      resolvedMapName ?? "current",
+      resolvedTargetPosition.map { String(format: "(%.2f,%.2f,%.2f)", $0.x, $0.y, $0.z) } ?? "nil",
       targetRegion[0], targetRegion[1], targetRegion[2], targetRegion[3],
       mode.rawValue
     )
@@ -149,6 +176,9 @@ class ReachingModule: NSObject {
         detectionUrl: nil,
         acquisitionUrl: nil,
         sessionId: sessionId,
+        initialWorldMap: resolvedWorldMap,
+        spatialTargetWorldPosition: resolvedTargetPosition,
+        spatialTargetMapName: resolvedMapName,
         mode: mode,
         startupSilent: startupSilent,
         ttsRate: ttsRate,
@@ -506,12 +536,128 @@ class ReachingModule: NSObject {
     }
   }
 
+  private struct SpatialTargetMapContext {
+    let worldMap: ARWorldMap
+    let targetPosition: simd_float3
+    let mapName: String
+  }
+
+  private static func resolveMapTarget(
+    targetName: String,
+    routeMapId: String?,
+    routeMapName: String?
+  ) throws -> SpatialTargetMapContext {
+    let store = ARMapStore()
+    let summaries = store.loadSummaries()
+    let trimmedMapId = routeMapId?.trimmingCharacters(in: .whitespacesAndNewlines)
+    let trimmedMapName = routeMapName?.trimmingCharacters(in: .whitespacesAndNewlines)
+
+    let selectedSummary: ARStoredMapSummary?
+    if let trimmedMapId, !trimmedMapId.isEmpty {
+      selectedSummary = summaries.first { $0.id == trimmedMapId }
+    } else if let trimmedMapName, !trimmedMapName.isEmpty {
+      selectedSummary = summaries.first {
+        $0.name.caseInsensitiveCompare(trimmedMapName) == .orderedSame
+      }
+    } else {
+      selectedSummary = summaries.first { summary in
+        guard let loaded = try? store.load(id: summary.id) else { return false }
+        return bestPOI(named: targetName, in: loaded.metadata.pois) != nil
+      }
+    }
+
+    guard let selectedSummary else {
+      throw NSError(
+        domain: "ReachingModule",
+        code: 404,
+        userInfo: [NSLocalizedDescriptionKey: "No saved AR map was found for Spatial Target reaching."]
+      )
+    }
+
+    let loaded = try store.load(id: selectedSummary.id)
+    guard let poi = bestPOI(named: targetName, in: loaded.metadata.pois) else {
+      throw NSError(
+        domain: "ReachingModule",
+        code: 404,
+        userInfo: [NSLocalizedDescriptionKey: "\(targetName) is not pinned in \(loaded.metadata.name). Pin it as a POI and save the AR map first."]
+      )
+    }
+
+    return SpatialTargetMapContext(
+      worldMap: loaded.worldMap,
+      targetPosition: poi.position.simdValue,
+      mapName: loaded.metadata.name
+    )
+  }
+
+  private static func bestPOI(named targetName: String, in pois: [ARStoredPOI]) -> ARStoredPOI? {
+    let targetKey = normalizedLookupKey(targetName)
+    guard !targetKey.isEmpty else { return nil }
+
+    if let exact = pois.first(where: { normalizedLookupKey($0.name) == targetKey }) {
+      return exact
+    }
+
+    let targetTokens = Set(targetKey.split(separator: " ").map(String.init))
+    return pois
+      .map { poi -> (poi: ARStoredPOI, score: Int) in
+        let poiTokens = Set(normalizedLookupKey(poi.name).split(separator: " ").map(String.init))
+        return (poi, targetTokens.intersection(poiTokens).count)
+      }
+      .filter { $0.score > 0 }
+      .sorted { $0.score > $1.score }
+      .first?
+      .poi
+  }
+
+  private static func normalizedLookupKey(_ raw: String) -> String {
+    raw
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+      .lowercased()
+      .replacingOccurrences(of: "doorknob", with: "door knob")
+      .replacingOccurrences(of: "doorhandle", with: "door handle")
+      .replacingOccurrences(of: "_", with: " ")
+      .replacingOccurrences(of: "-", with: " ")
+      .components(separatedBy: CharacterSet.alphanumerics.inverted)
+      .filter { !$0.isEmpty && !["the", "a", "an", "room", "rm", "suite", "office"].contains($0) }
+      .joined(separator: " ")
+  }
+
+  private static func parseWorldPosition(_ raw: Any?) -> simd_float3? {
+    if let dict = raw as? [String: Any] {
+      guard let x = floatValue(dict["x"]),
+            let y = floatValue(dict["y"]),
+            let z = floatValue(dict["z"]) else {
+        return nil
+      }
+      return simd_make_float3(x, y, z)
+    }
+
+    if let arr = raw as? [Any], arr.count >= 3,
+       let x = floatValue(arr[0]),
+       let y = floatValue(arr[1]),
+       let z = floatValue(arr[2]) {
+      return simd_make_float3(x, y, z)
+    }
+
+    return nil
+  }
+
+  private static func floatValue(_ raw: Any?) -> Float? {
+    if let number = raw as? NSNumber { return number.floatValue }
+    if let string = raw as? String { return Float(string) }
+    return nil
+  }
+
   private func presentReachingVC(
     bbox: [CGFloat], objectName: String, depth: Float?,
     imageW: CGFloat, imageH: CGFloat,
     detectionUrl: String?,
     acquisitionUrl: String?,
     sessionId: String?,
+    initialWorldMap: ARWorldMap? = nil,
+    spatialTargetWorldPosition: simd_float3? = nil,
+    spatialTargetMapName: String? = nil,
     mode: ReachingViewController.ReachingMode,
     startupSilent: Bool,
     ttsRate: Float,
@@ -532,6 +678,9 @@ class ReachingModule: NSObject {
                                    detectionUrl: detectionUrl,
                                    acquisitionUrl: acquisitionUrl,
                                    sessionId: sessionId,
+                                   initialWorldMap: initialWorldMap,
+                                   spatialTargetWorldPosition: spatialTargetWorldPosition,
+                                   spatialTargetMapName: spatialTargetMapName,
                                    mode: mode,
                                    startupSilent: startupSilent,
                                    ttsRate: ttsRate, distanceUnit: distanceUnit,
@@ -546,6 +695,9 @@ class ReachingModule: NSObject {
         detectionUrl: detectionUrl,
         acquisitionUrl: acquisitionUrl,
         sessionId: sessionId,
+        initialWorldMap: initialWorldMap,
+        spatialTargetWorldPosition: spatialTargetWorldPosition,
+        spatialTargetMapName: spatialTargetMapName,
         mode: mode,
         startupSilent: startupSilent,
         ttsRate: ttsRate,

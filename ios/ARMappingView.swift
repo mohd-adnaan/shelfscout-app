@@ -466,10 +466,48 @@ struct ARMappingView: View {
             success: success,
             reason: reason,
             targetName: automatedTargetName,
+            routeMapId: mappingManager.activeMapID ?? semanticNavigator.activeMap?.arWorldMapId,
             routeName: routeName ?? semanticNavigator.activeMap?.name,
+            targetWorldPosition: automatedTargetWorldPosition(),
             message: message
         )
         onAutomationComplete?(result)
+    }
+
+    private func automatedTargetWorldPosition() -> simd_float3? {
+        guard let target = automatedTargetName else { return nil }
+        let normalizedTarget = normalizedRouteLookupKey(target)
+
+        if let direct = mappingManager.mapPOIs.first(where: { name, _ in
+            normalizedRouteLookupKey(name) == normalizedTarget
+        }) {
+            return direct.value
+        }
+
+        guard let route = semanticNavigator.activeMap else { return nil }
+        let aliases = route.nodes
+            .filter { node in
+                normalizedRouteLookupKey(node.name) == normalizedTarget ||
+                node.aliases.contains { normalizedRouteLookupKey($0) == normalizedTarget }
+            }
+            .flatMap { [$0.name] + $0.aliases }
+        + route.landmarks
+            .filter { landmark in
+                normalizedRouteLookupKey(landmark.name) == normalizedTarget ||
+                landmark.aliases.contains { normalizedRouteLookupKey($0) == normalizedTarget }
+            }
+            .flatMap { [$0.name] + $0.aliases }
+
+        for alias in aliases {
+            let normalizedAlias = normalizedRouteLookupKey(alias)
+            if let match = mappingManager.mapPOIs.first(where: { name, _ in
+                normalizedRouteLookupKey(name) == normalizedAlias
+            }) {
+                return match.value
+            }
+        }
+
+        return nil
     }
 
     private var headerHUD: some View {
