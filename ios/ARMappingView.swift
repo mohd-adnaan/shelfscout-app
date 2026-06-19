@@ -1174,9 +1174,6 @@ struct ARMappingView: View {
 
     private func speakSemanticCue(_ cue: SemanticSpeechCue?) {
         guard let cue else { return }
-        guard !launchVoiceOverEnabled else {
-            return
-        }
         if lastSpokenSemanticCueText == cue.text,
            let lastSpokenSemanticCueAt,
            Date().timeIntervalSince(lastSpokenSemanticCueAt) < 2.5 {
@@ -1184,6 +1181,11 @@ struct ARMappingView: View {
         }
         lastSpokenSemanticCueText = cue.text
         lastSpokenSemanticCueAt = Date()
+
+        if launchVoiceOverEnabled {
+            UIAccessibility.post(notification: .announcement, argument: cue.text)
+            return
+        }
 
         switch cue.priority {
         case .regular:

@@ -8,6 +8,7 @@
 
 import AVFoundation
 import CoreHaptics
+import UIKit
 
 extension ReachingViewController {
 
@@ -298,7 +299,10 @@ extension ReachingViewController {
 
   func say(_ text: String) {
     guard !voiceOverSpeechSuppressed else {
-      NSLog("♿ [ReachingVC] Suppressing native speech while VoiceOver is active: %@", text)
+      NSLog("♿ [ReachingVC] Routing native speech through VoiceOver: %@", text)
+      DispatchQueue.main.async {
+        UIAccessibility.post(notification: .announcement, argument: text)
+      }
       return
     }
     guard guidanceAudioEnabled else {
