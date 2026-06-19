@@ -86,9 +86,6 @@ extension ReachingViewController {
 
     NSLog("◎ [SpatialTarget] ✅ Map target %@ locked at (%.3f,%.3f,%.3f), distance %.2fm",
           objectName, target.x, target.y, target.z, depth)
-    if guidanceAudioEnabled {
-      say("Map target locked.")
-    }
   }
 
   private func placeAndHoldInitialBboxReady(_ frame: ARFrame) -> Bool {

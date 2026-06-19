@@ -156,6 +156,15 @@ class ReachingModule: NSObject {
       NSLog("◎ [ReachingModule] Spatial target map lookup skipped/fallback: %@", error.localizedDescription)
     }
 
+    if resolvedTargetPosition != nil && resolvedWorldMap == nil {
+      rejecter(
+        "MAP_NOT_FOUND",
+        "Spatial Target has a saved target position but no ARWorldMap to relocalize against.",
+        nil
+      )
+      return
+    }
+
     NSLog(
       "◎ [ReachingModule] Spatial target=%@ map=%@ world=%@ region=[%.2f,%.2f,%.2f,%.2f] mode=%@",
       targetName,

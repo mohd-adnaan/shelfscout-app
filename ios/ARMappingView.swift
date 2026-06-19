@@ -485,18 +485,19 @@ struct ARMappingView: View {
         }
 
         guard let route = semanticNavigator.activeMap else { return nil }
-        let aliases = route.nodes
+        let nodeAliases = route.nodes
             .filter { node in
                 normalizedRouteLookupKey(node.name) == normalizedTarget ||
                 node.aliases.contains { normalizedRouteLookupKey($0) == normalizedTarget }
             }
             .flatMap { [$0.name] + $0.aliases }
-        + route.landmarks
+        let landmarkAliases = route.landmarks
             .filter { landmark in
                 normalizedRouteLookupKey(landmark.name) == normalizedTarget ||
                 landmark.aliases.contains { normalizedRouteLookupKey($0) == normalizedTarget }
             }
             .flatMap { [$0.name] + $0.aliases }
+        let aliases = nodeAliases + landmarkAliases
 
         for alias in aliases {
             let normalizedAlias = normalizedRouteLookupKey(alias)
