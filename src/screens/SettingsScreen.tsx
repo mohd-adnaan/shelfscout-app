@@ -17,7 +17,7 @@ import {
   StatusBar,
 } from 'react-native';
 import { useSettings } from '../context/SettingsContext';
-import { iOSTts } from '../services/iOSTtsClient';
+import { speechOutput } from '../services/SpeechOutputService';
 import { wearablesCamera, WearablesCameraStatus } from '../services/WearablesCamera';
 import {
   ARKitNavigationBridge,
@@ -432,15 +432,20 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       setLocalRate(v);
       await updateTtsRate(v);
 
-      // ✅ Preview new rate through singleton (avoids BOOL crash)
-      if (Platform.OS === 'ios') {
-        await iOSTts.stop();
-        iOSTts.synthesizeSpeech(`Voice speed set to ${rateLabel(v)}.`);
+      const label = `Voice speed changed to ${rateLabel(v)}, ${ratePercent(v)}.`;
+      const screenReaderEnabled = await speechOutput.isScreenReaderEnabled();
+
+      if (screenReaderEnabled) {
+        AccessibilityInfo.announceForAccessibility(label);
+        return;
       }
 
-      AccessibilityInfo.announceForAccessibility(
-        `Voice speed changed to ${rateLabel(v)}, ${ratePercent(v)}.`,
-      );
+      // ✅ Preview new rate through singleton (avoids BOOL crash)
+      if (Platform.OS === 'ios') {
+        await speechOutput.speak(`Voice speed set to ${rateLabel(v)}.`);
+      }
+
+      AccessibilityInfo.announceForAccessibility(label);
     },
     [updateTtsRate],
   );
@@ -989,8 +994,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
             style={styles.testBtn}
             onPress={async () => {
               if (Platform.OS === 'ios') {
-                await iOSTts.stop();
-                iOSTts.synthesizeSpeech(
+                await speechOutput.speak(
                   'This is how your voice guide will sound at this speed.',
                 );
               }

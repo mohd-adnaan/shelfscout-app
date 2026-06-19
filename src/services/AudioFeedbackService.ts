@@ -15,6 +15,7 @@ import { Vibration, Platform } from 'react-native';
 //old :import { speachesTTS } from './speachesTtsClient';
 import { iOSTts } from './iOSTtsClient';
 import { AccessibilityService } from './AccessibilityService';
+import { speechOutput } from './SpeechOutputService';
 
 class AudioFeedbackService {
   private lastAnnouncedState: string | null = null;
@@ -156,8 +157,7 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
       this.isSpeakingAnnouncement = true;
       console.log(`📢 Announcing: "${text}"`);
       
-      // Use native iOS TTS for announcement
-      await iOSTts.synthesizeSpeech(text);
+      await speechOutput.speak(text);
       
       this.isSpeakingAnnouncement = false;
       console.log(`✅ Announcement complete: "${text}"`);
@@ -202,7 +202,7 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
         try {
           this.isSpeakingAnnouncement = true;
           
-          await iOSTts.synthesizeSpeech(message);
+          await speechOutput.speak(message);
           
           this.isSpeakingAnnouncement = false;
           console.log('✅ Error spoken via TTS');

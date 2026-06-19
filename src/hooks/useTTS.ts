@@ -15,6 +15,7 @@ import { Alert } from 'react-native';
 //OLD: import { speachesTTS } from '../services/speachesTtsClient';
 import { iOSTts } from '../services/iOSTtsClient';
 import { AccessibilityService } from '../services/AccessibilityService';
+import { speechOutput } from '../services/SpeechOutputService';
 
 export const useTTS = () => {
   useEffect(() => {
@@ -65,7 +66,7 @@ export const useTTS = () => {
       // WCAG 4.1.3: Announce that we're about to speak
       // (This is handled by the calling code, so we don't duplicate it here)
       
-      await iOSTts.synthesizeSpeech(trimmedText);
+      await speechOutput.speak(trimmedText);
       
       console.log('✅ TTS playback started');
       

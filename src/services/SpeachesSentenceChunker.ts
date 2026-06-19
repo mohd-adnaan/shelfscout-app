@@ -1,7 +1,8 @@
 // src/services/SpeachesSentenceChunker.ts
 
-import { iOSTts } from './iOSTtsClient';
 import { AccessibilityService } from './AccessibilityService';
+import { iOSTts } from './iOSTtsClient';
+import { speechOutput } from './SpeechOutputService';
 
 class SpeachesSentenceChunker {
   private isStopped: boolean = false;
@@ -55,6 +56,23 @@ class SpeachesSentenceChunker {
     // ── STEP 3: Guard — if another call snuck in while we were stopping ───────
     if (this.sessionId !== mySession) {
       console.log(`⏩ Session ${mySession} superseded before starting — aborting`);
+      return;
+    }
+
+    if (await speechOutput.isScreenReaderEnabled()) {
+      this.isStopped = false;
+      this.isPlaying = true;
+      this.currentChunkIndex = 0;
+      this.totalChunks = 1;
+
+      try {
+        console.log(`♿ Session ${mySession}: routing speech through screen reader`);
+        await speechOutput.speak(trimmed);
+      } finally {
+        if (this.sessionId === mySession) {
+          this.isPlaying = false;
+        }
+      }
       return;
     }
 
