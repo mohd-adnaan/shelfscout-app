@@ -1,6 +1,7 @@
 import SwiftUI
 import ARKit
 import SceneKit
+import UIKit
 
 struct ARViewContainer: UIViewRepresentable {
     var session: ARSession
@@ -72,6 +73,7 @@ struct ARMappingView: View {
     private let launchRouteMapName: String?
     private let launchSpeakLandmarks: Bool
     private let launchErrorRecovery: Bool
+    private let launchVoiceOverEnabled: Bool
     private let onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
     @State private var newPOIName: String = ""
     @State private var mapName: String = ""
@@ -90,6 +92,7 @@ struct ARMappingView: View {
         launchRouteMapName: String? = nil,
         launchSpeakLandmarks: Bool = true,
         launchErrorRecovery: Bool = true,
+        launchVoiceOverEnabled: Bool = UIAccessibility.isVoiceOverRunning,
         onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)? = nil
     ) {
         _sourceSelection = sourceSelection
@@ -98,6 +101,7 @@ struct ARMappingView: View {
         self.launchRouteMapName = launchRouteMapName
         self.launchSpeakLandmarks = launchSpeakLandmarks
         self.launchErrorRecovery = launchErrorRecovery
+        self.launchVoiceOverEnabled = launchVoiceOverEnabled
         self.onAutomationComplete = onAutomationComplete
     }
 
@@ -1170,6 +1174,9 @@ struct ARMappingView: View {
 
     private func speakSemanticCue(_ cue: SemanticSpeechCue?) {
         guard let cue else { return }
+        guard !launchVoiceOverEnabled else {
+            return
+        }
         if lastSpokenSemanticCueText == cue.text,
            let lastSpokenSemanticCueAt,
            Date().timeIntervalSince(lastSpokenSemanticCueAt) < 2.5 {

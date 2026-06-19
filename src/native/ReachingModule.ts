@@ -33,6 +33,8 @@ export interface ReachingConfig {
   sessionId?: string;
   /** Start AR session silently; JS will enable guidance audio later */
   startupSilent?: boolean;
+  /** VoiceOver is active; native should suppress synthesized speech voices. */
+  voiceOverEnabled?: boolean;
 }
 
 export interface SpatialTargetReachingConfig {
@@ -51,6 +53,8 @@ export interface SpatialTargetReachingConfig {
   sessionId?: string;
   /** Start AR session silently; JS will enable guidance audio later */
   startupSilent?: boolean;
+  /** VoiceOver is active; native should suppress synthesized speech voices. */
+  voiceOverEnabled?: boolean;
   /** iOS TTS speech rate */
   ttsRate?: number;
   /** Distance unit for spoken guidance */

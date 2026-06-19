@@ -297,6 +297,10 @@ extension ReachingViewController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   func say(_ text: String) {
+    guard !voiceOverSpeechSuppressed else {
+      NSLog("♿ [ReachingVC] Suppressing native speech while VoiceOver is active: %@", text)
+      return
+    }
     guard guidanceAudioEnabled else {
       NSLog("🔇 [ReachingVC] Suppressing speech during silent bootstrap: %@", text)
       return

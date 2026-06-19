@@ -16,6 +16,7 @@ export interface ARKitNavigationConfig {
   sessionId?: string;
   speakLandmarks?: boolean;
   errorRecovery?: boolean;
+  voiceOverEnabled?: boolean;
   ttsRate?: number;
 }
 

@@ -131,6 +131,7 @@ final class ARKitNavigationModule: NSObject {
             let routeMapName = config["routeMapName"] as? String
             let speakLandmarks = (config["speakLandmarks"] as? NSNumber)?.boolValue ?? true
             let errorRecovery = (config["errorRecovery"] as? NSNumber)?.boolValue ?? true
+            let voiceOverEnabled = (config["voiceOverEnabled"] as? NSNumber)?.boolValue ?? UIAccessibility.isVoiceOverRunning
             let ttsRate = (config["ttsRate"] as? NSNumber)?.doubleValue
 
             let host = ARKitRouteHostView(
@@ -139,6 +140,7 @@ final class ARKitNavigationModule: NSObject {
                 launchRouteMapName: routeMapName,
                 speakLandmarks: speakLandmarks,
                 errorRecovery: errorRecovery,
+                voiceOverEnabled: voiceOverEnabled,
                 ttsRate: ttsRate,
                 onDone: { [weak self] in
                     self?.finishNavigation(ARKitNavigationNativeResult(
@@ -501,6 +503,7 @@ private struct ARKitRouteHostView: View {
     let launchRouteMapName: String?
     let speakLandmarks: Bool
     let errorRecovery: Bool
+    let voiceOverEnabled: Bool
     let onDone: () -> Void
     let onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
 
@@ -510,6 +513,7 @@ private struct ARKitRouteHostView: View {
         launchRouteMapName: String?,
         speakLandmarks: Bool,
         errorRecovery: Bool,
+        voiceOverEnabled: Bool = UIAccessibility.isVoiceOverRunning,
         ttsRate: Double?,
         onDone: @escaping () -> Void,
         onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
@@ -524,6 +528,7 @@ private struct ARKitRouteHostView: View {
         self.launchRouteMapName = launchRouteMapName
         self.speakLandmarks = speakLandmarks
         self.errorRecovery = errorRecovery
+        self.voiceOverEnabled = voiceOverEnabled
         self.onDone = onDone
         self.onAutomationComplete = onAutomationComplete
     }
@@ -536,6 +541,7 @@ private struct ARKitRouteHostView: View {
                 launchRouteMapName: launchRouteMapName,
                 launchSpeakLandmarks: speakLandmarks,
                 launchErrorRecovery: errorRecovery,
+                launchVoiceOverEnabled: voiceOverEnabled,
                 onAutomationComplete: onAutomationComplete
             )
             .environmentObject(sensorManager)

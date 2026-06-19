@@ -653,6 +653,9 @@ function AppInner(): React.JSX.Element {
       await playErrorSound();
     }
     AccessibilityInfo.announceForAccessibility(spoken);
+    if (screenReaderEnabledRef.current) {
+      return;
+    }
     await speachesSentenceChunker.synthesizeSpeechChunked(spoken);
   };
   // ────────────────────────────────────────────────────────────────────────
@@ -1325,6 +1328,13 @@ function AppInner(): React.JSX.Element {
     const spoken = (text || '').trim();
     if (!spoken || isEmergencyStopped.current) return;
 
+    if (screenReaderEnabledRef.current) {
+      AccessibilityInfo.announceForAccessibility(spoken);
+      const waitMs = Math.min(6500, Math.max(1200, spoken.length * 55));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), waitMs));
+      return;
+    }
+
     enqueueContinuousSpeech(spoken, options);
     await waitForContinuousSpeechQueueIdle(options);
   }, [enqueueContinuousSpeech, waitForContinuousSpeechQueueIdle]);
@@ -1382,7 +1392,8 @@ function AppInner(): React.JSX.Element {
             targetWorldPosition: result.targetWorldPosition || result.target_world_position,
             sessionId: getSessionId(),
             mode: settingsRef.current.reachingMode,
-            startupSilent: options?.startupSilent === true,
+            startupSilent: options?.startupSilent === true && !screenReaderEnabledRef.current,
+            voiceOverEnabled: screenReaderEnabledRef.current,
             ttsRate: settingsRef.current.ttsRate,
             distanceUnit: settingsRef.current.distanceUnit,
           });
@@ -1469,9 +1480,13 @@ function AppInner(): React.JSX.Element {
       // a tap during TTS routes to emergencyStop, NOT startListening (dead-loop fix)
       console.log('⚠️ [ARKit] reaching_ios=true but no valid bbox:', rawBbox);
       setIsSpeaking(true);
-      await speachesSentenceChunker.synthesizeSpeechChunked(
-        `I can detect the ${result.object || 'object'} in the scene, but I could not get precise coordinates for guidance. Try pointing your camera more directly at it and ask again.`
-      );
+      const noBboxMessage = `I can detect the ${result.object || 'object'} in the scene, but I could not get precise coordinates for guidance. Try pointing your camera more directly at it and ask again.`;
+      if (screenReaderEnabledRef.current) {
+        AccessibilityInfo.announceForAccessibility(noBboxMessage);
+        await new Promise<void>(resolve => setTimeout(() => resolve(), 3500));
+      } else {
+        await speachesSentenceChunker.synthesizeSpeechChunked(noBboxMessage);
+      }
       setIsSpeaking(false);                // ← release speaking guard
       // Clean transition to ready (matches the ARKit-success path below)
       setIsCameraActive(true);
@@ -1507,7 +1522,8 @@ function AppInner(): React.JSX.Element {
           detectionUrl: DETECTION_URL,
           ...(acquisitionUrl ? { acquisitionUrl } : {}),
           mode: settingsRef.current.reachingMode,
-          startupSilent: options?.startupSilent === true,
+          startupSilent: options?.startupSilent === true && !screenReaderEnabledRef.current,
+          voiceOverEnabled: screenReaderEnabledRef.current,
           ttsRate: settingsRef.current.ttsRate,
           distanceUnit: settingsRef.current.distanceUnit,
         });
@@ -2273,6 +2289,7 @@ function AppInner(): React.JSX.Element {
         sessionId: getSessionId(),
         speakLandmarks: true,
         errorRecovery: false,
+        voiceOverEnabled: screenReaderEnabledRef.current,
         ttsRate: settingsRef.current.ttsRate,
       });
     } catch (e: any) {
@@ -2645,7 +2662,14 @@ function AppInner(): React.JSX.Element {
           await new Promise<void>(resolve => setTimeout(() => resolve(), 600));
         }
 
-        introSpeechPromise = speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+        introSpeechPromise = (
+          screenReaderEnabledRef.current
+            ? new Promise<void>(resolve => {
+              AccessibilityInfo.announceForAccessibility(result.text);
+              setTimeout(resolve, Math.min(6500, Math.max(1200, result.text.length * 55)));
+            })
+            : speachesSentenceChunker.synthesizeSpeechChunked(result.text)
+        )
           .then(() => {
             setIsSpeaking(false);
             // Bug 4 defense: kill any latency loop that may have been
@@ -2768,9 +2792,12 @@ function AppInner(): React.JSX.Element {
           await playErrorSound();
         }
 
-        await speachesSentenceChunker.synthesizeSpeechChunked(
-          'Error processing your request. Try again.'
-        );
+        const errorMessage = 'Error processing your request. Try again.';
+        if (screenReaderEnabledRef.current) {
+          AccessibilityInfo.announceForAccessibility(errorMessage);
+        } else {
+          await speachesSentenceChunker.synthesizeSpeechChunked(errorMessage);
+        }
 
         setIsCameraActive(true);
         if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }

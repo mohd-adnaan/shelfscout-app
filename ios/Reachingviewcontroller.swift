@@ -394,6 +394,7 @@ class ReachingViewController: UIViewController {
   // ═══════════════════════════════════════════════════════════════════════════
 
   var running = false
+  var voiceOverSpeechSuppressed = false
   var currentDirection: Direction = .searching
   var proximityZone: ProximityZone = .searching
   var noHandFrames = 0
@@ -460,6 +461,7 @@ class ReachingViewController: UIViewController {
        spatialTargetMapName: String? = nil,
        mode: ReachingMode = .handFree,
       startupSilent: Bool = false,
+       voiceOverEnabled: Bool = false,
        ttsRate: Float = 0.5,
        distanceUnit: String = "steps",
        onDone: @escaping ([String: Any]) -> Void) {
@@ -478,6 +480,7 @@ class ReachingViewController: UIViewController {
     self.mode         = mode
     self.startupSilent = startupSilent
     self.guidanceAudioEnabled = !startupSilent
+    self.voiceOverSpeechSuppressed = voiceOverEnabled
     self.ttsRate      = ttsRate
     self.distanceUnit = distanceUnit
     self.onDone       = onDone

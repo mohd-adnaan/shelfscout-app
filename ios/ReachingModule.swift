@@ -51,6 +51,7 @@ class ReachingModule: NSObject {
     // Parse distance unit preference: "steps" (default) or "cm"
     let distanceUnit = (params["distanceUnit"] as? String) ?? "steps"
     let startupSilent = (params["startupSilent"] as? Bool) ?? false
+    let voiceOverEnabled = (params["voiceOverEnabled"] as? Bool) ?? UIAccessibility.isVoiceOverRunning
 
     var backendDepth: Float? = nil
     if let d = params["depth"] {
@@ -81,6 +82,7 @@ class ReachingModule: NSObject {
                               sessionId: sessionId,
                               mode: mode,
                               startupSilent: startupSilent,
+                              voiceOverEnabled: voiceOverEnabled,
                               ttsRate: ttsRate, distanceUnit: distanceUnit,
                               resolver: resolver, rejecter: rejecter)
     }
@@ -128,6 +130,7 @@ class ReachingModule: NSObject {
     let ttsRate: Float = (params["ttsRate"] as? NSNumber)?.floatValue ?? 0.5
     let distanceUnit = (params["distanceUnit"] as? String) ?? "steps"
     let startupSilent = (params["startupSilent"] as? Bool) ?? false
+    let voiceOverEnabled = (params["voiceOverEnabled"] as? Bool) ?? UIAccessibility.isVoiceOverRunning
     let sessionId = params["sessionId"] as? String
     let routeMapId = (params["routeMapId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     let routeMapName = params["routeMapName"] as? String
@@ -190,6 +193,7 @@ class ReachingModule: NSObject {
         spatialTargetMapName: resolvedMapName,
         mode: mode,
         startupSilent: startupSilent,
+        voiceOverEnabled: voiceOverEnabled,
         ttsRate: ttsRate,
         distanceUnit: distanceUnit,
         resolver: resolver,
@@ -669,6 +673,7 @@ class ReachingModule: NSObject {
     spatialTargetMapName: String? = nil,
     mode: ReachingViewController.ReachingMode,
     startupSilent: Bool,
+    voiceOverEnabled: Bool,
     ttsRate: Float,
     distanceUnit: String,
     resolver: @escaping RCTPromiseResolveBlock,
@@ -692,6 +697,7 @@ class ReachingModule: NSObject {
                                    spatialTargetMapName: spatialTargetMapName,
                                    mode: mode,
                                    startupSilent: startupSilent,
+                                   voiceOverEnabled: voiceOverEnabled,
                                    ttsRate: ttsRate, distanceUnit: distanceUnit,
                                    resolver: resolver, rejecter: rejecter)
           }
@@ -709,6 +715,7 @@ class ReachingModule: NSObject {
         spatialTargetMapName: spatialTargetMapName,
         mode: mode,
         startupSilent: startupSilent,
+        voiceOverEnabled: voiceOverEnabled,
         ttsRate: ttsRate,
         distanceUnit: distanceUnit,
         onDone: { result in
