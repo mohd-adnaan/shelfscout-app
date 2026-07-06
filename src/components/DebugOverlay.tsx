@@ -137,10 +137,16 @@ export function DebugOverlay(): React.JSX.Element {
 
   // ── Export ──────────────────────────────────────────────────────────────
 
-  const handleExport = useCallback(async (format: 'json' | 'csv') => {
+  const handleExport = useCallback(async (format: 'json' | 'csv' | 'sheets') => {
     setShowFormatPicker(false);
     setExporting(true);
     try {
+      if (format === 'sheets') {
+        await debugLogger.uploadToGoogleSheets(filter);
+        Alert.alert('Success', 'Logs uploaded to Google Sheets successfully.');
+        return;
+      }
+
       const ts = fileTimestamp();
       const ext = format;
       const filename = `cybersight_logs_${ts}.${ext}`;
@@ -264,6 +270,14 @@ export function DebugOverlay(): React.JSX.Element {
               >
                 <Text style={styles.formatOptionText}>CSV</Text>
                 <Text style={styles.formatOptionSub}>Spreadsheet</Text>
+              </TouchableOpacity>
+              <TouchableOpacity
+                style={styles.formatOption}
+                onPress={() => handleExport('sheets')}
+                activeOpacity={0.7}
+              >
+                <Text style={styles.formatOptionText}>Sheets</Text>
+                <Text style={styles.formatOptionSub}>Cloud</Text>
               </TouchableOpacity>
             </View>
           )}

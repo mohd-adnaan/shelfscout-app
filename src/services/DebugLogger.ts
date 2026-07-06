@@ -84,6 +84,7 @@ const MAX_ENTRIES = 5000;
 const MAX_UI_LENGTH = 300;
 const FORMAT_VERSION = '1.0.0';
 const APP_NAME = 'CyberSight/ShelfScout';
+const GOOGLE_SHEETS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycby7loaXFmAhh_LQ2nD_gHpkRCwcLFdN0x7mXqk5cYbnIl8napqz12_BcXDxuhn-Mkp-iA/exec';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Singleton
@@ -294,6 +295,29 @@ class DebugLoggerClass {
     });
 
     return header + CRLF + rows.join(CRLF) + CRLF;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // EXPORT — Google Sheets
+  // ════════════════════════════════════════════════════════════════════════
+
+  /**
+   * Upload the logs to a Google Sheets Web App via HTTP POST.
+   */
+  async uploadToGoogleSheets(filterLevel: LogLevel | 'all' = 'all'): Promise<void> {
+    const payload = this.exportAsJSON(filterLevel);
+
+    const response = await fetch(GOOGLE_SHEETS_WEB_APP_URL, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: payload,
+    });
+
+    if (!response.ok) {
+      throw new Error(`Google Sheets upload failed with status ${response.status}`);
+    }
   }
 
   // ── Internals ───────────────────────────────────────────────────────────
