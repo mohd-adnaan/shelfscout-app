@@ -319,6 +319,13 @@ struct SemanticNavigationPanel: View {
             .controlSize(.large)
             .disabled(!navigator.canSaveCapturedMap || isSavingARMap)
 
+            if let error = navigator.saveCapturedMapError, !isSavingARMap {
+                Text(error)
+                    .font(.caption2)
+                    .foregroundColor(.red)
+                    .multilineTextAlignment(.center)
+            }
+
             HStack(spacing: 10) {
                 Button("Discard") {
                     navigator.discardCapture()

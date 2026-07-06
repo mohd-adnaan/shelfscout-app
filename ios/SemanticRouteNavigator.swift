@@ -385,22 +385,22 @@ final class SemanticRouteNavigator: ObservableObject {
     private let routeStartEdgeSnapThreshold = 1.6
     private let visualRouteMatchInterval: TimeInterval = 0.45
     private let visualRouteMinimumConfidence = 0.68
-    private let visualRouteSnapConfidence = 0.78
+    private let visualRouteSnapConfidence = 0.88
     private let visualRouteArrivalConfidence = 0.76
-    private let visualRouteAmbiguousGap = 0.10
+    private let visualRouteAmbiguousGap = 0.20
     private let visualRouteAdvanceCooldownSeconds: TimeInterval = 1.4
     private let visualArrivalMaxHoldSeconds: TimeInterval = 4.5
-    private let maxImmediateARProgressCorrectionMeters = 1.25
+    private let maxImmediateARProgressCorrectionMeters = 0.75
     private let maxImmediateVisualProgressCorrectionMeters = 1.75
     private let largeProgressCorrectionConfirmationSeconds: TimeInterval = 0.85
-    private let largeProgressCorrectionRequiredSamples = 3
+    private let largeProgressCorrectionRequiredSamples = 5
     private let visualDecisionAdvanceConfidence = 0.86
     private let visualDecisionImmediateConfidence = 0.96
     private let decisionAdvanceConfirmationSeconds: TimeInterval = 0.65
     private let decisionAdvanceRequiredSamples = 2
     private let routeAdvanceMaxUnconfirmedRemainingMeters = 1.20
     private let routeStartHeadingPenaltyMeters = 1.25
-    private let routeStartAlignmentThresholdDegrees = 40.0
+    private let routeStartAlignmentThresholdDegrees = 20.0
     private let routeTurnAlignmentThresholdDegrees = 55.0
     private let routeAlignmentProgressWindowMeters = 1.10
     private let routeAlignmentCueCooldownSeconds: TimeInterval = 1.4
@@ -542,6 +542,20 @@ final class SemanticRouteNavigator: ObservableObject {
         return map.nodes.contains { $0.kind == .entrance }
             && map.nodes.contains { $0.kind == .destination }
             && !map.edges.isEmpty
+    }
+
+    var saveCapturedMapError: String? {
+        guard let map = activeMapDraft ?? activeMap else { return "No active map." }
+        if !map.nodes.contains(where: { $0.kind == .entrance }) {
+            return "Missing entrance point."
+        }
+        if !map.nodes.contains(where: { $0.kind == .destination }) {
+            return "Missing destination point."
+        }
+        if map.edges.isEmpty {
+            return "Missing route path."
+        }
+        return nil
     }
 
     var mappingStageTitle: String {
@@ -1199,7 +1213,7 @@ final class SemanticRouteNavigator: ObservableObject {
         var firstInstruction = currentInstruction
         if let headingCue = initialHeadingAlignmentInstruction(
             on: steps[0],
-            liveHeading: arHeading ?? imuState.bearing
+            liveHeading: imuState.bearing
         ) {
             firstInstruction = "\(headingCue) Then \(firstInstruction.lowercased())"
         }
@@ -2769,6 +2783,10 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
 
+        if confidence < 0.45 {
+            currentInstruction = "Tracking limited, please walk slowly. " + currentInstruction
+        }
+
         let bucket = Int(ceil(segmentRemainingMeters))
         let routineSpeechAllowed = forceSpeech || guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
         guard routineSpeechAllowed else { return }
@@ -3781,7 +3799,7 @@ final class SemanticRouteNavigator: ObservableObject {
                     continue
                 }
                 let similarity = fingerprinter.similarity(left, right)
-                guard similarity >= 0.88 else { continue }
+                guard similarity >= 0.82 else { continue }
                 let names = [
                     representativeName(forFingerprintID: leftID, in: map),
                     representativeName(forFingerprintID: rightID, in: map)
