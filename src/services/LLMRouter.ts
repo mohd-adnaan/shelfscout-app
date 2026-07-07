@@ -12,7 +12,7 @@ export interface LocalLLMResult<T = unknown> {
 }
 
 export interface IntentClassification {
-  intent: 'navigation' | 'reaching' | 'scene' | 'stop' | 'unknown';
+  intent: 'navigation' | 'reaching' | 'scene' | 'chat' | 'stop' | 'unknown';
   target: string | null;
   needsImage: boolean;
   confidence: number;

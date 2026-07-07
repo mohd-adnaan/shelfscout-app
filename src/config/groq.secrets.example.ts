@@ -12,3 +12,7 @@ export const GROQ_API_KEYS: string[] = [
 // Text model used for on-device intent extraction (mirrors the backend
 // "Extract Intent" node). llama-3.3-70b-versatile is fast + accurate.
 export const GROQ_INTENT_MODEL = 'llama-3.3-70b-versatile';
+
+// Multimodal model for on-device scene/object/general vision queries.
+// Matches the backend workflow's vision_model.
+export const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';

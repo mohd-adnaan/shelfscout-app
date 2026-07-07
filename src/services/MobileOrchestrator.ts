@@ -11,6 +11,7 @@ import { LocalLLMNativeResult, OnDeviceLLMBridge } from '../native/OnDeviceLLMMo
 import { IntentClassification, LocalLLMResult, llmRouter } from './LLMRouter';
 import { orchestratorConfig } from './OrchestratorConfig';
 import { groqIntentClient } from './GroqIntentClient';
+import { groqVisionClient } from './GroqVisionClient';
 
 type SessionMode = 'default' | 'navigation' | 'reaching' | 'reaching_ios';
 
@@ -300,12 +301,63 @@ class MobileOrchestrator {
       return this.neutralInDeviceResponse(sessionId, trace, '');
     }
 
-    // ── Scene / unknown → graceful degrade (no on-device vision here) ────────
-    const spoken =
+    // ── Scene / chat / informational image question → on-device Groq vision ──
+    if (
+      intent === 'scene' ||
+      intent === 'chat' ||
+      (localIntent.json?.needsImage === true && Boolean(request.imageUri))
+    ) {
+      const answer = await this.visionAnswerInDevice(request, intent, trace);
+      if (answer) {
+        return this.neutralInDeviceResponse(sessionId, trace, answer);
+      }
+      const why = request.imageUri
+        ? 'I could not analyze the image just now. Please try again.'
+        : 'Point your camera at what you want described, then ask again.';
+      return this.neutralInDeviceResponse(sessionId, trace, why);
+    }
+
+    // ── Unknown / no clear action ────────────────────────────────────────────
+    return this.neutralInDeviceResponse(
+      sessionId,
+      trace,
+      'I did not catch that. Try, for example, reach the water bottle, take me to the door, or what is in front of me.',
+    );
+  }
+
+  // Scene → full-surroundings description; chat/other → question answered
+  // against the current frame. Returns spoken text or null on failure.
+  private async visionAnswerInDevice(
+    request: WorkflowRequest,
+    intent: IntentClassification['intent'] | undefined,
+    trace: ProviderTraceEntry[],
+  ): Promise<string | null> {
+    if (!request.imageUri || !groqVisionClient.isConfigured()) {
+      trace.push({
+        provider: 'groq_vision',
+        ok: false,
+        confidence: 0,
+        needsRemote: false,
+        fallbackReason: !request.imageUri ? 'no_image' : 'groq_vision_not_configured',
+      });
+      return null;
+    }
+
+    const result =
       intent === 'scene'
-        ? 'Scene descriptions need online mode. Turn off In-Device Mode in settings to describe what is in front of you.'
-        : 'I did not catch a reach or navigation request. Try, for example, reach the water bottle, or take me to the door.';
-    return this.neutralInDeviceResponse(sessionId, trace, spoken);
+        ? await groqVisionClient.describeScene(request.imageUri, request.text)
+        : await groqVisionClient.answerQuestion(request.imageUri, request.text || '');
+
+    trace.push({
+      provider: 'groq_vision',
+      ok: result.ok,
+      confidence: result.ok ? 0.9 : 0,
+      needsRemote: false,
+      fallbackReason: result.fallbackReason,
+      diagnostics: { intent },
+    });
+
+    return result.ok ? result.text || null : null;
   }
 
   private neutralInDeviceResponse(

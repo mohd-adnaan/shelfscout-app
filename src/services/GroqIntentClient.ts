@@ -36,18 +36,19 @@ const SYSTEM_PROMPT = `You are the intent router for ShelfScout, a voice assista
 Classify the user's utterance into exactly one intent and extract the target.
 
 Return ONLY a compact JSON object, no prose, no markdown, with these keys:
-- "intent": one of "reaching" | "navigation" | "scene" | "stop" | "unknown"
+- "intent": one of "reaching" | "navigation" | "scene" | "chat" | "stop" | "unknown"
 - "target": the object or destination as a short noun phrase, or null
-- "needsImage": true if answering requires looking at the camera (scene questions), else false
+- "needsImage": true if answering requires looking at the camera, else false
 - "confidence": a number 0..1
 
 Rules:
-- "reaching": user wants to physically grab/find/pick up an object on a shelf/table ("reach the water bottle", "help me grab the cereal", "where is the mug", "find the remote"). target = the object.
+- "reaching": user wants to physically grab / pick up / be guided by hand to an object ("reach the water bottle", "help me grab the cereal", "guide me to the mug"). target = the object.
 - "navigation": user wants to be guided to a place/landmark ("take me to the kitchen", "walk me to the door", "go to aisle 3"). target = the destination.
-- "scene": user wants a description of surroundings ("what's in front of me", "describe the scene", "what's on the table"). target = null, needsImage = true.
-- "stop": cancel/stop/pause/emergency. target = null.
+- "scene": user wants a general description of their surroundings ("what's in front of me", "describe the scene", "what's around me"). target = null, needsImage = true.
+- "chat": user asks an informational question about what the camera sees, without wanting hand guidance ("is there yogurt here", "what's the price of this", "where is the milk", "what am I holding", "read this label"). target = the object if named, else null. needsImage = true.
+- "stop": cancel / stop / pause / emergency. target = null.
 - "unknown": anything else or too ambiguous. Keep confidence low.
-Prefer "reaching" over "scene" when a specific object is named.`;
+Distinguish carefully: naming an object with a grab/guide verb is "reaching"; naming an object with an ask/where/is-there/price/read verb is "chat".`;
 
 let keyCursor = 0;
 const nextKey = (): string | null => {
@@ -152,6 +153,7 @@ class GroqIntentClient {
           'reaching',
           'navigation',
           'scene',
+          'chat',
           'stop',
           'unknown',
         ];
@@ -169,7 +171,7 @@ class GroqIntentClient {
         const json: IntentClassification = {
           intent,
           target: normalizeTarget(parsed?.target),
-          needsImage: parsed?.needsImage === true || intent === 'scene',
+          needsImage: parsed?.needsImage === true || intent === 'scene' || intent === 'chat',
           confidence,
         };
 
@@ -177,8 +179,8 @@ class GroqIntentClient {
           available: true,
           usedProvider: 'groq',
           confidence,
-          // Scene still needs vision; reaching/navigation are fully local.
-          needsBackend: json.intent === 'scene',
+          // scene/chat need vision; handled on-device by GroqVisionClient.
+          needsBackend: json.intent === 'scene' || json.intent === 'chat',
           json,
           rawText: content,
         };
