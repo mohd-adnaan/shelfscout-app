@@ -1213,7 +1213,7 @@ final class SemanticRouteNavigator: ObservableObject {
         var firstInstruction = currentInstruction
         if let headingCue = initialHeadingAlignmentInstruction(
             on: steps[0],
-            liveHeading: imuState.bearing
+            liveHeading: arHeading ?? imuState.bearing
         ) {
             firstInstruction = "\(headingCue) Then \(firstInstruction.lowercased())"
         }
@@ -2783,7 +2783,8 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
 
-        if confidence < 0.45 {
+        let pastIntroProtection = guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
+        if confidence < 0.45, pastIntroProtection {
             currentInstruction = "Tracking limited, please walk slowly. " + currentInstruction
         }
 
