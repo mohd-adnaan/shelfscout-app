@@ -394,7 +394,7 @@ final class SemanticRouteNavigator: ObservableObject {
     private let maxImmediateVisualProgressCorrectionMeters = 1.75
     private let largeProgressCorrectionConfirmationSeconds: TimeInterval = 0.85
     private let largeProgressCorrectionRequiredSamples = 5
-    private let visualDecisionAdvanceConfidence = 0.86
+    private let visualDecisionAdvanceConfidence = 0.88
     private let visualDecisionImmediateConfidence = 0.96
     private let decisionAdvanceConfirmationSeconds: TimeInterval = 0.65
     private let decisionAdvanceRequiredSamples = 2
@@ -419,7 +419,7 @@ final class SemanticRouteNavigator: ObservableObject {
     private let routeBeliefMinimumLockedConfidence = 0.62
     private let routeBeliefMinimumInstructionMargin = 0.14
     private let routeBeliefMaximumInstructionUncertainty = 1.70
-    private let routeBeliefLargeCorrectionSupportMeters = 1.05
+    private let routeBeliefLargeCorrectionSupportMeters = 0.75
     private let routeBeliefLargeCorrectionMinimumSamples = 3
     private let routeBeliefLargeCorrectionMinimumDuration: TimeInterval = 0.75
     private let routeBeliefPhysicalSlackMeters = 0.85
