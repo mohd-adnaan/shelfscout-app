@@ -147,6 +147,10 @@ interface ContinuousSpeechEnqueueOptions {
   force?: boolean;
   allowPreempt?: boolean;
   ignoreAbort?: boolean;
+  /** Override CONTINUOUS_TTS_REPEAT_SUPPRESSION_MS for this call only.
+   *  Use a shorter value for real-time feedback (e.g. reaching guidance)
+   *  so repeated updates are spoken every ~N ms instead of every 10 s. */
+  suppressionMs?: number;
 }
 
 type EnqueueContinuousSpeech = (
@@ -241,7 +245,7 @@ const extractInstructionIntent = (normalized: string): ContinuousSpeechIntent =>
   if (/\b(straight|forward|continue|ahead|walk)\b/.test(normalized)) return 'straight';
   if (/\b(up|raise|tilt up)\b/.test(normalized)) return 'up';
   if (/\b(down|lower|tilt down)\b/.test(normalized)) return 'down';
-  if (/\b(reaching|hand|object|target)\b/.test(normalized)) return 'reaching';
+  if (/\b(reach(?:ing)?|hand|object|target|closer|approach|grab|grasp)\b/.test(normalized)) return 'reaching';
   if (extractDistanceMeters(normalized) !== undefined) return 'distance';
   return 'general';
 };
@@ -1254,7 +1258,7 @@ function AppInner(): React.JSX.Element {
 
       if (
         lastAccepted &&
-        now - lastAccepted.acceptedAt < CONTINUOUS_TTS_REPEAT_SUPPRESSION_MS &&
+        now - lastAccepted.acceptedAt < (options?.suppressionMs ?? CONTINUOUS_TTS_REPEAT_SUPPRESSION_MS) &&
         areInstructionsNearDuplicate(nextSignature, lastAccepted.signature)
       ) {
         logCoalesced('recently-accepted-near-duplicate', lastAccepted.text);
@@ -2099,6 +2103,11 @@ function AppInner(): React.JSX.Element {
           enqueueContinuousSpeech(result.text, {
             source: loopMode || 'backend',
             allowPreempt: true,
+            // Reaching guidance is real-time depth feedback that must repeat as
+            // the user approaches the object. Use a short suppression window so
+            // updates come through every ~3 s instead of the 10 s default that
+            // is appropriate for navigation instructions.
+            suppressionMs: loopMode === 'reaching' ? 3000 : CONTINUOUS_TTS_REPEAT_SUPPRESSION_MS,
           });
         } else if (isNullResponse) {
           // ── Fast-poll: "Null" text — skip TTS, rapid 500ms cycle ─────────
