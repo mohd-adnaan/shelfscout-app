@@ -218,6 +218,7 @@ interface SettingsScreenProps {
 export default function SettingsScreen({ onClose }: SettingsScreenProps) {
   const {
     settings,
+    updateInDeviceMode,
     updateReachingPipeline,
     updateNavigationPipeline,
     updateUseWearablesCamera,
@@ -232,6 +233,20 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
 
   const [localRate, setLocalRate] = useState(settings.ttsRate);
   const [wearablesStatus, setWearablesStatus] = useState<WearablesCameraStatus>('unknown');
+
+  // ── In-Device Mode (master) ───────────────────────────────────────────────
+
+  const handleInDeviceModeToggle = useCallback(
+    async (value: boolean) => {
+      await updateInDeviceMode(value);
+      await speechOutput.announce(
+        value
+          ? 'In-Device Mode on. Navigation and reaching run fully on your phone.'
+          : 'In-Device Mode off. Using the online backend.',
+      );
+    },
+    [updateInDeviceMode],
+  );
 
   // ── Reaching toggle ───────────────────────────────────────────────────────
 
@@ -491,6 +506,49 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       >
 
         {/* ══════════════════════════════════════════
+            SECTION 0 — Mode (master switch)
+        ══════════════════════════════════════════ */}
+        <Section title="Mode">
+          <View style={styles.pipelineBadgeRow}>
+            <View
+              style={[
+                styles.pipelineBadge,
+                settings.inDeviceMode ? styles.badgeArkit : styles.badgeStandard,
+              ]}
+            >
+              <Text style={styles.pipelineBadgeText}>
+                {settings.inDeviceMode ? 'In-Device' : 'Backend'}
+              </Text>
+            </View>
+          </View>
+
+          <Text style={styles.settingDescription}>
+            <Text style={styles.emphasisText}>In-Device Mode</Text> runs navigation and
+            reaching fully on your phone with ARKit — no network needed. Turn it off to use
+            the online backend (Kasra navigation and backend reaching).
+          </Text>
+
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabelBlock}>
+              <Text style={styles.settingLabel}>In-Device Mode</Text>
+              <Text style={styles.settingSubLabel}>
+                {settings.inDeviceMode
+                  ? 'On-device ARKit + local orchestration'
+                  : 'Online backend orchestration'}
+              </Text>
+            </View>
+            <Switch
+              value={settings.inDeviceMode}
+              onValueChange={handleInDeviceModeToggle}
+              accessibilityLabel="In-Device Mode"
+              accessibilityHint="Double tap to run navigation and reaching fully on device"
+            />
+          </View>
+        </Section>
+
+        {!settings.inDeviceMode && (
+          <>
+        {/* ══════════════════════════════════════════
             SECTION 1 — Navigation Pipeline
         ══════════════════════════════════════════ */}
         <Section title="Navigation Pipeline">
@@ -585,10 +643,13 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
           </View>
 
           <Text style={styles.settingDescription}>
-            Choose the reaching engine. <Text style={styles.emphasisText}>Spatial Target</Text> avoids backend bounding boxes after ARKit map arrival.
+            Backend reaching engine. <Text style={styles.emphasisText}>Vision Box</Text> uses
+            a backend bounding box with ARKit depth; <Text style={styles.emphasisText}>Standard</Text> is
+            Melody's tracker loop. For on-device reaching, use In-Device Mode above.
           </Text>
 
           <View style={styles.comparisonRow}>
+            {settings.developerMode && (
             <TouchableOpacity
               style={[
                 styles.pipelineOption,
@@ -609,8 +670,9 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 <View style={styles.activeDot} />
               )}
             </TouchableOpacity>
+            )}
 
-            <View style={styles.pipelineDivider} />
+            {settings.developerMode && <View style={styles.pipelineDivider} />}
 
             <TouchableOpacity
               style={[
@@ -658,6 +720,8 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
           </View>
 
         </Section>
+          </>
+        )}
 
         {/* ══════════════════════════════════════════
             SECTION 1.25 — Meta Ray-Ban Glasses

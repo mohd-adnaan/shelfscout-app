@@ -62,6 +62,7 @@ yarn-error.log
 
 # OpenAI local secrets
 src/config/openai.secrets.ts
+src/config/groq.secrets.ts
 
 # Yarn
 .yarn/*

@@ -9,6 +9,8 @@ import {
 } from '../utils/types';
 import { LocalLLMNativeResult, OnDeviceLLMBridge } from '../native/OnDeviceLLMModule';
 import { IntentClassification, LocalLLMResult, llmRouter } from './LLMRouter';
+import { orchestratorConfig } from './OrchestratorConfig';
+import { groqIntentClient } from './GroqIntentClient';
 
 type SessionMode = 'default' | 'navigation' | 'reaching' | 'reaching_ios';
 
@@ -95,6 +97,11 @@ class MobileOrchestrator {
   ): Promise<WorkflowResponse> {
     if (signal?.aborted) {
       throw new Error('Request cancelled');
+    }
+
+    // ── In-device mode: resolve everything locally, never touch the backend ──
+    if (orchestratorConfig.inDeviceMode) {
+      return this.processInDevice(request, signal, options);
     }
 
     const sessionId = options.getSessionId();
@@ -205,6 +212,160 @@ class MobileOrchestrator {
 
   async resetSession(sessionId: string): Promise<void> {
     await this.persistMemory(this.defaultMemory(sessionId));
+  }
+
+  // ───────────────────────────────────────────────────────────────────────────
+  // In-device mode: transcript → local intent → native ARKit pipeline flags.
+  // Never calls options.backendWorkflowProvider. Continuous iterations (image
+  // present) are no-ops here because the native reaching/navigation modules run
+  // their own on-device loops once launched.
+  // ───────────────────────────────────────────────────────────────────────────
+  private async processInDevice(
+    request: WorkflowRequest,
+    signal: AbortSignal | undefined,
+    options: MobileOrchestratorProcessOptions,
+  ): Promise<WorkflowResponse> {
+    if (signal?.aborted) throw new Error('Request cancelled');
+
+    const sessionId = options.getSessionId();
+    const trace: ProviderTraceEntry[] = [];
+    const memory = await this.loadMemory(sessionId);
+    const continuous = isContinuousRequest(request);
+
+    // A continuous-loop tick arriving while a native pipeline owns the loop:
+    // return a neutral, no-op response so the JS loop simply idles.
+    if (continuous || !request.text?.trim()) {
+      trace.push({
+        provider: 'in_device_noop',
+        ok: true,
+        confidence: 1,
+        needsRemote: false,
+        diagnostics: { reason: continuous ? 'native_pipeline_owns_loop' : 'no_transcript' },
+      });
+      return this.neutralInDeviceResponse(sessionId, trace);
+    }
+
+    const localIntent = await this.classifyIntentInDevice(request, trace);
+    await this.persistRequestState(memory, request, localIntent, sessionId, continuous);
+
+    const intent = localIntent.json?.intent;
+    const target = localIntent.json?.target?.trim() || undefined;
+    const provider = localIntent.usedProvider;
+
+    // ── Reaching → in-device spatial-target ARKit reaching (bbox-free) ───────
+    if (intent === 'reaching' && target) {
+      const response: WorkflowResponse = {
+        text: '',
+        navigation: false,
+        reaching_flag: false,
+        reaching_ios: true,
+        object: target,
+        loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
+        session_id: sessionId,
+        local_orchestrator_used: true,
+        local_llm_used: provider === 'apple_foundation_models' || provider === 'groq',
+        llm_provider: provider,
+        intent_provider: provider,
+        provider_trace: trace,
+      };
+      await this.persistResponseSummary(memory, response, 'in_device_reaching');
+      return response;
+    }
+
+    // ── Navigation → in-device ARKit route navigation ────────────────────────
+    if (intent === 'navigation' && target) {
+      const response: WorkflowResponse = {
+        text: '',
+        navigation: true,
+        navigation_ios: true,
+        navigation_arkit: true,
+        navigation_pipeline: 'arkit',
+        navigation_target: target,
+        reaching_flag: false,
+        reaching_ios: false,
+        loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
+        session_id: sessionId,
+        local_orchestrator_used: true,
+        local_llm_used: provider === 'apple_foundation_models' || provider === 'groq',
+        llm_provider: provider,
+        intent_provider: provider,
+        provider_trace: trace,
+      };
+      await this.persistResponseSummary(memory, response, 'in_device_navigation');
+      return response;
+    }
+
+    // ── Stop → neutral (App-level stop handling takes over on the UI side) ────
+    if (intent === 'stop') {
+      return this.neutralInDeviceResponse(sessionId, trace, '');
+    }
+
+    // ── Scene / unknown → graceful degrade (no on-device vision here) ────────
+    const spoken =
+      intent === 'scene'
+        ? 'Scene descriptions need online mode. Turn off In-Device Mode in settings to describe what is in front of you.'
+        : 'I did not catch a reach or navigation request. Try, for example, reach the water bottle, or take me to the door.';
+    return this.neutralInDeviceResponse(sessionId, trace, spoken);
+  }
+
+  private neutralInDeviceResponse(
+    sessionId: string,
+    trace: ProviderTraceEntry[],
+    text = '',
+  ): WorkflowResponse {
+    return {
+      text,
+      navigation: false,
+      reaching_flag: false,
+      reaching_ios: false,
+      loopDelay: NAVIGATION_CONFIG.DEFAULT_LOOP_DELAY_MS,
+      session_id: sessionId,
+      local_orchestrator_used: true,
+      provider_trace: trace,
+    };
+  }
+
+  private async classifyIntentInDevice(
+    request: WorkflowRequest,
+    trace: ProviderTraceEntry[],
+  ): Promise<LocalLLMResult<IntentClassification>> {
+    const hasImage = Boolean(request.imageUri);
+
+    // Groq first (reliable, mirrors backend Extract Intent), then on-device
+    // Apple FM / heuristic fallback via llmRouter.
+    if (groqIntentClient.isConfigured()) {
+      try {
+        const groq = await groqIntentClient.classifyIntent({ text: request.text, hasImage });
+        trace.push({
+          provider: 'groq',
+          ok: Boolean(groq.json?.intent),
+          confidence: groq.confidence,
+          needsRemote: groq.needsBackend,
+          fallbackReason: groq.fallbackReason,
+          diagnostics: { intent: groq.json?.intent, target: groq.json?.target },
+        });
+        if (groq.available && groq.json?.intent) return groq;
+      } catch (error: any) {
+        trace.push({
+          provider: 'groq',
+          ok: false,
+          confidence: 0,
+          needsRemote: true,
+          fallbackReason: error?.message || String(error),
+        });
+      }
+    }
+
+    const local = await llmRouter.classifyIntent({ text: request.text, hasImage });
+    trace.push({
+      provider: local.usedProvider,
+      ok: Boolean(local.json?.intent),
+      confidence: local.confidence,
+      needsRemote: local.needsBackend,
+      fallbackReason: local.fallbackReason,
+      diagnostics: { intent: local.json?.intent, target: local.json?.target },
+    });
+    return local;
   }
 
   private async classifyIntent(

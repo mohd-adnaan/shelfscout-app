@@ -12,6 +12,7 @@ import React, {
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 import { iOSTts } from '../services/iOSTtsClient';
+import { orchestratorConfig } from '../services/OrchestratorConfig';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -22,6 +23,16 @@ export type NavigationPipeline = 'rtab' | 'arkit';
 export type ReachingPipeline = 'visionBox' | 'spatialTarget' | 'standard';
 
 export interface AppSettings {
+  /**
+   * Master switch. When true, ShelfScout runs fully on-device: ARKit
+   * navigation + spatial-target ARKit reaching + local (Groq/Apple FM)
+   * orchestration, with no backend calls. When false, backend mode: Kasra
+   * RTAB navigation + backend-driven reaching (Vision Box or Standard/Melody).
+   * This is the effective driver; navigationPipeline/reachingPipeline below
+   * store the user's *backend-mode* preferences and are only used when this
+   * is false.
+   */
+  inDeviceMode: boolean;
   /** Indoor route navigation engine. Defaults to RTAB for compatibility. */
   navigationPipeline: NavigationPipeline;
   /** Reaching guidance engine. spatialTarget is backend-bbox-free on iOS. */
@@ -47,6 +58,7 @@ export interface AppSettings {
 interface SettingsContextValue {
   settings: AppSettings;
   isLoaded: boolean;
+  updateInDeviceMode: (value: boolean) => Promise<void>;
   updatePreferAlternativeReaching: (value: boolean) => Promise<void>;
   updateReachingPipeline: (pipeline: ReachingPipeline) => Promise<void>;
   updateUseWearablesCamera: (value: boolean) => Promise<void>;
@@ -75,6 +87,10 @@ interface SettingsContextValue {
     navigation_arkit?: boolean;
     navigation_pipeline?: NavigationPipeline;
   }) => NavigationPipeline | 'none';
+  /** Navigation engine actually in effect right now (honors In-Device Mode). */
+  effectiveNavigationPipeline: NavigationPipeline;
+  /** Reaching engine actually in effect right now (honors In-Device Mode). */
+  effectiveReachingPipeline: ReachingPipeline;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -82,6 +98,7 @@ interface SettingsContextValue {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const DEFAULT_SETTINGS: AppSettings = {
+  inDeviceMode: false,
   navigationPipeline: 'rtab',
   reachingPipeline: 'visionBox',
   preferAlternativeReaching: false,
@@ -120,13 +137,23 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
           const migratedReachingPipeline: ReachingPipeline =
             saved.reachingPipeline ||
             (saved.preferAlternativeReaching ? 'standard' : DEFAULT_SETTINGS.reachingPipeline);
+          // Legacy in-device combo (arkit nav + spatialTarget reaching saved
+          // before the master toggle existed) → infer inDeviceMode.
+          const migratedInDeviceMode =
+            typeof saved.inDeviceMode === 'boolean'
+              ? saved.inDeviceMode
+              : saved.navigationPipeline === 'arkit' && migratedReachingPipeline === 'spatialTarget';
           const merged: AppSettings = {
             ...DEFAULT_SETTINGS,
             ...saved,
+            inDeviceMode: migratedInDeviceMode,
             reachingPipeline: migratedReachingPipeline,
             preferAlternativeReaching: migratedReachingPipeline === 'standard',
           };
           setSettings(merged);
+
+          // Bridge the master switch into the plain orchestrator singleton.
+          orchestratorConfig.setInDeviceMode(merged.inDeviceMode);
 
           // ✅ Apply saved rate through singleton (per-utterance approach)
           // NEVER call Tts.setDefaultRate() — BOOL crash on New Architecture
@@ -151,6 +178,19 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   }, []);
 
   // ── Updaters ──────────────────────────────────────────────────────────────
+
+  const updateInDeviceMode = useCallback(
+    async (value: boolean) => {
+      const next = { ...settings, inDeviceMode: value };
+      setSettings(next);
+      await persist(next);
+      orchestratorConfig.setInDeviceMode(value);
+      console.log(
+        `[Settings] In-Device Mode → ${value ? 'ON (ARKit nav + Spatial Target reaching + local orchestration)' : 'OFF (backend)'}`,
+      );
+    },
+    [settings, persist],
+  );
 
   const updatePreferAlternativeReaching = useCallback(
     async (value: boolean) => {
@@ -273,6 +313,11 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     (flags: { reaching_ios?: boolean; reaching?: boolean }): ReachingPipeline | 'arkit' | 'none' => {
       const { reaching_ios, reaching } = flags;
 
+      // In-device mode always uses bbox-free spatial-target ARKit reaching.
+      if (settings.inDeviceMode) {
+        return Platform.OS === 'ios' ? 'spatialTarget' : 'none';
+      }
+
       if (settings.reachingPipeline === 'standard') {
         return reaching ? 'standard' : 'none';
       }
@@ -289,7 +334,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       }
       return 'none';
     },
-    [settings.reachingPipeline],
+    [settings.inDeviceMode, settings.reachingPipeline],
   );
 
   const resolveNavigationPipeline = useCallback(
@@ -299,6 +344,11 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       navigation_arkit?: boolean;
       navigation_pipeline?: NavigationPipeline;
     }): NavigationPipeline | 'none' => {
+      // In-device mode always uses on-device ARKit route navigation.
+      if (settings.inDeviceMode && Platform.OS === 'ios') {
+        return 'arkit';
+      }
+
       const wantsNavigation =
         flags.navigation === true ||
         flags.navigation_ios === true ||
@@ -318,7 +368,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
 
       return 'rtab';
     },
-    [settings.navigationPipeline],
+    [settings.inDeviceMode, settings.navigationPipeline],
   );
 
   // ── Value ─────────────────────────────────────────────────────────────────
@@ -326,6 +376,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   const value: SettingsContextValue = {
     settings,
     isLoaded,
+    updateInDeviceMode,
     updatePreferAlternativeReaching,
     updateReachingPipeline,
     updateUseWearablesCamera,
@@ -338,6 +389,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateEnableAcquisitionAutoExit,
     resolveReachingPipeline,
     resolveNavigationPipeline,
+    effectiveNavigationPipeline: settings.inDeviceMode ? 'arkit' : settings.navigationPipeline,
+    effectiveReachingPipeline: settings.inDeviceMode ? 'spatialTarget' : settings.reachingPipeline,
   };
 
   return (
