@@ -544,6 +544,25 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
               accessibilityHint="Double tap to run navigation and reaching fully on device"
             />
           </View>
+
+          {settings.inDeviceMode && Platform.OS === 'ios' && (
+            <>
+              <Text style={styles.settingDescription}>
+                Set up and manage the saved ARKit maps used by on-device
+                navigation and Spatial Target reaching.
+              </Text>
+              <TouchableOpacity
+                style={styles.testBtn}
+                onPress={handleManageARRoutes}
+                accessible={true}
+                accessibilityRole="button"
+                accessibilityLabel="Manage AR route maps"
+                accessibilityHint="Double tap to open the ARKit route mapping screen"
+              >
+                <Text style={styles.testBtnText}>Manage AR Route Maps</Text>
+              </TouchableOpacity>
+            </>
+          )}
         </Section>
 
         {!settings.inDeviceMode && (
