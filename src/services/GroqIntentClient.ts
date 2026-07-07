@@ -48,7 +48,8 @@ Rules:
 - "chat": user asks an informational question about what the camera sees, without wanting hand guidance ("is there yogurt here", "what's the price of this", "where is the milk", "what am I holding", "read this label"). target = the object if named, else null. needsImage = true.
 - "stop": cancel / stop / pause / emergency. target = null.
 - "unknown": anything else or too ambiguous. Keep confidence low.
-Distinguish carefully: naming an object with a grab/guide verb is "reaching"; naming an object with an ask/where/is-there/price/read verb is "chat".`;
+Distinguish carefully: naming an object with a grab/guide verb is "reaching"; naming an object with an ask/where/is-there/price/read verb is "chat".
+If the user only names an object or an object-with-location fragment with NO verb at all (e.g. "bottle on the table", "the milk carton", "cereal box"), classify as "chat" with that object as target and needsImage true — do NOT use "unknown". Reserve "unknown" for utterances with no identifiable object, place, or question.`;
 
 let keyCursor = 0;
 const nextKey = (): string | null => {

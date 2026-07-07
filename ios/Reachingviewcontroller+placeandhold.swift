@@ -204,20 +204,39 @@ extension ReachingViewController {
     var placedDepth: Float? = nil
     var placedSource = ""
 
+    // 0. LiDAR fast-path (Pro / LiDAR devices). Read true metric depth straight
+    //    from the ARKit scene depth map at the bbox center — accurate on the
+    //    first frame, no plane/feature-point wait and no DAv2 needed. Non-LiDAR
+    //    devices skip this (sampleLiDARDepth guards on hasLiDAR) and fall through
+    //    to the existing raycast → feature-point → default ladder UNCHANGED, so
+    //    behaviour on non-Pro hardware is identical to before.
+    if hasLiDAR {
+      let lidarScreenCenter = CGPoint(x: CGFloat(arNormX) * sw, y: CGFloat(arNormY) * sh)
+      if let lidarDepth = sampleLiDARDepth(frame: frame, screenCenter: lidarScreenCenter) {
+        placedDepth = lidarDepth
+        placedSource = "lidar"
+        lidarDepthSeeded = true
+        NSLog("🅿️ [PlaceHold] 🎯 LiDAR depth: %.2fm — skipping raycast/DAv2 ladder", lidarDepth)
+      }
+    }
+
     // 1. ARKit raycast along the bbox ray — best immediate depth IF a plane
     //    already exists. Usually nothing this early; that's expected.
-    let targets: [(ARRaycastQuery.Target, String)] = [
-      (.existingPlaneGeometry, "existingGeometry"),
-      (.estimatedPlane,        "estimatedPlane"),
-    ]
-    for (target, label) in targets {
-      let query = ARRaycastQuery(origin: camPos, direction: worldRayDir,
-                                 allowing: target, alignment: .any)
-      if let hit = sceneView.session.raycast(query).first {
-        let hitPos = simd_make_float3(hit.worldTransform.columns.3)
-        let d = simd_length(hitPos - camPos)
-        if d >= 0.15 && d <= 5.0 {
-          placedDepth = d; placedSource = "raycast:\(label)"; break
+    //    Skipped when LiDAR already supplied metric depth.
+    if placedDepth == nil {
+      let targets: [(ARRaycastQuery.Target, String)] = [
+        (.existingPlaneGeometry, "existingGeometry"),
+        (.estimatedPlane,        "estimatedPlane"),
+      ]
+      for (target, label) in targets {
+        let query = ARRaycastQuery(origin: camPos, direction: worldRayDir,
+                                   allowing: target, alignment: .any)
+        if let hit = sceneView.session.raycast(query).first {
+          let hitPos = simd_make_float3(hit.worldTransform.columns.3)
+          let d = simd_length(hitPos - camPos)
+          if d >= 0.15 && d <= 5.0 {
+            placedDepth = d; placedSource = "raycast:\(label)"; break
+          }
         }
       }
     }
@@ -266,12 +285,18 @@ extension ReachingViewController {
                       horizScale: horizScale, source: "\(placedSource), \(poseSource)", frame: frame)
     detectionFrameCameraTransform = nil
 
-    // Arm parallel DAv2 refinement — handled by tryDav2Refine() on later frames.
-    dav2RefineState = .pending
-    dav2RequestInFlight = false
-    dav2NoAnchorLogCount = 0
-    dav2RefineDeadline = ProcessInfo.processInfo.systemUptime + dav2RefineWindowSec
-    NSLog("🅿️ [PlaceHold] 🌊 DAv2 refinement armed (%.0fs window) — placement NOT blocked", dav2RefineWindowSec)
+    // Arm parallel DAv2 refinement — UNLESS LiDAR already gave us true metric
+    // depth this frame, in which case there is nothing to refine.
+    if placedSource == "lidar" {
+      dav2RefineState = .done
+      NSLog("🅿️ [PlaceHold] 🎯 LiDAR metric depth used — DAv2 refinement not armed")
+    } else {
+      dav2RefineState = .pending
+      dav2RequestInFlight = false
+      dav2NoAnchorLogCount = 0
+      dav2RefineDeadline = ProcessInfo.processInfo.systemUptime + dav2RefineWindowSec
+      NSLog("🅿️ [PlaceHold] 🌊 DAv2 refinement armed (%.0fs window) — placement NOT blocked", dav2RefineWindowSec)
+    }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
