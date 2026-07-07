@@ -82,10 +82,9 @@ type Subscriber = (entries: LogEntry[]) => void;
 
 const MAX_ENTRIES = 5000;
 const MAX_UI_LENGTH = 300;
-const FORMAT_VERSION = '1.0.0';
+const FORMAT_VERSION = '2.0.0';
 const APP_NAME = 'CyberSight/ShelfScout';
-const GOOGLE_SHEETS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycby7loaXFmAhh_LQ2nD_gHpkRCwcLFdN0x7mXqk5cYbnIl8napqz12_BcXDxuhn-Mkp-iA/exec';
-
+const GOOGLE_SHEETS_WEB_APP_URL = 'https://script.google.com/macros/s/AKfycbx5gE1hVEs7oqXQCqRyRz4lExsjq5-Le-QoUuimiZNPYo-JYIe4KeGrWQKXztrrTuHVOw/exec';
 // ─────────────────────────────────────────────────────────────────────────────
 // Singleton
 // ─────────────────────────────────────────────────────────────────────────────
@@ -96,6 +95,9 @@ class DebugLoggerClass {
   private nextId = 1;
   private initialized = false;
   private currentSession = 1;
+
+  private uploadQueue: LogEntry[] = [];
+  private isUploading = false;
 
   /** Original console methods — never lost */
   private origLog = console.log;
@@ -310,7 +312,7 @@ class DebugLoggerClass {
     const response = await fetch(GOOGLE_SHEETS_WEB_APP_URL, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
+        'Content-Type': 'text/plain',
       },
       body: payload,
     });
@@ -318,6 +320,54 @@ class DebugLoggerClass {
     if (!response.ok) {
       throw new Error(`Google Sheets upload failed with status ${response.status}`);
     }
+  }
+
+  // ── Background Auto-Upload ──────────────────────────────────────────────
+
+  private async processUploadQueue() {
+    if (this.isUploading || this.uploadQueue.length === 0) return;
+    this.isUploading = true;
+
+    while (this.uploadQueue.length > 0) {
+      const entry = this.uploadQueue.shift();
+      if (!entry) continue;
+
+      try {
+        const payload = JSON.stringify({
+          timestamp: entry.timestamp,
+          level: entry.level,
+          message: entry.message,
+          detail: entry.detail || ''
+        });
+
+        const response = await fetch(GOOGLE_SHEETS_WEB_APP_URL, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'text/plain',
+          },
+          body: payload,
+        });
+        
+        const responseText = await response.text();
+        
+        if (!response.ok) {
+           this.origError('[DebugLogger] Google Sheets HTTP Error:', response.status, responseText);
+        } else {
+           if (responseText.includes('"error"')) {
+               this.origError('[DebugLogger] Google Sheets Apps Script Error:', responseText);
+           } else {
+               this.origLog('[DebugLogger] Uploaded -> Google Sheets:', entry.message);
+           }
+        }
+      } catch (err) {
+        this.origError('[DebugLogger] Network error uploading to Google Sheets:', err);
+      }
+
+      // Delay to avoid Google Apps Script rate limits (concurrent executions)
+      await new Promise(resolve => setTimeout(resolve, 500));
+    }
+
+    this.isUploading = false;
   }
 
   // ── Internals ───────────────────────────────────────────────────────────
@@ -369,6 +419,9 @@ class DebugLoggerClass {
     if (this.entries.length > MAX_ENTRIES) {
       this.entries = this.entries.slice(this.entries.length - MAX_ENTRIES);
     }
+
+    this.uploadQueue.push(entry);
+    this.processUploadQueue();
 
     this.notify();
   }
