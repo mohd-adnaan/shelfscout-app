@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 struct SemanticNavigationPanel: View {
     @ObservedObject var navigator: SemanticRouteNavigator
@@ -339,7 +340,39 @@ struct SemanticNavigationPanel: View {
                 .buttonStyle(.bordered)
                 .frame(maxWidth: .infinity)
             }
+
+            exportMapReportButton
         }
+    }
+
+    private var exportMapReportButton: some View {
+        Button {
+            exportMapReport()
+        } label: {
+            Label("Export Map Report", systemImage: "square.and.arrow.up")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(navigator.activeMap == nil && navigator.maps.isEmpty)
+        .accessibilityHint("Shares an HTML report with the route plot and the camera frames captured while mapping.")
+    }
+
+    private func exportMapReport() {
+        guard let url = navigator.exportDebugReportURL() else { return }
+        guard let scene = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState == .foregroundActive }),
+              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+            return
+        }
+        var top = root
+        while let presented = top.presentedViewController { top = presented }
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        activity.popoverPresentationController?.sourceView = top.view
+        activity.popoverPresentationController?.sourceRect = CGRect(
+            x: top.view.bounds.midX, y: top.view.bounds.midY, width: 1, height: 1
+        )
+        top.present(activity, animated: true)
     }
 
     private var guideFlow: some View {
@@ -404,6 +437,8 @@ struct SemanticNavigationPanel: View {
                     .buttonStyle(.bordered)
                     .frame(maxWidth: .infinity)
                 }
+
+                exportMapReportButton
             }
         }
     }

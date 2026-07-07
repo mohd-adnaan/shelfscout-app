@@ -102,8 +102,14 @@ extension ReachingViewController {
     )
     placeAndHoldDepthLocked = true
 
-    NSLog("◎ [SpatialTarget] ✅ Map target %@ locked at (%.3f,%.3f,%.3f), distance %.2fm",
-          objectName, target.x, target.y, target.z, depth)
+    NSLog("◎ [SpatialTarget] ✅ Map target %@ locked at (%.3f,%.3f,%.3f), distance %.2fm, placement=%@",
+          objectName, target.x, target.y, target.z, depth,
+          spatialTargetIsSurfacePlacement ? "surface" : "camera_pose(legacy)")
+    if !spatialTargetIsSurfacePlacement && guidanceAudioEnabled {
+      // Legacy pin marks where the mapper STOOD, not the object itself.
+      // Tell the user so the last half-meter is on their hands, not the box.
+      say("Guiding you to the saved spot near \(objectName). It is within arm's reach from there.")
+    }
   }
 
   private func speakSpatialTargetRelocalizationCueIfNeeded() {

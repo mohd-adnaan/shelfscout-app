@@ -1,5 +1,7 @@
 import Foundation
+import CoreImage
 import CoreVideo
+import ImageIO
 import simd
 
 struct SemanticRoutePoint: Codable, Equatable {
@@ -1103,6 +1105,7 @@ final class SemanticRouteNavigator: ObservableObject {
         activeMap = cleaned
         activeMapDraft = nil
         phase = .ready
+        pruneFrameThumbnails()
         refreshCaptureMetrics(for: cleaned)
         currentInstruction = "Saved local map: \(capturedPointCount) points, \(Self.formatMeters(capturedDistanceMeters))."
         speechCue = SemanticSpeechCue(text: "Local navigation map saved.", priority: .regular)
@@ -1718,10 +1721,12 @@ final class SemanticRouteNavigator: ObservableObject {
             return nil
         }
 
-        return VisualFingerprintSample(
+        let sample = VisualFingerprintSample(
             id: UUID().uuidString,
             fingerprint: fingerprint
         )
+        SemanticRouteFrameStore.saveThumbnail(from: capturedImage, fingerprintID: sample.id)
+        return sample
     }
 
     private func appendVisualKeyframe(
@@ -3785,10 +3790,21 @@ final class SemanticRouteNavigator: ObservableObject {
         return canonical
     }
 
+    /// Two samples are only a navigation hazard when they look alike AND come
+    /// from different places on the route (perceptual aliasing). Neighboring
+    /// keyframes along a corridor are SUPPOSED to look similar — counting them
+    /// as aliases blocked every save of a normal corridor walkthrough.
+    private static let aliasMinimumSeparationMeters: Double = 3.0
+
     private static func visualAliasGroups(in map: SemanticRouteMap) -> [SemanticRouteVisualAliasGroup] {
         guard let fingerprints = map.visualFingerprints, fingerprints.count >= 2 else { return [] }
         let fingerprinter = ARFrameFingerprinter()
         let ordered = fingerprints.keys.sorted()
+        let capturePositions = fingerprintCapturePositions(in: map)
+        // Unarchive each Vision feature print once, not once per pair.
+        let observations = Dictionary(uniqueKeysWithValues: ordered.compactMap { id in
+            fingerprints[id].flatMap { fingerprinter.featurePrintObservation(for: $0).map { obs in (id, obs) } }
+        })
         var groups: [SemanticRouteVisualAliasGroup] = []
 
         for leftIndex in 0..<(ordered.count - 1) {
@@ -3799,7 +3815,16 @@ final class SemanticRouteNavigator: ObservableObject {
                       let right = fingerprints[rightID] else {
                     continue
                 }
-                let similarity = fingerprinter.similarity(left, right)
+                if let leftPoint = capturePositions[leftID],
+                   let rightPoint = capturePositions[rightID],
+                   leftPoint.distance(to: rightPoint) < aliasMinimumSeparationMeters {
+                    continue
+                }
+                let similarity = fingerprinter.similarity(
+                    left, right,
+                    lhsObservation: observations[leftID],
+                    rhsObservation: observations[rightID]
+                )
                 guard similarity >= 0.82 else { continue }
                 let names = [
                     representativeName(forFingerprintID: leftID, in: map),
@@ -3818,6 +3843,26 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         return groups
+    }
+
+    /// Best-known capture position for each visual fingerprint: keyframe pose,
+    /// or the anchor node position for landmark samples. Fingerprints without
+    /// a resolvable position stay eligible for aliasing (conservative).
+    private static func fingerprintCapturePositions(in map: SemanticRouteMap) -> [String: SemanticRoutePoint] {
+        var positions: [String: SemanticRoutePoint] = [:]
+        for keyframe in map.keyframes ?? [] {
+            if let fingerprintID = keyframe.visualFingerprintId {
+                positions[fingerprintID] = keyframe.pose
+            }
+        }
+        let nodesByID = Dictionary(uniqueKeysWithValues: map.nodes.map { ($0.id, $0) })
+        for landmark in map.landmarks {
+            guard let node = nodesByID[landmark.nodeID] else { continue }
+            for fingerprintID in landmark.visualFingerprintIds ?? [] where positions[fingerprintID] == nil {
+                positions[fingerprintID] = node.point
+            }
+        }
+        return positions
     }
 
     private static func representativeName(forFingerprintID fingerprintID: String, in map: SemanticRouteMap) -> String? {
@@ -3863,7 +3908,7 @@ final class SemanticRouteNavigator: ObservableObject {
             warnings.append("Keyframes are sparse; walk more slowly or rescan the route.")
         }
         if aliasedIDs.count > max(1, visualSampleCount / 3) {
-            warnings.append("Several samples look similar; add distinctive landmarks or more viewpoints.")
+            warnings.append("Distant parts of the route look identical; add a distinctive landmark near each.")
         }
 
         return SemanticRouteCaptureQuality(
@@ -4061,6 +4106,261 @@ private enum SemanticRouteMath {
     }
 }
 
+// MARK: - Map Debug Report Export
+
+extension SemanticRouteNavigator {
+
+    /// Writes a self-contained HTML debug report (top-down route plot, capture
+    /// quality, alias pairs, and the camera frames behind every visual sample)
+    /// for the active map and returns its file URL for the share sheet.
+    func exportDebugReportURL() -> URL? {
+        guard let map = activeMapDraft ?? activeMap ?? maps.first else { return nil }
+        let html = Self.debugReportHTML(for: map)
+        guard let data = html.data(using: .utf8) else { return nil }
+
+        let safeName = map.name
+            .replacingOccurrences(of: "[^A-Za-z0-9 _-]", with: "", options: .regularExpression)
+            .replacingOccurrences(of: " ", with: "-")
+        let fileName = "\(safeName.isEmpty ? "route-map" : safeName)-report.html"
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+        do {
+            try data.write(to: url, options: [.atomic])
+            return url
+        } catch {
+            return nil
+        }
+    }
+
+    func pruneFrameThumbnails() {
+        var referenced = Set<String>()
+        for map in maps + [activeMap, activeMapDraft].compactMap({ $0 }) {
+            if let keys = map.visualFingerprints?.keys {
+                referenced.formUnion(keys)
+            }
+        }
+        SemanticRouteFrameStore.pruneThumbnails(keeping: referenced)
+    }
+
+    private static func debugReportHTML(for map: SemanticRouteMap) -> String {
+        let quality = map.captureQuality
+        let aliasGroups = map.visualAliasGroups ?? visualAliasGroups(in: map)
+        let aliasedIDs = Set(aliasGroups.flatMap(\.fingerprintIds))
+        let keyframes = (map.keyframes ?? []).sorted { $0.capturedAt < $1.capturedAt }
+        let dateFormatter = DateFormatter()
+        dateFormatter.dateStyle = .medium
+        dateFormatter.timeStyle = .short
+
+        var html = """
+        <!DOCTYPE html>
+        <html lang="en"><head><meta charset="utf-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>\(htmlEscape(map.name)) — Route Map Report</title>
+        <style>
+          :root { color-scheme: light dark; }
+          body { font: 15px/1.5 -apple-system, system-ui, sans-serif; margin: 0 auto; max-width: 900px; padding: 16px; }
+          h1 { font-size: 22px; } h2 { font-size: 17px; margin-top: 28px; }
+          .badges span { display: inline-block; border-radius: 6px; padding: 2px 10px; margin: 2px 6px 2px 0; font-size: 13px; background: rgba(120,120,128,0.16); }
+          .badges .ok { background: rgba(52,199,89,0.22); } .badges .bad { background: rgba(255,59,48,0.25); }
+          .warn { color: #d64545; font-weight: 600; }
+          svg { width: 100%; height: auto; background: rgba(120,120,128,0.08); border-radius: 12px; }
+          .frames { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 12px; }
+          .frame { border: 1px solid rgba(120,120,128,0.3); border-radius: 10px; overflow: hidden; font-size: 12px; }
+          .frame.aliased { border-color: #d64545; box-shadow: 0 0 0 1px #d64545; }
+          .frame img { width: 100%; display: block; }
+          .frame .meta { padding: 6px 8px; }
+          .frame .tag { font-weight: 700; color: #d64545; }
+          table { border-collapse: collapse; width: 100%; font-size: 13px; }
+          td, th { border: 1px solid rgba(120,120,128,0.3); padding: 4px 8px; text-align: left; }
+          details pre { overflow-x: auto; font-size: 11px; background: rgba(120,120,128,0.1); padding: 10px; border-radius: 8px; }
+          .missing { display:flex; align-items:center; justify-content:center; aspect-ratio: 3/4; color: #888; background: rgba(120,120,128,0.12); }
+        </style></head><body>
+        <h1>\(htmlEscape(map.name))</h1>
+        <p>Created \(dateFormatter.string(from: map.createdAt)) · Updated \(dateFormatter.string(from: map.updatedAt)) · Coordinate space: \(htmlEscape(map.coordinateSpace))</p>
+        """
+
+        if let quality {
+            html += "<div class=\"badges\">"
+            html += "<span class=\"\(quality.isSufficientForGuidance ? "ok" : "bad")\">\(quality.isSufficientForGuidance ? "Save gate: PASS" : "Save gate: BLOCKED")</span>"
+            html += "<span>\(quality.keyframeCount) keyframes</span>"
+            html += "<span>\(quality.visualSampleCount) visual samples</span>"
+            html += "<span class=\"\(quality.aliasedVisualSampleCount > 0 ? "bad" : "ok")\">\(quality.aliasedVisualSampleCount) aliased</span>"
+            html += String(format: "<span>%.1fm route</span>", quality.routeDistanceMeters)
+            if let spacing = quality.averageKeyframeSpacingMeters {
+                html += String(format: "<span>%.2fm keyframe spacing</span>", spacing)
+            }
+            html += "</div>"
+            if !quality.warnings.isEmpty {
+                html += "<ul>" + quality.warnings.map { "<li class=\"warn\">\(htmlEscape($0))</li>" }.joined() + "</ul>"
+            }
+        }
+
+        html += "<h2>Top-down route</h2>" + svgRoutePlot(for: map, aliasGroups: aliasGroups)
+
+        html += "<h2>Route structure</h2><table><tr><th>Segment</th><th>Distance</th><th>Bearing</th><th>Keyframes</th></tr>"
+        let keyframesByEdge = Dictionary(grouping: keyframes) { $0.segmentID ?? "" }
+        for edge in map.edges {
+            let from = map.nodes.first { $0.id == edge.fromNodeID }?.name ?? "?"
+            let to = map.nodes.first { $0.id == edge.toNodeID }?.name ?? "?"
+            let attached = (keyframesByEdge[edge.id]?.count ?? 0) + (edge.keyframeIds?.count ?? 0)
+            html += String(
+                format: "<tr><td>%@ → %@</td><td>%.1fm</td><td>%.0f°</td><td>%d</td></tr>",
+                htmlEscape(from), htmlEscape(to), edge.distanceMeters, edge.bearingDegrees, attached
+            )
+        }
+        html += "</table>"
+
+        if !aliasGroups.isEmpty {
+            html += "<h2>Perceptual alias pairs (distant places that look alike)</h2><table><tr><th>Places</th><th>Similarity</th></tr>"
+            for group in aliasGroups.sorted(by: { $0.similarity > $1.similarity }) {
+                let names = group.representativeNames.isEmpty
+                    ? group.fingerprintIds.map { String($0.prefix(8)) }
+                    : group.representativeNames
+                html += String(
+                    format: "<tr><td>%@</td><td>%.0f%%</td></tr>",
+                    htmlEscape(names.joined(separator: " ↔ ")), group.similarity * 100
+                )
+            }
+            html += "</table>"
+        }
+
+        html += "<h2>Captured frames (\(keyframes.count) keyframes)</h2><div class=\"frames\">"
+        for (index, keyframe) in keyframes.enumerated() {
+            let fingerprintID = keyframe.visualFingerprintId
+            let isAliased = fingerprintID.map { aliasedIDs.contains($0) } ?? false
+            html += "<div class=\"frame\(isAliased ? " aliased" : "")\">"
+            if let fingerprintID, let data = SemanticRouteFrameStore.thumbnailData(for: fingerprintID) {
+                html += "<img src=\"data:image/jpeg;base64,\(data.base64EncodedString())\" alt=\"keyframe \(index)\">"
+            } else {
+                html += "<div class=\"missing\">no frame stored</div>"
+            }
+            html += String(
+                format: "<div class=\"meta\">#%d · pose (%.1f, %.1f)%@%@%@</div>",
+                index + 1, keyframe.pose.x, keyframe.pose.y,
+                keyframe.headingDegrees.map { String(format: " · %.0f°", $0) } ?? "",
+                String(format: " · %.1fm into segment", keyframe.distanceFromSegmentStart),
+                isAliased ? " · <span class=\"tag\">ALIASED</span>" : ""
+            )
+            html += "</div>"
+        }
+        html += "</div>"
+
+        let landmarkSamples = map.landmarks.flatMap { landmark in
+            (landmark.visualFingerprintIds ?? []).map { (landmark.name, $0) }
+        }
+        if !landmarkSamples.isEmpty {
+            html += "<h2>Landmark frames</h2><div class=\"frames\">"
+            for (name, fingerprintID) in landmarkSamples {
+                let isAliased = aliasedIDs.contains(fingerprintID)
+                html += "<div class=\"frame\(isAliased ? " aliased" : "")\">"
+                if let data = SemanticRouteFrameStore.thumbnailData(for: fingerprintID) {
+                    html += "<img src=\"data:image/jpeg;base64,\(data.base64EncodedString())\" alt=\"\(htmlEscape(name))\">"
+                } else {
+                    html += "<div class=\"missing\">no frame stored</div>"
+                }
+                html += "<div class=\"meta\">\(htmlEscape(name))\(isAliased ? " · <span class=\"tag\">ALIASED</span>" : "")</div></div>"
+            }
+            html += "</div>"
+        }
+
+        var strippedMap = map
+        strippedMap.visualFingerprints = nil
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        if let jsonData = try? encoder.encode(strippedMap),
+           let json = String(data: jsonData, encoding: .utf8) {
+            html += "<h2>Raw map JSON</h2><details><summary>Show JSON (fingerprint vectors stripped)</summary><pre>\(htmlEscape(json))</pre></details>"
+        }
+
+        html += "</body></html>"
+        return html
+    }
+
+    private static func svgRoutePlot(for map: SemanticRouteMap, aliasGroups: [SemanticRouteVisualAliasGroup]) -> String {
+        var points = map.nodes.map(\.point)
+        points += (map.keyframes ?? []).map(\.pose)
+        guard !points.isEmpty else { return "<p>No spatial data captured.</p>" }
+
+        let minX = points.map(\.x).min() ?? 0
+        let maxX = points.map(\.x).max() ?? 0
+        let minY = points.map(\.y).min() ?? 0
+        let maxY = points.map(\.y).max() ?? 0
+        let pad = 46.0
+        let innerWidth = 720.0
+        let scale = (innerWidth - pad * 2) / max(max(maxX - minX, maxY - minY), 1.0)
+        let width = (maxX - minX) * scale + pad * 2
+        let height = (maxY - minY) * scale + pad * 2
+
+        func sx(_ point: SemanticRoutePoint) -> Double { (point.x - minX) * scale + pad }
+        func sy(_ point: SemanticRoutePoint) -> Double { height - ((point.y - minY) * scale + pad) }
+
+        var svg = String(format: "<svg viewBox=\"0 0 %.0f %.0f\" xmlns=\"http://www.w3.org/2000/svg\">", width, height)
+
+        let nodesByID = Dictionary(uniqueKeysWithValues: map.nodes.map { ($0.id, $0) })
+        for edge in map.edges {
+            guard let from = nodesByID[edge.fromNodeID], let to = nodesByID[edge.toNodeID] else { continue }
+            svg += String(
+                format: "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#6d9ee8\" stroke-width=\"3\"/>",
+                sx(from.point), sy(from.point), sx(to.point), sy(to.point)
+            )
+            svg += String(
+                format: "<text x=\"%.1f\" y=\"%.1f\" font-size=\"10\" fill=\"#888\">%.1fm</text>",
+                (sx(from.point) + sx(to.point)) / 2 + 4, (sy(from.point) + sy(to.point)) / 2 - 4, edge.distanceMeters
+            )
+        }
+
+        let capturePositions = fingerprintCapturePositions(in: map)
+        for group in aliasGroups {
+            let positions = group.fingerprintIds.compactMap { capturePositions[$0] }
+            guard positions.count >= 2 else { continue }
+            svg += String(
+                format: "<line x1=\"%.1f\" y1=\"%.1f\" x2=\"%.1f\" y2=\"%.1f\" stroke=\"#d64545\" stroke-width=\"1.5\" stroke-dasharray=\"5 4\"/>",
+                sx(positions[0]), sy(positions[0]), sx(positions[1]), sy(positions[1])
+            )
+        }
+
+        for keyframe in map.keyframes ?? [] {
+            let aliased = keyframe.visualFingerprintId.map { id in
+                aliasGroups.contains { $0.fingerprintIds.contains(id) }
+            } ?? false
+            svg += String(
+                format: "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"3.5\" fill=\"%@\"/>",
+                sx(keyframe.pose), sy(keyframe.pose), aliased ? "#d64545" : "#4a90d9"
+            )
+        }
+
+        for node in map.nodes {
+            let color: String
+            switch node.kind {
+            case .entrance: color = "#34c759"
+            case .destination: color = "#ff3b30"
+            case .intersection: color = "#ff9500"
+            default: color = "#8e8e93"
+            }
+            svg += String(
+                format: "<circle cx=\"%.1f\" cy=\"%.1f\" r=\"7\" fill=\"%@\" stroke=\"white\" stroke-width=\"2\"/>",
+                sx(node.point), sy(node.point), color
+            )
+            svg += String(
+                format: "<text x=\"%.1f\" y=\"%.1f\" font-size=\"12\" font-weight=\"600\" fill=\"currentColor\">%@</text>",
+                sx(node.point) + 10, sy(node.point) + 4, htmlEscape(node.name)
+            )
+        }
+
+        svg += "</svg>"
+        svg += "<p style=\"font-size:12px;color:#888\">Green = start · Red = destination · Orange = turn · Blue dots = visual keyframes · Red dots/dashed lines = aliased pairs</p>"
+        return svg
+    }
+
+    private static func htmlEscape(_ raw: String) -> String {
+        raw
+            .replacingOccurrences(of: "&", with: "&amp;")
+            .replacingOccurrences(of: "<", with: "&lt;")
+            .replacingOccurrences(of: ">", with: "&gt;")
+            .replacingOccurrences(of: "\"", with: "&quot;")
+    }
+}
+
 private final class SemanticRouteMapStore {
     private let fileName = "semantic_route_maps.json"
 
@@ -4093,5 +4393,66 @@ private extension String {
     var nilIfBlank: String? {
         let trimmed = trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
+/// Persists small JPEG thumbnails of the frames behind each visual
+/// fingerprint so a saved map can be inspected instead of trusted blindly.
+/// Files live in Documents/SemanticRouteMaps/frames/<fingerprintID>.jpg.
+enum SemanticRouteFrameStore {
+    private static let ciContext = CIContext(options: [.cacheIntermediates: false])
+    private static let thumbnailMaxDimension: CGFloat = 320
+
+    static func framesDirectory() -> URL {
+        let documents = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+            ?? FileManager.default.temporaryDirectory
+        return documents
+            .appendingPathComponent("SemanticRouteMaps", isDirectory: true)
+            .appendingPathComponent("frames", isDirectory: true)
+    }
+
+    static func thumbnailURL(for fingerprintID: String) -> URL {
+        framesDirectory().appendingPathComponent("\(fingerprintID).jpg")
+    }
+
+    static func thumbnailData(for fingerprintID: String) -> Data? {
+        try? Data(contentsOf: thumbnailURL(for: fingerprintID))
+    }
+
+    static func saveThumbnail(from pixelBuffer: CVPixelBuffer, fingerprintID: String) {
+        // AR capturedImage is landscape sensor orientation; rotate to portrait
+        // so the exported report matches what the mapper saw on screen.
+        let image = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
+        let extent = image.extent
+        guard extent.width > 0, extent.height > 0 else { return }
+        let scale = min(thumbnailMaxDimension / extent.width, thumbnailMaxDimension / extent.height, 1.0)
+        let scaled = image
+            .transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        let colorSpace = CGColorSpaceCreateDeviceRGB()
+        guard let jpeg = ciContext.jpegRepresentation(
+            of: scaled,
+            colorSpace: colorSpace,
+            options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.6]
+        ) else { return }
+
+        let directory = framesDirectory()
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        try? jpeg.write(to: thumbnailURL(for: fingerprintID), options: [.atomic])
+    }
+
+    /// Deletes thumbnails whose fingerprints are no longer referenced by any
+    /// stored map, keeping the frames directory bounded.
+    static func pruneThumbnails(keeping fingerprintIDs: Set<String>) {
+        let directory = framesDirectory()
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: nil
+        ) else { return }
+        for file in files where file.pathExtension == "jpg" {
+            let id = file.deletingPathExtension().lastPathComponent
+            if !fingerprintIDs.contains(id) {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
     }
 }

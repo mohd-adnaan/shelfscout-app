@@ -127,6 +127,9 @@ class ReachingViewController: UIViewController {
   let initialWorldMap: ARWorldMap?
   let spatialTargetWorldPosition: simd_float3?
   let spatialTargetMapName: String?
+  /// true = POI was pinned on the object surface (LiDAR/raycast at mapping
+  /// time); false = legacy camera-pose pin, i.e. where the mapper stood.
+  let spatialTargetIsSurfacePlacement: Bool
   var bboxUpdateCount = 0
   var redetectTimer: Timer?
   let redetectInterval: TimeInterval = 8.0   // seconds between re-detections (Qwen takes ~10-20s)
@@ -459,6 +462,7 @@ class ReachingViewController: UIViewController {
        initialWorldMap: ARWorldMap? = nil,
        spatialTargetWorldPosition: simd_float3? = nil,
        spatialTargetMapName: String? = nil,
+       spatialTargetIsSurfacePlacement: Bool = true,
        mode: ReachingMode = .handFree,
       startupSilent: Bool = false,
        voiceOverEnabled: Bool = false,
@@ -474,6 +478,7 @@ class ReachingViewController: UIViewController {
     self.initialWorldMap = initialWorldMap
     self.spatialTargetWorldPosition = spatialTargetWorldPosition
     self.spatialTargetMapName = spatialTargetMapName
+    self.spatialTargetIsSurfacePlacement = spatialTargetIsSurfacePlacement
     self.acquisitionUrl = acquisitionUrl
     let cleanedSessionId = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.sessionId = cleanedSessionId.isEmpty ? UUID().uuidString : cleanedSessionId

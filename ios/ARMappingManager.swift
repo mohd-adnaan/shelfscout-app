@@ -198,7 +198,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                             position: ARCodableVector3(poi.position),
                             visualFingerprint: recordsByName[poi.name]?.visualFingerprints.first,
                             visualFingerprints: recordsByName[poi.name]?.visualFingerprints,
-                            motionFingerprint: recordsByName[poi.name]?.motionFingerprint
+                            motionFingerprint: recordsByName[poi.name]?.motionFingerprint,
+                            placement: recordsByName[poi.name]?.placement
                         )
                     }
                     let metadata = try self.mapStore.save(
@@ -258,7 +259,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                         name: poi.name,
                         position: poi.position,
                         visualFingerprints: metadataByName[poi.name]?.allVisualFingerprints ?? [],
-                        motionFingerprint: metadataByName[poi.name]?.motionFingerprint
+                        motionFingerprint: metadataByName[poi.name]?.motionFingerprint,
+                        placement: metadataByName[poi.name]?.placement
                     )
                 }
 
@@ -357,21 +359,25 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             statusMessage = "Start mapping or relocalize before pinning a POI."
             return false
         }
-        guard let currentTransform = session.currentFrame?.camera.transform else {
+        guard let currentFrame = session.currentFrame else {
             statusMessage = "Camera pose is not ready yet."
             return false
         }
-        let currentFrame = session.currentFrame
-        let visualFingerprint = currentFrame.flatMap { frameFingerprinter.makeFingerprint(from: $0.capturedImage) }
+        let visualFingerprint = frameFingerprinter.makeFingerprint(from: currentFrame.capturedImage)
 
         if let existingAnchor = poiAnchorsByName[trimmedName] {
             session.remove(anchor: existingAnchor)
         }
 
-        let anchor = ARAnchor(name: trimmedName, transform: currentTransform)
+        // Pin the anchor on the OBJECT the camera is aimed at, not at the
+        // camera's own pose. A camera-pose anchor is wherever the user was
+        // standing — offset from the real target by their whole reach
+        // distance, which poisons spatial-target reaching later.
+        let placed = surfacePOITransform(from: currentFrame)
+        let anchor = ARAnchor(name: trimmedName, transform: placed.transform)
         session.add(anchor: anchor)
 
-        let anchorPos = simd_make_float3(currentTransform.columns.3.x, currentTransform.columns.3.y, currentTransform.columns.3.z)
+        let anchorPos = simd_make_float3(placed.transform.columns.3.x, placed.transform.columns.3.y, placed.transform.columns.3.z)
 
         if !anchorsList.contains(trimmedName) {
             anchorsList.append(trimmedName)
@@ -383,13 +389,119 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             position: anchorPos,
             visualFingerprint: visualFingerprint,
             motionFingerprint: currentMotionFingerprint(),
-            preservesExistingSamples: true
+            preservesExistingSamples: true,
+            placement: placed.placement.rawValue
         )
         refreshPOIInspectionList()
-        statusMessage = visualFingerprint == nil
-            ? "Pinned \(trimmedName). Visual sample was not ready."
-            : "Pinned \(trimmedName) with visual sample."
+        NSLog("📍 [ARMapping] Pinned POI %@ via %@ at (%.2f, %.2f, %.2f)",
+              trimmedName, placed.placement.rawValue, anchorPos.x, anchorPos.y, anchorPos.z)
+        switch placed.placement {
+        case .cameraPose:
+            statusMessage = "Pinned \(trimmedName) at your position. Aim the camera at it and re-pin for surface accuracy."
+        default:
+            statusMessage = visualFingerprint == nil
+                ? "Pinned \(trimmedName) on the surface. Visual sample was not ready."
+                : "Pinned \(trimmedName) on the surface with visual sample."
+        }
         return true
+    }
+
+    /// How a stored POI anchor's position was derived. Surface placements sit
+    /// on the target itself; `cameraPose` is the legacy fallback (the user's
+    /// standing pose), which reaching treats as approximate.
+    enum POIPlacement: String {
+        case lidarSurface = "lidar_surface"
+        case raycastSurface = "raycast_surface"
+        case featurePointSurface = "feature_point_surface"
+        case cameraPose = "camera_pose"
+    }
+
+    private func surfacePOITransform(from frame: ARFrame) -> (transform: simd_float4x4, placement: POIPlacement) {
+        let camT = frame.camera.transform
+        let camPos = simd_make_float3(camT.columns.3)
+        let forward = -simd_normalize(simd_make_float3(camT.columns.2))
+
+        func transform(at depth: Float) -> simd_float4x4 {
+            var pinned = camT
+            let position = camPos + forward * depth
+            pinned.columns.3 = simd_float4(position.x, position.y, position.z, 1)
+            return pinned
+        }
+
+        // 1. LiDAR metric depth at the frame center (Pro devices).
+        if let lidarDepth = centerSceneDepth(from: frame), lidarDepth >= 0.15, lidarDepth <= 5.0 {
+            return (transform(at: lidarDepth), .lidarSurface)
+        }
+
+        // 2. ARKit plane raycast along the camera-forward ray.
+        for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
+            let query = ARRaycastQuery(origin: camPos, direction: forward, allowing: target, alignment: .any)
+            if let hit = session.raycast(query).first {
+                let hitPos = simd_make_float3(hit.worldTransform.columns.3)
+                let depth = simd_length(hitPos - camPos)
+                if depth >= 0.15, depth <= 5.0 {
+                    return (transform(at: depth), .raycastSurface)
+                }
+            }
+        }
+
+        // 3. Median feature-point distance in a narrow cone around the ray.
+        if let cloud = frame.rawFeaturePoints {
+            var dists: [Float] = []
+            dists.reserveCapacity(min(cloud.points.count, 64))
+            for point in cloud.points {
+                let toPoint = point - camPos
+                let d = simd_length(toPoint)
+                guard d > 0.15, d < 5.0 else { continue }
+                if simd_dot(toPoint / d, forward) > 0.95 {
+                    dists.append(d)
+                }
+            }
+            if dists.count >= 6 {
+                dists.sort()
+                let n = dists.count
+                let median = n % 2 == 0 ? (dists[n / 2 - 1] + dists[n / 2]) / 2 : dists[n / 2]
+                let iqr = dists[3 * n / 4] - dists[n / 4]
+                if iqr < 0.25 {
+                    return (transform(at: median), .featurePointSurface)
+                }
+            }
+        }
+
+        // 4. Legacy fallback: the camera pose itself.
+        return (camT, .cameraPose)
+    }
+
+    private func centerSceneDepth(from frame: ARFrame) -> Float? {
+        guard let sceneDepth = frame.sceneDepth else { return nil }
+        let depthMap = sceneDepth.depthMap
+        guard CVPixelBufferGetPixelFormatType(depthMap) == kCVPixelFormatType_DepthFloat32 else { return nil }
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
+        let width = CVPixelBufferGetWidth(depthMap)
+        let height = CVPixelBufferGetHeight(depthMap)
+        let rowBytes = CVPixelBufferGetBytesPerRow(depthMap)
+
+        // Median of a 5x5 center window rejects single-pixel LiDAR noise.
+        var samples: [Float] = []
+        samples.reserveCapacity(25)
+        for dy in -2...2 {
+            let y = height / 2 + dy
+            guard y >= 0, y < height else { continue }
+            let row = base.advanced(by: y * rowBytes).assumingMemoryBound(to: Float32.self)
+            for dx in -2...2 {
+                let x = width / 2 + dx
+                guard x >= 0, x < width else { continue }
+                let value = row[x]
+                if value.isFinite, value > 0 {
+                    samples.append(value)
+                }
+            }
+        }
+        guard samples.count >= 5 else { return nil }
+        samples.sort()
+        return samples[samples.count / 2]
     }
 
     @discardableResult
@@ -694,6 +806,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         let position: simd_float3
         let visualFingerprints: [ARVisualFingerprint]
         let motionFingerprint: ARPOIMotionFingerprint?
+        var placement: String? = nil
     }
 
     private struct ARIMUMotionState {
@@ -807,7 +920,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         position: simd_float3,
         visualFingerprint: ARVisualFingerprint?,
         motionFingerprint: ARPOIMotionFingerprint?,
-        preservesExistingSamples: Bool
+        preservesExistingSamples: Bool,
+        placement: String? = nil
     ) {
         poiRecordsQueue.sync(flags: .barrier) {
             let existingRecord = self.poiRecords.first(where: { $0.name == name })
@@ -825,7 +939,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     name: name,
                     position: position,
                     visualFingerprints: samples,
-                    motionFingerprint: motionFingerprint ?? existingRecord?.motionFingerprint
+                    motionFingerprint: motionFingerprint ?? existingRecord?.motionFingerprint,
+                    placement: placement ?? existingRecord?.placement
                 )
             )
         }
@@ -846,7 +961,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 name: existing.name,
                 position: existing.position,
                 visualFingerprints: samples,
-                motionFingerprint: motionFingerprint ?? existing.motionFingerprint
+                motionFingerprint: motionFingerprint ?? existing.motionFingerprint,
+                placement: existing.placement
             )
         }
     }
@@ -1792,6 +1908,13 @@ struct ARStoredPOI: Codable, Equatable {
     var visualFingerprint: ARVisualFingerprint? = nil
     var visualFingerprints: [ARVisualFingerprint]? = nil
     var motionFingerprint: ARPOIMotionFingerprint? = nil
+    /// ARMappingManager.POIPlacement raw value. nil = legacy camera-pose pin.
+    var placement: String? = nil
+
+    var isSurfacePlacement: Bool {
+        guard let placement else { return false }
+        return placement != ARMappingManager.POIPlacement.cameraPose.rawValue
+    }
 
     var allVisualFingerprints: [ARVisualFingerprint] {
         if let visualFingerprints, !visualFingerprints.isEmpty {
@@ -2071,6 +2194,21 @@ final class ARFrameFingerprinter {
     }
 
     func similarity(_ lhs: ARVisualFingerprint, _ rhs: ARVisualFingerprint) -> Float {
+        similarity(
+            lhs, rhs,
+            lhsObservation: featurePrintObservation(from: lhs.featurePrintData),
+            rhsObservation: featurePrintObservation(from: rhs.featurePrintData)
+        )
+    }
+
+    /// Variant that accepts pre-unarchived feature prints so O(n²) sweeps
+    /// (alias-group detection) don't unarchive each print once per pair.
+    func similarity(
+        _ lhs: ARVisualFingerprint,
+        _ rhs: ARVisualFingerprint,
+        lhsObservation: VNFeaturePrintObservation?,
+        rhsObservation: VNFeaturePrintObservation?
+    ) -> Float {
         guard lhs.dimension == rhs.dimension,
               lhs.luma.count == rhs.luma.count,
               lhs.colorMean.count == rhs.colorMean.count else {
@@ -2082,11 +2220,15 @@ final class ARFrameFingerprinter {
         let colorScore = colorSimilarity(lhs.colorMean, rhs.colorMean)
         let fallbackScore = max(0, min(1, lumaScore * 0.64 + hashScore * 0.24 + colorScore * 0.12))
 
-        guard let featureScore = featurePrintSimilarity(lhs, rhs) else {
+        guard let featureScore = featurePrintSimilarity(lhsObservation, rhsObservation) else {
             return fallbackScore
         }
 
         return max(0, min(1, featureScore * 0.82 + fallbackScore * 0.18))
+    }
+
+    func featurePrintObservation(for fingerprint: ARVisualFingerprint) -> VNFeaturePrintObservation? {
+        featurePrintObservation(from: fingerprint.featurePrintData)
     }
 
     private func makeFeaturePrintData(from image: CIImage, cropSide: CGFloat) -> Data? {
@@ -2094,6 +2236,12 @@ final class ARFrameFingerprinter {
         guard let cgImage = context.createCGImage(image, from: bounds) else { return nil }
 
         let request = VNGenerateImageFeaturePrintRequest()
+        // Pin revision 1: on iOS 17+ the request silently defaults to revision 2,
+        // whose distances are ~20x smaller than revision 1. Every downstream
+        // similarity constant (exp(-d/13), alias threshold 0.82) is calibrated
+        // for revision 1 — unpinned, nearly every frame pair scores "similar",
+        // aliasing floods, and map saving is permanently blocked.
+        request.revision = VNGenerateImageFeaturePrintRequestRevision1
         let handler = VNImageRequestHandler(cgImage: cgImage, orientation: .up, options: [:])
 
         do {
@@ -2105,16 +2253,24 @@ final class ARFrameFingerprinter {
         }
     }
 
-    private func featurePrintSimilarity(_ lhs: ARVisualFingerprint, _ rhs: ARVisualFingerprint) -> Float? {
-        guard let lhsObservation = featurePrintObservation(from: lhs.featurePrintData),
-              let rhsObservation = featurePrintObservation(from: rhs.featurePrintData) else {
+    private func featurePrintSimilarity(
+        _ lhsObservation: VNFeaturePrintObservation?,
+        _ rhsObservation: VNFeaturePrintObservation?
+    ) -> Float? {
+        guard let lhsObservation, let rhsObservation else {
             return nil
         }
 
         var distance: Float = 0
         do {
             try lhsObservation.computeDistance(&distance, to: rhsObservation)
-            let score = Foundation.exp(-Double(distance) / 13.0)
+            // Distance scale differs per feature-print revision. New prints are
+            // pinned to revision 1 (2048 elements, distances ~0–40). Prints
+            // stored before pinning may be revision 2 (768 elements, distances
+            // ~0–1.5); comparing across revisions throws and falls back below.
+            let isRevision2Pair = lhsObservation.elementCount == 768 && rhsObservation.elementCount == 768
+            let scale = isRevision2Pair ? 0.5 : 13.0
+            let score = Foundation.exp(-Double(distance) / scale)
             return Float(max(0, min(1, score)))
         } catch {
             return nil

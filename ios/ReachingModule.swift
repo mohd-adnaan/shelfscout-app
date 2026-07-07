@@ -139,6 +139,7 @@ class ReachingModule: NSObject {
     var resolvedWorldMap: ARWorldMap?
     var resolvedTargetPosition: simd_float3? = explicitTargetWorldPosition
     var resolvedMapName: String? = routeMapName
+    var resolvedIsSurfacePlacement = explicitTargetWorldPosition != nil
 
     do {
       if resolvedTargetPosition == nil || resolvedWorldMap == nil {
@@ -148,7 +149,10 @@ class ReachingModule: NSObject {
           routeMapName: routeMapName
         )
         resolvedWorldMap = mapContext.worldMap
-        resolvedTargetPosition = resolvedTargetPosition ?? mapContext.targetPosition
+        if resolvedTargetPosition == nil {
+          resolvedTargetPosition = mapContext.targetPosition
+          resolvedIsSurfacePlacement = mapContext.isSurfacePlacement
+        }
         resolvedMapName = mapContext.mapName
       }
     } catch {
@@ -169,10 +173,11 @@ class ReachingModule: NSObject {
     }
 
     NSLog(
-      "◎ [ReachingModule] Spatial target=%@ map=%@ world=%@ region=[%.2f,%.2f,%.2f,%.2f] mode=%@",
+      "◎ [ReachingModule] Spatial target=%@ map=%@ world=%@ placement=%@ region=[%.2f,%.2f,%.2f,%.2f] mode=%@",
       targetName,
       resolvedMapName ?? "current",
       resolvedTargetPosition.map { String(format: "(%.2f,%.2f,%.2f)", $0.x, $0.y, $0.z) } ?? "nil",
+      resolvedIsSurfacePlacement ? "surface" : "camera_pose(legacy)",
       targetRegion[0], targetRegion[1], targetRegion[2], targetRegion[3],
       mode.rawValue
     )
@@ -191,6 +196,7 @@ class ReachingModule: NSObject {
         initialWorldMap: resolvedWorldMap,
         spatialTargetWorldPosition: resolvedTargetPosition,
         spatialTargetMapName: resolvedMapName,
+        spatialTargetIsSurfacePlacement: resolvedIsSurfacePlacement,
         mode: mode,
         startupSilent: startupSilent,
         voiceOverEnabled: voiceOverEnabled,
@@ -553,6 +559,7 @@ class ReachingModule: NSObject {
     let worldMap: ARWorldMap
     let targetPosition: simd_float3
     let mapName: String
+    let isSurfacePlacement: Bool
   }
 
   private static func resolveMapTarget(
@@ -599,7 +606,8 @@ class ReachingModule: NSObject {
     return SpatialTargetMapContext(
       worldMap: loaded.worldMap,
       targetPosition: poi.position.simdValue,
-      mapName: loaded.metadata.name
+      mapName: loaded.metadata.name,
+      isSurfacePlacement: poi.isSurfacePlacement
     )
   }
 
@@ -671,6 +679,7 @@ class ReachingModule: NSObject {
     initialWorldMap: ARWorldMap? = nil,
     spatialTargetWorldPosition: simd_float3? = nil,
     spatialTargetMapName: String? = nil,
+    spatialTargetIsSurfacePlacement: Bool = true,
     mode: ReachingViewController.ReachingMode,
     startupSilent: Bool,
     voiceOverEnabled: Bool,
@@ -695,6 +704,7 @@ class ReachingModule: NSObject {
                                    initialWorldMap: initialWorldMap,
                                    spatialTargetWorldPosition: spatialTargetWorldPosition,
                                    spatialTargetMapName: spatialTargetMapName,
+                                   spatialTargetIsSurfacePlacement: spatialTargetIsSurfacePlacement,
                                    mode: mode,
                                    startupSilent: startupSilent,
                                    voiceOverEnabled: voiceOverEnabled,
@@ -713,6 +723,7 @@ class ReachingModule: NSObject {
         initialWorldMap: initialWorldMap,
         spatialTargetWorldPosition: spatialTargetWorldPosition,
         spatialTargetMapName: spatialTargetMapName,
+        spatialTargetIsSurfacePlacement: spatialTargetIsSurfacePlacement,
         mode: mode,
         startupSilent: startupSilent,
         voiceOverEnabled: voiceOverEnabled,
