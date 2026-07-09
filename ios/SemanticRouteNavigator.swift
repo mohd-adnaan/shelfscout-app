@@ -2100,8 +2100,8 @@ final class SemanticRouteNavigator: ObservableObject {
         phase = .recovering
         recoveryReason = routeBeliefState.evidenceSummary
         currentInstruction = routeLocalizationStatus == .lost
-            ? "I lost the route. Stop, hold the phone up, and slowly look around."
-            : "Hold on. Pan the phone slowly left and right."
+            ? "Route lost. Stop and slowly look around."
+            : "Hold on. Pan the phone slowly."
 
         if cueChanged || cueAge >= beliefHoldRepeatSeconds {
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)

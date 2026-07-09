@@ -393,15 +393,30 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             placement: placed.placement.rawValue
         )
         refreshPOIInspectionList()
-        NSLog("📍 [ARMapping] Pinned POI %@ via %@ at (%.2f, %.2f, %.2f)",
-              trimmedName, placed.placement.rawValue, anchorPos.x, anchorPos.y, anchorPos.z)
+        let cameraPos = simd_make_float3(
+            currentFrame.camera.transform.columns.3.x,
+            currentFrame.camera.transform.columns.3.y,
+            currentFrame.camera.transform.columns.3.z
+        )
+        let pinDistance = simd_distance(cameraPos, anchorPos)
+        NSLog("📍 [ARMapping] Pinned POI %@ via %@ at (%.2f, %.2f, %.2f), %.2fm from camera",
+              trimmedName, placed.placement.rawValue, anchorPos.x, anchorPos.y, anchorPos.z, pinDistance)
         switch placed.placement {
         case .cameraPose:
             statusMessage = "Pinned \(trimmedName) at your position. Aim the camera at it and re-pin for surface accuracy."
         default:
-            statusMessage = visualFingerprint == nil
-                ? "Pinned \(trimmedName) on the surface. Visual sample was not ready."
-                : "Pinned \(trimmedName) on the surface with visual sample."
+            // Raycast error grows with range; a far pin can land a meter or
+            // more past the object (e.g. through glass behind it).
+            if pinDistance > 2.0 {
+                statusMessage = String(
+                    format: "Pinned %@ %.1fm away. For reaching accuracy, step within arm's reach and re-pin.",
+                    trimmedName, pinDistance
+                )
+            } else {
+                statusMessage = visualFingerprint == nil
+                    ? "Pinned \(trimmedName) on the surface. Visual sample was not ready."
+                    : "Pinned \(trimmedName) on the surface with visual sample."
+            }
         }
         return true
     }

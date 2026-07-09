@@ -166,6 +166,11 @@ class ReachingViewController: UIViewController {
   var spatialTargetPlacementStartedAt: TimeInterval = 0
   var spatialTargetRelocalizationCueSpoken = false
   let spatialTargetPlacementTimeoutSec: TimeInterval = 18.0
+  /// Close-range correction of the map-pin anchor onto live geometry
+  /// (see refineSpatialAnchorOnApproach). Locks after the first snap.
+  var spatialAnchorSnapHits: [simd_float3] = []
+  var spatialAnchorSnapLocked = false
+  var lastSpatialAnchorSnapAttemptAt: TimeInterval = 0
   var handIsCloseEnoughInDepth = false
   /// Hand-free: lock anchor after first ARKit refinement converges.
   /// Re-detection still runs (for logging) but CANNOT move the anchor.

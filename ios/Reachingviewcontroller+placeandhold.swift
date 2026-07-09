@@ -36,8 +36,98 @@ extension ReachingViewController {
       tryPlaceAndHoldLockedRayDepthRefine(frame: frame)
     }
 
+    if spatialTargetWorldPosition != nil {
+      refineSpatialAnchorOnApproach(frame)
+    }
+
     processARFrameHandFree(frame)
     return true
+  }
+
+  /// A map POI can be off by a meter or more — the mapping-time raycast can
+  /// overshoot through glass, and relocalization adds drift. Once the user is
+  /// close and facing the anchor, the live camera sees the real surface:
+  /// raycast toward the anchor and snap it onto actual geometry. One-shot,
+  /// evidence-gated, never blocks guidance (see reaching-placement rules).
+  private func refineSpatialAnchorOnApproach(_ frame: ARFrame) {
+    guard spatialTargetIsSurfacePlacement,
+          !spatialAnchorSnapLocked,
+          anchorPlaced,
+          let anchorPos = objectWorldPosition else { return }
+    guard case .normal = frame.camera.trackingState else { return }
+
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - lastSpatialAnchorSnapAttemptAt >= 0.30 else { return }
+    lastSpatialAnchorSnapAttemptAt = now
+
+    let camera = frame.camera
+    let camPos = simd_make_float3(camera.transform.columns.3)
+    let toAnchor = anchorPos - camPos
+    let anchorDist = simd_length(toAnchor)
+    // Only near the target — from far away the ray samples unrelated geometry.
+    guard anchorDist > 0.05, anchorDist <= 2.6 else { return }
+
+    let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
+    let rayDir = toAnchor / anchorDist
+    // Camera must be roughly facing the anchor, or the raycast hits whatever
+    // wall the user is walking past.
+    guard simd_dot(camFwd, rayDir) > 0.80 else { return }
+
+    var hitPoint: simd_float3?
+    for target: ARRaycastQuery.Target in [.existingPlaneGeometry, .estimatedPlane] {
+      let query = ARRaycastQuery(origin: camPos, direction: rayDir, allowing: target, alignment: .any)
+      for hit in sceneView.session.raycast(query) {
+        let hp = simd_make_float3(hit.worldTransform.columns.3)
+        let d = simd_dot(hp - camPos, rayDir)
+        // Accept surfaces in front of the user up to slightly past the
+        // anchor: closer hits correct pin overshoot, slightly-farther hits
+        // correct undershoot/drift.
+        guard d > 0.15, d < anchorDist + 0.75 else { continue }
+        hitPoint = hp
+        break
+      }
+      if hitPoint != nil { break }
+    }
+    guard let hitPoint else { return }
+
+    // Pin already sits on real geometry — nothing to correct.
+    if simd_distance(hitPoint, anchorPos) <= 0.30 {
+      spatialAnchorSnapHits.removeAll()
+      return
+    }
+
+    spatialAnchorSnapHits.append(hitPoint)
+    if spatialAnchorSnapHits.count > 5 {
+      spatialAnchorSnapHits.removeFirst()
+    }
+    guard spatialAnchorSnapHits.count >= 3 else { return }
+
+    let recent = Array(spatialAnchorSnapHits.suffix(3))
+    let centroid = (recent[0] + recent[1] + recent[2]) / 3
+    let spread = recent.map { simd_distance($0, centroid) }.max() ?? 0
+    guard spread <= 0.12 else { return }
+
+    // Bounded correction — a surface far from the pin is a different object.
+    let correction = simd_distance(centroid, anchorPos)
+    guard correction <= 1.9 else {
+      spatialAnchorSnapHits.removeAll()
+      return
+    }
+
+    objectWorldPosition = centroid
+    anchorDepth = simd_distance(centroid, camPos)
+    liveDistanceToObject = anchorDepth
+    let camT = camera.transform
+    let right = -simd_normalize(simd_make_float3(camT.columns.1))
+    let up    =  simd_normalize(simd_make_float3(camT.columns.0))
+    objectWorldCornerTR = centroid + right * objectWorldHalfW + up * objectWorldHalfH
+    objectWorldCornerBL = centroid - right * objectWorldHalfW - up * objectWorldHalfH
+    placeAndHoldLastDepthSource = "surface snap"
+    spatialAnchorSnapLocked = true
+    spatialAnchorSnapHits.removeAll()
+
+    NSLog("◎ [SpatialTarget] 🧲 Anchor snapped to live surface — %.0fcm correction (map pin → real geometry), now %.2fm away",
+          correction * 100, anchorDepth)
   }
 
   private func attemptSpatialTargetPlacement(_ frame: ARFrame) {
@@ -92,13 +182,21 @@ extension ReachingViewController {
     dav2RequestInFlight = false
     placeAndHoldDepthLocked = true
 
+    // Graspable-object extents. Surface pins sit on the object itself, so a
+    // tight box (with slack for anchor error) keeps centering meaningful.
+    // Legacy camera-pose pins mark where the mapper stood — wider box.
+    let fixedHalfExtents: (w: Float, h: Float) = spatialTargetIsSurfacePlacement
+      ? (0.16, 0.20)
+      : (0.30, 0.35)
+
     finalizePlacement(
       worldPos: target,
       depth: depth,
       camera: camera,
       horizScale: 1.0,
       source: "saved map POI \(spatialTargetMapName ?? "unknown map")",
-      frame: frame
+      frame: frame,
+      fixedHalfExtents: fixedHalfExtents
     )
     placeAndHoldDepthLocked = true
 
@@ -589,7 +687,8 @@ extension ReachingViewController {
 
     private func finalizePlacement(worldPos: simd_float3, depth: Float,
                                      camera: ARCamera, horizScale: CGFloat,
-                                     source: String, frame: ARFrame) {
+                                     source: String, frame: ARFrame,
+                                     fixedHalfExtents: (w: Float, h: Float)? = nil) {
         objectWorldPosition = worldPos
         anchorDepth = depth
         liveDistanceToObject = depth
@@ -598,14 +697,23 @@ extension ReachingViewController {
         placeAndHoldAlternateDepthHits.removeAll()
         placeAndHoldLastDepthSource = source
 
-        // Box size from the REAL detected bbox — no cap, so the overlay
-        // wraps the actual object instead of a fixed narrow pill.
-        // Loose safety rail (depth * 0.45) only catches a runaway full-screen
-        // VLM detection; real object boxes stay well under it.
-        let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
-        let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
-        objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.45)
-        objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.45)
+        if let fixedHalfExtents {
+            // Spatial-target mode: the POI is a point on the object, there is
+            // no detection box. Back-projecting the generic seed region at
+            // lock distance made a hand-sized object metres wide (locked from
+            // 9.75m → 1.56m × 2.34m box). Use real-world object extents.
+            objectWorldHalfW = fixedHalfExtents.w
+            objectWorldHalfH = fixedHalfExtents.h
+        } else {
+            // Box size from the REAL detected bbox — no cap, so the overlay
+            // wraps the actual object instead of a fixed narrow pill.
+            // Loose safety rail (depth * 0.45) only catches a runaway full-screen
+            // VLM detection; real object boxes stay well under it.
+            let bboxNormW = bboxNormalized[2] - bboxNormalized[0]
+            let bboxNormH = bboxNormalized[3] - bboxNormalized[1]
+            objectWorldHalfW = min(depth * Float(bboxNormW * horizScale) * 0.5, depth * 0.45)
+            objectWorldHalfH = min(depth * Float(bboxNormH) * 0.5, depth * 0.45)
+        }
 
         let camT = camera.transform
         let right = -simd_normalize(simd_make_float3(camT.columns.1))
@@ -622,7 +730,10 @@ extension ReachingViewController {
         NSLog("🅿️ [PlaceHold] SelfCheck → screen (%.0f,%.0f)", back.x, back.y)
 
         // ── Seed visual tracker so subsequent refinement uses fresh 2D pixel target ──
-        if trackerEnabled {
+        // Skipped in spatial-target mode: bboxNormalized is a generic centered
+        // seed there, so the tracker would latch onto whatever happened to be
+        // mid-screen at relocalization time, not the target object.
+        if trackerEnabled, spatialTargetWorldPosition == nil {
           seedTracker(initialBboxPhotoNorm: bboxNormalized, frame: frame)
         }
 
