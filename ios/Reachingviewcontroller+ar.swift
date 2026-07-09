@@ -27,7 +27,18 @@ extension ReachingViewController {
   func startAR() {
     let config = ARWorldTrackingConfiguration()
     config.initialWorldMap = initialWorldMap
-    config.worldAlignment = .gravityAndHeading
+    if initialWorldMap != nil {
+      // Relocalizing to a saved map: use .gravity. With .gravityAndHeading
+      // ARKit keeps nudging the world yaw toward TODAY's compass reading,
+      // which fights the feature-matched map alignment; every degree of
+      // disagreement displaces a pin by r·θ laterally — a POI 12m from the
+      // map origin moves ~21cm PER DEGREE, so a routine 5° indoor compass
+      // error is a metre of lateral error while depth stays plausible.
+      // The map frame is already heading-aligned from capture time.
+      config.worldAlignment = .gravity
+    } else {
+      config.worldAlignment = .gravityAndHeading
+    }
     config.planeDetection = [.horizontal, .vertical]
 
     if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {

@@ -39,6 +39,7 @@ extension ReachingViewController {
     }
 
     if spatialTargetWorldPosition != nil {
+      followSpatialPOIAnchor(frame)
       refineSpatialAnchorOnApproach(frame)
       tryRefineSpatialTargetExtent(frame)
     }
@@ -139,7 +140,7 @@ extension ReachingViewController {
   }
 
   private func attemptSpatialTargetPlacement(_ frame: ARFrame) {
-    guard let target = spatialTargetWorldPosition else { return }
+    guard let storedTarget = spatialTargetWorldPosition else { return }
     guard arFrameCount >= 5 else { return }
 
     let now = ProcessInfo.processInfo.systemUptime
@@ -168,6 +169,41 @@ extension ReachingViewController {
               objectName)
       }
       return
+    }
+
+    // ── Prefer the RESTORED map anchor over the stored coordinate ────────
+    // The stored value is a snapshot of the map frame at pin time. The POI
+    // was also pinned into the ARWorldMap as a named ARAnchor; after
+    // relocalization ARKit restores it and keeps it registered to real
+    // geometry while alignment refines. A raw coordinate goes stale with
+    // every refinement — that is the "box glued to the wrong door" failure.
+    var target = storedTarget
+    var placementSource = "saved map POI \(spatialTargetMapName ?? "unknown map")"
+    if let poiAnchor = restoredSpatialPOIAnchor(in: frame) {
+      let anchorPos = simd_make_float3(poiAnchor.transform.columns.3)
+      let storedDelta = simd_distance(anchorPos, storedTarget)
+      spatialPOIAnchorUUID = poiAnchor.identifier
+      spatialPOIAnchorLastPosition = anchorPos
+      target = anchorPos
+      placementSource = "restored map anchor \(poiAnchor.name ?? objectName)"
+      NSLog("◎ [SpatialTarget] 🔗 Restored POI anchor '%@' at (%.2f,%.2f,%.2f) — %.0fcm from stored coordinate",
+            poiAnchor.name ?? "?", anchorPos.x, anchorPos.y, anchorPos.z, storedDelta * 100)
+    } else {
+      if spatialTargetFirstNormalAt <= 0 {
+        spatialTargetFirstNormalAt = now
+      }
+      if now - spatialTargetFirstNormalAt < spatialPOIAnchorGraceSec {
+        if arFrameCount % 30 == 0 {
+          NSLog("◎ [SpatialTarget] Tracking normal — waiting up to %.1fs for restored POI anchor '%@'",
+                spatialPOIAnchorGraceSec, spatialTargetPOIName ?? objectName)
+        }
+        return
+      }
+      // Sync reference so followSpatialPOIAnchor can jump the target to the
+      // anchor if it is restored later.
+      spatialPOIAnchorLastPosition = storedTarget
+      NSLog("◎ [SpatialTarget] ⚠️ POI anchor '%@' not restored after %.1fs of normal tracking — placing from stored coordinate",
+            spatialTargetPOIName ?? objectName, spatialPOIAnchorGraceSec)
     }
 
     let camera = frame.camera
@@ -207,20 +243,75 @@ extension ReachingViewController {
       depth: depth,
       camera: camera,
       horizScale: 1.0,
-      source: "saved map POI \(spatialTargetMapName ?? "unknown map")",
+      source: placementSource,
       frame: frame,
       fixedHalfExtents: fixedHalfExtents
     )
     placeAndHoldDepthLocked = true
 
-    NSLog("◎ [SpatialTarget] ✅ Map target %@ locked at (%.3f,%.3f,%.3f), distance %.2fm, placement=%@",
+    NSLog("◎ [SpatialTarget] ✅ Map target %@ locked at (%.3f,%.3f,%.3f), distance %.2fm, placement=%@ via %@",
           objectName, target.x, target.y, target.z, depth,
-          spatialTargetIsSurfacePlacement ? "surface" : "camera_pose(legacy)")
+          spatialTargetIsSurfacePlacement ? "surface" : "camera_pose(legacy)", placementSource)
     if !spatialTargetIsSurfacePlacement && guidanceAudioEnabled {
       // Legacy pin marks where the mapper STOOD, not the object itself.
       // Tell the user so the last half-meter is on their hands, not the box.
       say("Guiding you to the saved spot near \(objectName). It is within arm's reach from there.")
     }
+  }
+
+  /// The POI ARAnchor restored from the saved ARWorldMap, if relocalization
+  /// has brought it back. Matched by identifier once seen, by name before.
+  private func restoredSpatialPOIAnchor(in frame: ARFrame) -> ARAnchor? {
+    if let id = spatialPOIAnchorUUID,
+       let cached = frame.anchors.first(where: { $0.identifier == id }) {
+      return cached
+    }
+    let wanted = Set(
+      [spatialTargetPOIName ?? "", objectName]
+        .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+        .filter { !$0.isEmpty }
+    )
+    guard !wanted.isEmpty else { return nil }
+    return frame.anchors.first { anchor in
+      guard let name = anchor.name?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() else {
+        return false
+      }
+      return wanted.contains(name)
+    }
+  }
+
+  /// Keep the target glued to the restored map anchor. ARKit moves the
+  /// anchor as relocalization refines (loop closures, yaw corrections); the
+  /// target must move WITH it or it drifts off the real object — this is the
+  /// primary fix for the box parking a metre from the pinned doorknob.
+  /// Deltas are applied on top of the current target so surface-snap and
+  /// extent corrections are preserved; a large refinement re-arms both
+  /// passes since their evidence was gathered against the old position.
+  private func followSpatialPOIAnchor(_ frame: ARFrame) {
+    guard anchorPlaced else { return }
+    guard let poiAnchor = restoredSpatialPOIAnchor(in: frame),
+          let lastPin = spatialPOIAnchorLastPosition else { return }
+    let pos = simd_make_float3(poiAnchor.transform.columns.3)
+    let delta = pos - lastPin
+    let shift = simd_length(delta)
+    spatialPOIAnchorUUID = poiAnchor.identifier
+    guard shift > 0.015 else { return }
+    spatialPOIAnchorLastPosition = pos
+
+    if let current = objectWorldPosition {
+      objectWorldPosition = current + delta
+      objectWorldCornerTR += delta
+      objectWorldCornerBL += delta
+    }
+    if shift > 0.25 {
+      spatialAnchorSnapLocked = false
+      spatialAnchorSnapHits.removeAll()
+      extentRefineLocked = false
+      extentRefineAttempts = 0
+      extentCandidates.removeAll()
+    }
+    NSLog("◎ [SpatialTarget] 🔗 Map anchor moved %.0fcm (relocalization refinement) — target follows%@",
+          shift * 100, shift > 0.25 ? "; snap/extent re-armed" : "")
   }
 
   private func speakSpatialTargetRelocalizationCueIfNeeded() {
@@ -1031,8 +1122,13 @@ extension ReachingViewController {
   /// locks, this is what the user gets — so it should describe the physical
   /// object, not the pin uncertainty.
   func spatialTargetPriorHalfExtents() -> (w: Float, h: Float) {
+    // Split compound words the same way ReachingModule's POI lookup does,
+    // or "Doorknob" never matches the "knob" token and falls to the default.
+    let key = objectName.lowercased()
+      .replacingOccurrences(of: "doorknob", with: "door knob")
+      .replacingOccurrences(of: "doorhandle", with: "door handle")
     let tokens = Set(
-      objectName.lowercased()
+      key
         .components(separatedBy: CharacterSet.alphanumerics.inverted)
         .filter { !$0.isEmpty }
     )

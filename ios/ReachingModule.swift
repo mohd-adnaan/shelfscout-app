@@ -173,6 +173,7 @@ class ReachingModule: NSObject {
     var resolvedTargetPosition: simd_float3? = targetWorldPosition
     var resolvedMapName: String? = routeMapName
     var resolvedIsSurfacePlacement = targetWorldPosition != nil
+    var resolvedPOIName: String? = nil
 
     do {
       if resolvedTargetPosition == nil || resolvedWorldMap == nil {
@@ -193,6 +194,7 @@ class ReachingModule: NSObject {
         // and skipped the "saved spot near X" caveat.
         resolvedIsSurfacePlacement = mapContext.isSurfacePlacement
         resolvedMapName = mapContext.mapName
+        resolvedPOIName = mapContext.poiName
       }
     } catch {
       if routeMapId?.isEmpty == false || (routeMapName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) {
@@ -236,6 +238,7 @@ class ReachingModule: NSObject {
         spatialTargetWorldPosition: resolvedTargetPosition,
         spatialTargetMapName: resolvedMapName,
         spatialTargetIsSurfacePlacement: resolvedIsSurfacePlacement,
+        spatialTargetPOIName: resolvedPOIName,
         mode: mode,
         startupSilent: startupSilent,
         voiceOverEnabled: voiceOverEnabled,
@@ -599,6 +602,10 @@ class ReachingModule: NSObject {
     let targetPosition: simd_float3
     let mapName: String
     let isSurfacePlacement: Bool
+    /// Exact name of the POI anchor pinned inside the ARWorldMap — the
+    /// reaching session uses it to find the RESTORED ARAnchor after
+    /// relocalization instead of trusting the stored raw coordinate.
+    let poiName: String
   }
 
   private static func resolveMapTarget(
@@ -646,7 +653,8 @@ class ReachingModule: NSObject {
       worldMap: loaded.worldMap,
       targetPosition: poi.position.simdValue,
       mapName: loaded.metadata.name,
-      isSurfacePlacement: poi.isSurfacePlacement
+      isSurfacePlacement: poi.isSurfacePlacement,
+      poiName: poi.name
     )
   }
 
@@ -719,6 +727,7 @@ class ReachingModule: NSObject {
     spatialTargetWorldPosition: simd_float3? = nil,
     spatialTargetMapName: String? = nil,
     spatialTargetIsSurfacePlacement: Bool = true,
+    spatialTargetPOIName: String? = nil,
     mode: ReachingViewController.ReachingMode,
     startupSilent: Bool,
     voiceOverEnabled: Bool,
@@ -744,6 +753,7 @@ class ReachingModule: NSObject {
                                    spatialTargetWorldPosition: spatialTargetWorldPosition,
                                    spatialTargetMapName: spatialTargetMapName,
                                    spatialTargetIsSurfacePlacement: spatialTargetIsSurfacePlacement,
+                                   spatialTargetPOIName: spatialTargetPOIName,
                                    mode: mode,
                                    startupSilent: startupSilent,
                                    voiceOverEnabled: voiceOverEnabled,
@@ -763,6 +773,7 @@ class ReachingModule: NSObject {
         spatialTargetWorldPosition: spatialTargetWorldPosition,
         spatialTargetMapName: spatialTargetMapName,
         spatialTargetIsSurfacePlacement: spatialTargetIsSurfacePlacement,
+        spatialTargetPOIName: spatialTargetPOIName,
         mode: mode,
         startupSilent: startupSilent,
         voiceOverEnabled: voiceOverEnabled,

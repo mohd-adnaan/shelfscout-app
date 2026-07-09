@@ -130,6 +130,26 @@ class ReachingViewController: UIViewController {
   /// true = POI was pinned on the object surface (LiDAR/raycast at mapping
   /// time); false = legacy camera-pose pin, i.e. where the mapper stood.
   let spatialTargetIsSurfacePlacement: Bool
+  /// Exact name of the POI ARAnchor inside the saved ARWorldMap (can differ
+  /// from objectName after fuzzy matching). Used to find the RESTORED anchor
+  /// after relocalization — the live ground truth for the pin.
+  let spatialTargetPOIName: String?
+
+  // ── Live link to the restored map POI anchor ─────────────────────────────
+  // The stored coordinate is a snapshot of the map frame at pin time; the
+  // restored ARAnchor is kept registered to real geometry by ARKit as
+  // relocalization refines. followSpatialPOIAnchor tracks the anchor's
+  // movement and shifts the target with it (see +placeandhold).
+  var spatialPOIAnchorUUID: UUID?
+  /// Last pin position the target was synced to: the anchor position, or the
+  /// stored coordinate when placement had to fall back before the anchor
+  /// was restored.
+  var spatialPOIAnchorLastPosition: simd_float3?
+  /// Uptime of the first .normal tracking frame during spatial placement.
+  var spatialTargetFirstNormalAt: TimeInterval = 0
+  /// After tracking turns normal, wait this long for the restored anchor
+  /// before falling back to the stored coordinate.
+  let spatialPOIAnchorGraceSec: TimeInterval = 2.5
   var bboxUpdateCount = 0
   var redetectTimer: Timer?
   let redetectInterval: TimeInterval = 8.0   // seconds between re-detections (Qwen takes ~10-20s)
@@ -491,6 +511,7 @@ class ReachingViewController: UIViewController {
        spatialTargetWorldPosition: simd_float3? = nil,
        spatialTargetMapName: String? = nil,
        spatialTargetIsSurfacePlacement: Bool = true,
+       spatialTargetPOIName: String? = nil,
        mode: ReachingMode = .handFree,
       startupSilent: Bool = false,
        voiceOverEnabled: Bool = false,
@@ -507,6 +528,7 @@ class ReachingViewController: UIViewController {
     self.spatialTargetWorldPosition = spatialTargetWorldPosition
     self.spatialTargetMapName = spatialTargetMapName
     self.spatialTargetIsSurfacePlacement = spatialTargetIsSurfacePlacement
+    self.spatialTargetPOIName = spatialTargetPOIName
     self.acquisitionUrl = acquisitionUrl
     let cleanedSessionId = sessionId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     self.sessionId = cleanedSessionId.isEmpty ? UUID().uuidString : cleanedSessionId
@@ -824,6 +846,10 @@ class ReachingViewController: UIViewController {
     // Reset spatial extent refinement state
     extentRefineInFlight = false
     extentCandidates.removeAll()
+    // Reset restored-POI-anchor tracking
+    spatialPOIAnchorUUID = nil
+    spatialPOIAnchorLastPosition = nil
+    spatialTargetFirstNormalAt = 0
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
