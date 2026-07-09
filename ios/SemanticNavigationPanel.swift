@@ -23,22 +23,25 @@ struct SemanticNavigationPanel: View {
     let captureStart: (String) -> Void
     let captureTurn: (SemanticTurnHint) -> Void
     let captureLandmark: (String, SemanticRouteSide, String, Bool) -> Void
+    let captureReachingObject: (String) -> Void
     let saveWalkthrough: () -> Void
     let startNavigation: (String, Bool, Bool) -> Void
     let snapToRoute: () -> Void
+    let startReachingHandoff: () -> Void
 
     @State private var mode: RoutePanelMode = .map
     @State private var startName = ""
     @State private var landmarkName = ""
     @State private var destinationName = ""
     @State private var landmarkNote = ""
+    @State private var reachingObjectName = ""
     @State private var selectedSide: SemanticRouteSide = .left
     @State private var targetName = ""
     @State private var showsSavedMapLoader = false
     @State private var showsLandmarkForm = false
     @State private var showsReview = false
     @State private var speakLandmarks = true
-    @State private var errorRecoveryEnabled = false
+    @State private var errorRecoveryEnabled = true
     @State private var routeIDPendingDeletion: String?
     @State private var showsDeleteRouteConfirm = false
 
@@ -285,7 +288,44 @@ struct SemanticNavigationPanel: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .disabled(destinationName.trimmedRouteText.isEmpty || !canUseARPose)
+
+            if navigator.capturedDestinationCount > 0 {
+                reachingObjectForm
+            }
         }
+    }
+
+    private var reachingObjectForm: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let linked = navigator.capturedReachingObjectSummary {
+                Label("Reaching object: \(linked.object) → \(linked.destination)", systemImage: "hand.point.up.left")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.green)
+            }
+
+            Text("Optional last-meter reaching: aim the camera straight at the object to grab at \(navigator.latestCapturedDestinationName ?? "the destination"), then pin it. After navigation arrives, reaching guidance targets this object.")
+                .font(.footnote)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 10) {
+                TextField("Reaching object (e.g. kettle)", text: $reachingObjectName)
+                    .routeTextField()
+
+                Button {
+                    captureReachingObject(reachingObjectName)
+                    reachingObjectName = ""
+                } label: {
+                    Label("Pin", systemImage: "hand.point.up.left")
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(reachingObjectName.trimmedRouteText.isEmpty || !canUseARPose)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(uiColor: .secondarySystemBackground))
+        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
     private var routeReview: some View {
@@ -430,6 +470,18 @@ struct SemanticNavigationPanel: View {
                     .accessibilityLabel("Recenter on route")
                 }
 
+                if navigator.phase == .arrived,
+                   let reachingObject = navigator.reachingObjectName(forTarget: navigator.targetName) {
+                    Button {
+                        startReachingHandoff()
+                    } label: {
+                        Label("Reach \(reachingObject)", systemImage: "hand.point.up.left")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.large)
+                }
+
                 if navigator.phase == .navigating || navigator.phase == .recovering || navigator.phase == .arrived {
                     Button("Stop Guidance") {
                         navigator.stopNavigation()
@@ -508,7 +560,7 @@ struct SemanticNavigationPanel: View {
                         .font(.headline.weight(.semibold))
                     Text(recoveryReason)
                         .font(.subheadline)
-                    Text("Pause, slowly scan left and right, then tap recenter when the route is stable.")
+                    Text("Hold position and pan the phone slowly left and right. If guidance stays stuck, tap recenter.")
                         .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }

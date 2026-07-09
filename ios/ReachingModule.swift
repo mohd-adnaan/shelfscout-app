@@ -74,17 +74,17 @@ class ReachingModule: NSObject {
     let sessionId = params["sessionId"] as? String
 
     let status = AVCaptureDevice.authorizationStatus(for: .video)
-    let launch = { [weak self] in
-      self?.presentReachingVC(bbox: bbox, objectName: objectName,
-                              depth: backendDepth, imageW: imgW, imageH: imgH,
-                              detectionUrl: detectionUrl,
-                              acquisitionUrl: acquisitionUrl,
-                              sessionId: sessionId,
-                              mode: mode,
-                              startupSilent: startupSilent,
-                              voiceOverEnabled: voiceOverEnabled,
-                              ttsRate: ttsRate, distanceUnit: distanceUnit,
-                              resolver: resolver, rejecter: rejecter)
+    let launch = {
+      ReachingModule.presentReachingVC(bbox: bbox, objectName: objectName,
+                                       depth: backendDepth, imageW: imgW, imageH: imgH,
+                                       detectionUrl: detectionUrl,
+                                       acquisitionUrl: acquisitionUrl,
+                                       sessionId: sessionId,
+                                       mode: mode,
+                                       startupSilent: startupSilent,
+                                       voiceOverEnabled: voiceOverEnabled,
+                                       ttsRate: ttsRate, distanceUnit: distanceUnit,
+                                       resolver: resolver, rejecter: rejecter)
     }
     if status == .authorized { launch() }
     else if status == .notDetermined {
@@ -103,10 +103,6 @@ class ReachingModule: NSObject {
 
     let targetName = ((params["targetName"] as? String) ?? "target")
       .trimmingCharacters(in: .whitespacesAndNewlines)
-    guard !targetName.isEmpty else {
-      rejecter("BAD_TARGET", "targetName is required for spatial target reaching", nil)
-      return
-    }
 
     var targetRegion: [CGFloat] = [0.42, 0.38, 0.58, 0.62]
     if let raw = params["targetRegion"] {
@@ -127,23 +123,60 @@ class ReachingModule: NSObject {
 
     let modeStr = (params["mode"] as? String) ?? "handFree"
     let mode: ReachingViewController.ReachingMode = modeStr == "withHand" ? .withHand : .handFree
-    let ttsRate: Float = (params["ttsRate"] as? NSNumber)?.floatValue ?? 0.5
-    let distanceUnit = (params["distanceUnit"] as? String) ?? "steps"
-    let startupSilent = (params["startupSilent"] as? Bool) ?? false
-    let voiceOverEnabled = (params["voiceOverEnabled"] as? Bool) ?? UIAccessibility.isVoiceOverRunning
-    let sessionId = params["sessionId"] as? String
-    let routeMapId = (params["routeMapId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
-    let routeMapName = params["routeMapName"] as? String
-    let explicitTargetWorldPosition = Self.parseWorldPosition(params["targetWorldPosition"])
+
+    ReachingModule.launchSpatialTargetReaching(
+      targetName: targetName,
+      routeMapId: (params["routeMapId"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+      routeMapName: params["routeMapName"] as? String,
+      targetWorldPosition: Self.parseWorldPosition(params["targetWorldPosition"]),
+      targetRegion: targetRegion,
+      mode: mode,
+      startupSilent: (params["startupSilent"] as? Bool) ?? false,
+      voiceOverEnabled: (params["voiceOverEnabled"] as? Bool) ?? UIAccessibility.isVoiceOverRunning,
+      ttsRate: (params["ttsRate"] as? NSNumber)?.floatValue ?? 0.5,
+      distanceUnit: (params["distanceUnit"] as? String) ?? "steps",
+      sessionId: params["sessionId"] as? String,
+      onFailure: { code, message, error in
+        rejecter(code, message, error)
+      },
+      onDone: { result in
+        resolver(result)
+      }
+    )
+  }
+
+  /// Shared spatial-target launcher. The RN bridge method above and native
+  /// callers (ARKit navigation's arrival handoff) both come through here so
+  /// map resolution, permission handling, and presentation stay identical.
+  static func launchSpatialTargetReaching(
+    targetName rawTargetName: String,
+    routeMapId: String? = nil,
+    routeMapName: String? = nil,
+    targetWorldPosition: simd_float3? = nil,
+    targetRegion: [CGFloat] = [0.42, 0.38, 0.58, 0.62],
+    mode: ReachingViewController.ReachingMode = .handFree,
+    startupSilent: Bool = false,
+    voiceOverEnabled: Bool = UIAccessibility.isVoiceOverRunning,
+    ttsRate: Float = 0.5,
+    distanceUnit: String = "steps",
+    sessionId: String? = nil,
+    onFailure: @escaping (_ code: String, _ message: String, _ error: Error?) -> Void,
+    onDone: @escaping ([String: Any]) -> Void
+  ) {
+    let targetName = rawTargetName.trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !targetName.isEmpty else {
+      onFailure("BAD_TARGET", "targetName is required for spatial target reaching", nil)
+      return
+    }
 
     var resolvedWorldMap: ARWorldMap?
-    var resolvedTargetPosition: simd_float3? = explicitTargetWorldPosition
+    var resolvedTargetPosition: simd_float3? = targetWorldPosition
     var resolvedMapName: String? = routeMapName
-    var resolvedIsSurfacePlacement = explicitTargetWorldPosition != nil
+    var resolvedIsSurfacePlacement = targetWorldPosition != nil
 
     do {
       if resolvedTargetPosition == nil || resolvedWorldMap == nil {
-        let mapContext = try Self.resolveMapTarget(
+        let mapContext = try resolveMapTarget(
           targetName: targetName,
           routeMapId: routeMapId,
           routeMapName: routeMapName
@@ -157,14 +190,14 @@ class ReachingModule: NSObject {
       }
     } catch {
       if routeMapId?.isEmpty == false || (routeMapName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) {
-        rejecter("TARGET_NOT_IN_MAP", error.localizedDescription, error)
+        onFailure("TARGET_NOT_IN_MAP", error.localizedDescription, error)
         return
       }
       NSLog("◎ [ReachingModule] Spatial target map lookup skipped/fallback: %@", error.localizedDescription)
     }
 
     if resolvedTargetPosition != nil && resolvedWorldMap == nil {
-      rejecter(
+      onFailure(
         "MAP_NOT_FOUND",
         "Spatial Target has a saved target position but no ARWorldMap to relocalize against.",
         nil
@@ -183,8 +216,8 @@ class ReachingModule: NSObject {
     )
 
     let status = AVCaptureDevice.authorizationStatus(for: .video)
-    let launch = { [weak self] in
-      self?.presentReachingVC(
+    let launch = {
+      presentReachingVC(
         bbox: targetRegion,
         objectName: targetName,
         depth: nil,
@@ -202,16 +235,16 @@ class ReachingModule: NSObject {
         voiceOverEnabled: voiceOverEnabled,
         ttsRate: ttsRate,
         distanceUnit: distanceUnit,
-        resolver: resolver,
-        rejecter: rejecter
+        resolver: { result in onDone(result as? [String: Any] ?? [:]) },
+        rejecter: { code, message, error in onFailure(code ?? "ERROR", message ?? "Reaching failed.", error) }
       )
     }
     if status == .authorized { launch() }
     else if status == .notDetermined {
       AVCaptureDevice.requestAccess(for: .video) { ok in
-        if ok { launch() } else { rejecter("CAM", "Camera denied", nil) }
+        if ok { launch() } else { onFailure("CAM", "Camera denied", nil) }
       }
-    } else { rejecter("CAM", "Camera not authorized", nil) }
+    } else { onFailure("CAM", "Camera not authorized", nil) }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -670,7 +703,7 @@ class ReachingModule: NSObject {
     return nil
   }
 
-  private func presentReachingVC(
+  private static func presentReachingVC(
     bbox: [CGFloat], objectName: String, depth: Float?,
     imageW: CGFloat, imageH: CGFloat,
     detectionUrl: String?,
@@ -696,7 +729,7 @@ class ReachingModule: NSObject {
       if top is ReachingViewController {
         top.dismiss(animated: false) {
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-            self.presentReachingVC(bbox: bbox, objectName: objectName, depth: depth,
+            presentReachingVC(bbox: bbox, objectName: objectName, depth: depth,
                                    imageW: imageW, imageH: imageH,
                                    detectionUrl: detectionUrl,
                                    acquisitionUrl: acquisitionUrl,

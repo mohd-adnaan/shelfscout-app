@@ -114,6 +114,10 @@ struct SemanticRouteNode: Identifiable, Codable, Equatable {
     var aliases: [String]
     var capturedAt: Date
     var poiAnchorId: String?
+    /// Destination nodes only: the graspable object pinned for last-meter
+    /// reaching. Must match a surface-pinned POI anchor in the linked
+    /// ARWorldMap so spatial-target reaching can resolve it after arrival.
+    var reachingObjectName: String? = nil
 }
 
 struct SemanticRouteEdge: Identifiable, Codable, Equatable {
@@ -354,6 +358,8 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastRecoveredAt: Date?
     private var lastRecoveryCueAt: Date?
     private var lastRecoveryCueKey: String?
+    private var beliefIssueStartedAt: Date?
+    private var lastTrackingLimitedPrefixAt: Date?
     private var guidanceIntroProtectedUntil: Date?
     private var lastVisualRouteMatchAt: TimeInterval = 0
     private var lastVisualRouteMatch: VisualRouteMatch?
@@ -377,7 +383,10 @@ final class SemanticRouteNavigator: ObservableObject {
     private let recoverySnapThreshold = 1.15
     private let headingRecoveryThreshold = 95.0
     private let recoveryHoldSeconds: TimeInterval = 0.6
-    private let recoveryCueCooldownSeconds: TimeInterval = 2.5
+    private let recoveryCueCooldownSeconds: TimeInterval = 5.0
+    private let beliefHoldGraceSeconds: TimeInterval = 1.25
+    private let beliefHoldRepeatSeconds: TimeInterval = 9.0
+    private let trackingLimitedPrefixCooldownSeconds: TimeInterval = 10.0
     private let guidanceIntroProtectionSeconds: TimeInterval = 4.0
     private let autoSampleDistanceMeters = 0.60
     private let autoSampleTurnDegrees = 24.0
@@ -418,6 +427,10 @@ final class SemanticRouteNavigator: ObservableObject {
     private let destinationCorridorMaxMeters = 1.65
     private let routeBeliefWindowSeconds: TimeInterval = 2.4
     private let routeBeliefBucketMeters = 0.85
+    /// Same-step candidates closer than this are one belief, not competitors.
+    /// Must exceed the bucket width, or ordinary PDR-vs-AR disagreement lands
+    /// in adjacent buckets and reads as "ambiguous", spamming pause cues.
+    private let routeBeliefAmbiguityMergeMeters = 1.35
     private let routeBeliefMinimumLockedConfidence = 0.62
     private let routeBeliefMinimumInstructionMargin = 0.14
     private let routeBeliefMaximumInstructionUncertainty = 1.70
@@ -1081,6 +1094,103 @@ final class SemanticRouteNavigator: ObservableObject {
         return true
     }
 
+    /// Links a graspable object to the most recent destination so arrival can
+    /// hand off into spatial-target reaching. The caller must also pin the
+    /// same name as a surface POI anchor in the active ARWorldMap — that
+    /// anchor is what reaching relocalizes against.
+    @discardableResult
+    func attachReachingObject(
+        named requestedName: String,
+        capturedImage: CVPixelBuffer? = nil
+    ) -> Bool {
+        guard phase == .mapping else { return false }
+        let trimmed = Self.sanitizedSpokenLabel(requestedName)
+        guard !trimmed.isEmpty else {
+            currentInstruction = "Name the reaching object first."
+            return false
+        }
+        guard var workingMap = activeMapDraft ?? activeMap else { return false }
+        guard let destinationIndex = latestDestinationNodeIndex(in: workingMap) else {
+            currentInstruction = "Set the destination before pinning its reaching object."
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            return false
+        }
+
+        workingMap.nodes[destinationIndex].reachingObjectName = trimmed
+        let destinationNode = workingMap.nodes[destinationIndex]
+
+        // The object doubles as a spoken destination alias ("take me to the
+        // kettle") and as visual arrival evidence at the destination.
+        let visualSample = makeVisualFingerprint(from: capturedImage)
+        if let visualSample {
+            var fingerprints = workingMap.visualFingerprints ?? [:]
+            fingerprints[visualSample.id] = visualSample.fingerprint
+            workingMap.visualFingerprints = fingerprints
+        }
+        let landmark = SemanticRouteLandmark(
+            id: UUID().uuidString,
+            name: trimmed,
+            aliases: Self.aliases(for: trimmed),
+            nodeID: destinationNode.id,
+            edgeID: nil,
+            offsetMeters: nil,
+            side: .ahead,
+            context: "Reaching object at \(destinationNode.name)",
+            priority: 20,
+            kind: .destinationContext,
+            visualFingerprintIds: visualSample.map { [$0.id] }
+        )
+        workingMap.landmarks.removeAll { Self.matches($0.name, trimmed) }
+        workingMap.landmarks.append(landmark)
+        workingMap.updatedAt = Date()
+        activeMapDraft = workingMap
+        activeMap = workingMap
+        refreshCaptureMetrics(for: workingMap)
+        currentInstruction = "Linked reaching object \(trimmed) to \(destinationNode.name)."
+        speechCue = SemanticSpeechCue(
+            text: "Reaching object \(trimmed) linked to \(destinationNode.name). After arrival, reaching guidance will target it.",
+            priority: .regular
+        )
+        rebuildRAGContext()
+        return true
+    }
+
+    /// The reaching object linked to whichever destination `target` resolves
+    /// to, or nil when none was marked during capture.
+    func reachingObjectName(forTarget target: String) -> String? {
+        guard let map = activeMap ?? activeMapDraft else { return nil }
+        let trimmed = Self.sanitizedSpokenLabel(target)
+        guard !trimmed.isEmpty,
+              let node = resolveTarget(trimmed, in: map) else {
+            return nil
+        }
+        return Self.sanitizedSpokenLabel(node.reachingObjectName ?? "").nilIfBlank
+    }
+
+    var latestCapturedDestinationName: String? {
+        (activeMapDraft ?? activeMap)?.nodes.last(where: { $0.kind == .destination })?.name
+    }
+
+    var capturedReachingObjectSummary: (destination: String, object: String)? {
+        guard let map = activeMapDraft ?? activeMap,
+              let node = map.nodes.last(where: {
+                  $0.kind == .destination && ($0.reachingObjectName?.isEmpty == false)
+              }),
+              let object = node.reachingObjectName else {
+            return nil
+        }
+        return (node.name, object)
+    }
+
+    private func latestDestinationNodeIndex(in map: SemanticRouteMap) -> Int? {
+        if let lastID = lastCapturedNodeID,
+           let index = map.nodes.firstIndex(where: { $0.id == lastID }),
+           map.nodes[index].kind == .destination {
+            return index
+        }
+        return map.nodes.lastIndex(where: { $0.kind == .destination })
+    }
+
     @discardableResult
     func saveCapturedMap() -> Bool {
         guard var map = activeMapDraft ?? activeMap else { return false }
@@ -1199,6 +1309,8 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryStartedAt = nil
         lastRecoveredAt = nil
         lastRecoveryCueAt = nil
+        beliefIssueStartedAt = nil
+        lastTrackingLimitedPrefixAt = nil
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
         arrivalVisualHoldStartedAt = nil
@@ -1243,6 +1355,8 @@ final class SemanticRouteNavigator: ObservableObject {
         announcedLandmarkIDs.removeAll()
         recoveryStartedAt = nil
         lastRecoveryCueAt = nil
+        beliefIssueStartedAt = nil
+        lastTrackingLimitedPrefixAt = nil
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
         arrivalVisualHoldStartedAt = nil
@@ -1430,6 +1544,20 @@ final class SemanticRouteNavigator: ObservableObject {
             evidenceSummary: routeBeliefState.evidenceSummary
         )
 
+        // ── Destination proximity check ──────────────────────────────
+        // Runs before the belief hold on purpose: standing at the target
+        // with ambiguous evidence must still complete the route instead of
+        // looping "pause and scan" forever at the finish line.
+        if isAtFinalDestination(on: step, arPoint: arPoint, visualMatch: visualMatch, arLocalized: arLocalized) {
+            if shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
+                rebuildRAGContext()
+                return
+            }
+            advanceStepOrArrive()
+            rebuildRAGContext()
+            return
+        }
+
         if handleRouteBeliefHoldIfNeeded() {
             rebuildRAGContext()
             return
@@ -1464,19 +1592,6 @@ final class SemanticRouteNavigator: ObservableObject {
                 routeProjection: routeProjection,
                 backwardDriftMeters: backwardDriftMeters
             )
-        }
-
-        // ── Destination proximity check ──────────────────────────────
-        // If AR pose is close to the final destination node, trigger
-        // arrival even if segment progress is throttled by heading gating.
-        if isAtFinalDestination(on: step, arPoint: arPoint, visualMatch: visualMatch, arLocalized: arLocalized) {
-            if shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
-                rebuildRAGContext()
-                return
-            }
-            advanceStepOrArrive()
-            rebuildRAGContext()
-            return
         }
 
         // ── Turn/node proximity check ────────────────────────────────
@@ -1903,7 +2018,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private func isSameBeliefPlace(_ lhs: RouteBeliefCandidate, _ rhs: RouteBeliefCandidate) -> Bool {
         lhs.stepIndex == rhs.stepIndex &&
-            abs(lhs.progressMeters - rhs.progressMeters) <= routeBeliefLargeCorrectionSupportMeters
+            abs(lhs.progressMeters - rhs.progressMeters) <= routeBeliefAmbiguityMergeMeters
     }
 
     private func pdrUncertaintyMeters(imuState: IMUState, pdrDelta: Double, headingError: Double) -> Double {
@@ -1950,7 +2065,7 @@ final class SemanticRouteNavigator: ObservableObject {
             source,
             observedProgress
         )
-        recoveryReason = "Route evidence disagrees. Pause and scan slowly."
+        recoveryReason = "Route evidence disagrees."
     }
 
     private func handleRouteBeliefHoldIfNeeded() -> Bool {
@@ -1960,14 +2075,24 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         guard routeLocalizationStatus == .ambiguous || routeLocalizationStatus == .lost else {
+            beliefIssueStartedAt = nil
             if phase == .recovering, routeBeliefState.isInstructionSafe {
-                phase = .navigating
-                recoveryReason = nil
+                exitRecovery(announce: true)
             }
             return false
         }
 
         let now = Date()
+        if beliefIssueStartedAt == nil {
+            beliefIssueStartedAt = now
+        }
+        // Ambiguity flickers for a moment whenever PDR and AR briefly disagree.
+        // Keep guiding through those; hold only when the conflict persists.
+        if phase != .recovering,
+           now.timeIntervalSince(beliefIssueStartedAt ?? now) < beliefHoldGraceSeconds {
+            return false
+        }
+
         let key = "route_belief_\(routeLocalizationStatus.rawValue)"
         let cueChanged = key != lastRecoveryCueKey
         let cueAge = lastRecoveryCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
@@ -1975,15 +2100,33 @@ final class SemanticRouteNavigator: ObservableObject {
         phase = .recovering
         recoveryReason = routeBeliefState.evidenceSummary
         currentInstruction = routeLocalizationStatus == .lost
-            ? "Route uncertain. Pause and scan slowly."
-            : "Pause and scan slowly."
+            ? "I lost the route. Stop, hold the phone up, and slowly look around."
+            : "Hold on. Pan the phone slowly left and right."
 
-        if cueChanged || cueAge >= recoveryCueCooldownSeconds {
+        if cueChanged || cueAge >= beliefHoldRepeatSeconds {
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             lastRecoveryCueAt = now
             lastRecoveryCueKey = key
         }
         return true
+    }
+
+    /// Leaves the recovering phase and, when a recovery cue was actually
+    /// spoken, tells the user guidance is trustworthy again — a silent flip
+    /// back leaves them unsure whether to keep pausing.
+    private func exitRecovery(announce: Bool) {
+        let hadSpokenCue = lastRecoveryCueKey != nil
+        phase = .navigating
+        recoveryReason = nil
+        recoveryStartedAt = nil
+        beliefIssueStartedAt = nil
+        lastRecoveryCueKey = nil
+        lastRecoveredAt = Date()
+        updateInstruction(forceSpeech: false)
+        if announce, hadSpokenCue {
+            currentInstruction = "Back on route. \(currentInstruction)"
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+        }
     }
 
     private func pdrDistanceDelta(from imuState: IMUState) -> Double {
@@ -2426,28 +2569,28 @@ final class SemanticRouteNavigator: ObservableObject {
            visualMatch.confidence >= visualRouteSnapConfidence,
            visualMatch.stepIndex >= currentStepIndex,
            visualMatch.stepIndex <= currentStepIndex + 1 {
-            recoveryStartedAt = nil
-            recoveryReason = nil
-            lastRecoveryCueKey = nil
             if phase == .recovering {
-                phase = .navigating
-                updateInstruction(forceSpeech: false)
+                exitRecovery(announce: true)
+            } else {
+                recoveryStartedAt = nil
+                recoveryReason = nil
+                lastRecoveryCueKey = nil
             }
             return
         }
 
         guard crossTrackBad || backwardBad || headingBad || lowConfidenceBad || localizationBad else {
-            recoveryStartedAt = nil
-            lastRecoveryCueKey = nil
             if phase == .recovering {
                 let sinceRecovery = lastRecoveredAt?.timeIntervalSinceNow ?? -10
                 if arLocalized || sinceRecovery < -1.0 {
-                    phase = .navigating
-                    recoveryReason = nil
+                    exitRecovery(announce: true)
+                } else {
                     recoveryStartedAt = nil
-                    lastRecoveredAt = Date()
-                    updateInstruction(forceSpeech: false)
+                    lastRecoveryCueKey = nil
                 }
+            } else {
+                recoveryStartedAt = nil
+                lastRecoveryCueKey = nil
             }
             return
         }
@@ -2686,6 +2829,7 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryStartedAt = nil
         recoveryReason = nil
         lastRecoveryCueKey = nil
+        beliefIssueStartedAt = nil
         lastRecoveredAt = Date()
         arrivalVisualHoldStartedAt = nil
         guidanceIntroProtectedUntil = nil
@@ -2709,8 +2853,13 @@ final class SemanticRouteNavigator: ObservableObject {
             segmentRemainingMeters = 0
             totalRemainingMeters = 0
             recoveryReason = nil
+            beliefIssueStartedAt = nil
             arrivalVisualHoldStartedAt = nil
-            currentInstruction = "Arrived at \(targetName). Start object search and reaching mode."
+            if let reachingObject = reachingObjectName(forTarget: targetName) {
+                currentInstruction = "Arrived at \(targetName). Switching to reaching guidance for \(reachingObject)."
+            } else {
+                currentInstruction = "Arrived at \(targetName)."
+            }
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             rebuildRAGContext()
             return
@@ -2730,6 +2879,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastAnnouncedLandmarkID = nil
         recoveryStartedAt = nil
         recoveryReason = nil
+        beliefIssueStartedAt = nil
         arrivalVisualHoldStartedAt = nil
         if phase == .recovering { phase = .navigating }
         let nextContext: String
@@ -2790,7 +2940,14 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let pastIntroProtection = guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
         if confidence < 0.45, pastIntroProtection {
-            currentInstruction = "Tracking limited, please walk slowly. " + currentInstruction
+            // Say it once per stretch of weak tracking, not on every meter cue.
+            let now = Date()
+            let prefixAge = lastTrackingLimitedPrefixAt.map { now.timeIntervalSince($0) }
+                ?? .greatestFiniteMagnitude
+            if prefixAge >= trackingLimitedPrefixCooldownSeconds {
+                currentInstruction = "Tracking limited, walk slowly. " + currentInstruction
+                lastTrackingLimitedPrefixAt = now
+            }
         }
 
         let bucket = Int(ceil(segmentRemainingMeters))
@@ -3932,6 +4089,9 @@ final class SemanticRouteNavigator: ObservableObject {
             copy.name = sanitizedSpokenLabel(node.name, fallback: node.kind.displayName)
             copy.aliases = aliases(for: copy.name)
             copy.poiAnchorId = sanitizedSpokenLabel(copy.poiAnchorId ?? "").nilIfBlank
+            copy.reachingObjectName = copy.kind == .destination
+                ? sanitizedSpokenLabel(copy.reachingObjectName ?? "").nilIfBlank
+                : nil
             return copy
         }
         cleaned.edges = map.edges.map { edge in

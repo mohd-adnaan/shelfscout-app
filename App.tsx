@@ -1353,13 +1353,21 @@ function AppInner(): React.JSX.Element {
     options?: {
       startupSilent?: boolean;
       introSpeechPromise?: Promise<void>;
+      /**
+       * Bypass the reaching-pipeline preference and run in-device spatial
+       * target reaching. Used by the navigation→reaching handoff when a
+       * reaching object was explicitly marked on the arrived destination.
+       */
+      forceSpatialTarget?: boolean;
     }
   ): Promise<boolean> => {
     // ── Resolve user preference ───────────────────────────────────────────
-    const pipeline = resolveReachingPipeline({
-      reaching_ios: result.reaching_ios,
-      reaching: result.reaching_flag,
-    });
+    const pipeline = options?.forceSpatialTarget
+      ? 'spatialTarget'
+      : resolveReachingPipeline({
+        reaching_ios: result.reaching_ios,
+        reaching: result.reaching_flag,
+      });
 
     if (pipeline !== 'arkit' && pipeline !== 'spatialTarget') {
       // User prefers standard pipeline or ARKit not available
@@ -2297,7 +2305,7 @@ function AppInner(): React.JSX.Element {
         routeMapName: normalizeTextValue(result.route_map_name) || undefined,
         sessionId: getSessionId(),
         speakLandmarks: true,
-        errorRecovery: false,
+        errorRecovery: true,
         voiceOverEnabled: screenReaderEnabledRef.current,
         ttsRate: settingsRef.current.ttsRate,
       });
@@ -2313,14 +2321,24 @@ function AppInner(): React.JSX.Element {
     console.log('🧭 [ARKitNavigation] Native result:', navResult);
 
     if (navResult?.success && navResult.reason === 'arrived') {
-      stopContinuousMode('ARKit navigation arrived; starting iOS reaching acquisition', false);
-      setIsReaching(true);
-      setIsProcessing(true);
+      // Reaching object marked on this destination during route capture.
+      // When present, navigation hands off into in-device spatial-target
+      // reaching for THAT object — not the destination POI itself.
+      const reachingObjectName = normalizeTextValue(navResult.reachingObjectName);
+      const willAutoReach =
+        !!reachingObjectName || settingsRef.current.reachingPipeline !== 'spatialTarget';
+
+      stopContinuousMode('ARKit navigation arrived', false);
+      setIsReaching(willAutoReach);
+      setIsProcessing(willAutoReach);
       setIsNavigation(false);
       setIsSpeaking(false);
 
       await speakContinuousSpeechAndWait(
-        navResult.message || `Arrived at ${targetName}. Switching to object guidance.`,
+        navResult.message ||
+          (reachingObjectName
+            ? `Arrived at ${targetName}. Switching to reaching guidance for ${reachingObjectName}.`
+            : `Arrived at ${targetName}.`),
         { ignoreAbort: true },
       );
 
@@ -2330,24 +2348,24 @@ function AppInner(): React.JSX.Element {
         return true;
       }
 
-      if (settingsRef.current.reachingPipeline === 'spatialTarget') {
+      if (reachingObjectName) {
         const handled = await handleiOSReaching(
           {
             text: '',
             reaching_ios: true,
             reaching_flag: false,
-            object: targetName,
-            navigation_target: targetName,
+            object: reachingObjectName,
+            navigation_target: reachingObjectName,
             route_map_id: navResult.routeMapId || result.route_map_id,
             route_map_name: navResult.routeName || result.route_map_name,
-            targetWorldPosition: navResult.targetWorldPosition,
+            targetWorldPosition: navResult.reachingObjectWorldPosition,
           },
-          { startupSilent: false },
+          { startupSilent: false, forceSpatialTarget: true },
         );
 
         if (!handled) {
           await speakContinuousSpeechAndWait(
-            `I could not start Spatial Target reaching for ${targetName}.`,
+            `I could not start reaching guidance for ${reachingObjectName}.`,
             { ignoreAbort: true },
           );
           setIsReaching(false);
@@ -2357,6 +2375,17 @@ function AppInner(): React.JSX.Element {
           announceTapToStart('Ready.');
         }
 
+        return true;
+      }
+
+      if (settingsRef.current.reachingPipeline === 'spatialTarget') {
+        // In-device mode with no reaching object marked: arrival is final.
+        // Reaching only activates for destinations with a pinned object.
+        setIsReaching(false);
+        setIsProcessing(false);
+        setIsCameraActive(true);
+        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        announceTapToStart('Ready.');
         return true;
       }
 

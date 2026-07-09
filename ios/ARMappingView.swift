@@ -84,6 +84,7 @@ struct ARMappingView: View {
     @State private var didAttemptAutomatedRouteSelection: Bool = false
     @State private var didStartAutomatedGuidance: Bool = false
     @State private var didResolveAutomation: Bool = false
+    @State private var didTriggerReachingHandoff: Bool = false
 
     init(
         sourceSelection: Binding<String> = .constant(""),
@@ -182,16 +183,91 @@ struct ARMappingView: View {
     }
 
     private func handleNavigationPhaseChange(_ phase: SemanticNavigationPhase) {
-        guard launchTargetName != nil,
-              phase == .arrived else {
+        if phase == .navigating || phase == .recovering {
+            didTriggerReachingHandoff = false
+        }
+        guard phase == .arrived else { return }
+
+        if launchTargetName != nil {
+            resolveAutomation(
+                success: true,
+                reason: "arrived",
+                message: semanticNavigator.currentInstruction
+            )
             return
         }
 
-        resolveAutomation(
-            success: true,
-            reason: "arrived",
-            message: semanticNavigator.currentInstruction
+        triggerManualReachingHandoffIfNeeded()
+    }
+
+    /// Route-manager testing flow: after a manual guidance run arrives at a
+    /// destination that has a reaching object, switch into the in-device
+    /// spatial-target reaching session automatically. The automated (JS
+    /// driven) flow does this on the React Native side instead.
+    private func triggerManualReachingHandoffIfNeeded() {
+        guard !isAutomatedNavigation,
+              didTriggerReachingHandoff == false,
+              arrivedReachingObjectName != nil else {
+            return
+        }
+        guard mappingManager.activeMapID != nil else {
+            mappingManager.statusMessage = "Save and load the AR map to enable the reaching handoff."
+            return
+        }
+        didTriggerReachingHandoff = true
+        // Give the arrival announcement a beat before reaching takes over
+        // the camera and audio session.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.6) {
+            startReachingHandoff()
+        }
+    }
+
+    private var arrivedReachingObjectName: String? {
+        let target = automatedTargetName
+            ?? semanticNavigator.targetName.nilIfRouteBlank
+        guard let target else { return nil }
+        return semanticNavigator.reachingObjectName(forTarget: target)
+    }
+
+    private func startReachingHandoff() {
+        guard let objectName = arrivedReachingObjectName else { return }
+        let manager = mappingManager
+        let speech = ttsManager
+        let mapId = manager.activeMapID
+        let mapName = manager.activeMapName
+        let objectPosition = reachingObjectWorldPosition(for: objectName)
+
+        // Reaching runs its own AR session; release the camera first.
+        manager.stopMapping()
+
+        ReachingModule.launchSpatialTargetReaching(
+            targetName: objectName,
+            routeMapId: mapId,
+            routeMapName: mapName,
+            targetWorldPosition: objectPosition,
+            voiceOverEnabled: launchVoiceOverEnabled,
+            onFailure: { _, message, _ in
+                DispatchQueue.main.async {
+                    manager.statusMessage = message
+                    speech.speakPriority("Reaching could not start. \(message)")
+                }
+            },
+            onDone: { result in
+                DispatchQueue.main.async {
+                    let reason = result["reason"] as? String
+                    manager.statusMessage = reason == "user_confirmed"
+                        ? "Reaching complete for \(objectName)."
+                        : "Reaching session ended."
+                }
+            }
         )
+    }
+
+    private func reachingObjectWorldPosition(for objectName: String) -> simd_float3? {
+        let normalizedTarget = normalizedRouteLookupKey(objectName)
+        return mappingManager.mapPOIs.first(where: { name, _ in
+            normalizedRouteLookupKey(name) == normalizedTarget
+        })?.value
     }
 
     private func handleSessionModeChanged() {
@@ -466,6 +542,9 @@ struct ARMappingView: View {
     ) {
         guard didResolveAutomation == false else { return }
         didResolveAutomation = true
+        let reachingObjectName = success && reason == "arrived"
+            ? arrivedReachingObjectName
+            : nil
         let result = ARKitNavigationNativeResult(
             success: success,
             reason: reason,
@@ -473,6 +552,8 @@ struct ARMappingView: View {
             routeMapId: mappingManager.activeMapID ?? semanticNavigator.activeMap?.arWorldMapId,
             routeName: routeName ?? semanticNavigator.activeMap?.name,
             targetWorldPosition: automatedTargetWorldPosition(),
+            reachingObjectName: reachingObjectName,
+            reachingObjectWorldPosition: reachingObjectName.flatMap { reachingObjectWorldPosition(for: $0) },
             message: message
         )
         onAutomationComplete?(result)
@@ -648,9 +729,11 @@ struct ARMappingView: View {
                 captureStart: captureSemanticStart,
                 captureTurn: captureSemanticTurn,
                 captureLandmark: captureSemanticLandmark,
+                captureReachingObject: captureSemanticReachingObject,
                 saveWalkthrough: saveSemanticWalkthrough,
                 startNavigation: startSemanticNavigation,
-                snapToRoute: snapSemanticNavigationToRoute
+                snapToRoute: snapSemanticNavigationToRoute,
+                startReachingHandoff: startReachingHandoff
             )
         }
     }
@@ -1107,6 +1190,18 @@ struct ARMappingView: View {
         if didCapture, isDestination {
             sourceSelection = resolvedName
         }
+    }
+
+    private func captureSemanticReachingObject(_ name: String) {
+        let resolvedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !resolvedName.isEmpty else { return }
+        // Surface-pin the object into the ARWorldMap first — spatial-target
+        // reaching resolves this exact anchor by name after relocalizing.
+        capturePOIEvidence(named: resolvedName)
+        semanticNavigator.attachReachingObject(
+            named: resolvedName,
+            capturedImage: currentCapturedImage
+        )
     }
 
     private func captureSemanticRoutePoint(_ name: String) {

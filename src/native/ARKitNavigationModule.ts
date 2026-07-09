@@ -27,6 +27,13 @@ export interface ARKitNavigationResult {
   routeMapId?: string;
   routeName?: string;
   targetWorldPosition?: { x: number; y: number; z: number } | [number, number, number];
+  /**
+   * Graspable object marked on the arrived destination during route capture.
+   * Present only when reason === 'arrived'. When set, the app should hand off
+   * into in-device spatial-target reaching for this object.
+   */
+  reachingObjectName?: string;
+  reachingObjectWorldPosition?: { x: number; y: number; z: number } | [number, number, number];
   message?: string;
 }
 

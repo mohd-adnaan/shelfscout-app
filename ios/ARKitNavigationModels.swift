@@ -123,6 +123,11 @@ struct ARKitNavigationNativeResult {
     let routeMapId: String?
     let routeName: String?
     let targetWorldPosition: simd_float3?
+    /// Graspable object marked on the arrived destination during mapping.
+    /// Present only on `arrived`; JS switches into spatial-target reaching
+    /// for this object instead of the destination itself.
+    var reachingObjectName: String? = nil
+    var reachingObjectWorldPosition: simd_float3? = nil
     let message: String?
 
     func dictionary() -> [String: Any] {
@@ -138,6 +143,14 @@ struct ARKitNavigationNativeResult {
                 "x": targetWorldPosition.x,
                 "y": targetWorldPosition.y,
                 "z": targetWorldPosition.z
+            ]
+        }
+        if let reachingObjectName { output["reachingObjectName"] = reachingObjectName }
+        if let reachingObjectWorldPosition {
+            output["reachingObjectWorldPosition"] = [
+                "x": reachingObjectWorldPosition.x,
+                "y": reachingObjectWorldPosition.y,
+                "z": reachingObjectWorldPosition.z
             ]
         }
         if let message { output["message"] = message }
