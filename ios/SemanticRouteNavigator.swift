@@ -168,6 +168,10 @@ struct SemanticRouteMap: Identifiable, Codable, Equatable {
     var createdAt: Date
     var updatedAt: Date
     var coordinateSpace: String
+    /// nil/1 = legacy ar_world_xz maps that stored raw ARKit z as route-y
+    /// (left-handed: geometric left/right cues were mirrored). 2 = y is -z,
+    /// compass-like. Legacy maps are migrated once on load.
+    var axisConvention: Int? = nil
     var arWorldMapId: String?
     var startNodeId: String?
     var destinationNodeIds: [String]?
@@ -606,7 +610,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
     func loadMaps() {
         let loaded = store.load()
-        let cleaned = loaded.map(Self.sanitizedMap)
+        let cleaned = loaded.map { Self.sanitizedMap(Self.migratedToNorthUpAxes($0)) }
         if cleaned != loaded {
             store.save(cleaned)
         }
@@ -694,6 +698,7 @@ final class SemanticRouteNavigator: ObservableObject {
             createdAt: Date(),
             updatedAt: Date(),
             coordinateSpace: "ar_world_xz",
+            axisConvention: Self.northUpAxisConvention,
             nodes: [],
             edges: [],
             landmarks: [],
@@ -3698,7 +3703,12 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private static func routePoint(from arPosition: simd_float3?) -> SemanticRoutePoint? {
         guard let arPosition else { return nil }
-        return SemanticRoutePoint(x: Double(arPosition.x), y: Double(arPosition.z))
+        // Route frame is compass-like: y must grow toward the camera's initial
+        // facing (-Z) so that bearingDegrees = atan2(dx, dy) increases on
+        // physical RIGHT turns, matching relativeTurnCommand and the PDR
+        // (east, north) frame. Storing raw +z here mirrors every left/right
+        // cue and the exported top-down plot.
+        return SemanticRoutePoint(x: Double(arPosition.x), y: -Double(arPosition.z))
     }
 
     fileprivate static func makeEdge(
@@ -4080,6 +4090,45 @@ final class SemanticRouteNavigator: ObservableObject {
         )
     }
 
+    /// Route-frame axis convention where y = -(ARKit z), making bearings
+    /// increase on physical right turns. See SemanticRouteMap.axisConvention.
+    static let northUpAxisConvention = 2
+
+    /// Legacy ar_world_xz maps stored raw ARKit z as route-y — a left-handed
+    /// ground frame in which every geometric left/right cue and the exported
+    /// top-down plot came out mirrored. Flip them once into the compass-like
+    /// frame: negate stored y and remap stored angles via θ' = 180° - θ
+    /// (because atan2(a, -b) = 180° - atan2(a, b)). User-marked turn hints
+    /// and landmark sides are physical ground truth and stay untouched.
+    private static func migratedToNorthUpAxes(_ map: SemanticRouteMap) -> SemanticRouteMap {
+        guard map.coordinateSpace == "ar_world_xz",
+              (map.axisConvention ?? 1) < northUpAxisConvention else { return map }
+        func flippedAngle(_ degrees: Double) -> Double {
+            SemanticRouteMath.normalizedDegrees(180 - degrees)
+        }
+        var migrated = map
+        migrated.nodes = map.nodes.map { node in
+            var copy = node
+            copy.point.y = -copy.point.y
+            copy.headingDegrees = copy.headingDegrees.map(flippedAngle)
+            return copy
+        }
+        migrated.keyframes = map.keyframes?.map { keyframe in
+            var copy = keyframe
+            copy.pose.y = -copy.pose.y
+            copy.headingDegrees = copy.headingDegrees.map(flippedAngle)
+            return copy
+        }
+        migrated.edges = map.edges.map { edge in
+            var copy = edge
+            copy.bearingDegrees = flippedAngle(edge.bearingDegrees)
+            copy.reverseBearingDegrees = flippedAngle(edge.reverseBearingDegrees)
+            return copy
+        }
+        migrated.axisConvention = northUpAxisConvention
+        return migrated
+    }
+
     private static func sanitizedMap(_ map: SemanticRouteMap) -> SemanticRouteMap {
         var cleaned = map
         let storedFingerprints = map.visualFingerprints ?? [:]
@@ -4335,7 +4384,7 @@ extension SemanticRouteNavigator {
           .missing { display:flex; align-items:center; justify-content:center; aspect-ratio: 3/4; color: #888; background: rgba(120,120,128,0.12); }
         </style></head><body>
         <h1>\(htmlEscape(map.name))</h1>
-        <p>Created \(dateFormatter.string(from: map.createdAt)) · Updated \(dateFormatter.string(from: map.updatedAt)) · Coordinate space: \(htmlEscape(map.coordinateSpace))</p>
+        <p>Created \(dateFormatter.string(from: map.createdAt)) · Updated \(dateFormatter.string(from: map.updatedAt)) · Coordinate space: \(htmlEscape(map.coordinateSpace)) (axes v\(map.axisConvention ?? 1))</p>
         """
 
         if let quality {

@@ -1767,7 +1767,11 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     }
 
     private func headingDegrees(for cameraForward: simd_float3) -> Double? {
-        let horizontal = SIMD2<Double>(Double(cameraForward.x), Double(cameraForward.z))
+        // Must match SemanticRouteNavigator's route frame (y = -z): 0° is the
+        // session's initial facing (-Z) and heading increases on physical
+        // RIGHT turns. Using raw +z flips the handedness and mirrors every
+        // geometric left/right cue.
+        let horizontal = SIMD2<Double>(Double(cameraForward.x), -Double(cameraForward.z))
         guard simd_length(horizontal) > 0.001 else { return nil }
         return normalizedDegrees(atan2(horizontal.x, horizontal.y) * 180 / Double.pi)
     }
