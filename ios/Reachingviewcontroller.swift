@@ -176,6 +176,29 @@ class ReachingViewController: UIViewController {
   /// Re-detection still runs (for logging) but CANNOT move the anchor.
   var anchorLockedForHandFree = false
 
+  // ── Spatial-target extent & center refinement (on-device Vision) ─────────
+  // A map POI is a point with no extent, so the box starts as a name-prior
+  // guess and the pin can sit tens of cm off the real object. Objectness
+  // saliency around the projected pin measures the object's true metric
+  // extents and corrects the anchor laterally onto it. Same one-shot,
+  // consensus-gated pattern as the surface snap above.
+  // (see tryRefineSpatialTargetExtent in +placeandhold)
+  struct SpatialExtentCandidate {
+    let worldCenter: simd_float3
+    let halfW: Float
+    let halfH: Float
+    let gapMeters: Float   // candidate center ↔ projected pin, for logging
+  }
+  var extentRefineInFlight = false
+  var extentRefineLocked = false
+  var extentRefineAttempts = 0
+  var lastExtentRefineAttemptAt: TimeInterval = 0
+  var extentCandidates: [SpatialExtentCandidate] = []
+  let extentRefineInterval: TimeInterval = 0.6
+  let extentRefineMaxAttempts = 40
+  let extentRefineMaxLateralCorrection: Float = 0.45
+  let extentQ = DispatchQueue(label: "reach.extent", qos: .userInitiated)
+
   // ── DAv2 parallel depth refinement (place-and-hold path) ─────────────────
   // Placement NO LONGER waits for DAv2. The anchor is placed IMMEDIATELY from
   // the fallback ladder (raycast → feature points → near default) so the box appears
@@ -798,6 +821,9 @@ class ReachingViewController: UIViewController {
     initialReseedStatus = .pending
     initialReseedStartTime = 0
     detectionFrameCameraTransform = nil
+    // Reset spatial extent refinement state
+    extentRefineInFlight = false
+    extentCandidates.removeAll()
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

@@ -184,8 +184,14 @@ class ReachingModule: NSObject {
         resolvedWorldMap = mapContext.worldMap
         if resolvedTargetPosition == nil {
           resolvedTargetPosition = mapContext.targetPosition
-          resolvedIsSurfacePlacement = mapContext.isSurfacePlacement
         }
+        // The stored POI record knows how the pin was actually placed
+        // (surface raycast vs camera-pose fallback). The caller passing an
+        // explicit position doesn't change that — the seed above
+        // (`targetWorldPosition != nil` → surface) was mislabeling legacy
+        // camera-pose pins as surface pins, which gave them tight extents
+        // and skipped the "saved spot near X" caveat.
+        resolvedIsSurfacePlacement = mapContext.isSurfacePlacement
         resolvedMapName = mapContext.mapName
       }
     } catch {

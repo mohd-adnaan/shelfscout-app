@@ -12,6 +12,8 @@
 //  reflection and place every off-center object on the wrong side.
 
 import ARKit
+import Vision
+import CoreImage
 
 extension ReachingViewController {
 
@@ -38,6 +40,7 @@ extension ReachingViewController {
 
     if spatialTargetWorldPosition != nil {
       refineSpatialAnchorOnApproach(frame)
+      tryRefineSpatialTargetExtent(frame)
     }
 
     processARFrameHandFree(frame)
@@ -49,9 +52,14 @@ extension ReachingViewController {
   /// close and facing the anchor, the live camera sees the real surface:
   /// raycast toward the anchor and snap it onto actual geometry. One-shot,
   /// evidence-gated, never blocks guidance (see reaching-placement rules).
+  ///
+  /// Runs for BOTH pin types. Legacy camera-pose pins mark where the mapper
+  /// stood, so the real surface is typically a short distance PAST the pin —
+  /// inside the +0.75m accept window below. Snapping moves the "saved spot"
+  /// onto the actual thing the user is facing, which is strictly better than
+  /// leaving the anchor floating at the mapper's old standing pose.
   private func refineSpatialAnchorOnApproach(_ frame: ARFrame) {
-    guard spatialTargetIsSurfacePlacement,
-          !spatialAnchorSnapLocked,
+    guard !spatialAnchorSnapLocked,
           anchorPlaced,
           let anchorPos = objectWorldPosition else { return }
     guard case .normal = frame.camera.trackingState else { return }
@@ -182,12 +190,17 @@ extension ReachingViewController {
     dav2RequestInFlight = false
     placeAndHoldDepthLocked = true
 
-    // Graspable-object extents. Surface pins sit on the object itself, so a
-    // tight box (with slack for anchor error) keeps centering meaningful.
-    // Legacy camera-pose pins mark where the mapper stood — wider box.
+    // Box extents from the POI name, not a one-size-fits-all blanket.
+    // (0.16, 0.20) drew a 32×40cm box over a 15cm door handle — visually
+    // wrong and useless as a size signal. Surface pins sit on the object
+    // itself, so the prior describes the object; legacy camera-pose pins
+    // mark where the mapper STOOD, so keep a wide uncertainty box there.
+    // Either way tryRefineSpatialTargetExtent replaces the prior with
+    // measured extents once saliency locks onto the real object.
+    let prior = spatialTargetPriorHalfExtents()
     let fixedHalfExtents: (w: Float, h: Float) = spatialTargetIsSurfacePlacement
-      ? (0.16, 0.20)
-      : (0.30, 0.35)
+      ? prior
+      : (max(prior.w, 0.30), max(prior.h, 0.35))
 
     finalizePlacement(
       worldPos: target,
@@ -742,4 +755,317 @@ extension ReachingViewController {
         }
         say("Target locked.")
       }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Spatial Target Extent & Center Refinement (on-device Vision)
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // A map POI is a POINT — it carries no object extent, so placement falls
+  // back to name-prior box sizes, and the pin itself can sit tens of cm off
+  // the real object (mapping-time raycast error + relocalization drift).
+  // The surface snap above corrects DEPTH along the camera→pin ray, but
+  // nothing corrected the LATERAL error or measured the box SIZE.
+  //
+  // This pass looks at the actual camera image: objectness-based saliency
+  // (Apple Vision, fully on-device, ~20ms) on a crop around the projected
+  // anchor point finds the distinct object nearest the pin. From its rect:
+  //   - true metric half-extents  (rect px × depth / focal length)
+  //   - a lateral correction      (anchor re-aimed along the rect-center ray
+  //                                at the same camera distance — the surface
+  //                                snap owns depth, this pass owns bearing)
+  //
+  // Safety gates — for a blind user a confidently WRONG box is worse than a
+  // big honest one, so every step is evidence-gated:
+  //   - candidate must lie within 30cm of the projected pin
+  //   - metric size must be graspable-plausible (1.5–45cm half-extent)
+  //   - 3-candidate consensus with ≤12cm world spread (same evidence style
+  //     as the surface snap above)
+  //   - total lateral correction bounded at 45cm; one-shot lock on success
+  //   - never blocks guidance — Vision runs on its own queue, state changes
+  //     apply on visionQ (see reaching-placement non-blocking rules)
+  // On any failure it silently keeps the prior-sized box — never worse than
+  // the behaviour before this pass existed.
+
+  func tryRefineSpatialTargetExtent(_ frame: ARFrame) {
+    guard spatialTargetWorldPosition != nil,
+          anchorPlaced,
+          !extentRefineLocked,
+          !extentRefineInFlight,
+          !hasCompleted,
+          extentRefineAttempts < extentRefineMaxAttempts,
+          let anchorPos = objectWorldPosition else { return }
+    guard case .normal = frame.camera.trackingState else { return }
+
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - lastExtentRefineAttemptAt >= extentRefineInterval else { return }
+
+    let camera = frame.camera
+    let camPos = simd_make_float3(camera.transform.columns.3)
+    let dist = simd_distance(anchorPos, camPos)
+    // Too close → object overflows the frame; too far → too few pixels.
+    guard dist >= 0.35, dist <= 3.0 else { return }
+
+    // Camera must be aimed at the anchor and the anchor must project well
+    // inside the frame, or the crop would clip the object.
+    let camFwd = -simd_normalize(simd_make_float3(camera.transform.columns.2))
+    guard simd_dot(camFwd, simd_normalize(anchorPos - camPos)) > 0.85 else { return }
+    guard let p = arPortraitNorm(of: anchorPos, camera: camera),
+          p.x > 0.15, p.x < 0.85, p.y > 0.12, p.y < 0.88 else { return }
+
+    lastExtentRefineAttemptAt = now
+    extentRefineAttempts += 1
+    extentRefineInFlight = true
+
+    // Snapshot value types only — an ARFrame must not cross queues
+    // (CVPixelBuffer is refcounted and safe, same pattern as DAv2).
+    let pixelBuffer = frame.capturedImage
+    let camTransform = camera.transform
+    let intrinsics = camera.intrinsics
+    let imgRes = camera.imageResolution
+
+    extentQ.async { [weak self] in
+      guard let self = self else { return }
+      guard self.running, !self.hasCompleted else {
+        self.visionQ.async { self.extentRefineInFlight = false }
+        return
+      }
+      let candidate = self.detectSpatialExtentCandidate(
+        pixelBuffer: pixelBuffer,
+        camTransform: camTransform,
+        intrinsics: intrinsics,
+        imageResolution: imgRes,
+        projectedPoint: p,
+        anchorDistance: dist
+      )
+      self.visionQ.async {
+        self.extentRefineInFlight = false
+        guard let candidate else { return }
+        self.recordSpatialExtentCandidate(candidate)
+      }
+    }
+  }
+
+  /// Runs saliency on a crop around the projected pin and returns the best
+  /// object candidate, or nil when nothing near the pin passes the gates.
+  /// Pure function of its snapshot inputs — safe on extentQ.
+  private func detectSpatialExtentCandidate(
+    pixelBuffer: CVPixelBuffer,
+    camTransform: simd_float4x4,
+    intrinsics: simd_float3x3,
+    imageResolution: CGSize,
+    projectedPoint p: CGPoint,
+    anchorDistance: Float
+  ) -> SpatialExtentCandidate? {
+    let arW = imageResolution.width, arH = imageResolution.height  // landscape, e.g. 1920×1440
+    let fx = CGFloat(intrinsics[0][0]), fy = CGFloat(intrinsics[1][1])
+
+    // Orient to portrait so we share the .right convention every other
+    // Vision call in this pipeline uses. CIImage coords are bottom-left.
+    let ci = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
+    let pw = ci.extent.width    // = arH
+    let ph = ci.extent.height   // = arW
+
+    // Portrait px per metre at the anchor. Portrait-x spans the landscape-y
+    // axis (fy) and portrait-y spans landscape-x (fx) — see the
+    // portrait→landscape pixel mapping in attemptPlaceAndHold.
+    let pxPerMeterX = fy / CGFloat(anchorDistance)
+    let pxPerMeterY = fx / CGFloat(anchorDistance)
+
+    // Crop a window covering ~1.1m of scene around the pin: object + context
+    // fits, and the small saliency net gets a zoomed view of the target
+    // instead of the whole room.
+    let cropW = min(max(pxPerMeterX * 1.1, pw * 0.28), pw * 0.8)
+    let cropH = min(max(pxPerMeterY * 1.1, ph * 0.28), ph * 0.8)
+    let pinCiX = p.x * pw
+    let pinCiY = (1.0 - p.y) * ph   // portrait-norm is top-left, CI is bottom-left
+    var crop = CGRect(x: pinCiX - cropW / 2, y: pinCiY - cropH / 2,
+                      width: cropW, height: cropH)
+    crop = crop.intersection(ci.extent).integral
+    guard crop.width > 60, crop.height > 60 else { return nil }
+
+    let cropped = ci.cropped(to: crop)
+      .transformed(by: CGAffineTransform(translationX: -crop.origin.x, y: -crop.origin.y))
+
+    let request = VNGenerateObjectnessBasedSaliencyImageRequest()
+    let handler = VNImageRequestHandler(ciImage: cropped, orientation: .up, options: [:])
+    do {
+      try handler.perform([request])
+    } catch {
+      NSLog("◎ [ExtentRefine] Saliency failed: %@", error.localizedDescription)
+      return nil
+    }
+    guard let salient = (request.results?.first as? VNSaliencyImageObservation)?.salientObjects,
+          !salient.isEmpty else { return nil }
+
+    // Pin position inside the crop — Vision-normalized (bottom-left origin),
+    // same space as the salient rects.
+    let pInCrop = CGPoint(x: (pinCiX - crop.origin.x) / crop.width,
+                          y: (pinCiY - crop.origin.y) / crop.height)
+
+    var bestRect: CGRect?
+    var bestGap: Float = .greatestFiniteMagnitude
+    var bestScore: Float = .greatestFiniteMagnitude
+    for obs in salient {
+      let r = obs.boundingBox   // normalized to the crop, bottom-left origin
+      // Whole-crop blobs are the shelf/door/wall, not the object.
+      if r.width > 0.92 && r.height > 0.92 { continue }
+      // Metric size gate — graspable objects only.
+      let halfWm = Float(r.width * crop.width / pxPerMeterX) / 2
+      let halfHm = Float(r.height * crop.height / pxPerMeterY) / 2
+      guard halfWm >= 0.015, halfWm <= 0.45,
+            halfHm >= 0.015, halfHm <= 0.45 else { continue }
+      // Must be at/near the pin.
+      let dxM = Float((r.midX - pInCrop.x) * crop.width) / Float(pxPerMeterX)
+      let dyM = Float((r.midY - pInCrop.y) * crop.height) / Float(pxPerMeterY)
+      let gap = (dxM * dxM + dyM * dyM).squareRoot()
+      guard gap <= 0.30 else { continue }
+      // Prefer the rect containing the pin; break ties by distance.
+      let score = r.contains(pInCrop) ? gap * 0.5 : gap
+      if score < bestScore {
+        bestScore = score
+        bestGap = gap
+        bestRect = r
+      }
+    }
+    guard let chosen = bestRect else { return nil }
+
+    // ── Chosen rect → world ──────────────────────────────────────────────
+    // Rect center: crop Vision coords → full-portrait CI px → AR-portrait
+    // norm (top-left) → landscape px → camera ray → world point at the
+    // anchor's current camera distance. Angular correction only — the
+    // surface snap owns depth.
+    let centerCiX = crop.origin.x + chosen.midX * crop.width
+    let centerCiY = crop.origin.y + chosen.midY * crop.height
+    let portraitX = centerCiX / pw
+    let portraitY = 1.0 - (centerCiY / ph)
+    let arPxX = portraitY * arW
+    let arPxY = (1.0 - portraitX) * arH
+    let cxi = CGFloat(intrinsics[2][0]), cyi = CGFloat(intrinsics[2][1])
+    let rX = Float((arPxX - cxi) / fx)
+    let rY = Float((arPxY - cyi) / fy)
+    let rayCam = simd_normalize(simd_float3(rX, -rY, -1.0))
+    let worldRay = simd_normalize(simd_make_float3(camTransform * simd_float4(rayCam, 0)))
+    let camPos = simd_make_float3(camTransform.columns.3)
+    let worldCenter = camPos + worldRay * anchorDistance
+
+    return SpatialExtentCandidate(
+      worldCenter: worldCenter,
+      halfW: Float(chosen.width * crop.width / pxPerMeterX) / 2,
+      halfH: Float(chosen.height * crop.height / pxPerMeterY) / 2,
+      gapMeters: bestGap
+    )
+  }
+
+  /// Consensus + apply. Runs on visionQ (the pipeline's state-mutation queue).
+  private func recordSpatialExtentCandidate(_ candidate: SpatialExtentCandidate) {
+    guard !extentRefineLocked, anchorPlaced else { return }
+
+    extentCandidates.append(candidate)
+    if extentCandidates.count > 5 {
+      extentCandidates.removeFirst()
+    }
+    NSLog("◎ [ExtentRefine] Candidate #%d: %.0f×%.0fcm, %.0fcm from pin (%d buffered)",
+          extentRefineAttempts, candidate.halfW * 200, candidate.halfH * 200,
+          candidate.gapMeters * 100, extentCandidates.count)
+
+    guard extentCandidates.count >= 3 else { return }
+    let recent = Array(extentCandidates.suffix(3))
+    let centroid = (recent[0].worldCenter + recent[1].worldCenter + recent[2].worldCenter) / 3
+    let spread = recent.map { simd_distance($0.worldCenter, centroid) }.max() ?? 0
+    guard spread <= 0.12 else { return }
+
+    guard let anchorPos = objectWorldPosition else { return }
+    let correction = simd_distance(centroid, anchorPos)
+    guard correction <= extentRefineMaxLateralCorrection else {
+      // A stable object that far from the pin is probably a DIFFERENT
+      // object — moving the anchor to it would guide the user's hand to
+      // the wrong thing. Drop the cluster and keep looking.
+      NSLog("◎ [ExtentRefine] Consistent object %.0fcm from anchor — beyond %.0fcm budget, rejecting cluster",
+            correction * 100, extentRefineMaxLateralCorrection * 100)
+      extentCandidates.removeAll()
+      return
+    }
+
+    let medHalfW = recent.map { $0.halfW }.sorted()[1]
+    let medHalfH = recent.map { $0.halfH }.sorted()[1]
+    applySpatialExtentRefinement(center: centroid, halfW: medHalfW, halfH: medHalfH,
+                                 correction: correction)
+  }
+
+  private func applySpatialExtentRefinement(center: simd_float3, halfW: Float, halfH: Float,
+                                            correction: Float) {
+    // Prior bounds the measurement: saliency occasionally merges the object
+    // with its surroundings, and a runaway box would re-blur the centering
+    // signal this pass exists to sharpen.
+    let prior = spatialTargetPriorHalfExtents()
+    let newHalfW = min(max(halfW, 0.02), max(prior.w * 2.5, 0.25))
+    let newHalfH = min(max(halfH, 0.02), max(prior.h * 2.5, 0.30))
+    let oldW = objectWorldHalfW, oldH = objectWorldHalfH
+
+    objectWorldPosition = center
+    objectWorldHalfW = newHalfW
+    objectWorldHalfH = newHalfH
+    if let camT = lastARFrame?.camera.transform {
+      let camPos = simd_make_float3(camT.columns.3)
+      anchorDepth = simd_distance(center, camPos)
+      liveDistanceToObject = anchorDepth
+      let right = -simd_normalize(simd_make_float3(camT.columns.1))
+      let up    =  simd_normalize(simd_make_float3(camT.columns.0))
+      objectWorldCornerTR = center + right * newHalfW + up * newHalfH
+      objectWorldCornerBL = center - right * newHalfW - up * newHalfH
+    }
+    extentRefineLocked = true
+    extentCandidates.removeAll()
+
+    NSLog("◎ [ExtentRefine] ✅ LOCKED — box %.0f×%.0fcm → %.0f×%.0fcm, center corrected %.0fcm (saliency consensus)",
+          oldW * 200, oldH * 200, newHalfW * 200, newHalfH * 200, correction * 100)
+
+    DispatchQueue.main.async { [weak self] in
+      guard let self = self else { return }
+      self.distanceLabel.text = "\(Int(self.anchorDepth * 100)) cm"
+    }
+  }
+
+  /// Blind size prior for the box, from the POI name. Used at placement and
+  /// as the sanity bound for measured extents. If the saliency pass never
+  /// locks, this is what the user gets — so it should describe the physical
+  /// object, not the pin uncertainty.
+  func spatialTargetPriorHalfExtents() -> (w: Float, h: Float) {
+    let tokens = Set(
+      objectName.lowercased()
+        .components(separatedBy: CharacterSet.alphanumerics.inverted)
+        .filter { !$0.isEmpty }
+    )
+    // Ordered — first matching row wins ("door handle" must hit the handle
+    // row, not the door row).
+    let table: [(tokens: [String], half: (w: Float, h: Float))] = [
+      (["handle", "knob", "lever", "latch", "button", "switch", "keyhole", "lock"], (0.10, 0.07)),
+      (["bottle", "can", "cup", "mug", "glass", "jar", "flask", "thermos"],         (0.07, 0.14)),
+      (["phone", "remote", "wallet", "keys", "key", "card", "mouse", "glasses"],    (0.09, 0.07)),
+      (["book", "folder", "tablet", "notebook", "laptop", "keyboard"],              (0.14, 0.11)),
+      (["box", "package", "parcel", "bag", "backpack", "basket"],                   (0.18, 0.18)),
+      (["door", "gate", "exit", "entrance", "doorway", "fridge", "cabinet"],        (0.40, 0.55)),
+      (["chair", "seat", "stool", "desk", "table", "shelf", "counter"],             (0.35, 0.30)),
+    ]
+    for entry in table where !tokens.isDisjoint(with: entry.tokens) {
+      return entry.half
+    }
+    return (0.14, 0.16)
+  }
+
+  /// Project a world point into AR-portrait normalized coordinates
+  /// (top-left origin) — the inverse of the ray construction used across
+  /// this pipeline (see attemptPlaceAndHold). nil when behind the camera.
+  private func arPortraitNorm(of world: simd_float3, camera: ARCamera) -> CGPoint? {
+    let local = simd_inverse(camera.transform) * simd_float4(world, 1)
+    guard local.z < -0.05 else { return nil }   // camera looks down -z
+    let intr = camera.intrinsics
+    let fx = CGFloat(intr[0][0]), fy = CGFloat(intr[1][1])
+    let cx = CGFloat(intr[2][0]), cy = CGFloat(intr[2][1])
+    let pxX = cx + fx * CGFloat(local.x / -local.z)
+    let pxY = cy + fy * CGFloat(local.y / local.z)
+    let imgRes = camera.imageResolution
+    // Landscape px → portrait norm: inverse of pxX = pY·W, pxY = (1-pX)·H
+    return CGPoint(x: 1.0 - pxY / imgRes.height, y: pxX / imgRes.width)
+  }
 }
