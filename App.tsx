@@ -2305,7 +2305,7 @@ function AppInner(): React.JSX.Element {
         routeMapName: normalizeTextValue(result.route_map_name) || undefined,
         sessionId: getSessionId(),
         speakLandmarks: true,
-        errorRecovery: true,
+        errorRecovery: settingsRef.current.navigationErrorRecovery,
         voiceOverEnabled: screenReaderEnabledRef.current,
         ttsRate: settingsRef.current.ttsRate,
       });

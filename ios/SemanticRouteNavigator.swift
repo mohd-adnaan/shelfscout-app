@@ -73,8 +73,16 @@ enum SemanticTurnHint: String, Codable, CaseIterable, Identifiable {
     case right
     case straight
     case corner
+    case cornerLeft
+    case cornerRight
 
     var id: String { rawValue }
+
+    /// Corners are small course adjustments to stay on the route, not full
+    /// turns — guidance phrasing must say "corner", never "turn".
+    var isCorner: Bool {
+        self == .corner || self == .cornerLeft || self == .cornerRight
+    }
 
     var displayName: String {
         switch self {
@@ -82,6 +90,8 @@ enum SemanticTurnHint: String, Codable, CaseIterable, Identifiable {
         case .right: return "Right"
         case .straight: return "Straight"
         case .corner: return "Corner"
+        case .cornerLeft: return "Left corner"
+        case .cornerRight: return "Right corner"
         }
     }
 
@@ -91,6 +101,8 @@ enum SemanticTurnHint: String, Codable, CaseIterable, Identifiable {
         case .right: return "Right turn"
         case .straight: return "Straight point"
         case .corner: return "Corner"
+        case .cornerLeft: return "Left corner"
+        case .cornerRight: return "Right corner"
         }
     }
 
@@ -99,7 +111,9 @@ enum SemanticTurnHint: String, Codable, CaseIterable, Identifiable {
         case .left: return "turn left"
         case .right: return "turn right"
         case .straight: return "continue straight"
-        case .corner: return "turn at the corner"
+        case .corner: return "follow the corner"
+        case .cornerLeft: return "take a slight left at the corner"
+        case .cornerRight: return "take a slight right at the corner"
         }
     }
 }
@@ -379,6 +393,16 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastPDRDeltaWasCapped = false
     private var lastHeadingAlignmentCueAt: Date?
     private var lastHeadingAlignmentCueKey: String?
+    /// Straight-line AR distance to the current step's end node, set every
+    /// navigation update while AR is localized. Floors spoken turn/arrival
+    /// countdowns so PDR overshoot cannot announce a turn the AR pose clearly
+    /// hasn't reached yet.
+    private var lastARNodeDistanceMeters: Double?
+    /// Along-track remaining from the AR projection, only when cross-track is
+    /// small enough to trust it. Used to pull dead-reckoned progress back when
+    /// AR contradicts a pending step completion.
+    private var lastTrustedARRemainingMeters: Double?
+    private var lastRouteRebuildAttemptAt: Date?
 
     private let arrivalThresholdMeters = 0.55
     private let destinationProximityMeters = 0.75
@@ -389,7 +413,19 @@ final class SemanticRouteNavigator: ObservableObject {
     private let recoveryHoldSeconds: TimeInterval = 0.6
     private let recoveryCueCooldownSeconds: TimeInterval = 5.0
     private let beliefHoldGraceSeconds: TimeInterval = 1.25
-    private let beliefHoldRepeatSeconds: TimeInterval = 9.0
+    private let beliefHoldRepeatSeconds: TimeInterval = 7.0
+    /// After this long in a belief hold, stop asking the user to pan and
+    /// actively snap back onto the best-matching route position.
+    private let beliefRelocalizeAfterSeconds: TimeInterval = 5.0
+    /// After this long, rebuild the whole route from the live pose instead of
+    /// looping the same recovery cue.
+    private let beliefRebuildAfterSeconds: TimeInterval = 12.0
+    private let routeRebuildRetrySeconds: TimeInterval = 4.0
+    private let postRecoveryAlignmentWindowSeconds: TimeInterval = 6.0
+    /// AR must disagree with a dead-reckoned step completion by more than
+    /// this before the advance is blocked.
+    private let arStepCompletionSlackMeters = 1.0
+    private let destinationJustAheadMeters = 1.6
     private let trackingLimitedPrefixCooldownSeconds: TimeInterval = 10.0
     private let guidanceIntroProtectionSeconds: TimeInterval = 4.0
     private let autoSampleDistanceMeters = 0.60
@@ -404,7 +440,9 @@ final class SemanticRouteNavigator: ObservableObject {
     private let visualRouteArrivalConfidence = 0.76
     private let visualRouteAmbiguousGap = 0.20
     private let visualRouteAdvanceCooldownSeconds: TimeInterval = 1.4
-    private let visualArrivalMaxHoldSeconds: TimeInterval = 4.5
+    /// Kept short: at the finish line a long visual-confirmation hold reads
+    /// as "the app is lost" and delays the reaching handoff.
+    private let visualArrivalMaxHoldSeconds: TimeInterval = 2.5
     private let maxImmediateARProgressCorrectionMeters = 0.75
     private let maxImmediateVisualProgressCorrectionMeters = 1.75
     private let largeProgressCorrectionConfirmationSeconds: TimeInterval = 0.85
@@ -931,7 +969,7 @@ final class SemanticRouteNavigator: ObservableObject {
             currentSegmentDraftMeters = 0
             refreshCaptureMetrics(for: workingMap)
             currentInstruction = kind == .intersection
-                ? "Marked \(name). Continue walking after the turn."
+                ? "Marked \(name). Continue walking after the \(turnHint?.isCorner == true ? "corner" : "turn")."
                 : "Updated route point \(name)."
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .regular)
             rebuildRAGContext()
@@ -993,7 +1031,7 @@ final class SemanticRouteNavigator: ObservableObject {
         currentSegmentDraftMeters = 0
         refreshCaptureMetrics(for: workingMap)
         currentInstruction = kind == .intersection
-            ? "Marked \(name). Continue walking after the turn."
+            ? "Marked \(name). Continue walking after the \(turnHint?.isCorner == true ? "corner" : "turn")."
             : kind == .entrance
                 ? "Point A captured. Walk toward the first turn or destination."
                 : kind == .destination
@@ -1323,6 +1361,9 @@ final class SemanticRouteNavigator: ObservableObject {
         lastPDRDeltaWasCapped = false
         lastHeadingAlignmentCueAt = nil
         lastHeadingAlignmentCueKey = nil
+        lastARNodeDistanceMeters = nil
+        lastTrustedARRemainingMeters = nil
+        lastRouteRebuildAttemptAt = nil
         resetRouteCorrectionGuards()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = Date().addingTimeInterval(guidanceIntroProtectionSeconds)
@@ -1368,6 +1409,9 @@ final class SemanticRouteNavigator: ObservableObject {
         lastRouteAdvanceAt = nil
         lastHeadingAlignmentCueAt = nil
         lastHeadingAlignmentCueKey = nil
+        lastARNodeDistanceMeters = nil
+        lastTrustedARRemainingMeters = nil
+        lastRouteRebuildAttemptAt = nil
         resetRouteCorrectionGuards()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = nil
@@ -1438,12 +1482,18 @@ final class SemanticRouteNavigator: ObservableObject {
         var routeProjection: RouteProjection?
         var observationConfidence = 0.58
         let arPoint = Self.routePoint(from: arPosition)
+        lastARNodeDistanceMeters = nil
+        lastTrustedARRemainingMeters = nil
         if let arPoint,
            activeMap?.coordinateSpace == "ar_world_xz" {
             let projection = Self.projectDetailed(arPoint, onto: step)
             routeProjection = projection
             crossTrackError = projection.crossTrackMeters
             if arLocalized {
+                lastARNodeDistanceMeters = arPoint.distance(to: step.to.point)
+                if projection.crossTrackMeters <= offAxisProgressThresholdMeters(for: step) {
+                    lastTrustedARRemainingMeters = max(0, step.edge.distanceMeters - projection.alongTrackMeters)
+                }
                 recordRouteEvidence(
                     stepIndex: currentStepIndex,
                     progressMeters: projection.alongTrackMeters,
@@ -1554,7 +1604,11 @@ final class SemanticRouteNavigator: ObservableObject {
         // with ambiguous evidence must still complete the route instead of
         // looping "pause and scan" forever at the finish line.
         if isAtFinalDestination(on: step, arPoint: arPoint, visualMatch: visualMatch, arLocalized: arLocalized) {
-            if shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
+            // A localized AR pose on the destination node is direct evidence;
+            // don't stall arrival waiting for a visual confirmation.
+            let strongARArrival = arLocalized &&
+                (arPoint.map { $0.distance(to: step.to.point) <= destinationArrivalRadiusMeters(for: step) } ?? false)
+            if !strongARArrival, shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
                 rebuildRAGContext()
                 return
             }
@@ -1563,7 +1617,14 @@ final class SemanticRouteNavigator: ObservableObject {
             return
         }
 
-        if handleRouteBeliefHoldIfNeeded() {
+        if handleRouteBeliefHoldIfNeeded(
+            arPosition: arPosition,
+            arPoint: arPoint,
+            liveHeading: liveHeading,
+            visualMatch: visualMatch,
+            imuState: imuState,
+            arLocalized: arLocalized
+        ) {
             rebuildRAGContext()
             return
         }
@@ -1619,7 +1680,8 @@ final class SemanticRouteNavigator: ObservableObject {
         if phase == .recovering {
             // During recovery, still check segment-based arrival but
             // skip normal instruction updates.
-            if segmentRemainingMeters <= stepCompletionWindowMeters(for: step) {
+            if segmentRemainingMeters <= stepCompletionWindowMeters(for: step),
+               !arContradictsStepCompletion(on: step, arPoint: arPoint, arLocalized: arLocalized) {
                 if currentStepIndex >= routeSteps.count - 1,
                    shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
                     rebuildRAGContext()
@@ -1632,17 +1694,49 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         if segmentRemainingMeters <= stepCompletionWindowMeters(for: step) {
-            if currentStepIndex >= routeSteps.count - 1,
-               shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
+            if arContradictsStepCompletion(on: step, arPoint: arPoint, arLocalized: arLocalized) {
+                // Dead reckoning says the node is reached but the AR pose is
+                // clearly short of it — hold the advance and pull progress
+                // back so the turn is not announced early.
+                holdBackProgressTowardTrustedAR(on: step)
+                updateInstruction(forceSpeech: false)
+            } else if currentStepIndex >= routeSteps.count - 1,
+                      shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
                 rebuildRAGContext()
                 return
+            } else {
+                advanceStepOrArrive()
             }
-            advanceStepOrArrive()
         } else {
             updateInstruction(forceSpeech: false)
             announceVisualLandmarkIfNeeded(visualMatch)
         }
         rebuildRAGContext()
+    }
+
+    /// True when a localized AR pose is still clearly short of the step's end
+    /// node while dead-reckoned progress claims completion. PDR step-length
+    /// overshoot otherwise announces turns before the user reaches them.
+    private func arContradictsStepCompletion(
+        on step: SemanticRouteStep,
+        arPoint: SemanticRoutePoint?,
+        arLocalized: Bool
+    ) -> Bool {
+        guard arLocalized, let arPoint,
+              activeMap?.coordinateSpace == "ar_world_xz" else {
+            return false
+        }
+        return arPoint.distance(to: step.to.point) >
+            stepCompletionWindowMeters(for: step) + arStepCompletionSlackMeters
+    }
+
+    private func holdBackProgressTowardTrustedAR(on step: SemanticRouteStep) {
+        guard let arRemaining = lastTrustedARRemainingMeters else { return }
+        let arProgress = max(0, step.edge.distanceMeters - arRemaining)
+        if arProgress < segmentProgressMeters {
+            segmentProgressMeters = arProgress
+            segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
+        }
     }
 
     func snapToNearestGraphPose(arPosition: simd_float3?, imuState: IMUState) {
@@ -2073,7 +2167,14 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryReason = "Route evidence disagrees."
     }
 
-    private func handleRouteBeliefHoldIfNeeded() -> Bool {
+    private func handleRouteBeliefHoldIfNeeded(
+        arPosition: simd_float3?,
+        arPoint: SemanticRoutePoint?,
+        liveHeading: Double,
+        visualMatch: VisualRouteMatch?,
+        imuState: IMUState,
+        arLocalized: Bool
+    ) -> Bool {
         guard shouldEnableErrorRecovery,
               phase == .navigating || phase == .recovering else {
             return false
@@ -2098,21 +2199,110 @@ final class SemanticRouteNavigator: ObservableObject {
             return false
         }
 
+        let holdDuration = now.timeIntervalSince(beliefIssueStartedAt ?? now)
+
+        // Escalation 1: after a short hold, stop asking the user to keep
+        // panning and actively snap back onto the best-matching route
+        // position. Panning alone rarely resolves a persistent conflict.
+        if holdDuration >= beliefRelocalizeAfterSeconds,
+           let snap = bestRecoverySnap(
+            pose: arPoint,
+            liveHeading: liveHeading,
+            visualMatch: visualMatch,
+            searchAllSteps: routeLocalizationStatus == .lost
+           ),
+           snap.crossTrackMeters <= recoverySnapThreshold ||
+            ((snap.visualConfidence ?? 0) >= visualRouteSnapConfidence && snap.crossTrackMeters <= 3.0) {
+            applyRecoverySnap(snap, announce: true)
+            return true
+        }
+
+        // Escalation 2: rebuild the route from the live pose. This is the
+        // hard fallback that ends the "pan slowly" loop for good.
+        if holdDuration >= beliefRebuildAfterSeconds, arLocalized {
+            let attemptAge = lastRouteRebuildAttemptAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+            if attemptAge >= routeRebuildRetrySeconds {
+                lastRouteRebuildAttemptAt = now
+                if rebuildRouteFromCurrentPose(
+                    arPosition: arPosition,
+                    imuState: imuState,
+                    heading: liveHeading
+                ) {
+                    return true
+                }
+            }
+        }
+
         let key = "route_belief_\(routeLocalizationStatus.rawValue)"
         let cueChanged = key != lastRecoveryCueKey
         let cueAge = lastRecoveryCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
 
         phase = .recovering
         recoveryReason = routeBeliefState.evidenceSummary
-        currentInstruction = routeLocalizationStatus == .lost
+        var instruction = routeLocalizationStatus == .lost
             ? "Route lost. Stop and slowly look around."
             : "Hold on. Pan the phone slowly."
+        // On repeats, add something actionable instead of the same sentence:
+        // point the camera at a mapped landmark so visual matching can lock.
+        if !cueChanged, let hint = expectedRecoveryLandmarkHint() {
+            instruction += " Look for \(hint)."
+        }
+        currentInstruction = instruction
 
         if cueChanged || cueAge >= beliefHoldRepeatSeconds {
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             lastRecoveryCueAt = now
             lastRecoveryCueKey = key
         }
+        return true
+    }
+
+    /// Re-resolves the path to the current target from the live pose and
+    /// restarts guidance on it. Last-resort recovery when route belief cannot
+    /// converge; announces the realignment so the user knows why the
+    /// instructions changed.
+    private func rebuildRouteFromCurrentPose(
+        arPosition: simd_float3?,
+        imuState: IMUState,
+        heading: Double?
+    ) -> Bool {
+        guard let map = activeMap,
+              !targetName.isEmpty,
+              let targetNode = resolveTarget(targetName, in: map),
+              let start = resolveNavigationStart(
+                in: map,
+                targetNodeID: targetNode.id,
+                arPosition: arPosition,
+                imuState: imuState,
+                headingDegrees: heading
+              ),
+              start.nodePath.count >= 2 else {
+            return false
+        }
+        let steps = buildSteps(for: start.nodePath, in: map)
+        guard let firstStep = steps.first else { return false }
+
+        routeSteps = steps
+        currentStepIndex = 0
+        segmentProgressMeters = min(max(start.initialProgressMeters, 0), firstStep.edge.distanceMeters)
+        segmentRemainingMeters = max(0, firstStep.edge.distanceMeters - segmentProgressMeters)
+        lastAnnouncedRemainingMeter = nil
+        lastAnnouncedLandmarkID = nil
+        recoveryStartedAt = nil
+        recoveryReason = nil
+        lastRecoveryCueKey = nil
+        beliefIssueStartedAt = nil
+        lastRecoveredAt = Date()
+        arrivalVisualHoldStartedAt = nil
+        lastARNodeDistanceMeters = nil
+        lastTrustedARRemainingMeters = nil
+        resetRouteCorrectionGuards()
+        resetRouteBelief(status: .initializing)
+        phase = .navigating
+        updateInstruction(forceSpeech: false)
+        currentInstruction = "Route realigned from your position. \(currentInstruction)"
+        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        rebuildRAGContext()
         return true
     }
 
@@ -2127,6 +2317,16 @@ final class SemanticRouteNavigator: ObservableObject {
         beliefIssueStartedAt = nil
         lastRecoveryCueKey = nil
         lastRecoveredAt = Date()
+        // Re-sync progress from the trusted AR projection before speaking the
+        // next instruction: dead reckoning drifted during the hold, and
+        // resuming from its stale progress produces wrong guidance.
+        if let arRemaining = lastTrustedARRemainingMeters, let step = activeStep {
+            segmentProgressMeters = min(
+                max(step.edge.distanceMeters - arRemaining, 0),
+                step.edge.distanceMeters
+            )
+            segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
+        }
         updateInstruction(forceSpeech: false)
         if announce, hadSpokenCue {
             currentInstruction = "Back on route. \(currentInstruction)"
@@ -2184,8 +2384,13 @@ final class SemanticRouteNavigator: ObservableObject {
         let recentlyAdvanced = lastRouteAdvanceAt.map {
             Date().timeIntervalSince($0) <= visualRouteAdvanceCooldownSeconds
         } ?? false
+        // After recovery the user has been panning and may face anywhere;
+        // give them an alignment cue before resuming walking guidance.
+        let recentlyRecovered = lastRecoveredAt.map {
+            Date().timeIntervalSince($0) <= postRecoveryAlignmentWindowSeconds
+        } ?? false
         let nearStepStart = segmentProgressMeters <= routeAlignmentProgressWindowMeters
-        guard nearStepStart || recentlyAdvanced else { return false }
+        guard nearStepStart || recentlyAdvanced || recentlyRecovered else { return false }
 
         let instruction = Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees)
         let key = "align_\(Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees).key)_\(currentStepIndex)"
@@ -2524,6 +2729,13 @@ final class SemanticRouteNavigator: ObservableObject {
 
         guard arLocalized, let arPoint else { return false }
         if arPoint.distance(to: step.to.point) <= destinationArrivalRadiusMeters(for: step) {
+            // The AR pose is directly on the destination node. Dead-reckoned
+            // progress may still be lagging (missed steps, heading gating) —
+            // snap it up from the AR projection instead of telling a user who
+            // is standing at the target to keep walking.
+            let projection = Self.project(arPoint, onto: step)
+            segmentProgressMeters = max(segmentProgressMeters, projection.alongTrackMeters)
+            segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
             return segmentRemainingMeters <= max(
                 routeAdvanceMaxUnconfirmedRemainingMeters,
                 destinationAlongTrackArrivalWindowMeters(for: step)
@@ -2744,12 +2956,13 @@ final class SemanticRouteNavigator: ObservableObject {
     private func bestRecoverySnap(
         pose: SemanticRoutePoint?,
         liveHeading: Double,
-        visualMatch: VisualRouteMatch?
+        visualMatch: VisualRouteMatch?,
+        searchAllSteps: Bool = false
     ) -> RecoverySnapCandidate? {
         guard let pose, !routeSteps.isEmpty else { return nil }
         return routeSteps.enumerated().compactMap { pair -> RecoverySnapCandidate? in
             let index = pair.offset
-            guard abs(index - currentStepIndex) <= 1 else { return nil }
+            guard searchAllSteps || abs(index - currentStepIndex) <= 1 else { return nil }
             let step = pair.element
             let projection = Self.project(pose, onto: step)
             let headingError = abs(SemanticRouteMath.signedAngleDifference(liveHeading, step.edge.bearingDegrees))
@@ -2839,6 +3052,9 @@ final class SemanticRouteNavigator: ObservableObject {
         arrivalVisualHoldStartedAt = nil
         guidanceIntroProtectedUntil = nil
         resetRouteCorrectionGuards()
+        // The snap is the new best belief; drop the conflicting evidence
+        // window so the very next update doesn't re-enter the hold loop.
+        resetRouteBelief(status: .locked)
         phase = .navigating
         updateInstruction(forceSpeech: false)
         if announce {
@@ -2886,9 +3102,13 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryReason = nil
         beliefIssueStartedAt = nil
         arrivalVisualHoldStartedAt = nil
+        lastARNodeDistanceMeters = nil
+        lastTrustedARRemainingMeters = nil
         if phase == .recovering { phase = .navigating }
         let nextContext: String
-        if next.to.turnHint != nil {
+        if let hint = next.to.turnHint, hint.isCorner {
+            nextContext = "toward the corner"
+        } else if next.to.turnHint != nil {
             nextContext = "toward the next turn"
         } else {
             nextContext = "toward \(Self.sanitizedSpokenLabel(next.to.name, fallback: "the next point"))"
@@ -2902,8 +3122,15 @@ final class SemanticRouteNavigator: ObservableObject {
         } else {
             landmarkPrefix = ""
         }
-        currentInstruction = "\(landmarkPrefix)\(turn.capitalized). Walk \(Self.formatMeters(next.edge.distanceMeters)), \(nextContext)."
+        currentInstruction = "\(landmarkPrefix)\(Self.sentenceCased(turn)). Walk \(Self.formatMeters(next.edge.distanceMeters)), \(nextContext)."
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+    }
+
+    /// Uppercases only the first letter — String.capitalized would title-case
+    /// every word of multi-word instructions ("Take A Slight Left…").
+    private static func sentenceCased(_ raw: String) -> String {
+        guard let first = raw.first else { return raw }
+        return first.uppercased() + raw.dropFirst()
     }
 
     private func updateInstruction(forceSpeech: Bool) {
@@ -2919,27 +3146,42 @@ final class SemanticRouteNavigator: ObservableObject {
             return partial + pair.element.edge.distanceMeters
         }
 
+        // Countdown cues are floored by the live AR distance to the node:
+        // dead-reckoned progress alone announces turns early when the step
+        // model overshoots.
+        let cueRemainingMeters = lastARNodeDistanceMeters.map { max(segmentRemainingMeters, $0) }
+            ?? segmentRemainingMeters
+
         // Use turn direction for intersection nodes, destination name for destinations
         let context: String
-        if step.to.turnHint != nil {
+        if let hint = step.to.turnHint, hint.isCorner {
+            context = "toward the corner"
+        } else if step.to.turnHint != nil {
             context = "toward the next turn"
         } else {
             context = "toward \(Self.sanitizedSpokenLabel(step.to.name, fallback: "the next point"))"
         }
-        if segmentRemainingMeters <= turnAnnouncementThresholdMeters, currentStepIndex < routeSteps.count - 1 {
+        if cueRemainingMeters <= turnAnnouncementThresholdMeters, currentStepIndex < routeSteps.count - 1 {
             let next = routeSteps[currentStepIndex + 1]
             let turn = Self.turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees)
-            if segmentRemainingMeters <= 0.75 {
-                currentInstruction = "At the turn, \(turn)."
+            if cueRemainingMeters <= 0.75 {
+                currentInstruction = step.to.turnHint?.isCorner == true
+                    ? "\(Self.sentenceCased(turn))."
+                    : "At the turn, \(turn)."
             } else {
-                currentInstruction = "In \(Self.formatMeters(segmentRemainingMeters)), \(turn)."
+                currentInstruction = "In \(Self.formatMeters(cueRemainingMeters)), \(turn)."
             }
+        } else if currentStepIndex >= routeSteps.count - 1,
+                  (lastARNodeDistanceMeters ?? cueRemainingMeters) <= destinationJustAheadMeters {
+            // Final approach: "keep walking X meters" reads as being lost when
+            // the target is within arm's-plus reach.
+            currentInstruction = "\(Self.sanitizedSpokenLabel(targetName, fallback: "The destination")) is just ahead."
         } else {
             let landmarkContext = shouldSpeakLandmarks ? nextLandmarkPhrase(on: step, after: segmentProgressMeters) : nil
             if let landmarkContext {
-                currentInstruction = "Walk \(Self.formatMeters(segmentRemainingMeters)), \(context). Passing \(landmarkContext)."
+                currentInstruction = "Walk \(Self.formatMeters(cueRemainingMeters)), \(context). Passing \(landmarkContext)."
             } else {
-                currentInstruction = "Walk \(Self.formatMeters(segmentRemainingMeters)), \(context)."
+                currentInstruction = "Walk \(Self.formatMeters(cueRemainingMeters)), \(context)."
             }
         }
 
@@ -2955,7 +3197,7 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
 
-        let bucket = Int(ceil(segmentRemainingMeters))
+        let bucket = Int(ceil(cueRemainingMeters))
         let routineSpeechAllowed = forceSpeech || guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
         guard routineSpeechAllowed else { return }
 
@@ -3439,9 +3681,16 @@ final class SemanticRouteNavigator: ObservableObject {
         baseEdgeID: String,
         reversed: Bool
     ) -> Double? {
-        if landmark.edgeID == baseEdgeID, let offset = landmark.offsetMeters {
-            let progress = reversed ? step.edge.distanceMeters - offset : offset
-            return min(max(progress, 0), step.edge.distanceMeters)
+        // A landmark assigned to a segment belongs ONLY to that segment. Its
+        // anchor node is usually the turn that starts the segment, and the
+        // node fallbacks below would otherwise surface it near the END of the
+        // previous step — announcing an object before the turn it sits behind.
+        if let landmarkEdgeID = landmark.edgeID {
+            guard landmarkEdgeID == baseEdgeID else { return nil }
+            if let offset = landmark.offsetMeters {
+                let progress = reversed ? step.edge.distanceMeters - offset : offset
+                return min(max(progress, 0), step.edge.distanceMeters)
+            }
         }
         if landmark.nodeID == step.from.id {
             return min(0.8, step.edge.distanceMeters)
@@ -4296,6 +4545,10 @@ extension SemanticRouteNavigator {
 
     func expireRecoveryHoldForTesting() {
         recoveryStartedAt = Date().addingTimeInterval(-(recoveryHoldSeconds + 0.1))
+    }
+
+    func expireGuidanceIntroProtectionForTesting() {
+        guidanceIntroProtectedUntil = nil
     }
 }
 #endif

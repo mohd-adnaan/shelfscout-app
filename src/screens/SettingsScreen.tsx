@@ -228,6 +228,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     updateReachingMode,
     updateDistanceUnit,
     updateEnableAcquisitionAutoExit,
+    updateNavigationErrorRecovery,
   } =
     useSettings();
 
@@ -330,6 +331,18 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       await speechOutput.announce(label);
     },
     [updateEnableAcquisitionAutoExit],
+  );
+
+  const handleErrorRecoveryToggle = useCallback(
+    async (value: boolean) => {
+      await updateNavigationErrorRecovery(value);
+      await speechOutput.announce(
+        value
+          ? 'Navigation error recovery enabled.'
+          : 'Navigation error recovery disabled.',
+      );
+    },
+    [updateNavigationErrorRecovery],
   );
 
   const handleWearablesMicrophoneToggle = useCallback(
@@ -547,6 +560,32 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
 
           {settings.inDeviceMode && Platform.OS === 'ios' && (
             <>
+              <View style={styles.settingRow}>
+                <View style={styles.settingLabelBlock}>
+                  <Text style={styles.settingLabel}>Navigation error recovery</Text>
+                  <Text style={styles.settingSubLabel}>
+                    {settings.navigationErrorRecovery
+                      ? 'Off-route and lost-tracking recovery cues on'
+                      : 'Recovery cues off (study condition)'}
+                  </Text>
+                </View>
+                <Switch
+                  value={settings.navigationErrorRecovery}
+                  onValueChange={handleErrorRecoveryToggle}
+                  trackColor={{ false: C.border, true: C.success }}
+                  thumbColor={settings.navigationErrorRecovery ? C.success : C.sliderThumb}
+                  ios_backgroundColor={C.border}
+                  accessible={true}
+                  accessibilityRole="switch"
+                  accessibilityLabel="Navigation error recovery"
+                  accessibilityHint={
+                    settings.navigationErrorRecovery
+                      ? 'Double tap to disable route error recovery during guidance.'
+                      : 'Double tap to enable route error recovery during guidance.'
+                  }
+                />
+              </View>
+
               <Text style={styles.settingDescription}>
                 Set up and manage the saved ARKit maps used by on-device
                 navigation and Spatial Target reaching.
@@ -622,6 +661,34 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
               }}
             />
           </View>
+
+          {settings.navigationPipeline === 'arkit' && (
+            <View style={styles.settingRow}>
+              <View style={styles.settingLabelBlock}>
+                <Text style={styles.settingLabel}>Navigation error recovery</Text>
+                <Text style={styles.settingSubLabel}>
+                  {settings.navigationErrorRecovery
+                    ? 'Off-route and lost-tracking recovery cues on'
+                    : 'Recovery cues off (study condition)'}
+                </Text>
+              </View>
+              <Switch
+                value={settings.navigationErrorRecovery}
+                onValueChange={handleErrorRecoveryToggle}
+                trackColor={{ false: C.border, true: C.success }}
+                thumbColor={settings.navigationErrorRecovery ? C.success : C.sliderThumb}
+                ios_backgroundColor={C.border}
+                accessible={true}
+                accessibilityRole="switch"
+                accessibilityLabel="Navigation error recovery"
+                accessibilityHint={
+                  settings.navigationErrorRecovery
+                    ? 'Double tap to disable route error recovery during guidance.'
+                    : 'Double tap to enable route error recovery during guidance.'
+                }
+              />
+            </View>
+          )}
 
           {Platform.OS === 'ios' && (
             <TouchableOpacity

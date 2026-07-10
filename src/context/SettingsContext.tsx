@@ -49,10 +49,17 @@ export interface AppSettings {
   developerMode: boolean;
   /** ARKit reaching mode: 'handFree' (default) or 'withHand' */
   reachingMode: 'handFree' | 'withHand';
-  /** Distance unit for reaching guidance: 'steps' (default) or 'cm' */
+  /** Distance unit for reaching guidance: 'steps' | 'cm' */
   distanceUnit: 'steps' | 'cm';
   /** When true, allow ARKit auto-exit via acquisition validation */
   enableAcquisitionAutoExit: boolean;
+  /**
+   * When false, ARKit route guidance never enters error recovery (no
+   * "off route" / "pan slowly" holds). Used to run user studies with and
+   * without recovery. Applies to the end-to-end voice flow; the Manage AR
+   * Route Maps screen has its own per-run toggle.
+   */
+  navigationErrorRecovery: boolean;
 }
 
 interface SettingsContextValue {
@@ -69,6 +76,7 @@ interface SettingsContextValue {
   updateReachingMode: (mode: 'handFree' | 'withHand') => Promise<void>;
   updateDistanceUnit: (unit: 'steps' | 'cm') => Promise<void>;
   updateEnableAcquisitionAutoExit: (value: boolean) => Promise<void>;
+  updateNavigationErrorRecovery: (value: boolean) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
    * Returns 'spatialTarget' | 'arkit' | 'standard' | 'none'.
@@ -109,6 +117,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   reachingMode: 'handFree',
   distanceUnit: 'steps',
   enableAcquisitionAutoExit: false,
+  navigationErrorRecovery: true,
 };
 
 const STORAGE_KEY = '@cybersight_settings_v1';
@@ -307,6 +316,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateNavigationErrorRecovery = useCallback(
+    async (value: boolean) => {
+      const next = { ...settings, navigationErrorRecovery: value };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Navigation error recovery → ${value ? 'ON' : 'OFF'}`);
+    },
+    [settings, persist],
+  );
+
   // ── Pipeline resolver ─────────────────────────────────────────────────────
 
   const resolveReachingPipeline = useCallback(
@@ -387,6 +406,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateReachingMode,
     updateDistanceUnit,
     updateEnableAcquisitionAutoExit,
+    updateNavigationErrorRecovery,
     resolveReachingPipeline,
     resolveNavigationPipeline,
     effectiveNavigationPipeline: settings.inDeviceMode ? 'arkit' : settings.navigationPipeline,

@@ -119,6 +119,117 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertGreaterThan(navigator.segmentRemainingMeters, 6.7)
     }
 
+    func testMidSegmentLandmarkAnnouncedOnItsOwnSegmentOnly() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnMapWithSecondSegmentLandmark()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: true,
+            arHeading: 0
+        ))
+
+        // Reach the end of segment 1. The Fridge sits on segment 2 (after the
+        // turn); the turn announcement must not mention it.
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 3.5)
+        navigator.update(
+            imuState: Self.imu(bearing: 0),
+            arPosition: nil,
+            arHeading: 0,
+            arLocalized: false
+        )
+
+        XCTAssertEqual(navigator.currentStepIndex, 1, "Should have advanced past the turn")
+        XCTAssertFalse(navigator.currentInstruction.localizedCaseInsensitiveContains("Fridge"))
+
+        // Now on segment 2 the landmark should be announced ahead.
+        navigator.expireGuidanceIntroProtectionForTesting()
+        navigator.update(
+            imuState: Self.imu(bearing: 90),
+            arPosition: nil,
+            arHeading: 90,
+            arLocalized: false
+        )
+
+        XCTAssertTrue(navigator.speechCue?.text.localizedCaseInsensitiveContains("Fridge") == true)
+    }
+
+    func testCornerHintSpeaksCornerNotTurn() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.cornerMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 3.3)
+
+        navigator.update(
+            imuState: Self.imu(bearing: 0),
+            arPosition: nil,
+            arHeading: 0,
+            arLocalized: false
+        )
+
+        XCTAssertTrue(navigator.currentInstruction.localizedCaseInsensitiveContains("corner"))
+        XCTAssertFalse(navigator.currentInstruction.localizedCaseInsensitiveContains("turn"))
+    }
+
+    func testARContradictionBlocksPrematureTurnAdvance() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        // PDR overshoot claims the turn is 0.4m away, but the localized AR
+        // pose is still 2.5m from the turn node.
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 3.6)
+
+        navigator.update(
+            imuState: Self.imu(bearing: 0),
+            arPosition: simd_float3(2.5, 0, -3.9),
+            arHeading: 0,
+            arLocalized: true
+        )
+
+        XCTAssertEqual(navigator.currentStepIndex, 0, "Turn must not be announced before AR reaches it")
+        XCTAssertEqual(navigator.phase, .navigating)
+        XCTAssertFalse(navigator.currentInstruction.contains("At the turn"))
+    }
+
+    func testARDestinationProximityCompletesRouteDespitePDRLag() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        // Dead reckoning lags 3m behind while the AR pose stands directly on
+        // the destination node. Arrival must complete instead of telling the
+        // user to keep walking into a shelf.
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 5.0)
+
+        navigator.update(
+            imuState: Self.imu(bearing: 0),
+            arPosition: simd_float3(0, 0, -7.6),
+            arHeading: 0,
+            arLocalized: true
+        )
+
+        XCTAssertEqual(navigator.phase, .arrived)
+        XCTAssertTrue(navigator.currentInstruction.contains("Arrived at Milk"))
+    }
+
     private static func straightMap(coordinateSpace: String) -> SemanticRouteMap {
         let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
         let target = node(id: "milk", name: "Milk", point: SemanticRoutePoint(x: 0, y: 8), kind: .destination)
@@ -132,7 +243,43 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         return map(id: "l-turn", coordinateSpace: "pdr_xy", nodes: [start, turn, target])
     }
 
-    private static func map(id: String, coordinateSpace: String, nodes: [SemanticRouteNode]) -> SemanticRouteMap {
+    private static func lTurnARMap() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let turn = node(id: "turn", name: "Turn", point: SemanticRoutePoint(x: 0, y: 4), kind: .intersection, turnHint: .right)
+        let target = node(id: "checkout", name: "Checkout", point: SemanticRoutePoint(x: 4, y: 4), kind: .destination)
+        return map(id: "l-turn-ar", coordinateSpace: "ar_world_xz", nodes: [start, turn, target])
+    }
+
+    private static func cornerMap() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let corner = node(id: "corner", name: "Right corner 1", point: SemanticRoutePoint(x: 0, y: 4), kind: .intersection, turnHint: .cornerRight)
+        let target = node(id: "checkout", name: "Checkout", point: SemanticRoutePoint(x: 4, y: 4), kind: .destination)
+        return map(id: "corner", coordinateSpace: "pdr_xy", nodes: [start, corner, target])
+    }
+
+    private static func lTurnMapWithSecondSegmentLandmark() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let turn = node(id: "turn", name: "Turn", point: SemanticRoutePoint(x: 0, y: 4), kind: .intersection, turnHint: .right)
+        let target = node(id: "checkout", name: "Checkout", point: SemanticRoutePoint(x: 4, y: 4), kind: .destination)
+        // Mapped mid-segment between the two turns: anchored to the turn node
+        // that starts segment 2 and assigned to segment 2's edge.
+        let fridge = SemanticRouteLandmark(
+            id: "lm-fridge",
+            name: "Fridge",
+            aliases: [],
+            nodeID: turn.id,
+            edgeID: "\(turn.id)__\(target.id)",
+            offsetMeters: 1.0,
+            side: .left,
+            context: nil,
+            priority: 10,
+            kind: .object,
+            visualFingerprintIds: nil
+        )
+        return map(id: "l-turn-landmark", coordinateSpace: "pdr_xy", nodes: [start, turn, target], landmarks: [fridge])
+    }
+
+    private static func map(id: String, coordinateSpace: String, nodes: [SemanticRouteNode], landmarks: [SemanticRouteLandmark] = []) -> SemanticRouteMap {
         var edges: [SemanticRouteEdge] = []
         for index in 0..<(nodes.count - 1) {
             edges.append(edge(from: nodes[index], to: nodes[index + 1]))
@@ -148,7 +295,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             destinationNodeIds: nodes.filter { $0.kind == .destination }.map(\.id),
             nodes: nodes,
             edges: edges,
-            landmarks: [],
+            landmarks: landmarks,
             keyframes: nil,
             source: "test",
             notes: nil

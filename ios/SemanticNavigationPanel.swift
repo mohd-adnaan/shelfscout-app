@@ -232,9 +232,11 @@ struct SemanticNavigationPanel: View {
             }
 
             HStack(spacing: 10) {
-                turnButton(.straight, title: "Straight", systemImage: "arrow.up")
-                turnButton(.corner, title: "Corner", systemImage: "arrow.turn.up.forward.iphone")
+                turnButton(.cornerLeft, title: "Left Corner", systemImage: "arrow.up.left")
+                turnButton(.cornerRight, title: "Right Corner", systemImage: "arrow.up.right")
             }
+
+            turnButton(.straight, title: "Straight", systemImage: "arrow.up")
         }
     }
 
