@@ -315,12 +315,19 @@ extension ReachingViewController {
   }
 
   private func speakSpatialTargetRelocalizationCueIfNeeded() {
-    guard guidanceAudioEnabled,
-          spatialTargetRelocalizationCueSpoken == false else {
+    guard guidanceAudioEnabled else { return }
+    let now = ProcessInfo.processInfo.systemUptime
+    guard now - spatialTargetRelocalizationCueLastAt >= spatialTargetRelocalizationCueIntervalSec else {
       return
     }
-    spatialTargetRelocalizationCueSpoken = true
-    say("Finding the saved map. Move the phone slowly and point toward the mapped shelf.")
+    spatialTargetRelocalizationCueLastAt = now
+    spatialTargetRelocalizationCueCount += 1
+    switch spatialTargetRelocalizationCueCount {
+    case 1:
+      say("Finding the saved map. Move the phone slowly and point toward the mapped shelf.")
+    default:
+      say("Still matching the map. Keep panning slowly across the shelf in front of you.")
+    }
   }
 
   private func placeAndHoldInitialBboxReady(_ frame: ARFrame) -> Bool {

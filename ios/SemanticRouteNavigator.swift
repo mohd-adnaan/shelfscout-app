@@ -2164,7 +2164,11 @@ final class SemanticRouteNavigator: ObservableObject {
             source,
             observedProgress
         )
-        recoveryReason = "Route evidence disagrees."
+        // The belief bookkeeping above always runs; the user-facing recovery
+        // banner only exists when the user left error recovery on.
+        if shouldEnableErrorRecovery {
+            recoveryReason = "Route evidence disagrees."
+        }
     }
 
     private func handleRouteBeliefHoldIfNeeded(
@@ -2378,6 +2382,10 @@ final class SemanticRouteNavigator: ObservableObject {
         liveHeading: Double,
         headingError: Double
     ) -> Bool {
+        // Alignment nudges are corrective guidance. With error recovery
+        // disabled the user asked for turn-by-turn only — no "turn around"
+        // interjections, even when the heading disagrees with the route.
+        guard shouldEnableErrorRecovery else { return false }
         guard phase == .navigating else { return false }
         guard headingError >= routeTurnAlignmentThresholdDegrees else { return false }
 

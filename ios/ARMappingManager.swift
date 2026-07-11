@@ -694,6 +694,28 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 switch camera.trackingState {
                 case .normal:
                     if !self.isLocalized {
+                        // Publish a post-relocalization pose BEFORE isLocalized:
+                        // the published cameraMapPosition is frame-throttled and
+                        // can still hold the pre-relocalization pose (≈ session
+                        // origin ≈ route start). Observers react to isLocalized
+                        // immediately and would start guidance from that stale
+                        // point instead of where the user actually stands.
+                        if let frame = self.session.currentFrame {
+                            let transform = frame.camera.transform
+                            let position = simd_make_float3(
+                                transform.columns.3.x,
+                                transform.columns.3.y,
+                                transform.columns.3.z
+                            )
+                            let forward = simd_make_float3(
+                                -transform.columns.2.x,
+                                -transform.columns.2.y,
+                                -transform.columns.2.z
+                            )
+                            self.cameraMapPosition = position
+                            self.cameraMapForward = forward
+                            self.arHeadingDegrees = self.headingDegrees(for: forward)
+                        }
                         self.isLocalized = true
                         self.statusMessage = "Localized against saved map."
                     }
@@ -746,7 +768,16 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private func makeWorldTrackingConfiguration(initialWorldMap: ARWorldMap? = nil) -> ARWorldTrackingConfiguration {
         let config = ARWorldTrackingConfiguration()
         config.initialWorldMap = initialWorldMap
-        config.worldAlignment = .gravityAndHeading
+        // Relocalizing to a saved map must use .gravity: with .gravityAndHeading
+        // ARKit keeps pulling the world yaw toward TODAY's compass reading,
+        // which fights the feature-matched map frame. Indoors (metal shelving)
+        // the compass is routinely 5–30° off, so the whole route graph rotates
+        // around the user — start poses land on the wrong part of the route,
+        // every left/right cue mirrors, and relocalization can stall entirely
+        // because tracking never settles. The saved map frame is already
+        // heading-aligned from capture time. (Same rule as the reaching
+        // session — see Reachingviewcontroller+ar.swift startAR.)
+        config.worldAlignment = initialWorldMap != nil ? .gravity : .gravityAndHeading
         config.planeDetection = [.horizontal, .vertical]
         config.environmentTexturing = .none
         config.isLightEstimationEnabled = false

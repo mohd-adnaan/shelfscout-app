@@ -733,6 +733,7 @@ class ReachingModule: NSObject {
     voiceOverEnabled: Bool,
     ttsRate: Float,
     distanceUnit: String,
+    presentationAttempt: Int = 0,
     resolver: @escaping RCTPromiseResolveBlock,
     rejecter: @escaping RCTPromiseRejectBlock
   ) {
@@ -740,7 +741,49 @@ class ReachingModule: NSObject {
       guard let root = UIApplication.shared.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
         rejecter("NO_VC", "No root VC", nil); return
       }
-      var top = root; while let p = top.presentedViewController { top = p }
+      let retryLater: (String) -> Void = { why in
+        // UIKit silently drops a present() issued while another modal is
+        // mid-transition — the exact state right after ARKit navigation
+        // resolves "arrived" and its full-screen host starts dismissing.
+        // That silent drop was "reaching never started after arrival".
+        guard presentationAttempt < 12 else {
+          rejecter("PRESENT_BUSY",
+                   "Could not open reaching: another screen kept transitioning (\(why)).",
+                   nil)
+          return
+        }
+        NSLog("🎯 [ReachingModule] Presentation busy (%@) — retry %d/12 in 0.3s",
+              why, presentationAttempt + 1)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+          presentReachingVC(bbox: bbox, objectName: objectName, depth: depth,
+                            imageW: imageW, imageH: imageH,
+                            detectionUrl: detectionUrl,
+                            acquisitionUrl: acquisitionUrl,
+                            sessionId: sessionId,
+                            initialWorldMap: initialWorldMap,
+                            spatialTargetWorldPosition: spatialTargetWorldPosition,
+                            spatialTargetMapName: spatialTargetMapName,
+                            spatialTargetIsSurfacePlacement: spatialTargetIsSurfacePlacement,
+                            spatialTargetPOIName: spatialTargetPOIName,
+                            mode: mode,
+                            startupSilent: startupSilent,
+                            voiceOverEnabled: voiceOverEnabled,
+                            ttsRate: ttsRate, distanceUnit: distanceUnit,
+                            presentationAttempt: presentationAttempt + 1,
+                            resolver: resolver, rejecter: rejecter)
+        }
+      }
+
+      var top = root
+      while let p = top.presentedViewController, !p.isBeingDismissed { top = p }
+      if top.presentedViewController?.isBeingDismissed == true {
+        retryLater("dismissal in progress")
+        return
+      }
+      if top.isBeingPresented || top.isBeingDismissed {
+        retryLater(top.isBeingPresented ? "presentation in progress" : "host dismissing")
+        return
+      }
       if top is ReachingViewController {
         top.dismiss(animated: false) {
           DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
@@ -758,6 +801,7 @@ class ReachingModule: NSObject {
                                    startupSilent: startupSilent,
                                    voiceOverEnabled: voiceOverEnabled,
                                    ttsRate: ttsRate, distanceUnit: distanceUnit,
+                                   presentationAttempt: presentationAttempt + 1,
                                    resolver: resolver, rejecter: rejecter)
           }
         }

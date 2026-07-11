@@ -184,7 +184,12 @@ class ReachingViewController: UIViewController {
   // the prototype's placement deadline.
   var sessionStartTime: TimeInterval = 0
   var spatialTargetPlacementStartedAt: TimeInterval = 0
-  var spatialTargetRelocalizationCueSpoken = false
+  /// Relocalization narration state: repeat the "keep panning" cue on an
+  /// interval — a single cue followed by up to 18s of silence reads as a
+  /// frozen app to a blind user.
+  var spatialTargetRelocalizationCueLastAt: TimeInterval = 0
+  var spatialTargetRelocalizationCueCount = 0
+  let spatialTargetRelocalizationCueIntervalSec: TimeInterval = 7.0
   let spatialTargetPlacementTimeoutSec: TimeInterval = 18.0
   /// Close-range correction of the map-pin anchor onto live geometry
   /// (see refineSpatialAnchorOnApproach). Locks after the first snap.

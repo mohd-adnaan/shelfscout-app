@@ -2503,7 +2503,7 @@ function AppInner(): React.JSX.Element {
     const fallbackMessages: Record<string, string> = {
       map_not_found: `No saved AR route map was found for ${targetName}. Open Settings, Manage AR Route Maps, and map the route first.`,
       target_not_found: `${targetName} is not in the saved AR route maps. Add it as a destination or landmark, then try again.`,
-      relocalization_failed: 'I could not relocalize against the saved AR map. Return to the route start and slowly scan the area.',
+      relocalization_failed: navResult.message || 'I could not relocalize against the saved AR map. Walk to any spot on the mapped route, hold the phone at chest height, and slowly scan the shelves.',
       cancelled: 'ARKit navigation cancelled.',
       error: navResult.message || 'ARKit navigation ended with an error.',
     };

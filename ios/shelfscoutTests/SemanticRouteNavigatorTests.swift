@@ -46,6 +46,31 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertEqual(navigator.currentInstruction, "Turn right to face the route.")
     }
 
+    func testHeadingAlignmentCueSuppressedWhenErrorRecoveryDisabled() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            errorRecovery: false,
+            arHeading: 0
+        ))
+        navigator.setRouteProgressForTesting(stepIndex: 1, progressMeters: 0, markRecentAdvance: true)
+
+        navigator.update(
+            imuState: Self.imu(bearing: 0),
+            arPosition: nil,
+            arHeading: 0,
+            arLocalized: false
+        )
+
+        XCTAssertEqual(navigator.phase, .navigating)
+        XCTAssertFalse(navigator.currentInstruction.contains("face the route"))
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Walk"))
+    }
+
     func testBackwardARMovementTriggersWrongDirectionRecovery() {
         let navigator = SemanticRouteNavigator()
         navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
@@ -69,6 +94,52 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertEqual(navigator.phase, .recovering)
         XCTAssertEqual(navigator.currentInstruction, "Wrong direction.")
         XCTAssertTrue(navigator.recoveryReason?.contains("Backward movement") == true)
+    }
+
+    func testRecoveryNeverEnteredWhenErrorRecoveryDisabled() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            errorRecovery: false,
+            arHeading: 0
+        ))
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 2.0)
+        navigator.expireRecoveryHoldForTesting()
+
+        navigator.update(
+            imuState: Self.imu(stepCount: 3, isMoving: true, bearing: 0),
+            arPosition: simd_float3(0, 0, 1.0),
+            arHeading: 0,
+            arLocalized: true
+        )
+
+        XCTAssertEqual(navigator.phase, .navigating)
+        XCTAssertNotEqual(navigator.currentInstruction, "Wrong direction.")
+        XCTAssertNil(navigator.recoveryReason)
+    }
+
+    func testMidRouteStartLocalizesToUserPositionNotRouteStart() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+
+        // Standing 4 m along the 8 m route (route y = -(ARKit z)).
+        let started = navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, -4),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertEqual(navigator.phase, .navigating)
+        XCTAssertEqual(navigator.currentStepIndex, 0)
+        XCTAssertEqual(navigator.segmentProgressMeters, 4.0, accuracy: 0.05)
+        XCTAssertEqual(navigator.segmentRemainingMeters, 4.0, accuracy: 0.05)
     }
 
     func testSuddenPDRStepJumpDoesNotTeleportToDestination() {

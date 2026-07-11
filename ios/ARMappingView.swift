@@ -85,6 +85,15 @@ struct ARMappingView: View {
     @State private var didStartAutomatedGuidance: Bool = false
     @State private var didResolveAutomation: Bool = false
     @State private var didTriggerReachingHandoff: Bool = false
+    @State private var automatedRelocalizationStartedAt: Date?
+    @State private var lastRelocalizationVoiceCueAt: Date?
+    @State private var relocalizationVoiceCueCount: Int = 0
+
+    /// The coaching overlay is visual-only; a blind user standing in silence
+    /// while the map searches gets spoken guidance instead, then a hard
+    /// timeout so the JS side can recover rather than waiting forever.
+    private let relocalizationVoiceCueIntervalSeconds: TimeInterval = 8.0
+    private let automatedRelocalizationTimeoutSeconds: TimeInterval = 35.0
 
     init(
         sourceSelection: Binding<String> = .constant(""),
@@ -317,6 +326,7 @@ struct ARMappingView: View {
 
     private func handleIMUStateChanged(_ imuState: IMUState) {
         mappingManager.updateIMUMotion(imuState)
+        tickAutomatedRelocalizationWatchdog()
         semanticNavigator.update(
             imuState: imuState,
             arPosition: mappingManager.cameraMapPosition,
@@ -324,6 +334,66 @@ struct ARMappingView: View {
             arLocalized: mappingManager.isLocalized || mappingManager.isMapping,
             capturedImage: currentCapturedImage
         )
+    }
+
+    /// Runs on the IMU heartbeat while the automated flow waits for
+    /// relocalization. Nothing else speaks in that window — the coaching
+    /// overlay is a visual icon — so this narrates the wait for a blind user
+    /// and resolves the automation with a failure once the wait is hopeless.
+    private func tickAutomatedRelocalizationWatchdog() {
+        guard isAutomatedNavigation,
+              didResolveAutomation == false,
+              didStartAutomatedGuidance == false,
+              didAttemptAutomatedRouteSelection,
+              mappingManager.sessionMode == .relocalizing,
+              mappingManager.isLocalized == false else {
+            automatedRelocalizationStartedAt = nil
+            lastRelocalizationVoiceCueAt = nil
+            relocalizationVoiceCueCount = 0
+            return
+        }
+
+        let now = Date()
+        guard let startedAt = automatedRelocalizationStartedAt else {
+            automatedRelocalizationStartedAt = now
+            return
+        }
+
+        if now.timeIntervalSince(startedAt) >= automatedRelocalizationTimeoutSeconds {
+            resolveAutomation(
+                success: false,
+                reason: "relocalization_failed",
+                message: "I could not match the saved route map from here. Walk to a spot on the mapped route, hold the phone at chest height facing the shelves, and try again."
+            )
+            return
+        }
+
+        let sinceCue = lastRelocalizationVoiceCueAt.map { now.timeIntervalSince($0) }
+            ?? .greatestFiniteMagnitude
+        guard sinceCue >= relocalizationVoiceCueIntervalSeconds else { return }
+        lastRelocalizationVoiceCueAt = now
+        relocalizationVoiceCueCount += 1
+
+        let cue: String
+        switch relocalizationVoiceCueCount {
+        case 1:
+            cue = "Loading the saved route. Hold the phone at chest height and slowly pan left and right."
+        case 2:
+            cue = "Still matching the map. Keep panning slowly, and point the camera at the shelves ahead."
+        default:
+            cue = "Still searching. Take a small step forward or turn slightly, then pan slowly again."
+        }
+        announceAutomatedStatus(cue)
+    }
+
+    /// Speaks automation status through the same VoiceOver-aware channel as
+    /// semantic cues so announcements are not doubled for screen-reader users.
+    private func announceAutomatedStatus(_ text: String) {
+        if launchVoiceOverEnabled {
+            UIAccessibility.post(notification: .announcement, argument: text)
+            return
+        }
+        ttsManager.speakPriority(text)
     }
 
     private func handleSpeechCueChanged() {
