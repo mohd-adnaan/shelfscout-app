@@ -207,12 +207,19 @@ class WearablesCameraModule: NSObject {
   // the wake-word hook is `enabled`), so by the time the user actually
   // wants to capture a photo, HFP has already claimed the BT link.
   //
-  // Fix: temporarily deactivate iOS's AVAudioSession before each MWDAT
-  // session start. This releases HFP, freeing the BT radio for MWDAT
-  // exclusively. After capture completes, the wake-word recognizer will
-  // re-acquire HFP on its next session start (the JS-side `resume()`
-  // path already calls `configureBluetoothRecordingSession` before
-  // restarting Voice).
+  // Resolution (per Meta's MWDAT audio docs — HFP and streaming CAN
+  // coexist, but only in this exact order):
+  //   1. deactivate the iOS audio session (releaseBTRadioForMWDAT) so the
+  //      glasses-side ActivityManager accepts the DEVICE SESSION start —
+  //      this only happens when a fresh device session is needed, never on
+  //      steady-state captures;
+  //   2. add the stream to the session (addStream, not started yet);
+  //   3. re-configure the HFP microphone and WAIT for the route to settle
+  //      (prepareHFPBeforeStreamStart → GlassesAudioCoordinator);
+  //   4. start the stream.
+  // Starting the stream before HFP is ready makes the audio route fail
+  // silently (glasses mic dead); re-acquiring HFP after the stream is up
+  // corrupts the stream (recv bitrate: 0). The old build did both.
   //
   // The audio session must be deactivated with .notifyOthersOnDeactivation
   // so any active audio output (TTS) is gracefully wound down rather than
@@ -362,6 +369,13 @@ class WearablesCameraModule: NSObject {
       deviceSession = nil
     }
 
+    // Release iOS's hold on the BT radio (HFP audio session) ONLY when we
+    // actually need to start a fresh device session. Doing this
+    // unconditionally on every capturePhoto (as earlier builds did) killed
+    // the wake-word recognizer's HFP mic on every single capture, forcing
+    // a Voice restart and a multi-second route flap each time.
+    await releaseBTRadioForMWDAT()
+
     // Active-device wait is now ADVISORY, not gating.
     //
     // Background: in some environments (Developer Mode off on glasses,
@@ -442,6 +456,18 @@ class WearablesCameraModule: NSObject {
     )
   }
 
+  /// Meta's mandated ordering for HFP mic + DAT camera stream coexistence
+  /// (see the GlassesAudioCoordinator comment block in ReachingModule.swift):
+  /// the HFP microphone must be FULLY configured — route verified — before
+  /// the stream starts. "Starting the DAT stream before HFP is ready can
+  /// cause the audio route to fail silently." Only relevant when the user
+  /// selected the glasses mic; phone-mic mode skips this entirely.
+  private func prepareHFPBeforeStreamStart() async {
+    guard GlassesAudioCoordinator.shared.preferredMicSource == "wearables" else { return }
+    NSLog("🎤 [Wearables] Configuring HFP mic BEFORE stream start (Meta-mandated ordering)")
+    await GlassesAudioCoordinator.shared.configureHFPAndWaitForRoute()
+  }
+
   private func ensureStreamSession(_ deviceSession: DeviceSession) async throws -> StreamSession {
     if let stream = streamSession {
       switch stream.state {
@@ -449,6 +475,7 @@ class WearablesCameraModule: NSObject {
         return stream
       case .starting, .waitingForDevice:
         if stream.state != .starting {
+          await prepareHFPBeforeStreamStart()
           await stream.start()
         }
         if try await waitForStreaming(stream) {
@@ -465,6 +492,7 @@ class WearablesCameraModule: NSObject {
         await stream.stop()
       }
       streamSession = nil
+      GlassesAudioCoordinator.shared.isStreamActive = false
       latestVideoFrame = nil
       stateListenerToken = nil
       errorListenerToken = nil
@@ -490,6 +518,9 @@ class WearablesCameraModule: NSObject {
     // ── Subscribe BEFORE start() — listeners must be live the moment frames arrive
     stateListenerToken = stream.statePublisher.listen { state in
       NSLog("📡 [Wearables] Stream state: %@", "\(state)")
+      // Keep the shared coordinator in sync so audio-session code elsewhere
+      // (TTS playback, earcons) knows not to switch routes mid-stream.
+      GlassesAudioCoordinator.shared.isStreamActive = (state == .streaming)
     }
     errorListenerToken = stream.errorPublisher.listen { error in
       NSLog("⚠️ [Wearables] Stream error: %@", "\(error)")
@@ -501,6 +532,10 @@ class WearablesCameraModule: NSObject {
     videoFrameListenerToken = stream.videoFramePublisher.listen { [weak self] frame in
       self?.latestVideoFrame = frame
     }
+
+    // Stream is ADDED but not started — this is the window where Meta
+    // requires HFP to be configured and route-settled.
+    await prepareHFPBeforeStreamStart()
 
     await stream.start()
 
@@ -654,10 +689,9 @@ class WearablesCameraModule: NSObject {
       do {
         let wearables = try self.ensureConfigured()
         try await self.ensureCameraPermission(wearables)
-        // CRITICAL: Release iOS's hold on the BT radio (HFP audio session)
-        // before MWDAT tries to claim it. Without this, the glasses'
-        // ActivityManagerService rejects MWDAT with error code 11.
-        await self.releaseBTRadioForMWDAT()
+        // BT radio release now happens inside ensureDeviceSession, and only
+        // when a fresh device session actually has to start — steady-state
+        // captures no longer disturb the audio route at all.
         let deviceSession = try await self.ensureDeviceSession(wearables)
         let stream = try await self.ensureStreamSession(deviceSession)
 
@@ -705,9 +739,6 @@ class WearablesCameraModule: NSObject {
       do {
         let wearables = try self.ensureConfigured()
         try await self.ensureCameraPermission(wearables)
-        // CRITICAL: Release BT-HFP before MWDAT claims the radio.
-        // See releaseBTRadioForMWDAT() comment block for full rationale.
-        await self.releaseBTRadioForMWDAT()
         let deviceSession = try await self.ensureDeviceSession(wearables)
         _ = try await self.ensureStreamSession(deviceSession)
         NSLog("✅ [Wearables] preWarm complete — session streaming, video frames flowing")
@@ -731,6 +762,7 @@ class WearablesCameraModule: NSObject {
         await stream.stop()
       }
       self.streamSession = nil
+      GlassesAudioCoordinator.shared.isStreamActive = false
       self.latestVideoFrame = nil
       self.stateListenerToken = nil
       self.errorListenerToken = nil

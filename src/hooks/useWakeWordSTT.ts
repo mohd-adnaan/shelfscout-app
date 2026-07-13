@@ -719,6 +719,29 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
     }
   }, [enabled, startRecognition, clearSilenceTimer]);
 
+  // ── Restart on microphone-source change ────────────────────────────────
+  // The Settings toggle (glasses mic ↔ phone mic) updates microphoneSourceRef,
+  // but the audio session is only configured inside startRecognition(). Without
+  // an explicit restart the new source silently takes effect "sometime later"
+  // (next auto-restart, up to ~60s away) — which reads as "the toggle doesn't
+  // work". Cancel the live session and restart so the switch is immediate.
+  const prevMicSourceRef = useRef<RecordingMicrophoneSource>(microphoneSource);
+  useEffect(() => {
+    const prev = prevMicSourceRef.current;
+    prevMicSourceRef.current = microphoneSource;
+    if (prev === microphoneSource) return;
+    if (!enabledRef.current || isPausedRef.current) return;
+
+    console.log(`🎤 [WakeWord] Mic source changed ${prev} → ${microphoneSource}; restarting recognizer`);
+    Voice.cancel().catch(() => {});
+    isActiveRef.current = false;
+    setTimeout(() => {
+      if (enabledRef.current && !isPausedRef.current) {
+        startRecognition();
+      }
+    }, RESTART_DELAY_MS);
+  }, [microphoneSource, startRecognition]);
+
   // ── Public API ─────────────────────────────────────────────────────────
 
   const pause = useCallback(async () => {

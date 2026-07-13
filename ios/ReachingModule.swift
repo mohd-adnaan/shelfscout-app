@@ -357,7 +357,22 @@ class ReachingModule: NSObject {
       let shouldUseSpeaker = useSpeaker?.boolValue ?? true
       let session = AVAudioSession.sharedInstance()
 
-      if shouldUseSpeaker {
+      if GlassesAudioCoordinator.shared.isStreamActive {
+        // A DAT camera stream is live on the glasses. HFP and A2DP are
+        // mutually exclusive on their single BT radio — switching to
+        // .playback/A2DP here tears down HFP mid-stream, which corrupts
+        // the video stream (observed as "recv bitrate: 0") and silently
+        // kills the glasses microphone. Keep the HFP-compatible session;
+        // TTS output is 8 kHz mono for the duration of the stream, which
+        // Meta's docs call out as expected behavior.
+        try session.setCategory(
+          .playAndRecord,
+          mode: .default,
+          options: [.allowBluetooth]
+        )
+        try session.setActive(true)
+        NSLog("🔊 [ReachingModule] Audio → playAndRecord+HFP (DAT stream active, route switch suppressed)")
+      } else if shouldUseSpeaker {
         // Force phone speaker — requires .playAndRecord + .defaultToSpeaker.
         // overrideOutputAudioPort(.speaker) on .playback throws OSStatus -50.
         try session.setCategory(
@@ -461,6 +476,10 @@ class ReachingModule: NSObject {
     var fallbackReason: String?
     var preferredInput: AVAudioSessionPortDescription?
 
+    // Record the user's choice so WearablesCameraModule can honor Meta's
+    // HFP-before-stream ordering when it (re)starts a camera stream.
+    GlassesAudioCoordinator.shared.preferredMicSource = preferredSource.rawValue
+
     switch preferredSource {
     case .wearables:
       // .allowBluetooth enables the HFP microphone. We then explicitly select
@@ -511,7 +530,18 @@ class ReachingModule: NSObject {
     }
 
     try session.setActive(true)
-    try? await Task.sleep(nanoseconds: 100_000_000)
+    if preferredSource == .wearables && preferredInput?.portType == .bluetoothHFP {
+      // BT route changes need up to ~2s to settle (Meta MWDAT audio docs).
+      // The old fixed 100ms sleep reported a stale route: the payload said
+      // "wearables" while iOS was still recording from the iPhone mic.
+      let settled = await GlassesAudioCoordinator.shared.waitForHFPRoute()
+      if !settled {
+        selectedSource = RecordingMicrophoneSource.phone.rawValue
+        fallbackReason = "Bluetooth HFP route did not activate within 2s; audio is coming from the current system input."
+      }
+    } else {
+      try? await Task.sleep(nanoseconds: 100_000_000)
+    }
 
     let input = session.currentRoute.inputs.first ?? preferredInput
     let output = session.currentRoute.outputs.first
@@ -832,5 +862,97 @@ class ReachingModule: NSObject {
       vc.modalPresentationStyle = .fullScreen
       top.present(vc, animated: true)
     }
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARK: - Glasses audio coordination (shared with WearablesCameraModule)
+// ═══════════════════════════════════════════════════════════════════════════
+//
+// Meta's MWDAT audio guidance ("Use device microphones and speakers",
+// wearables.developer.meta.com) mandates a strict ordering when combining
+// the glasses' HFP microphone with a DAT camera stream:
+//
+//   1. add the camera stream to the session (do NOT start it)
+//   2. configure + activate the HFP microphone, wait for the BT route to
+//      settle (allow ~2s), and VERIFY the route is active
+//   3. only then start the DAT camera stream
+//
+// "Starting the DAT stream before HFP is ready can cause the audio route
+// to fail silently." — which is exactly the "glasses mic never works"
+// symptom: the recognizer silently records from the iPhone mic (or
+// nothing) even though the session reports an HFP input as available.
+//
+// This singleton is the one place both native modules consult so the
+// recording path (ReachingModule) and the camera path
+// (WearablesCameraModule) agree on:
+//   • which mic the user selected (wearables vs phone),
+//   • whether a DAT stream is currently live (so playback config must
+//     not tear down HFP mid-stream), and
+//   • how to (re)configure HFP with proper route-settling verification.
+final class GlassesAudioCoordinator {
+  static let shared = GlassesAudioCoordinator()
+
+  private let queue = DispatchQueue(label: "glasses.audio.coordinator")
+  private var _preferredMicSource = "wearables"
+  private var _isStreamActive = false
+
+  /// Last mic source requested via configureRecordingSession ("wearables"
+  /// or "phone"). WearablesCameraModule reads this to decide whether HFP
+  /// must be configured before starting a stream.
+  var preferredMicSource: String {
+    get { queue.sync { _preferredMicSource } }
+    set { queue.sync { _preferredMicSource = newValue } }
+  }
+
+  /// True while a DAT camera stream is in the .streaming state. While
+  /// true, audio-session reconfiguration must stay HFP-compatible —
+  /// switching to .playback/A2DP kills the HFP route, which corrupts the
+  /// stream (observed as "recv bitrate: 0") and silences the glasses mic.
+  var isStreamActive: Bool {
+    get { queue.sync { _isStreamActive } }
+    set { queue.sync { _isStreamActive = newValue } }
+  }
+
+  /// Configure the audio session for the glasses HFP microphone and block
+  /// until iOS actually routes input through Bluetooth HFP (or timeout).
+  /// Returns true when the HFP route is verified live.
+  @discardableResult
+  func configureHFPAndWaitForRoute(timeoutSeconds: TimeInterval = 2.0) async -> Bool {
+    let session = AVAudioSession.sharedInstance()
+    do {
+      try session.setCategory(.playAndRecord, mode: .default, options: [.allowBluetooth])
+      try session.setActive(true)
+      if let hfp = session.availableInputs?.first(where: { $0.portType == .bluetoothHFP }) {
+        try session.setPreferredInput(hfp)
+      } else {
+        NSLog("⚠️ [GlassesAudio] No HFP input advertised — glasses may be off or A2DP-only right now")
+      }
+    } catch {
+      NSLog("⚠️ [GlassesAudio] HFP configure failed: %@", error.localizedDescription)
+      return false
+    }
+    return await waitForHFPRoute(timeoutSeconds: timeoutSeconds)
+  }
+
+  /// Poll the CURRENT route (not availableInputs — that lists candidates,
+  /// not reality) until an HFP input appears. Meta's guidance: allow ~2s
+  /// for the Bluetooth route to stabilize and verify before proceeding.
+  @discardableResult
+  func waitForHFPRoute(timeoutSeconds: TimeInterval = 2.0) async -> Bool {
+    let session = AVAudioSession.sharedInstance()
+    let deadline = Date().addingTimeInterval(timeoutSeconds)
+    while Date() < deadline {
+      if session.currentRoute.inputs.contains(where: { $0.portType == .bluetoothHFP }) {
+        NSLog("✅ [GlassesAudio] HFP route settled (input=%@)",
+              session.currentRoute.inputs.first?.portName ?? "?")
+        return true
+      }
+      try? await Task.sleep(nanoseconds: 100_000_000)
+    }
+    NSLog("⏱️ [GlassesAudio] HFP route did not settle within %.1fs (input=%@)",
+          timeoutSeconds,
+          session.currentRoute.inputs.first?.portName ?? "none")
+    return false
   }
 }
