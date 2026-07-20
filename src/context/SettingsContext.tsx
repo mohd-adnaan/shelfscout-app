@@ -60,6 +60,12 @@ export interface AppSettings {
    * Route Maps screen has its own per-run toggle.
    */
   navigationErrorRecovery: boolean;
+  /**
+   * When true, ARKit route guidance speaks turns as clock-face hours
+   * ("turn to 2 o'clock") instead of left/right, preserving turn magnitude
+   * for users trained in O&M clock directions.
+   */
+  navigationClockFaceDirections: boolean;
 }
 
 interface SettingsContextValue {
@@ -77,6 +83,7 @@ interface SettingsContextValue {
   updateDistanceUnit: (unit: 'steps' | 'cm') => Promise<void>;
   updateEnableAcquisitionAutoExit: (value: boolean) => Promise<void>;
   updateNavigationErrorRecovery: (value: boolean) => Promise<void>;
+  updateNavigationClockFaceDirections: (value: boolean) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
    * Returns 'spatialTarget' | 'arkit' | 'standard' | 'none'.
@@ -118,6 +125,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   distanceUnit: 'steps',
   enableAcquisitionAutoExit: false,
   navigationErrorRecovery: true,
+  navigationClockFaceDirections: false,
 };
 
 const STORAGE_KEY = '@cybersight_settings_v1';
@@ -326,6 +334,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateNavigationClockFaceDirections = useCallback(
+    async (value: boolean) => {
+      const next = { ...settings, navigationClockFaceDirections: value };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Clock-face directions → ${value ? 'ON' : 'OFF'}`);
+    },
+    [settings, persist],
+  );
+
   // ── Pipeline resolver ─────────────────────────────────────────────────────
 
   const resolveReachingPipeline = useCallback(
@@ -407,6 +425,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateDistanceUnit,
     updateEnableAcquisitionAutoExit,
     updateNavigationErrorRecovery,
+    updateNavigationClockFaceDirections,
     resolveReachingPipeline,
     resolveNavigationPipeline,
     effectiveNavigationPipeline: settings.inDeviceMode ? 'arkit' : settings.navigationPipeline,

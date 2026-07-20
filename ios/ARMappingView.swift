@@ -73,6 +73,7 @@ struct ARMappingView: View {
     private let launchRouteMapName: String?
     private let launchSpeakLandmarks: Bool
     private let launchErrorRecovery: Bool
+    private let launchClockFaceDirections: Bool
     private let launchVoiceOverEnabled: Bool
     private let onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
     @State private var newPOIName: String = ""
@@ -102,6 +103,7 @@ struct ARMappingView: View {
         launchRouteMapName: String? = nil,
         launchSpeakLandmarks: Bool = true,
         launchErrorRecovery: Bool = true,
+        launchClockFaceDirections: Bool = false,
         launchVoiceOverEnabled: Bool = UIAccessibility.isVoiceOverRunning,
         onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)? = nil
     ) {
@@ -111,6 +113,7 @@ struct ARMappingView: View {
         self.launchRouteMapName = launchRouteMapName
         self.launchSpeakLandmarks = launchSpeakLandmarks
         self.launchErrorRecovery = launchErrorRecovery
+        self.launchClockFaceDirections = launchClockFaceDirections
         self.launchVoiceOverEnabled = launchVoiceOverEnabled
         self.onAutomationComplete = onAutomationComplete
     }
@@ -519,6 +522,7 @@ struct ARMappingView: View {
             activeARWorldMapID: mappingManager.activeMapID,
             speakLandmarks: launchSpeakLandmarks,
             errorRecovery: launchErrorRecovery,
+            clockFaceDirections: launchClockFaceDirections,
             arHeading: mappingManager.arHeadingDegrees
         )
 
@@ -526,7 +530,14 @@ struct ARMappingView: View {
             didStartAutomatedGuidance = true
         } else {
             let lower = semanticNavigator.currentInstruction.lowercased()
-            let reason = lower.contains("not in this semantic map") ? "target_not_found" : "relocalization_failed"
+            let reason: String
+            if lower.contains("not in this semantic map") {
+                reason = "target_not_found"
+            } else if lower.contains("can't confirm you are at") {
+                reason = "arrival_unverified"
+            } else {
+                reason = "relocalization_failed"
+            }
             resolveAutomation(
                 success: false,
                 reason: reason,
@@ -539,17 +550,40 @@ struct ARMappingView: View {
     private func bestAutomatedRoute(for target: String, in maps: [SemanticRouteMap]) -> SemanticRouteMap? {
         let normalizedTarget = normalizedRouteLookupKey(target)
 
+        // The pinned map is a preference, not a filter: when the requested
+        // target lives in a different saved map, switch to that map instead
+        // of failing the session (pilot: querying cereal with the produce
+        // map selected ended guidance).
         if let launchRouteMapId,
-           let byId = maps.first(where: { $0.id == launchRouteMapId }) {
-            return routeContainsTarget(byId, normalizedTarget: normalizedTarget) ? byId : nil
+           let byId = maps.first(where: { $0.id == launchRouteMapId }),
+           routeContainsTarget(byId, normalizedTarget: normalizedTarget) {
+            return byId
         }
 
         if let launchRouteMapName,
-           let byName = maps.first(where: { $0.name.caseInsensitiveCompare(launchRouteMapName) == .orderedSame }) {
-            return routeContainsTarget(byName, normalizedTarget: normalizedTarget) ? byName : nil
+           let byName = maps.first(where: { $0.name.caseInsensitiveCompare(launchRouteMapName) == .orderedSame }),
+           routeContainsTarget(byName, normalizedTarget: normalizedTarget) {
+            return byName
         }
 
-        return maps.first(where: { routeContainsTarget($0, normalizedTarget: normalizedTarget) })
+        if let exact = maps.first(where: { routeContainsTarget($0, normalizedTarget: normalizedTarget) }) {
+            return exact
+        }
+
+        // Fuzzy fallback for ASR noise: "serial" must still find the map
+        // holding "cereal".
+        return maps.first(where: { routeContainsTargetFuzzily($0, target: target) })
+    }
+
+    private func routeContainsTargetFuzzily(_ route: SemanticRouteMap, target: String) -> Bool {
+        route.nodes.contains { node in
+            SemanticRouteNavigator.fuzzyMatchesSpokenTarget(node.name, target) ||
+            node.aliases.contains { SemanticRouteNavigator.fuzzyMatchesSpokenTarget($0, target) }
+        } ||
+        route.landmarks.contains { landmark in
+            SemanticRouteNavigator.fuzzyMatchesSpokenTarget(landmark.name, target) ||
+            landmark.aliases.contains { SemanticRouteNavigator.fuzzyMatchesSpokenTarget($0, target) }
+        }
     }
 
     private func routeContainsTarget(_ route: SemanticRouteMap, normalizedTarget: String) -> Bool {
@@ -1220,6 +1254,18 @@ struct ARMappingView: View {
     }
 
     private func beginSemanticWalkthrough(_ requestedName: String) {
+        // Relocalized into a saved map → extend that map's semantic network
+        // instead of starting a parallel one-way map. One store area, one
+        // map: new trails stitch onto the existing route graph.
+        if mappingManager.sessionMode != .idle,
+           mappingManager.isLocalized,
+           let activeARMapID = mappingManager.activeMapID,
+           let existingRoute = semanticNavigator.maps.first(where: { $0.arWorldMapId == activeARMapID }) {
+            mapName = existingRoute.name
+            semanticNavigator.beginRouteCaptureAppending(toMapID: existingRoute.id)
+            return
+        }
+
         let resolvedName = requestedName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? mappingManager.suggestedMapName()
             : requestedName
@@ -1311,6 +1357,7 @@ struct ARMappingView: View {
             activeARWorldMapID: mappingManager.activeMapID,
             speakLandmarks: speakLandmarks,
             errorRecovery: errorRecovery,
+            clockFaceDirections: launchClockFaceDirections,
             arHeading: mappingManager.arHeadingDegrees
         )
     }

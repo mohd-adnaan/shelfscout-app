@@ -301,6 +301,168 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertTrue(navigator.currentInstruction.contains("Arrived at Milk"))
     }
 
+    // MARK: - Spoken-target fuzzy matching
+
+    func testPhoneticMisrecognitionResolvesToMappedLabel() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.cerealMap()])
+
+        let started = navigator.startNavigation(
+            to: "serial",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertEqual(navigator.targetName, "Cereal")
+    }
+
+    func testPluralDriftResolvesToMappedLabel() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.onionsMap()])
+
+        let started = navigator.startNavigation(
+            to: "onion",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertEqual(navigator.targetName, "Onions")
+    }
+
+    func testShortLabelsNeverFuzzyMatchDifferentWords() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+
+        let started = navigator.startNavigation(
+            to: "silk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertFalse(started)
+        XCTAssertTrue(navigator.currentInstruction.contains("not in this semantic map"))
+    }
+
+    // MARK: - Instant-arrival gating
+
+    func testFarPoseWithSingleNodePathRefusesInstantArrival() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+
+        // Pose far off the route whose nearest node happens to be the
+        // destination: previously this declared "already at Milk" and fired
+        // the reaching handoff from across the store.
+        let started = navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(x: 6, y: 8, bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertFalse(started)
+        XCTAssertNotEqual(navigator.phase, .arrived)
+        XCTAssertTrue(navigator.currentInstruction.contains("can't confirm"))
+    }
+
+    func testNearPoseWithSingleNodePathStillArrives() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+
+        let started = navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 9.9, bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertEqual(navigator.phase, .arrived)
+    }
+
+    // MARK: - Clock-face phrasing
+
+    func testClockFaceModeSpeaksHoursInAlignmentCue() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+
+        // Route bearing 0, facing 90 → the route is at the user's 9 o'clock.
+        let started = navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 90),
+            speakLandmarks: false,
+            clockFaceDirections: true,
+            arHeading: 90
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertTrue(navigator.currentInstruction.contains("9 o'clock"))
+    }
+
+    // MARK: - Paused-user cues
+
+    func testStillnessRepromptsFullWalkInstruction() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+
+        navigator.forceStillnessRepromptWindowForTesting()
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+
+        XCTAssertEqual(navigator.speechCue?.text.hasPrefix("Walk"), true)
+    }
+
+    func testAlignmentCompletionSpeaksWalkResumeCue() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 180),
+            speakLandmarks: false,
+            arHeading: 180
+        ))
+
+        // Facing away from the route → alignment cue arms the resume follow-up.
+        navigator.update(imuState: Self.imu(bearing: 180), arPosition: nil, arHeading: 180, arLocalized: false)
+        XCTAssertTrue(navigator.currentInstruction.contains("face the route"))
+
+        // Turn completed → explicit walk resumption, not silence.
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+        XCTAssertEqual(navigator.speechCue?.text.hasPrefix("Good."), true)
+        XCTAssertNotNil(navigator.speechCue?.text.range(of: "walk", options: .caseInsensitive))
+    }
+
+    private static func cerealMap() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Produce", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let target = node(id: "cereal", name: "Cereal", point: SemanticRoutePoint(x: 0, y: 8), kind: .destination)
+        return map(id: "cereal-route", coordinateSpace: "pdr_xy", nodes: [start, target])
+    }
+
+    private static func onionsMap() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Cereal", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let target = node(id: "onions", name: "Onions", point: SemanticRoutePoint(x: 0, y: 8), kind: .destination)
+        return map(id: "onions-route", coordinateSpace: "pdr_xy", nodes: [start, target])
+    }
+
     private static func straightMap(coordinateSpace: String) -> SemanticRouteMap {
         let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
         let target = node(id: "milk", name: "Milk", point: SemanticRoutePoint(x: 0, y: 8), kind: .destination)

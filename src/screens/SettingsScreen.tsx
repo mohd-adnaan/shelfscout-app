@@ -229,6 +229,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     updateDistanceUnit,
     updateEnableAcquisitionAutoExit,
     updateNavigationErrorRecovery,
+    updateNavigationClockFaceDirections,
   } =
     useSettings();
 
@@ -343,6 +344,18 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       );
     },
     [updateNavigationErrorRecovery],
+  );
+
+  const handleClockFaceDirectionsToggle = useCallback(
+    async (value: boolean) => {
+      await updateNavigationClockFaceDirections(value);
+      await speechOutput.announce(
+        value
+          ? 'Clock face directions enabled. Turns are spoken as clock hours, like turn to 2 o\'clock.'
+          : 'Clock face directions disabled. Turns are spoken as left and right.',
+      );
+    },
+    [updateNavigationClockFaceDirections],
   );
 
   const handleWearablesMicrophoneToggle = useCallback(
@@ -586,6 +599,32 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 />
               </View>
 
+              <View style={styles.settingRow}>
+                <View style={styles.settingLabelBlock}>
+                  <Text style={styles.settingLabel}>Clock-face directions</Text>
+                  <Text style={styles.settingSubLabel}>
+                    {settings.navigationClockFaceDirections
+                      ? 'Turns spoken as clock hours (2 o\'clock)'
+                      : 'Turns spoken as left and right'}
+                  </Text>
+                </View>
+                <Switch
+                  value={settings.navigationClockFaceDirections}
+                  onValueChange={handleClockFaceDirectionsToggle}
+                  trackColor={{ false: C.border, true: C.success }}
+                  thumbColor={settings.navigationClockFaceDirections ? C.success : C.sliderThumb}
+                  ios_backgroundColor={C.border}
+                  accessible={true}
+                  accessibilityRole="switch"
+                  accessibilityLabel="Clock-face directions"
+                  accessibilityHint={
+                    settings.navigationClockFaceDirections
+                      ? 'Double tap to speak turns as left and right.'
+                      : 'Double tap to speak turns as clock hours.'
+                  }
+                />
+              </View>
+
               <Text style={styles.settingDescription}>
                 Set up and manage the saved ARKit maps used by on-device
                 navigation and Spatial Target reaching.
@@ -685,6 +724,34 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                   settings.navigationErrorRecovery
                     ? 'Double tap to disable route error recovery during guidance.'
                     : 'Double tap to enable route error recovery during guidance.'
+                }
+              />
+            </View>
+          )}
+
+          {settings.navigationPipeline === 'arkit' && (
+            <View style={styles.settingRow}>
+              <View style={styles.settingLabelBlock}>
+                <Text style={styles.settingLabel}>Clock-face directions</Text>
+                <Text style={styles.settingSubLabel}>
+                  {settings.navigationClockFaceDirections
+                    ? 'Turns spoken as clock hours (2 o\'clock)'
+                    : 'Turns spoken as left and right'}
+                </Text>
+              </View>
+              <Switch
+                value={settings.navigationClockFaceDirections}
+                onValueChange={handleClockFaceDirectionsToggle}
+                trackColor={{ false: C.border, true: C.success }}
+                thumbColor={settings.navigationClockFaceDirections ? C.success : C.sliderThumb}
+                ios_backgroundColor={C.border}
+                accessible={true}
+                accessibilityRole="switch"
+                accessibilityLabel="Clock-face directions"
+                accessibilityHint={
+                  settings.navigationClockFaceDirections
+                    ? 'Double tap to speak turns as left and right.'
+                    : 'Double tap to speak turns as clock hours.'
                 }
               />
             </View>

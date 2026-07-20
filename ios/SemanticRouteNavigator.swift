@@ -68,6 +68,14 @@ enum SemanticRouteSide: String, Codable, CaseIterable, Identifiable {
     }
 }
 
+/// How relative directions are spoken: plain left/right words, or clock-face
+/// hours ("turn to 2 o'clock") — the O&M convention many blind users prefer
+/// because it encodes the turn magnitude a bare "turn left" loses.
+enum SemanticTurnPhrasing: String {
+    case leftRight
+    case clockFace
+}
+
 enum SemanticTurnHint: String, Codable, CaseIterable, Identifiable {
     case left
     case right
@@ -202,15 +210,31 @@ struct SemanticRouteMap: Identifiable, Codable, Equatable {
 
     var targetNames: [String] {
         let destinationIDs = Set(destinationNodeIds ?? nodes.filter { $0.kind == .destination }.map(\.id))
+        // Entrances, shelves, and aisles are queryable too: a route mapped
+        // produce→cereal must also answer "take me to produce" in reverse.
+        let queryableKinds: Set<SemanticRouteNodeKind> = [.destination, .entrance, .shelf, .aisle]
         let nodeNames = nodes
-            .filter { $0.kind == .destination || destinationIDs.contains($0.id) }
+            .filter { queryableKinds.contains($0.kind) || destinationIDs.contains($0.id) }
             .map(\.name)
+            .filter { Self.isQueryableTargetName($0) }
         let landmarkNames = landmarks
             .filter { $0.kind == .destinationContext || $0.priority >= 20 }
             .map(\.name)
+            .filter { Self.isQueryableTargetName($0) }
         return Array(Set(nodeNames + landmarkNames)).sorted {
             $0.localizedCaseInsensitiveCompare($1) == .orderedAscending
         }
+    }
+
+    /// Generic capture labels are not meaningful spoken destinations and
+    /// would pollute the grounding vocabulary offered to the voice layer.
+    private static func isQueryableTargetName(_ name: String) -> Bool {
+        let lower = name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let generic: Set<String> = [
+            "", "start", "point a", "waypoint", "turn", "corner",
+            "left turn", "right turn", "left corner", "right corner", "straight point"
+        ]
+        return !generic.contains(lower)
     }
 }
 
@@ -403,6 +427,11 @@ final class SemanticRouteNavigator: ObservableObject {
     /// AR contradicts a pending step completion.
     private var lastTrustedARRemainingMeters: Double?
     private var lastRouteRebuildAttemptAt: Date?
+    private var stillnessStartedAt: Date?
+    private var lastStillnessRepromptAt: Date?
+    private var pendingAlignmentResumeCue = false
+    private var didRebuildRouteThisUpdate = false
+    private var turnPhrasing: SemanticTurnPhrasing = .leftRight
 
     private let arrivalThresholdMeters = 0.55
     private let destinationProximityMeters = 0.75
@@ -480,6 +509,24 @@ final class SemanticRouteNavigator: ObservableObject {
     private let routeBeliefLargeCorrectionMinimumSamples = 3
     private let routeBeliefLargeCorrectionMinimumDuration: TimeInterval = 0.75
     private let routeBeliefPhysicalSlackMeters = 0.85
+    /// A single-node path means "already there" — only believable when the
+    /// live pose is genuinely this close to the target node.
+    private let immediateArrivalMaxMeters = 2.0
+    /// Standing still this long re-speaks the full walk instruction; the
+    /// meter-countdown speech only fires while progress changes.
+    private let stillnessRepromptAfterSeconds: TimeInterval = 7.0
+    private let stillnessRepromptRepeatSeconds: TimeInterval = 18.0
+    /// Off-corridor recovery escalates from orientation nudges to a real
+    /// rejoin route ("walk N meters back to the route") after this long.
+    private let rejoinGuidanceAfterSeconds: TimeInterval = 6.0
+    private let rejoinMaxDistanceMeters = 12.0
+    private let rejoinMinimumDistanceMeters = 0.75
+    /// Appended captures must begin near the existing network so the new
+    /// branch connects instead of forming an unroutable island.
+    private let appendConnectRadiusMeters = 4.0
+    /// New nodes landing this close to an already-mapped node get a
+    /// connector edge — crossings become routable junctions.
+    private let junctionSnapRadiusMeters = 0.9
 
     private typealias RouteProjection = (
         alongTrackMeters: Double,
@@ -646,6 +693,26 @@ final class SemanticRouteNavigator: ObservableObject {
         return routeSteps[currentStepIndex]
     }
 
+    /// Spoken-label vocabulary across every saved map, used by the voice
+    /// layer to ground an ASR target ("serial") against real labels
+    /// ("cereal") before the AR session is even opened. Reads the persisted
+    /// store directly and touches no live navigator state, so it is safe to
+    /// call from any queue.
+    nonisolated static func availableTargetVocabulary() -> [[String: String]] {
+        let storedMaps = SemanticRouteMapStore().load()
+        var seen = Set<String>()
+        var entries: [[String: String]] = []
+        for map in storedMaps {
+            for label in map.targetNames {
+                let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !trimmed.isEmpty else { continue }
+                guard seen.insert("\(trimmed.lowercased())|\(map.id)").inserted else { continue }
+                entries.append(["label": trimmed, "mapId": map.id, "mapName": map.name])
+            }
+        }
+        return entries
+    }
+
     func loadMaps() {
         let loaded = store.load()
         let cleaned = loaded.map { Self.sanitizedMap(Self.migratedToNorthUpAxes($0)) }
@@ -762,6 +829,31 @@ final class SemanticRouteNavigator: ObservableObject {
         currentInstruction = "Mark Point A. Use the detected POI if it is correct, or type a start label."
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
         rebuildRAGContext()
+    }
+
+    /// Continues capture inside an existing saved map instead of starting a
+    /// new one. The pilot's "one-way map per trip" workflow came from every
+    /// capture creating a fresh map: extend the store map instead, and the
+    /// first new node is stitched to the nearest already-mapped node so the
+    /// trails form one routable network.
+    @discardableResult
+    func beginRouteCaptureAppending(toMapID mapID: String) -> Bool {
+        guard let existing = maps.first(where: { $0.id == mapID }) else { return false }
+        stopNavigation(resetInstruction: false)
+        activeMapDraft = existing
+        activeMap = existing
+        lastCapturedNodeID = nil
+        lastAutoSampledPoint = nil
+        lastAutoSampledHeading = nil
+        lastAutoSampledAt = nil
+        currentSegmentDraftMeters = 0
+        refreshCaptureMetrics(for: existing)
+        phase = .mapping
+        mappingQualityText = "Extending \(existing.name)"
+        currentInstruction = "Extending \(existing.name). Walk near the mapped route and mark points; new paths connect to the nearest mapped point."
+        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+        rebuildRAGContext()
+        return true
     }
 
     @discardableResult
@@ -1004,9 +1096,32 @@ final class SemanticRouteNavigator: ObservableObject {
             nodeKeyframeSegmentID = edge.id
             nodeKeyframeDistance = edge.distanceMeters
             workingMap.edges.append(edge)
+        } else if !workingMap.nodes.isEmpty {
+            // Append mode: no capture predecessor yet — stitch the new branch
+            // onto the nearest already-mapped node so the network stays one
+            // routable graph instead of growing a disconnected island.
+            guard let anchor = nearestNode(in: workingMap, to: pose),
+                  anchor.point.distance(to: pose) <= appendConnectRadiusMeters else {
+                currentInstruction = "Walk within \(Int(appendConnectRadiusMeters)) meters of the mapped route first so the new path connects, then mark the point again."
+                speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+                return false
+            }
+            var edge = Self.makeEdge(
+                from: anchor,
+                to: node,
+                leftContext: nil,
+                rightContext: nil,
+                spokenContext: "toward \(name)",
+                confidence: arPosition == nil ? 0.6 : 0.85
+            )
+            Self.attachPendingEvidence(to: &edge, in: &workingMap, fromNodeID: anchor.id)
+            nodeKeyframeSegmentID = edge.id
+            nodeKeyframeDistance = edge.distanceMeters
+            workingMap.edges.append(edge)
         }
 
         workingMap.nodes.append(node)
+        stitchJunctionIfNeeded(for: node, in: &workingMap)
         appendVisualKeyframe(
             to: &workingMap,
             pose: node.point,
@@ -1035,11 +1150,36 @@ final class SemanticRouteNavigator: ObservableObject {
             : kind == .entrance
                 ? "Point A captured. Walk toward the first turn or destination."
                 : kind == .destination
-                    ? "Destination \(name) captured. Review and save the route."
+                    ? "Destination \(name) captured. Keep walking to add more stops, or save the map."
                     : "Captured route point \(name)."
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .regular)
         rebuildRAGContext()
         return true
+    }
+
+    /// When a newly captured point lands on an already-mapped spot (a trail
+    /// crossing an earlier one), add a connector edge so routing can pass
+    /// through the junction instead of treating the trails as separate
+    /// one-way corridors.
+    private func stitchJunctionIfNeeded(for node: SemanticRouteNode, in map: inout SemanticRouteMap) {
+        let connectedIDs = Set(map.edges.flatMap { edge in
+            edge.fromNodeID == node.id ? [edge.toNodeID] : (edge.toNodeID == node.id ? [edge.fromNodeID] : [])
+        })
+        let candidates = map.nodes.filter { $0.id != node.id && !connectedIDs.contains($0.id) }
+        guard let nearest = candidates.min(by: {
+            $0.point.distance(to: node.point) < $1.point.distance(to: node.point)
+        }), nearest.point.distance(to: node.point) <= junctionSnapRadiusMeters else {
+            return
+        }
+        let edge = Self.makeEdge(
+            from: nearest,
+            to: node,
+            leftContext: nil,
+            rightContext: nil,
+            spokenContext: "through the junction",
+            confidence: 0.8
+        )
+        map.edges.append(edge)
     }
 
     @discardableResult
@@ -1284,6 +1424,7 @@ final class SemanticRouteNavigator: ObservableObject {
         activeARWorldMapID: String? = nil,
         speakLandmarks: Bool = true,
         errorRecovery: Bool = true,
+        clockFaceDirections: Bool = false,
         arHeading: Double? = nil
     ) -> Bool {
         guard let map = activeMap else {
@@ -1306,11 +1447,16 @@ final class SemanticRouteNavigator: ObservableObject {
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
             return false
         }
-        guard let targetNode = resolveTarget(trimmed, in: map) else {
+        guard let resolved = resolveTargetDetailed(trimmed, in: map) else {
             currentInstruction = "\(trimmed) is not in this semantic map."
             speechCue = SemanticSpeechCue(text: "\(trimmed) is not in this semantic map.", priority: .priority)
             return false
         }
+        let targetNode = resolved.node
+        // A fuzzy resolution ("serial" → cereal) adopts the mapped label so
+        // every later announcement speaks the real destination name.
+        let spokenTarget = resolved.isExact ? trimmed : Self.sanitizedSpokenLabel(targetNode.name, fallback: trimmed)
+        turnPhrasing = clockFaceDirections ? .clockFace : .leftRight
         guard let start = resolveNavigationStart(
             in: map,
             targetNodeID: targetNode.id,
@@ -1324,8 +1470,21 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let path = start.nodePath
         guard path.count >= 2 else {
+            // "Already there" is only believable when the live pose is truly
+            // near the target: a bad relocalization snapping to the
+            // destination node must not fire the reaching handoff from
+            // across the store.
+            let pose = map.coordinateSpace == "ar_world_xz"
+                ? Self.routePoint(from: arPosition)
+                : SemanticRoutePoint(x: imuState.position.x, y: imuState.position.y)
+            let distanceToTarget = pose?.distance(to: targetNode.point)
+            guard let distanceToTarget, distanceToTarget <= immediateArrivalMaxMeters else {
+                currentInstruction = "I can't confirm you are at \(targetNode.name) yet. Walk a few steps along the route and ask again."
+                speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+                return false
+            }
             phase = .arrived
-            targetName = trimmed
+            targetName = spokenTarget
             currentInstruction = "You are already at \(targetNode.name)."
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             rebuildRAGContext()
@@ -1338,7 +1497,7 @@ final class SemanticRouteNavigator: ObservableObject {
             return false
         }
 
-        targetName = trimmed
+        targetName = spokenTarget
         routeSteps = steps
         currentStepIndex = 0
         segmentProgressMeters = min(max(start.initialProgressMeters, 0), steps.first?.edge.distanceMeters ?? 0)
@@ -1364,6 +1523,9 @@ final class SemanticRouteNavigator: ObservableObject {
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
         lastRouteRebuildAttemptAt = nil
+        stillnessStartedAt = nil
+        lastStillnessRepromptAt = nil
+        pendingAlignmentResumeCue = false
         resetRouteCorrectionGuards()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = Date().addingTimeInterval(guidanceIntroProtectionSeconds)
@@ -1412,6 +1574,9 @@ final class SemanticRouteNavigator: ObservableObject {
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
         lastRouteRebuildAttemptAt = nil
+        stillnessStartedAt = nil
+        lastStillnessRepromptAt = nil
+        pendingAlignmentResumeCue = false
         resetRouteCorrectionGuards()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = nil
@@ -1638,6 +1803,21 @@ final class SemanticRouteNavigator: ObservableObject {
             return
         }
 
+        if pendingAlignmentResumeCue, headingError <= routeStartAlignmentThresholdDegrees, phase == .navigating {
+            // The corrective turn just completed. Without an explicit "walk"
+            // resumption the user stands still waiting for permission to
+            // move — the pilot heard only turn cues after pausing.
+            pendingAlignmentResumeCue = false
+            updateInstruction(forceSpeech: false)
+            currentInstruction = "Good. \(currentInstruction)"
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            // Claim this meter bucket so the routine countdown can't clobber
+            // the resume cue later in the same tick.
+            lastAnnouncedRemainingMeter = Int(ceil(segmentRemainingMeters))
+            stillnessStartedAt = nil
+            lastStillnessRepromptAt = nil
+        }
+
         if advanceFromVisualDecisionPoint(visualMatch, on: step) {
             rebuildRAGContext()
             return
@@ -1658,6 +1838,13 @@ final class SemanticRouteNavigator: ObservableObject {
                 routeProjection: routeProjection,
                 backwardDriftMeters: backwardDriftMeters
             )
+            if didRebuildRouteThisUpdate {
+                // Rejoin guidance replaced routeSteps; the local `step`
+                // binding is stale, so later checks must not run this tick.
+                didRebuildRouteThisUpdate = false
+                rebuildRAGContext()
+                return
+            }
         }
 
         // ── Turn/node proximity check ────────────────────────────────
@@ -1710,8 +1897,34 @@ final class SemanticRouteNavigator: ObservableObject {
         } else {
             updateInstruction(forceSpeech: false)
             announceVisualLandmarkIfNeeded(visualMatch)
+            repromptWalkIfStalled(imuState: imuState)
         }
         rebuildRAGContext()
+    }
+
+    /// Meter-countdown speech only fires while progress changes, so a paused
+    /// user hears nothing actionable. Re-speak the full walk instruction
+    /// after a stretch of stillness, repeating on a slow cadence.
+    private func repromptWalkIfStalled(imuState: IMUState) {
+        if imuState.isMoving {
+            stillnessStartedAt = nil
+            lastStillnessRepromptAt = nil
+            return
+        }
+        guard phase == .navigating else { return }
+        let now = Date()
+        guard guidanceIntroProtectedUntil.map({ now >= $0 }) ?? true else { return }
+        guard let stillSince = stillnessStartedAt else {
+            stillnessStartedAt = now
+            return
+        }
+        guard now.timeIntervalSince(stillSince) >= stillnessRepromptAfterSeconds else { return }
+        if let last = lastStillnessRepromptAt,
+           now.timeIntervalSince(last) < stillnessRepromptRepeatSeconds {
+            return
+        }
+        lastStillnessRepromptAt = now
+        updateInstruction(forceSpeech: true)
     }
 
     /// True when a localized AR pose is still clearly short of the step's end
@@ -2310,6 +2523,83 @@ final class SemanticRouteNavigator: ObservableObject {
         return true
     }
 
+    /// Off-corridor recovery beyond orientation nudges: routes from the live
+    /// pose back to the best network node, then onward to the target, so the
+    /// user hears real "walk N meters" countdown guidance instead of bare
+    /// turn cues with no follow-up.
+    private func startRejoinGuidance(from pose: SemanticRoutePoint, liveHeading: Double) -> Bool {
+        guard let map = activeMap,
+              !targetName.isEmpty,
+              let targetNode = resolveTarget(targetName, in: map) else {
+            return false
+        }
+
+        var best: (node: SemanticRouteNode, path: [String], cost: Double)?
+        for node in map.nodes {
+            let approach = pose.distance(to: node.point)
+            guard approach <= rejoinMaxDistanceMeters else { continue }
+            let path = node.id == targetNode.id ? [node.id] : shortestPath(in: map, from: node.id, to: targetNode.id)
+            guard !path.isEmpty else { continue }
+            let cost = approach + pathCost(for: path, in: map)
+            if cost < (best?.cost ?? .greatestFiniteMagnitude) {
+                best = (node, path, cost)
+            }
+        }
+        guard let best, pose.distance(to: best.node.point) >= rejoinMinimumDistanceMeters else {
+            return false
+        }
+
+        let hereNode = SemanticRouteNode(
+            id: "rejoin_start_\(UUID().uuidString)",
+            name: "your position",
+            point: pose,
+            headingDegrees: liveHeading,
+            kind: .waypoint,
+            turnHint: nil,
+            aliases: [],
+            capturedAt: Date(),
+            poiAnchorId: nil
+        )
+        let rejoinEdge = Self.makeEdge(
+            from: hereNode,
+            to: best.node,
+            leftContext: nil,
+            rightContext: nil,
+            spokenContext: "back to the route",
+            confidence: 0.6
+        )
+        let tailSteps = buildSteps(for: best.path, in: map)
+        routeSteps = [SemanticRouteStep(edge: rejoinEdge, from: hereNode, to: best.node)] + tailSteps
+        currentStepIndex = 0
+        segmentProgressMeters = 0
+        segmentRemainingMeters = rejoinEdge.distanceMeters
+        lastAnnouncedRemainingMeter = nil
+        lastAnnouncedLandmarkID = nil
+        recoveryStartedAt = nil
+        recoveryReason = nil
+        lastRecoveryCueKey = nil
+        beliefIssueStartedAt = nil
+        lastRecoveredAt = Date()
+        arrivalVisualHoldStartedAt = nil
+        lastARNodeDistanceMeters = nil
+        lastTrustedARRemainingMeters = nil
+        pendingAlignmentResumeCue = false
+        resetRouteCorrectionGuards()
+        resetRouteBelief(status: .initializing)
+        phase = .navigating
+        didRebuildRouteThisUpdate = true
+
+        let turn = Self.relativeTurnCommand(from: liveHeading, to: rejoinEdge.bearingDegrees, style: turnPhrasing)
+        let nodeName = Self.sanitizedSpokenLabel(best.node.name, fallback: "the route")
+        let walkText = "Walk \(Self.formatMeters(rejoinEdge.distanceMeters)) to \(nodeName)."
+        currentInstruction = turn.key == "straight"
+            ? "Off route. \(walkText)"
+            : "Off route. \(turn.text) Then walk \(Self.formatMeters(rejoinEdge.distanceMeters)) to \(nodeName)."
+        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        rebuildRAGContext()
+        return true
+    }
+
     /// Leaves the recovering phase and, when a recovery cue was actually
     /// spoken, tells the user guidance is trustworthy again — a silent flip
     /// back leaves them unsure whether to keep pausing.
@@ -2374,7 +2664,7 @@ final class SemanticRouteNavigator: ObservableObject {
     ) -> String? {
         let headingError = abs(SemanticRouteMath.signedAngleDifference(liveHeading, step.edge.bearingDegrees))
         guard headingError >= routeStartAlignmentThresholdDegrees else { return nil }
-        return Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees)
+        return Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing)
     }
 
     private func issueHeadingAlignmentCueIfNeeded(
@@ -2400,8 +2690,8 @@ final class SemanticRouteNavigator: ObservableObject {
         let nearStepStart = segmentProgressMeters <= routeAlignmentProgressWindowMeters
         guard nearStepStart || recentlyAdvanced || recentlyRecovered else { return false }
 
-        let instruction = Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees)
-        let key = "align_\(Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees).key)_\(currentStepIndex)"
+        let instruction = Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing)
+        let key = "align_\(Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing).key)_\(currentStepIndex)"
         let now = Date()
         let cueChanged = key != lastHeadingAlignmentCueKey
         let cueAge = lastHeadingAlignmentCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
@@ -2415,6 +2705,9 @@ final class SemanticRouteNavigator: ObservableObject {
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             lastHeadingAlignmentCueAt = now
             lastHeadingAlignmentCueKey = key
+            // Once the user finishes this turn, follow up with an explicit
+            // "walk" resumption instead of going silent.
+            pendingAlignmentResumeCue = true
         }
         return true
     }
@@ -2861,6 +3154,23 @@ final class SemanticRouteNavigator: ObservableObject {
 
         phase = .recovering
         recoveryReason = cue.reason
+
+        // Escalation past orientation nudges: still off the corridor after
+        // several seconds of cues means the user walked off the mapped path
+        // (pilot: "points us back but gives no walking instructions"). Build
+        // a real rejoin route so they get walk-N-meters countdown guidance.
+        if crossTrackBad,
+           arLocalized,
+           let pose,
+           let startedAt = recoveryStartedAt,
+           now.timeIntervalSince(startedAt) >= rejoinGuidanceAfterSeconds,
+           lastRouteRebuildAttemptAt.map({ now.timeIntervalSince($0) >= routeRebuildRetrySeconds }) ?? true {
+            lastRouteRebuildAttemptAt = now
+            if startRejoinGuidance(from: pose, liveHeading: liveHeading) {
+                return
+            }
+        }
+
         guard cueChanged || cueAge >= recoveryCueCooldownSeconds else {
             return
         }
@@ -2893,7 +3203,7 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         if headingBad, headingError >= 135 {
-            let turn = Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees)
+            let turn = Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing)
             return RecoveryCueDecision(
                 instruction: turn.text,
                 reason: String(format: "Heading %.0f degrees off.", headingError),
@@ -2904,7 +3214,7 @@ final class SemanticRouteNavigator: ObservableObject {
         if crossTrackBad {
             if let pose, let routeProjection {
                 let routeBearing = pose.bearingDegrees(to: routeProjection.nearestPoint)
-                let command = Self.relativeRecoveryCommand(from: liveHeading, to: routeBearing)
+                let command = Self.relativeRecoveryCommand(from: liveHeading, to: routeBearing, style: turnPhrasing)
                 let context = recoveryContext(on: step, progressMeters: routeProjection.alongTrackMeters)
                 return RecoveryCueDecision(
                     instruction: Self.compactRecoveryInstruction(command, meters: observedCrossTrack),
@@ -2920,7 +3230,7 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         if headingBad {
-            let turn = Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees)
+            let turn = Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing)
             return RecoveryCueDecision(
                 instruction: turn.text,
                 reason: String(format: "Heading %.0f degrees off.", headingError),
@@ -3096,7 +3406,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let current = routeSteps[currentStepIndex]
         let next = routeSteps[currentStepIndex + 1]
-        let turn = Self.turnInstruction(at: current.to, from: current.edge.bearingDegrees, to: next.edge.bearingDegrees)
+        let turn = turnInstruction(at: current.to, from: current.edge.bearingDegrees, to: next.edge.bearingDegrees)
         let decisionLandmarkCue = shouldSpeakLandmarks
             ? nearbyLandmarkCue(on: current, after: max(segmentProgressMeters, current.edge.distanceMeters - 0.75))
             : nil
@@ -3112,6 +3422,9 @@ final class SemanticRouteNavigator: ObservableObject {
         arrivalVisualHoldStartedAt = nil
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
+        pendingAlignmentResumeCue = false
+        stillnessStartedAt = nil
+        lastStillnessRepromptAt = nil
         if phase == .recovering { phase = .navigating }
         let nextContext: String
         if let hint = next.to.turnHint, hint.isCorner {
@@ -3171,7 +3484,7 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         if cueRemainingMeters <= turnAnnouncementThresholdMeters, currentStepIndex < routeSteps.count - 1 {
             let next = routeSteps[currentStepIndex + 1]
-            let turn = Self.turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees)
+            let turn = turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees)
             if cueRemainingMeters <= 0.75 {
                 currentInstruction = step.to.turnHint?.isCorner == true
                     ? "\(Self.sentenceCased(turn))."
@@ -3223,7 +3536,7 @@ final class SemanticRouteNavigator: ObservableObject {
             let cue: String
             if bucket == 1, currentStepIndex < routeSteps.count - 1 {
                 let next = routeSteps[currentStepIndex + 1]
-                cue = "One meter. \(Self.turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees))."
+                cue = "One meter. \(turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees))."
             } else if bucket == 1 {
                 cue = "One meter to \(targetName)."
             } else {
@@ -3710,13 +4023,34 @@ final class SemanticRouteNavigator: ObservableObject {
     }
 
     private func resolveTarget(_ target: String, in map: SemanticRouteMap) -> SemanticRouteNode? {
+        resolveTargetDetailed(target, in: map)?.node
+    }
+
+    private func resolveTargetDetailed(_ target: String, in map: SemanticRouteMap) -> (node: SemanticRouteNode, isExact: Bool)? {
         if let landmark = map.landmarks.first(where: { Self.matches($0.name, target) || $0.aliases.contains(where: { Self.matches($0, target) }) }),
            let node = map.nodes.first(where: { $0.id == landmark.nodeID }) {
-            return node
+            return (node, true)
         }
-        return map.nodes.first { node in
+        if let node = map.nodes.first(where: { node in
             Self.matches(node.name, target) || node.aliases.contains { Self.matches($0, target) }
+        }) {
+            return (node, true)
         }
+        // Fuzzy/phonetic fallback: ASR noise ("serial", "onion") must still
+        // resolve instead of dead-ending guidance with "not in this map".
+        if let landmark = map.landmarks.first(where: {
+            Self.fuzzyMatchesSpokenTarget($0.name, target) ||
+            $0.aliases.contains(where: { Self.fuzzyMatchesSpokenTarget($0, target) })
+        }), let node = map.nodes.first(where: { $0.id == landmark.nodeID }) {
+            return (node, false)
+        }
+        if let node = map.nodes.first(where: { node in
+            Self.fuzzyMatchesSpokenTarget(node.name, target) ||
+            node.aliases.contains { Self.fuzzyMatchesSpokenTarget($0, target) }
+        }) {
+            return (node, false)
+        }
+        return nil
     }
 
     private func resolveNavigationStart(
@@ -4083,56 +4417,103 @@ final class SemanticRouteNavigator: ObservableObject {
         }
     }
 
-    private static func relativeRecoveryCommand(from heading: Double, to targetBearing: Double) -> (text: String, key: String) {
+    private static func relativeRecoveryCommand(
+        from heading: Double,
+        to targetBearing: Double,
+        style: SemanticTurnPhrasing = .leftRight
+    ) -> (text: String, key: String) {
         let diff = SemanticRouteMath.signedAngleDifference(targetBearing, heading)
         let magnitude = abs(diff)
         if magnitude < 25 { return ("Forward", "forward") }
+        if style == .clockFace {
+            let hour = clockHour(forSignedDegrees: diff)
+            return ("Head to \(hour) o'clock", "clock_\(hour)")
+        }
         if magnitude < 75 { return diff > 0 ? ("Step right", "right") : ("Step left", "left") }
         if magnitude < 135 { return diff > 0 ? ("Turn right", "turn_right") : ("Turn left", "turn_left") }
         return ("Turn around", "turn_around")
     }
 
     private static func compactRecoveryInstruction(_ command: (text: String, key: String), meters: Double) -> String {
-        guard meters >= 1.5, command.key == "left" || command.key == "right" || command.key == "forward" else {
+        let carriesDistance = command.key == "left" || command.key == "right" ||
+            command.key == "forward" || command.key.hasPrefix("clock_")
+        guard meters >= 1.5, carriesDistance else {
             return "\(command.text)."
         }
         return "\(command.text), \(formatShortMeters(meters))."
     }
 
-    private static func relativeTurnCommand(from heading: Double, to targetBearing: Double) -> (text: String, key: String) {
+    /// Signed heading offset → clock hour: +90° is 3 o'clock, −90° is 9,
+    /// ±180° is 6. Callers handle the near-straight band before calling.
+    private static func clockHour(forSignedDegrees diff: Double) -> Int {
+        var hour = Int((diff / 30.0).rounded())
+        while hour <= 0 { hour += 12 }
+        while hour > 12 { hour -= 12 }
+        return hour
+    }
+
+    private static func relativeTurnCommand(
+        from heading: Double,
+        to targetBearing: Double,
+        style: SemanticTurnPhrasing = .leftRight
+    ) -> (text: String, key: String) {
         let diff = SemanticRouteMath.signedAngleDifference(targetBearing, heading)
         let magnitude = abs(diff)
         if magnitude < 25 { return ("Go straight.", "straight") }
-        if magnitude < 75 { return diff > 0 ? ("Turn right.", "right") : ("Turn left.", "left") }
-        if magnitude < 145 { return diff > 0 ? ("Turn right.", "right") : ("Turn left.", "left") }
+        if style == .clockFace {
+            let hour = clockHour(forSignedDegrees: diff)
+            return ("Turn to \(hour) o'clock.", "clock_\(hour)")
+        }
+        // A "sharp" band keeps a 130° aisle-end turn from being spoken the
+        // same as a gentle 50° one — under-specified turns walked the pilot
+        // users into shelves.
+        if magnitude < 110 { return diff > 0 ? ("Turn right.", "right") : ("Turn left.", "left") }
+        if magnitude < 150 { return diff > 0 ? ("Turn sharp right.", "sharp_right") : ("Turn sharp left.", "sharp_left") }
         return ("Turn around.", "around")
     }
 
-    private static func routeAlignmentInstruction(from heading: Double, to targetBearing: Double) -> String {
-        let command = relativeTurnCommand(from: heading, to: targetBearing)
+    private static func routeAlignmentInstruction(
+        from heading: Double,
+        to targetBearing: Double,
+        style: SemanticTurnPhrasing = .leftRight
+    ) -> String {
+        let command = relativeTurnCommand(from: heading, to: targetBearing, style: style)
         switch command.key {
-        case "right":
-            return "Turn right to face the route."
-        case "left":
-            return "Turn left to face the route."
+        case "straight":
+            return "Face the route."
         case "around":
             return "Turn around to face the route."
         default:
-            return "Face the route."
+            let text = command.text.hasSuffix(".") ? String(command.text.dropLast()) : command.text
+            return "\(text) to face the route."
         }
     }
 
-    private static func turnInstruction(from currentBearing: Double, to nextBearing: Double) -> String {
+    private static func turnInstruction(
+        from currentBearing: Double,
+        to nextBearing: Double,
+        style: SemanticTurnPhrasing = .leftRight
+    ) -> String {
         let diff = SemanticRouteMath.signedAngleDifference(nextBearing, currentBearing)
         let magnitude = abs(diff)
         if magnitude < 18 { return "continue straight" }
+        if style == .clockFace {
+            return "turn to \(clockHour(forSignedDegrees: diff)) o'clock"
+        }
         if magnitude < 45 { return diff > 0 ? "take a slight right" : "take a slight left" }
-        if magnitude < 135 { return diff > 0 ? "turn right" : "turn left" }
+        if magnitude < 110 { return diff > 0 ? "turn right" : "turn left" }
+        if magnitude < 150 { return diff > 0 ? "turn sharp right" : "turn sharp left" }
         return "turn around"
     }
 
-    private static func turnInstruction(at node: SemanticRouteNode, from currentBearing: Double, to nextBearing: Double) -> String {
-        node.turnHint?.spokenInstruction ?? turnInstruction(from: currentBearing, to: nextBearing)
+    private func turnInstruction(at node: SemanticRouteNode, from currentBearing: Double, to nextBearing: Double) -> String {
+        // Corners keep their dedicated phrasing in every mode; recorded
+        // left/right hints lose to computed geometry in clock-face mode
+        // because the hint carries no magnitude.
+        if let hint = node.turnHint, turnPhrasing == .leftRight || hint.isCorner {
+            return hint.spokenInstruction
+        }
+        return Self.turnInstruction(from: currentBearing, to: nextBearing, style: turnPhrasing)
     }
 
     private static func formatMeters(_ meters: Double) -> String {
@@ -4174,6 +4555,98 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private static func matches(_ lhs: String, _ rhs: String) -> Bool {
         normalizedLookupKey(lhs) == normalizedLookupKey(rhs)
+    }
+
+    /// Tolerant spoken-label match for ASR noise: absorbs plural drift
+    /// ("onion" vs "onions") via edit distance and accent-driven phonetic
+    /// swaps ("serial" vs "cereal") via a consonant-skeleton key. Exact
+    /// matching must always be tried first — this is the fallback layer.
+    static func fuzzyMatchesSpokenTarget(_ lhs: String, _ rhs: String) -> Bool {
+        let a = normalizedLookupKey(lhs)
+        let b = normalizedLookupKey(rhs)
+        guard !a.isEmpty, !b.isEmpty else { return false }
+        if a == b { return true }
+        // Numbered labels must stay exact on the number: one edit is all
+        // that separates "aisle 3" from "aisle 4". Short labels ("milk")
+        // stay exact-only so one edit can't cross to a different word.
+        if digitTokens(a) == digitTokens(b) {
+            let shorter = min(a.count, b.count)
+            let allowedEdits = shorter >= 8 ? 2 : (shorter >= 5 ? 1 : 0)
+            if allowedEdits > 0, levenshteinDistance(a, b) <= allowedEdits { return true }
+        }
+        let phoneticA = phoneticKey(a)
+        return phoneticA.count >= 2 && phoneticA == phoneticKey(b)
+    }
+
+    private static func digitTokens(_ s: String) -> String {
+        s.split(separator: " ")
+            .filter { $0.allSatisfy(\.isNumber) }
+            .joined(separator: " ")
+    }
+
+    private static func levenshteinDistance(_ lhs: String, _ rhs: String) -> Int {
+        let a = Array(lhs)
+        let b = Array(rhs)
+        guard !a.isEmpty else { return b.count }
+        guard !b.isEmpty else { return a.count }
+        var previous = Array(0...b.count)
+        var current = [Int](repeating: 0, count: b.count + 1)
+        for i in 1...a.count {
+            current[0] = i
+            for j in 1...b.count {
+                let substitution = previous[j - 1] + (a[i - 1] == b[j - 1] ? 0 : 1)
+                current[j] = min(previous[j] + 1, current[j - 1] + 1, substitution)
+            }
+            swap(&previous, &current)
+        }
+        return previous[b.count]
+    }
+
+    /// Consonant-skeleton phonetic key: soft/hard c resolution plus common
+    /// digraphs, then vowels dropped and doubles collapsed, so "cereal" and
+    /// "serial" both reduce to "srl". Digit-only tokens are kept verbatim so
+    /// "aisle 3" and "aisle 4" never collide.
+    static func phoneticKey(_ raw: String) -> String {
+        var keys: [String] = []
+        for word in raw.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted) where !word.isEmpty {
+            if word.allSatisfy(\.isNumber) {
+                keys.append(word)
+                continue
+            }
+            var normalized = word
+                .replacingOccurrences(of: "ph", with: "f")
+                .replacingOccurrences(of: "gh", with: "g")
+                .replacingOccurrences(of: "wh", with: "w")
+            if normalized.hasPrefix("wr") { normalized = String(normalized.dropFirst()) }
+            if normalized.hasPrefix("kn") { normalized = String(normalized.dropFirst()) }
+
+            let chars = Array(normalized)
+            var mapped = ""
+            for (index, ch) in chars.enumerated() {
+                switch ch {
+                case "c":
+                    let next = index + 1 < chars.count ? chars[index + 1] : " "
+                    mapped.append("eiy".contains(next) ? "s" : "k")
+                case "q":
+                    mapped.append("k")
+                case "z":
+                    mapped.append("s")
+                case "x":
+                    mapped.append("ks")
+                default:
+                    mapped.append(ch)
+                }
+            }
+
+            var key = ""
+            for (index, ch) in mapped.enumerated() {
+                if index > 0, "aeiou".contains(ch) { continue }
+                if let last = key.last, last == ch { continue }
+                key.append(ch)
+            }
+            keys.append(key)
+        }
+        return keys.joined(separator: " ")
     }
 
     private static func normalizedLookupKey(_ raw: String) -> String {
@@ -4557,6 +5030,11 @@ extension SemanticRouteNavigator {
 
     func expireGuidanceIntroProtectionForTesting() {
         guidanceIntroProtectedUntil = nil
+    }
+
+    func forceStillnessRepromptWindowForTesting() {
+        stillnessStartedAt = Date().addingTimeInterval(-(stillnessRepromptAfterSeconds + 1))
+        lastStillnessRepromptAt = nil
     }
 }
 #endif

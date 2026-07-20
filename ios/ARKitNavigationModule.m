@@ -15,6 +15,9 @@ RCT_EXTERN_METHOD(stopNavigation:(RCTPromiseResolveBlock)resolve
 RCT_EXTERN_METHOD(isAvailable:(RCTPromiseResolveBlock)resolve
                   rejecter:(RCTPromiseRejectBlock)reject)
 
+RCT_EXTERN_METHOD(availableNavigationTargets:(RCTPromiseResolveBlock)resolve
+                  rejecter:(RCTPromiseRejectBlock)reject)
+
 @end
 
 @interface RCT_EXTERN_MODULE(OnDeviceLLMModule, NSObject)

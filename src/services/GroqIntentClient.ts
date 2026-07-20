@@ -95,6 +95,63 @@ class GroqIntentClient {
     return GROQ_API_KEYS.length > 0;
   }
 
+  /**
+   * Maps a spoken/transcribed target to one of the saved destination labels
+   * (synonyms, misrecognitions, singular/plural). Returns the chosen label
+   * verbatim from `candidates`, or null when nothing plausibly matches or
+   * the request fails — grounding is always best-effort.
+   */
+  async resolveTargetLabel(target: string, candidates: string[]): Promise<string | null> {
+    const trimmed = target?.trim();
+    if (!trimmed || !candidates.length || !this.isConfigured()) return null;
+    const key = nextKey();
+    if (!key) return null;
+
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+    try {
+      const res = await fetch(GROQ_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${key}`,
+        },
+        body: JSON.stringify({
+          model: GROQ_INTENT_MODEL,
+          temperature: 0,
+          max_tokens: 60,
+          response_format: { type: 'json_object' },
+          messages: [
+            {
+              role: 'system',
+              content:
+                'You match a possibly misheard shopping destination to a saved label. ' +
+                'Pick the label the user most plausibly meant (synonym, plural/singular, or speech-recognition slip). ' +
+                'Return ONLY {"label": "<one of the provided labels>"} or {"label": null} if none plausibly match.',
+            },
+            {
+              role: 'user',
+              content: `Requested: "${trimmed}"\nSaved labels: ${JSON.stringify(candidates)}`,
+            },
+          ],
+        }),
+        signal: controller.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) return null;
+
+      const data = await res.json();
+      const parsed = extractJson(data?.choices?.[0]?.message?.content);
+      const label = typeof parsed?.label === 'string' ? parsed.label.trim() : null;
+      if (!label) return null;
+      // Only trust labels that are actually in the candidate list.
+      return candidates.find(c => c.toLowerCase() === label.toLowerCase()) ?? null;
+    } catch {
+      clearTimeout(timer);
+      return null;
+    }
+  }
+
   async classifyIntent(input: { text: string; hasImage?: boolean }): Promise<LocalLLMResult<IntentClassification>> {
     const text = input.text?.trim();
     if (!text) return unconfigured('empty_text');

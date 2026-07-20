@@ -75,6 +75,7 @@ import { debugLogger } from './src/services/DebugLogger';
 import { DebugOverlay } from './src/components/DebugOverlay';
 import { wearablesCamera } from './src/services/WearablesCamera';
 import { ARKitNavigationBridge, ARKitNavigationResult } from './src/native/ARKitNavigationModule';
+import { groundNavigationTarget } from './src/services/TargetGroundingService';
 import RNFS from 'react-native-fs';
 
 const { width, height } = Dimensions.get('window');
@@ -2221,7 +2222,7 @@ function AppInner(): React.JSX.Element {
       return false;
     }
 
-    const targetName = normalizeTextValue(result.navigation_target) ||
+    let targetName = normalizeTextValue(result.navigation_target) ||
       normalizeTextValue(result.object) ||
       inferNavigationTargetFromCommand(options?.requestedText);
 
@@ -2239,6 +2240,45 @@ function AppInner(): React.JSX.Element {
       if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
       announceTapToStart('Ready.');
       return true;
+    }
+
+    // Ground the transcribed target against the saved map vocabulary before
+    // opening AR: "serial" resolves to "cereal", and a genuine miss gets a
+    // spoken listing of saved destinations instead of a silent dead end.
+    let groundedRouteMapId: string | undefined;
+    try {
+      const grounding = await groundNavigationTarget(targetName);
+      if (grounding.status === 'matched' && grounding.label) {
+        if (grounding.label.toLowerCase() !== targetName.toLowerCase()) {
+          console.log('🧭 [ARKitNavigation] Grounded target:', {
+            requested: targetName,
+            resolved: grounding.label,
+            method: grounding.method,
+          });
+        }
+        targetName = grounding.label;
+        groundedRouteMapId = grounding.mapId;
+      } else if (grounding.status === 'no_match') {
+        if (options?.introSpeechPromise) {
+          try { await options.introSpeechPromise; } catch { }
+        }
+        const known = grounding.availableTargets.slice(0, 6).join(', ');
+        await speakContinuousSpeechAndWait(
+          known
+            ? `I could not find ${targetName} in your saved routes. Saved destinations include: ${known}.`
+            : `I could not find ${targetName} in your saved routes. Map it first from Settings.`,
+          { ignoreAbort: true },
+        );
+        setIsNavigation(false);
+        setIsProcessing(false);
+        setIsCameraActive(true);
+        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        announceTapToStart('Ready.');
+        return true;
+      }
+      // 'no_vocabulary' falls through: native matching still applies.
+    } catch {
+      // Grounding is best-effort; the native layer has its own fuzzy match.
     }
 
     let arAvailable = false;
@@ -2301,11 +2341,12 @@ function AppInner(): React.JSX.Element {
     try {
       navResult = await ARKitNavigationBridge.startNavigation({
         targetName,
-        routeMapId: normalizeTextValue(result.route_map_id) || undefined,
+        routeMapId: normalizeTextValue(result.route_map_id) || groundedRouteMapId || undefined,
         routeMapName: normalizeTextValue(result.route_map_name) || undefined,
         sessionId: getSessionId(),
         speakLandmarks: true,
         errorRecovery: settingsRef.current.navigationErrorRecovery,
+        clockFaceDirections: settingsRef.current.navigationClockFaceDirections,
         voiceOverEnabled: screenReaderEnabledRef.current,
         ttsRate: settingsRef.current.ttsRate,
       });
@@ -2504,6 +2545,7 @@ function AppInner(): React.JSX.Element {
       map_not_found: `No saved AR route map was found for ${targetName}. Open Settings, Manage AR Route Maps, and map the route first.`,
       target_not_found: `${targetName} is not in the saved AR route maps. Add it as a destination or landmark, then try again.`,
       relocalization_failed: navResult.message || 'I could not relocalize against the saved AR map. Walk to any spot on the mapped route, hold the phone at chest height, and slowly scan the shelves.',
+      arrival_unverified: navResult.message || `I could not confirm your position at ${targetName}. Walk along the mapped route and ask again.`,
       cancelled: 'ARKit navigation cancelled.',
       error: navResult.message || 'ARKit navigation ended with an error.',
     };

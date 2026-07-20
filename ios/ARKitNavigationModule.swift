@@ -25,6 +25,17 @@ final class ARKitNavigationModule: NSObject {
         resolve(ARWorldTrackingConfiguration.isSupported)
     }
 
+    /// Spoken-label vocabulary across every saved route map. The JS layer
+    /// grounds ASR targets against this before launching the AR session, so
+    /// "serial" resolves to "cereal" instead of dead-ending guidance.
+    @objc(availableNavigationTargets:rejecter:)
+    func availableNavigationTargets(
+        _ resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        resolve(SemanticRouteNavigator.availableTargetVocabulary())
+    }
+
     @objc(presentRouteManager:rejecter:)
     func presentRouteManager(
         _ resolve: @escaping RCTPromiseResolveBlock,
@@ -47,6 +58,7 @@ final class ARKitNavigationModule: NSObject {
                 launchRouteMapName: nil,
                 speakLandmarks: true,
                 errorRecovery: true,
+                clockFaceDirections: false,
                 ttsRate: nil,
                 onDone: { [weak self] in
                     self?.dismissPresentedController(resolveCancelledNavigation: false)
@@ -131,6 +143,7 @@ final class ARKitNavigationModule: NSObject {
             let routeMapName = config["routeMapName"] as? String
             let speakLandmarks = (config["speakLandmarks"] as? NSNumber)?.boolValue ?? true
             let errorRecovery = (config["errorRecovery"] as? NSNumber)?.boolValue ?? true
+            let clockFaceDirections = (config["clockFaceDirections"] as? NSNumber)?.boolValue ?? false
             let voiceOverEnabled = (config["voiceOverEnabled"] as? NSNumber)?.boolValue ?? UIAccessibility.isVoiceOverRunning
             let ttsRate = (config["ttsRate"] as? NSNumber)?.doubleValue
 
@@ -140,6 +153,7 @@ final class ARKitNavigationModule: NSObject {
                 launchRouteMapName: routeMapName,
                 speakLandmarks: speakLandmarks,
                 errorRecovery: errorRecovery,
+                clockFaceDirections: clockFaceDirections,
                 voiceOverEnabled: voiceOverEnabled,
                 ttsRate: ttsRate,
                 onDone: { [weak self] in
@@ -503,6 +517,7 @@ private struct ARKitRouteHostView: View {
     let launchRouteMapName: String?
     let speakLandmarks: Bool
     let errorRecovery: Bool
+    let clockFaceDirections: Bool
     let voiceOverEnabled: Bool
     let onDone: () -> Void
     let onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
@@ -513,6 +528,7 @@ private struct ARKitRouteHostView: View {
         launchRouteMapName: String?,
         speakLandmarks: Bool,
         errorRecovery: Bool,
+        clockFaceDirections: Bool = false,
         voiceOverEnabled: Bool = UIAccessibility.isVoiceOverRunning,
         ttsRate: Double?,
         onDone: @escaping () -> Void,
@@ -528,6 +544,7 @@ private struct ARKitRouteHostView: View {
         self.launchRouteMapName = launchRouteMapName
         self.speakLandmarks = speakLandmarks
         self.errorRecovery = errorRecovery
+        self.clockFaceDirections = clockFaceDirections
         self.voiceOverEnabled = voiceOverEnabled
         self.onDone = onDone
         self.onAutomationComplete = onAutomationComplete
@@ -541,6 +558,7 @@ private struct ARKitRouteHostView: View {
                 launchRouteMapName: launchRouteMapName,
                 launchSpeakLandmarks: speakLandmarks,
                 launchErrorRecovery: errorRecovery,
+                launchClockFaceDirections: clockFaceDirections,
                 launchVoiceOverEnabled: voiceOverEnabled,
                 onAutomationComplete: onAutomationComplete
             )

@@ -7,6 +7,7 @@ export type ARKitNavigationReason =
   | 'target_not_found'
   | 'ar_unavailable'
   | 'relocalization_failed'
+  | 'arrival_unverified'
   | 'error';
 
 export interface ARKitNavigationConfig {
@@ -16,8 +17,17 @@ export interface ARKitNavigationConfig {
   sessionId?: string;
   speakLandmarks?: boolean;
   errorRecovery?: boolean;
+  /** Speak turns as clock-face hours ("turn to 2 o'clock") instead of left/right. */
+  clockFaceDirections?: boolean;
   voiceOverEnabled?: boolean;
   ttsRate?: number;
+}
+
+/** One spoken destination label from a saved semantic route map. */
+export interface ARKitNavigationTargetEntry {
+  label: string;
+  mapId: string;
+  mapName: string;
 }
 
 export interface ARKitNavigationResult {
@@ -42,6 +52,7 @@ interface NativeARKitNavigationModule {
   presentRouteManager(): Promise<void>;
   stopNavigation(): Promise<void>;
   isAvailable(): Promise<boolean>;
+  availableNavigationTargets(): Promise<ARKitNavigationTargetEntry[]>;
 }
 
 const nativeModule = NativeModules.ARKitNavigationModule as NativeARKitNavigationModule | undefined;
@@ -71,6 +82,9 @@ const unavailableModule: NativeARKitNavigationModule = {
   },
   async isAvailable(): Promise<boolean> {
     return false;
+  },
+  async availableNavigationTargets(): Promise<ARKitNavigationTargetEntry[]> {
+    return [];
   },
 };
 
