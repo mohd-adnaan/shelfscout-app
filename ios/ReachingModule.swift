@@ -7,6 +7,37 @@ import AudioToolbox
 import UIKit
 import ARKit
 
+/// Reaching preferences mirrored down from the React Native Settings screen.
+///
+/// The JS launcher passes these per session, but native callers cannot: the
+/// Manage AR Route Maps screen starts reaching itself when a guided route
+/// arrives at a destination with a reaching object, and it has no way to read
+/// AsyncStorage. It reads this instead, so "Hands-free vs With hand" (and the
+/// spoken distance unit and rate) apply to every way a reaching session can
+/// start, not only the voice flow.
+///
+/// Mirrors `reachingMode` / `distanceUnit` / `ttsRate` in
+/// `src/context/SettingsContext.tsx`; pushed by `setReachingPreferences`.
+enum ReachingPreferences {
+  private static let queue = DispatchQueue(label: "com.shelfscout.reachingprefs")
+  private static var _mode: ReachingViewController.ReachingMode = .handFree
+  private static var _distanceUnit = "steps"
+  private static var _ttsRate: Float = 0.5
+
+  static var mode: ReachingViewController.ReachingMode {
+    get { queue.sync { _mode } }
+    set { queue.sync { _mode = newValue } }
+  }
+  static var distanceUnit: String {
+    get { queue.sync { _distanceUnit } }
+    set { queue.sync { _distanceUnit = newValue } }
+  }
+  static var ttsRate: Float {
+    get { queue.sync { _ttsRate } }
+    set { queue.sync { _ttsRate = newValue } }
+  }
+}
+
 @objc(ReachingModule)
 class ReachingModule: NSObject {
 
@@ -14,6 +45,33 @@ class ReachingModule: NSObject {
   static weak var activeVC: ReachingViewController?
 
   @objc static func requiresMainQueueSetup() -> Bool { return false }
+
+  /// Mirror the Settings-screen reaching preferences into native. Called on
+  /// app start and on every change; see `ReachingPreferences`.
+  @objc func setReachingPreferences(
+    _ params: NSDictionary,
+    resolver: @escaping RCTPromiseResolveBlock,
+    rejecter: @escaping RCTPromiseRejectBlock
+  ) {
+    if let modeStr = params["mode"] as? String {
+      ReachingPreferences.mode = modeStr == "withHand" ? .withHand : .handFree
+    }
+    if let unit = params["distanceUnit"] as? String, unit == "cm" || unit == "steps" {
+      ReachingPreferences.distanceUnit = unit
+    }
+    if let rate = (params["ttsRate"] as? NSNumber)?.floatValue {
+      ReachingPreferences.ttsRate = min(max(rate, 0.1), 1.0)
+    }
+    NSLog("🎯 [ReachingModule] Preferences → mode=%@ distanceUnit=%@ ttsRate=%.2f",
+          ReachingPreferences.mode.rawValue,
+          ReachingPreferences.distanceUnit,
+          ReachingPreferences.ttsRate)
+    resolver([
+      "mode": ReachingPreferences.mode.rawValue,
+      "distanceUnit": ReachingPreferences.distanceUnit,
+      "ttsRate": Double(ReachingPreferences.ttsRate),
+    ])
+  }
 
   @objc func startReaching(
     _ params: NSDictionary,
@@ -121,7 +179,9 @@ class ReachingModule: NSObject {
       }
     }
 
-    let modeStr = (params["mode"] as? String) ?? "handFree"
+    // No explicit mode means the caller has no session-level opinion — fall
+    // back to the mirrored Settings choice rather than assuming hand-free.
+    let modeStr = (params["mode"] as? String) ?? ReachingPreferences.mode.rawValue
     let mode: ReachingViewController.ReachingMode = modeStr == "withHand" ? .withHand : .handFree
 
     ReachingModule.launchSpatialTargetReaching(
@@ -133,8 +193,8 @@ class ReachingModule: NSObject {
       mode: mode,
       startupSilent: (params["startupSilent"] as? Bool) ?? false,
       voiceOverEnabled: (params["voiceOverEnabled"] as? Bool) ?? UIAccessibility.isVoiceOverRunning,
-      ttsRate: (params["ttsRate"] as? NSNumber)?.floatValue ?? 0.5,
-      distanceUnit: (params["distanceUnit"] as? String) ?? "steps",
+      ttsRate: (params["ttsRate"] as? NSNumber)?.floatValue ?? ReachingPreferences.ttsRate,
+      distanceUnit: (params["distanceUnit"] as? String) ?? ReachingPreferences.distanceUnit,
       sessionId: params["sessionId"] as? String,
       onFailure: { code, message, error in
         rejecter(code, message, error)
@@ -154,11 +214,14 @@ class ReachingModule: NSObject {
     routeMapName: String? = nil,
     targetWorldPosition: simd_float3? = nil,
     targetRegion: [CGFloat] = [0.42, 0.38, 0.58, 0.62],
-    mode: ReachingViewController.ReachingMode = .handFree,
+    // Defaults resolve per call, so a native caller with nothing to say about
+    // guidance style (the route-manager arrival handoff) still runs whatever
+    // the user picked in Settings.
+    mode: ReachingViewController.ReachingMode = ReachingPreferences.mode,
     startupSilent: Bool = false,
     voiceOverEnabled: Bool = UIAccessibility.isVoiceOverRunning,
-    ttsRate: Float = 0.5,
-    distanceUnit: String = "steps",
+    ttsRate: Float = ReachingPreferences.ttsRate,
+    distanceUnit: String = ReachingPreferences.distanceUnit,
     sessionId: String? = nil,
     onFailure: @escaping (_ code: String, _ message: String, _ error: Error?) -> Void,
     onDone: @escaping ([String: Any]) -> Void

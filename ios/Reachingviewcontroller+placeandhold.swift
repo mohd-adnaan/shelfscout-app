@@ -44,7 +44,16 @@ extension ReachingViewController {
       tryRefineSpatialTargetExtent(frame)
     }
 
-    processARFrameHandFree(frame)
+    // Guidance style is the user's Settings choice and is independent of how
+    // the anchor was placed, so it routes the same for a backend bbox and for
+    // a map POI: with-hand walks the user in on camera bearing, then hands
+    // over to Vision hand tracking inside arm's reach; hand-free stays on
+    // camera bearing the whole way. Both read the same held anchor.
+    if mode == .withHand {
+      processARFrameWithHand(frame)
+    } else {
+      processARFrameHandFree(frame)
+    }
     return true
   }
 

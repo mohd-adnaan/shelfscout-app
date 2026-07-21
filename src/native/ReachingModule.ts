@@ -61,6 +61,20 @@ export interface SpatialTargetReachingConfig {
   distanceUnit?: 'steps' | 'cm';
 }
 
+/**
+ * Settings-screen reaching preferences mirrored into native.
+ *
+ * Sessions started from JS pass these per call. Sessions started *inside*
+ * native — the Manage AR Route Maps screen hands off to reaching when a guided
+ * route arrives at a destination with a reaching object — cannot read
+ * AsyncStorage, so they read this mirror instead.
+ */
+export interface ReachingPreferences {
+  mode: 'handFree' | 'withHand';
+  distanceUnit: 'steps' | 'cm';
+  ttsRate: number;
+}
+
 export type ReachingState = 'idle' | 'tracking' | 'locked' | 'reached' | 'lost';
 
 export interface ReachingModuleInterface {
@@ -76,7 +90,13 @@ export interface ReachingModuleInterface {
    * map-anchor relocalization behind a separate API from backend bbox reaching.
    */
   startSpatialTargetReaching(config: SpatialTargetReachingConfig): Promise<void>;
-  
+
+  /**
+   * Mirror the Settings reaching preferences into native so natively-started
+   * sessions honour them too.
+   */
+  setReachingPreferences(prefs: ReachingPreferences): Promise<ReachingPreferences>;
+
   /**
    * Stop reaching mode and dismiss ARKit view
    */
@@ -142,6 +162,7 @@ const AndroidStub: ReachingModuleInterface = {
     console.warn('[ReachingModule] spatial target reaching is iOS-only.');
     throw new Error('Spatial target reaching is only available on iOS.');
   },
+  setReachingPreferences: async (prefs) => prefs,
   stopReaching: async () => {
     console.log('[ReachingModule] stopReaching called on Android (no-op)');
   },
@@ -274,6 +295,39 @@ export const startSpatialTargetReachingMode = async (
 };
 
 /**
+ * Push the Settings reaching preferences down to native.
+ *
+ * Guards the method itself, not just the module: an app running against a
+ * native binary built before setReachingPreferences existed would otherwise
+ * throw on every settings change. Native falls back to its own defaults
+ * (hand-free / steps) in that case.
+ */
+export const syncReachingPreferences = async (
+  prefs: ReachingPreferences,
+): Promise<void> => {
+  if (Platform.OS !== 'ios') {
+    return;
+  }
+
+  try {
+    if (typeof ReachingBridge.setReachingPreferences !== 'function') {
+      console.warn(
+        '[ReachingModule] Native setReachingPreferences unavailable — rebuild iOS for the reaching mode to apply to route-manager handoffs',
+      );
+      return;
+    }
+    await ReachingBridge.setReachingPreferences(prefs);
+    console.log(
+      `🎯 [ReachingModule] Native preferences → mode=${prefs.mode} unit=${prefs.distanceUnit} rate=${prefs.ttsRate}`,
+    );
+  } catch (error) {
+    // Never let a mirror failure break a settings change: the JS launch path
+    // still passes the mode per session.
+    console.warn('[ReachingModule] Failed to sync reaching preferences:', error);
+  }
+};
+
+/**
  * Safely stop reaching mode
  */
 export const stopReachingMode = async (): Promise<void> => {
@@ -299,4 +353,5 @@ export default {
   startReachingMode,
   startSpatialTargetReachingMode,
   stopReachingMode,
+  syncReachingPreferences,
 };

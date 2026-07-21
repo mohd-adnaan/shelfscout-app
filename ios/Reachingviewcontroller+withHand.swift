@@ -303,8 +303,9 @@ extension ReachingViewController {
 
     let bboxCx    = projectedBboxCenter.x
     let bboxCy    = projectedBboxCenter.y
-    let bboxHalfW = projectedBboxW / 2
-    let bboxHalfH = projectedBboxH / 2
+    let handTol   = handAlignmentHalfExtents()
+    let bboxHalfW = handTol.w
+    let bboxHalfH = handTol.h
 
     // ── No hand detected ────────────────────────────────────────────────
     guard let obs = handReq.results?.first else {
@@ -442,6 +443,37 @@ extension ReachingViewController {
 
     // ── Acquisition validation (auto-exit) ──────────────────────────────
     checkAcquisitionTriggerWithHand(innerOverlap: innerOverlap, dist: dist)
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Phase 2 Alignment Tolerance
+  // ═══════════════════════════════════════════════════════════════════════════
+  //
+  // The drawn box is not always the object. A backend bbox outlines the thing
+  // itself, so the hand belongs anywhere inside it and the drawn box is the
+  // right tolerance. A spatial (map POI) target draws a SIZE PRIOR instead —
+  // 80×110cm for a door, 60×70cm for a legacy camera-pose pin — and taking
+  // that at face value calls the hand "aligned" the moment it enters frame,
+  // which collapses with-hand back into hand-free.
+  //
+  // Tolerance per axis: never demand better than a palm (the pin itself is
+  // only good to a few cm), never accept more than half the box. Small map
+  // targets — a handle at 10cm — keep their box untouched. The overlay still
+  // draws the full target box; only the alignment test tightens.
+
+  private func handAlignmentHalfExtents() -> (w: CGFloat, h: CGFloat) {
+    let drawn = (w: projectedBboxW / 2, h: projectedBboxH / 2)
+    guard spatialTargetWorldPosition != nil else { return drawn }
+
+    let palm: Float = 0.12   // metres
+    func shrink(_ halfExtent: Float) -> CGFloat {
+      let cap = max(palm, halfExtent * 0.5)
+      return halfExtent > cap ? CGFloat(cap / halfExtent) : 1
+    }
+    // Floor at 20pt: a tolerance smaller than the hand dot itself is
+    // unreachable and would leave the user hunting a pixel.
+    return (max(drawn.w * shrink(objectWorldHalfW), 20),
+            max(drawn.h * shrink(objectWorldHalfH), 20))
   }
 
   // ═══════════════════════════════════════════════════════════════════════════

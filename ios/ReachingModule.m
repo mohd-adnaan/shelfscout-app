@@ -13,6 +13,10 @@ RCT_EXTERN_METHOD(startSpatialTargetReaching:(NSDictionary *)params
                   resolver:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)
 
+RCT_EXTERN_METHOD(setReachingPreferences:(NSDictionary *)params
+                  resolver:(RCTPromiseResolveBlock)resolver
+                  rejecter:(RCTPromiseRejectBlock)rejecter)
+
 RCT_EXTERN_METHOD(updateBbox:(NSDictionary *)params
                   resolver:(RCTPromiseResolveBlock)resolver
                   rejecter:(RCTPromiseRejectBlock)rejecter)

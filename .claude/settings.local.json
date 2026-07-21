@@ -42,7 +42,10 @@
       "Bash(timeout 20 node wake.mjs)",
       "Bash(timeout 10 node wake.mjs)",
       "Bash(node -e ' *)",
-      "Bash(echo \"--- exit: $? ---\")"
+      "Bash(echo \"--- exit: $? ---\")",
+      "Bash(git -C /Users/mohammadadnaan/Projects/ic4u diff --stat)",
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout diff --stat)",
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout diff .claude/settings.local.json)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",
