@@ -25,6 +25,7 @@ import {
 } from 'react-native-vision-camera';
 import Video from 'react-native-video';
 import { useTTS } from './src/hooks/useTTS';
+import { strings } from './src/i18n';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
 import { useWakeWordSTT } from './src/hooks/useWakeWordSTT';
 import { useDeviceOrientation } from './src/hooks/useDeviceOrientation';
@@ -1387,9 +1388,7 @@ function AppInner(): React.JSX.Element {
       console.log('◎ [SpatialTarget] Launching native reaching for:', targetName);
       prewarmDAv2InBackground('spatial target reaching');
 
-      AccessibilityInfo.announceForAccessibility(
-        `Guiding you to ${targetName}. Follow the audio beeps. Tap anywhere when you have it.`
-      );
+      AccessibilityInfo.announceForAccessibility(strings().reaching.guidingTo(targetName));
 
       setIsCameraActive(false);
       setIsReaching(true);
@@ -1443,14 +1442,12 @@ function AppInner(): React.JSX.Element {
             : reachingResult?.success
               ? `${targetName} reached!`
               : reachingResult?.reason === 'spatial_relocalization_timeout'
-                ? 'I could not match the saved map here. Move closer to the mapped shelf and try again.'
-                : 'Reaching guidance ended.';
+                ? strings().reaching.relocalizationTimeout
+                : strings().reaching.ended;
           AccessibilityInfo.announceForAccessibility(msg);
         } else {
           console.warn('⚠️ startSpatialTargetReaching not available — native module not linked');
-          AccessibilityInfo.announceForAccessibility(
-            'Spatial Target reaching is not available. Please rebuild the app.'
-          );
+          AccessibilityInfo.announceForAccessibility(strings().reaching.spatialTargetUnavailable);
         }
       } catch (e: any) {
         console.error('❌ [SpatialTarget] Native module error:', e);
@@ -1458,8 +1455,8 @@ function AppInner(): React.JSX.Element {
         const message = code === 'TARGET_NOT_IN_MAP'
           ? `${targetName} is not pinned in the saved AR map. Add it as a POI and save the map first.`
           : code === 'MAP_NOT_FOUND'
-            ? 'The saved AR map for this target was not found on this device.'
-            : `Reaching error: ${e.message || 'Unknown error'}`;
+            ? strings().reaching.mapNotFound
+            : strings().reaching.error(e.message || strings().reaching.unknownError);
         AccessibilityInfo.announceForAccessibility(message);
       }
 
@@ -1493,7 +1490,9 @@ function AppInner(): React.JSX.Element {
       // a tap during TTS routes to emergencyStop, NOT startListening (dead-loop fix)
       console.log('⚠️ [ARKit] reaching_ios=true but no valid bbox:', rawBbox);
       setIsSpeaking(true);
-      const noBboxMessage = `I can detect the ${result.object || 'object'} in the scene, but I could not get precise coordinates for guidance. Try pointing your camera more directly at it and ask again.`;
+      const noBboxMessage = strings().reaching.noPreciseCoordinates(
+        result.object || strings().reaching.defaultObjectName,
+      );
       if (screenReaderEnabledRef.current) {
         AccessibilityInfo.announceForAccessibility(noBboxMessage);
         await new Promise<void>(resolve => setTimeout(() => resolve(), 3500));
@@ -1512,7 +1511,7 @@ function AppInner(): React.JSX.Element {
     prewarmDAv2InBackground('reaching_ios response');
 
     AccessibilityInfo.announceForAccessibility(
-      `Guiding you to ${result.object || 'object'}. Follow the audio beeps. Tap anywhere when you have it.`
+      strings().reaching.guidingTo(result.object || strings().reaching.defaultObjectName),
     );
 
     setIsCameraActive(false);
@@ -1574,18 +1573,16 @@ function AppInner(): React.JSX.Element {
         const msg = reachingResult?.reason === 'user_confirmed'
           ? 'Reaching complete.'
           : reachingResult?.success
-            ? `${result.object || 'Object'} reached!`
-            : 'Reaching guidance ended.';
+            ? strings().reaching.reached(result.object || strings().reaching.defaultObjectName)
+            : strings().reaching.ended;
         AccessibilityInfo.announceForAccessibility(msg);
       } else {
         console.warn('⚠️ ReachingModule not available — native module not linked');
-        AccessibilityInfo.announceForAccessibility(
-          'Reaching module not available. Please rebuild the app.'
-        );
+        AccessibilityInfo.announceForAccessibility(strings().reaching.moduleUnavailable);
       }
     } catch (e: any) {
       console.error('❌ [ARKit] Native module error:', e);
-      AccessibilityInfo.announceForAccessibility(`Reaching error: ${e.message || 'Unknown error'}`);
+      AccessibilityInfo.announceForAccessibility(strings().reaching.error(e.message || strings().reaching.unknownError));
     }
 
     resetSessionId();
@@ -1656,7 +1653,7 @@ function AppInner(): React.JSX.Element {
       }
 
       if (shouldPreventInfiniteLoop()) {
-        AccessibilityInfo.announceForAccessibility('Stopped due to time limit.');
+        AccessibilityInfo.announceForAccessibility(strings().speech.stoppedTimeLimit);
         break;
       }
 
@@ -2349,6 +2346,7 @@ function AppInner(): React.JSX.Element {
         clockFaceDirections: settingsRef.current.navigationClockFaceDirections,
         voiceOverEnabled: screenReaderEnabledRef.current,
         ttsRate: settingsRef.current.ttsRate,
+        language: settingsRef.current.language,
       });
     } catch (e: any) {
       navResult = {
@@ -2684,7 +2682,7 @@ function AppInner(): React.JSX.Element {
         }
 
         console.warn('⚠️ No photo — voice-only mode');
-        AccessibilityInfo.announceForAccessibility('Processing without photo.');
+        AccessibilityInfo.announceForAccessibility(strings().speech.processingWithoutPhoto);
       }
 
       if (isEmergencyStopped.current) return;
@@ -2872,7 +2870,7 @@ function AppInner(): React.JSX.Element {
           await playErrorSound();
         }
 
-        const errorMessage = 'Error processing your request. Try again.';
+        const errorMessage = strings().speech.requestFailed;
         if (screenReaderEnabledRef.current) {
           AccessibilityInfo.announceForAccessibility(errorMessage);
         } else {
@@ -2920,7 +2918,7 @@ function AppInner(): React.JSX.Element {
     finalText = stripVoiceOverListeningPrefix(finalText);
 
     if (!finalText) {
-      AccessibilityInfo.announceForAccessibility('No voice input detected. Tap to try again.');
+      AccessibilityInfo.announceForAccessibility(strings().speech.noVoiceInput);
       if (!screenReaderEnabledRef.current) { playErrorSound(); }
       return;
     }
@@ -3012,9 +3010,7 @@ function AppInner(): React.JSX.Element {
 
       if (!photoPath && !settingsRef.current.useWearablesCamera) {
         // Voice-only fallback only applies when iPhone camera is selected.
-        AccessibilityInfo.announceForAccessibility(
-          'Warning: Failed to capture photo. Continuing with voice only.'
-        );
+        AccessibilityInfo.announceForAccessibility(strings().speech.photoCaptureFailed);
       }
 
       if (isEmergencyStopped.current) {
@@ -3276,7 +3272,7 @@ function AppInner(): React.JSX.Element {
     } catch (error) {
       console.error('❌ Start listening error:', error);
       if (screenReaderEnabled) {
-        AccessibilityInfo.announceForAccessibility('Error starting voice. Tap to try again.');
+        AccessibilityInfo.announceForAccessibility(strings().speech.errorStartingVoice);
       }
     } finally {
       isStartingRef.current = false;
@@ -3500,7 +3496,7 @@ function AppInner(): React.JSX.Element {
       // Bug 1/2 fix: Skip announcement when VoiceOver is on to avoid
       // consuming the next double-tap gesture.
       if (!screenReaderEnabledRef.current) {
-        AccessibilityInfo.announceForAccessibility(`Stopping ${mode}.`);
+        AccessibilityInfo.announceForAccessibility(strings().speech.stoppingMode(mode));
       }
       await stopContinuousModeLoop();
       // Resume wake word after stopping continuous mode
@@ -3515,7 +3511,7 @@ function AppInner(): React.JSX.Element {
       // VoiceOver reading 'Stopping' consumes the next double-tap gesture,
       // making the user tap additional times to reach the Ready state.
       if (!screenReaderEnabledRef.current) {
-        AccessibilityInfo.announceForAccessibility('Stopping.');
+        AccessibilityInfo.announceForAccessibility(strings().speech.stopping);
       }
       await emergencyStop();
       return;
@@ -3524,7 +3520,7 @@ function AppInner(): React.JSX.Element {
     if (isListening) {
       // Bug 1/2 fix: VoiceOver reads the label change to 'Thinking' automatically.
       if (!screenReaderEnabledRef.current) {
-        AccessibilityInfo.announceForAccessibility('Thinking.');
+        AccessibilityInfo.announceForAccessibility(strings().speech.thinking);
       }
       await stopListeningManually();
       return;

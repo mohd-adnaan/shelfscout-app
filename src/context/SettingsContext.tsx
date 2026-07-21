@@ -13,6 +13,13 @@ import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Platform } from 'react-native';
 import { iOSTts } from '../services/iOSTtsClient';
 import { orchestratorConfig } from '../services/OrchestratorConfig';
+import {
+  AppLanguage,
+  detectDeviceLanguage,
+  parseLanguage,
+  setAppLanguage,
+} from '../i18n';
+import { startNativeLanguageSync } from '../services/NativeLanguageSync';
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -66,6 +73,14 @@ export interface AppSettings {
    * for users trained in O&M clock directions.
    */
   navigationClockFaceDirections: boolean;
+  /**
+   * Language ShelfScout speaks, listens, and renders in. Seeded from the
+   * device language on first launch, then user-controlled: a Quebec user may
+   * run an English iPhone but want French guidance, or the reverse. Drives
+   * TTS voice, speech-recognition locale, wake-word variants, intent
+   * prompts, and UI copy.
+   */
+  language: AppLanguage;
 }
 
 interface SettingsContextValue {
@@ -84,6 +99,7 @@ interface SettingsContextValue {
   updateEnableAcquisitionAutoExit: (value: boolean) => Promise<void>;
   updateNavigationErrorRecovery: (value: boolean) => Promise<void>;
   updateNavigationClockFaceDirections: (value: boolean) => Promise<void>;
+  updateLanguage: (language: AppLanguage) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
    * Returns 'spatialTarget' | 'arkit' | 'standard' | 'none'.
@@ -126,9 +142,17 @@ const DEFAULT_SETTINGS: AppSettings = {
   enableAcquisitionAutoExit: false,
   navigationErrorRecovery: true,
   navigationClockFaceDirections: false,
+  // Seeded from the device on first launch (and on upgrade from a build that
+  // predates this setting); an explicit choice in Settings overrides it.
+  language: detectDeviceLanguage(),
 };
 
 const STORAGE_KEY = '@cybersight_settings_v1';
+
+// Prime the i18n store before React mounts so anything that speaks during
+// startup (permission prompts, wake-word boot) already uses the right
+// language. The saved preference replaces this once storage resolves.
+setAppLanguage(DEFAULT_SETTINGS.language);
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Context
@@ -143,6 +167,11 @@ const SettingsContext = createContext<SettingsContextValue | undefined>(undefine
 export function SettingsProvider({ children }: { children: ReactNode }) {
   const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
   const [isLoaded, setIsLoaded] = useState(false);
+
+  // ── Mirror language into the native speech layer ─────────────────────────
+  useEffect(() => {
+    startNativeLanguageSync();
+  }, []);
 
   // ── Load from storage on mount ───────────────────────────────────────────
   useEffect(() => {
@@ -166,11 +195,19 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
             inDeviceMode: migratedInDeviceMode,
             reachingPipeline: migratedReachingPipeline,
             preferAlternativeReaching: migratedReachingPipeline === 'standard',
+            // A persisted value from an older build (or a hand-edited store)
+            // may name a language we no longer ship; fall back to the
+            // device-seeded default rather than speaking an unsupported locale.
+            language: parseLanguage(saved.language) ?? DEFAULT_SETTINGS.language,
           };
           setSettings(merged);
 
           // Bridge the master switch into the plain orchestrator singleton.
           orchestratorConfig.setInDeviceMode(merged.inDeviceMode);
+
+          // Publish to the i18n store so non-React services (TTS voice
+          // selection, STT locale, wake word) pick up the saved language.
+          setAppLanguage(merged.language);
 
           // ✅ Apply saved rate through singleton (per-utterance approach)
           // NEVER call Tts.setDefaultRate() — BOOL crash on New Architecture
@@ -344,6 +381,20 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateLanguage = useCallback(
+    async (language: AppLanguage) => {
+      const next = { ...settings, language };
+      setSettings(next);
+      await persist(next);
+
+      // Publish before returning: the caller announces the change, and that
+      // announcement must already be in the new language.
+      setAppLanguage(language);
+      console.log(`[Settings] Language → ${language}`);
+    },
+    [settings, persist],
+  );
+
   // ── Pipeline resolver ─────────────────────────────────────────────────────
 
   const resolveReachingPipeline = useCallback(
@@ -426,6 +477,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateEnableAcquisitionAutoExit,
     updateNavigationErrorRecovery,
     updateNavigationClockFaceDirections,
+    updateLanguage,
     resolveReachingPipeline,
     resolveNavigationPipeline,
     effectiveNavigationPipeline: settings.inDeviceMode ? 'arkit' : settings.navigationPipeline,

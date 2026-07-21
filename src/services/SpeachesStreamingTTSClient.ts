@@ -7,12 +7,11 @@
 import Sound from 'react-native-sound';
 import RNFS from 'react-native-fs';
 import { Buffer } from 'buffer';
+import { kokoroParamsForCurrentLanguage } from './speachesLanguage';
 
 const SPEACHES_CONFIG = {
   ttsUrl: 'https://cybersight.cim.mcgill.ca/speaches/v1/audio/speech',
   model: 'speaches-ai/Kokoro-82M-v1.0-ONNX',
-  voice: 'af_heart',
-  language: 'en-us',
   responseFormat: 'mp3',
   speed: 1,
   sampleRate: 24000,
@@ -80,11 +79,12 @@ class SpeachesStreamingTTSClient {
     return new Promise((resolve, reject) => {
       this.xhr = new XMLHttpRequest();
 
+      const { voice, language } = kokoroParamsForCurrentLanguage();
       const payload = {
         model: SPEACHES_CONFIG.model,
         input: text,
-        voice: SPEACHES_CONFIG.voice,
-        language: SPEACHES_CONFIG.language,
+        voice,
+        language,
         response_format: SPEACHES_CONFIG.responseFormat,
         speed: SPEACHES_CONFIG.speed,
         sample_rate: SPEACHES_CONFIG.sampleRate,

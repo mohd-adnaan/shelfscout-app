@@ -23,6 +23,7 @@ import Voice, {
   SpeechStartEvent,
 } from '@react-native-voice/voice';
 import { openAIVADService } from '../services/OpenAIVADService';
+import { currentLocales } from '../i18n';
 
 // ============================================================================
 // Types
@@ -442,7 +443,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       // ✅ VOICEOVER FIX: Record start time BEFORE Voice.start()
       sttStartTimeRef.current = Date.now();
 
-      await Voice.start('en-US');
+      await Voice.start(currentLocales().stt);
       setIsListening(true);
       
       console.log('✅ iOS voice started - waiting for speech...');

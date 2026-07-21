@@ -16,6 +16,14 @@ import {
   StatusBar,
 } from 'react-native';
 import { useSettings } from '../context/SettingsContext';
+import {
+  AppLanguage,
+  LANGUAGE_ENDONYMS,
+  LANGUAGE_LOCALES,
+  SUPPORTED_LANGUAGES,
+  strings,
+  useStrings,
+} from '../i18n';
 import { speechOutput } from '../services/SpeechOutputService';
 import { wearablesCamera, WearablesCameraStatus } from '../services/WearablesCamera';
 import {
@@ -230,11 +238,30 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     updateEnableAcquisitionAutoExit,
     updateNavigationErrorRecovery,
     updateNavigationClockFaceDirections,
+    updateLanguage,
   } =
     useSettings();
 
   const [localRate, setLocalRate] = useState(settings.ttsRate);
   const [wearablesStatus, setWearablesStatus] = useState<WearablesCameraStatus>('unknown');
+
+  // Re-renders this screen when the language changes, so the switch and every
+  // localized label below it update in place.
+  const t = useStrings();
+
+  // ── Language ──────────────────────────────────────────────────────────────
+
+  const handleLanguageChange = useCallback(
+    async (language: AppLanguage) => {
+      if (language === settings.language) return;
+      await updateLanguage(language);
+      // updateLanguage publishes to the i18n store before resolving, so this
+      // confirmation is already spoken in the language just selected — which
+      // is the confirmation the user needs to hear.
+      await speechOutput.announce(strings().settings.languageChanged);
+    },
+    [settings.language, updateLanguage],
+  );
 
   // ── In-Device Mode (master) ───────────────────────────────────────────────
 
@@ -530,6 +557,57 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
+
+        {/* ══════════════════════════════════════════
+            SECTION 0 — Language
+            First section on purpose: it governs every spoken cue below it,
+            and a user who opened Settings because the app is speaking the
+            wrong language should reach it without hunting.
+        ══════════════════════════════════════════ */}
+        <Section title={t.settings.languageSection}>
+          <Text style={styles.settingDescription}>
+            {t.settings.languageDescription}
+          </Text>
+
+          <View style={styles.comparisonRow}>
+            {SUPPORTED_LANGUAGES.map((code, index) => {
+              const isSelected = settings.language === code;
+              // Endonyms: each option names itself in its own language, so
+              // "Français" stays findable to someone who cannot read the
+              // language currently active. Same convention as iOS Settings.
+              const label = LANGUAGE_ENDONYMS[code];
+
+              return (
+                <React.Fragment key={code}>
+                  {index > 0 && <View style={styles.pipelineDivider} />}
+                  <TouchableOpacity
+                    style={[
+                      styles.pipelineOption,
+                      isSelected && styles.pipelineOptionActive,
+                    ]}
+                    accessible={true}
+                    accessibilityRole="button"
+                    accessibilityLabel={t.settings.languageOptionAccessibilityLabel(
+                      label,
+                      isSelected,
+                    )}
+                    accessibilityHint={t.settings.languageOptionAccessibilityHint}
+                    onPress={() => handleLanguageChange(code)}
+                  >
+                    <Text style={styles.pipelineOptionIcon}>
+                      {code === 'fr' ? '🇨🇦' : '🇬🇧'}
+                    </Text>
+                    <Text style={styles.pipelineOptionName}>{label}</Text>
+                    <Text style={styles.pipelineOptionDesc}>
+                      {LANGUAGE_LOCALES[code].bcp47}
+                    </Text>
+                    {isSelected && <View style={styles.activeDot} />}
+                  </TouchableOpacity>
+                </React.Fragment>
+              );
+            })}
+          </View>
+        </Section>
 
         {/* ══════════════════════════════════════════
             SECTION 0 — Mode (master switch)

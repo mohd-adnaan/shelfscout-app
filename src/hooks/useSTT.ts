@@ -13,6 +13,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Platform, Alert, AccessibilityInfo } from 'react-native';
 import Voice from '@react-native-voice/voice';
 import { AccessibilityService } from '../services/AccessibilityService';
+import { currentLocales } from '../i18n';
 import { SPEACHES_CONFIG } from '../utils/constants';
 
 interface UseSTTReturn {
@@ -270,7 +271,7 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
           
           await new Promise<void>(resolve => setTimeout(() => resolve(), 100));
           
-          await Voice.start('en-US');
+          await Voice.start(currentLocales().stt);
           setIsListening(true);
           console.log('✅ iOS voice started - waiting for speech...');
           

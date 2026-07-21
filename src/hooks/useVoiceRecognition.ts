@@ -20,6 +20,7 @@ import Voice, {
   SpeechEndEvent,
 } from '@react-native-voice/voice';
 import { AccessibilityService } from '../services/AccessibilityService';
+import { currentLocales } from '../i18n';
 
 /**
  * Voice Recognition Hook with WCAG-compliant error handling
@@ -167,7 +168,7 @@ export const useVoiceRecognition = () => {
         }
 
         console.log('[Voice] ✅ Starting voice recognition');
-        await Voice.start('en-US');
+        await Voice.start(currentLocales().stt);
         
         console.log('[Voice] ✅ Voice recognition started successfully');
         
@@ -188,7 +189,7 @@ export const useVoiceRecognition = () => {
               // Try to recover
               await Voice.cancel();
               await new Promise<void>(resolve => setTimeout(() => resolve(), 200));
-              await Voice.start('en-US');
+              await Voice.start(currentLocales().stt);
               
               console.log('[Voice] ✅ Recovery successful');
               

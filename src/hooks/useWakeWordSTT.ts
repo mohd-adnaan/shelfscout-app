@@ -28,6 +28,8 @@ import Voice, {
   SpeechStartEvent,
 } from '@react-native-voice/voice';
 import { openAIVADService } from '../services/OpenAIVADService';
+import { currentLocales } from '../i18n';
+import { containsPartialWakePhrase, stripWakePhrase } from './wakePhrases';
 import { configureBluetoothRecordingSession } from '../utils/soundEffects';
 import type { RecordingMicrophoneSource } from '../utils/soundEffects';
 
@@ -93,95 +95,11 @@ const RESTART_DELAY_MS = 400;
 const MAX_RESTART_FAILURES = 5;
 
 /**
- * Wake phrase variants the speech recognizer might produce.
- *
- * REAL-WORLD CALIBRATION (from device logs, BT mic via Ray-Ban Meta):
- * Apple's on-device speech recogniser frequently mis-hears "shelfscout":
- *   - "shelfscout" is not a dictionary word, so the recogniser substitutes
- *     phonetically similar tokens. Observed substitutions include:
- *       "shelf scout", "shell scout", "shelves", "shelves scout",
- *       "hey scout"  (← `shelf` gets dropped entirely; most common),
- *       "asian scout", "patient scout", "shell scout scott", "scout watson",
- *       "she scout", "shelf scott", "shell scott", "scout".
- *   - Sometimes the leading "hey" survives ("hey scout") and sometimes the
- *     "hey" gets merged with the next word ("asian", "patient").
- *
- * Strategy: list every commonly-observed variant. Matching is now
- * SUBSTRING (not prefix) to handle the case where the iOS recogniser
- * concatenates multiple utterances into one ever-growing FINAL transcript.
- */
-const WAKE_PHRASES: string[] = [
-  // Canonical forms
-  'hey shelfscout',
-  'hey shelf scout',
-  'hey shelfscout,',
-  'hey shelf scout,',
-  'hey shellscout',
-  'hi shelfscout',
-  'hishelf scout',
-  'hi shelfscout',
-  'hi shelf scout',
-  'hey she',
-  'he she',
-  'scout',
-  'skout',
-  'shelfcout',
-  'shelves code',
-  'Asian Scout',
-
-  // "shelf" → "self" / "shell" / "shelves" substitutions
-  'hey self scout',
-  'hey self scout,',
-  'hey shell scout',
-  'hey shell scout,',
-  'hey shelves scout',
-  'hey shelves',
-  'Hey Scout',
-  'Hey Shell',
-  'hey patient',
-
-
-  // "hey" mis-merged with following word
-  'asian scout',
-  'patient scout',
-  'a shelfscout',
-  'a shelf scout',
-
-  // "shelf" entirely dropped — most common mis-hearing in BT-mic logs
-  'hey scout',
-  'hey scott',
-  'hey shell scott',
-  'hey shell scott,',
-  'he shall scout',
-  'he shall scouts',
-  'he shall scout Hazel Shell',
-  'hey Shell',
-  'hey Scott',
-  'hey Shall',
-  'he Scott',
-  'scotland',
-  'hi scott',
-  'hi scount',
-  'hi scout',
-
-
-  // No-"hey" variants (when "hey" gets lost in BT compression)
-  'shelfscout',
-  'shelf scout',
-  'shell scout',
-  'shell scott',
-  'shelves scout',
-  'Haitian scout',
-  'haitian',
-];
-
-/**
  * Minimum query length (after stripping the wake phrase) to be considered
  * valid. Prevents false positives from someone just saying "hey shelfscout"
  * with no actual question.
  */
 const MIN_QUERY_LENGTH = 2;
-
 /**
  * If the accumulated transcript exceeds this without a wake-word match, we
  * force-restart the recogniser. iOS sometimes keeps appending to a single
@@ -191,73 +109,6 @@ const MIN_QUERY_LENGTH = 2;
  * lands at position 0 of a fresh transcript.
  */
 const MAX_NO_MATCH_TRANSCRIPT_LEN = 80;
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/**
- * Search `text` for any wake phrase variant and return the substring that
- * follows the LAST occurrence (i.e. the user's query). Returns null if no
- * wake phrase variant is present anywhere in the transcript.
- *
- * Why "last occurrence" and not "first"?
- *   iOS STT accumulates a long transcript over time. If the user says the
- *   wake phrase twice (a retry), we want the query that follows the most
- *   recent wake — not stale text after the first one.
- *
- * Word-boundary aware: a phrase is only considered matched if it sits on
- * word boundaries, so "shelf" doesn't accidentally match inside "shelves".
- */
-function stripWakePhrase(text: string): string | null {
-  const lower = text.toLowerCase().trim();
-  if (!lower) return null;
-
-  let bestEndIndex = -1;     // position immediately AFTER the matched phrase
-  let bestPhrase = '';
-
-  for (const phrase of WAKE_PHRASES) {
-    // Find the LAST occurrence of this phrase in the lower-cased transcript
-    let idx = lower.lastIndexOf(phrase);
-    while (idx !== -1) {
-      // Word-boundary check: char before must not be alphanumeric, char
-      // after must not be alphanumeric (or end-of-string).
-      const charBefore = idx === 0 ? ' ' : lower[idx - 1];
-      const charAfter = lower[idx + phrase.length] ?? ' ';
-      const isWordBoundaryBefore = !/[a-z0-9]/.test(charBefore);
-      const isWordBoundaryAfter = !/[a-z0-9]/.test(charAfter);
-
-      if (isWordBoundaryBefore && isWordBoundaryAfter) {
-        const endIdx = idx + phrase.length;
-        if (endIdx > bestEndIndex) {
-          bestEndIndex = endIdx;
-          bestPhrase = phrase;
-        }
-        break; // we already have the LAST occurrence of THIS phrase
-      }
-      // Not a word boundary, look earlier in the string for another match
-      idx = lower.lastIndexOf(phrase, idx - 1);
-    }
-  }
-
-  if (bestEndIndex === -1) return null;
-
-  // Extract whatever comes after the matched wake phrase as the query.
-  // Use the original-case `text` so user words keep their casing.
-  let rest = text.substring(bestEndIndex).replace(/^[,\s.!?]+/, '').trim();
-  console.log(`🎯 [WakeWord] Matched phrase "${bestPhrase}" → query: "${rest}"`);
-  return rest;
-}
-
-/**
- * Check if a partial transcript contains the beginning of a wake phrase,
- * even if it's incomplete (e.g. just "hey" or "hey shelf").
- */
-function containsPartialWakePhrase(text: string): boolean {
-  const lower = text.toLowerCase().trim();
-  // Check if any wake phrase starts with what we have
-  return WAKE_PHRASES.some(phrase => phrase.startsWith(lower) && lower.length >= 3);
-}
 
 // ============================================================================
 // Hook Implementation
@@ -454,7 +305,7 @@ export const useWakeWordSTT = (options: UseWakeWordSTTOptions): UseWakeWordSTTRe
       Voice.onSpeechError = handleSpeechErrorRef.current;
 
       setDebugStatus(`Starting Voice... (mic: ${activeSource} - ${micInfo})`);
-      await Voice.start('en-US');
+      await Voice.start(currentLocales().stt);
       isActiveRef.current = true;
       restartFailCountRef.current = 0;
 

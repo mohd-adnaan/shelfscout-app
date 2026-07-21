@@ -99,7 +99,9 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         utterance.rate = speechRate
         utterance.pitchMultiplier = 1.0
         utterance.volume = 1.0
-        utterance.voice = AVSpeechSynthesisVoice(language: "en-US")
+        // Resolved per utterance, not cached: the user can switch language
+        // from Settings while a route is active.
+        utterance.voice = AVSpeechSynthesisVoice(language: AppLocale.current.speechLocale)
         ttsState.lastSpokenText = item.text
         ttsState.lastSpeechTime = Date()
         ttsState.isSpeaking = true

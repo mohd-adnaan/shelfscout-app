@@ -1,9 +1,11 @@
 import {
+  foldDiacritics,
   levenshteinDistance,
   matchTargetAgainstVocabulary,
   normalizeSpokenLabel,
   phoneticKey,
 } from '../src/services/TargetGroundingService';
+import { setAppLanguage } from '../src/i18n';
 
 const vocabulary = [
   { label: 'Cereal', mapId: 'map-1', mapName: 'Store Route' },
@@ -13,6 +15,10 @@ const vocabulary = [
 ];
 
 describe('TargetGroundingService', () => {
+  // The grounding cascade reads the active language from the i18n store, so
+  // every English assertion below depends on it being English.
+  beforeEach(() => setAppLanguage('en'));
+
   it('normalizes articles, case, and punctuation', () => {
     expect(normalizeSpokenLabel('The Cereal!')).toBe('cereal');
     expect(normalizeSpokenLabel('aisle-3')).toBe('aisle 3');
@@ -69,5 +75,90 @@ describe('TargetGroundingService', () => {
   it('reports no_vocabulary when no maps are saved', () => {
     const result = matchTargetAgainstVocabulary('cereal', []);
     expect(result.status).toBe('no_vocabulary');
+  });
+});
+
+describe('TargetGroundingService — French (fr-CA)', () => {
+  const vocabulaire = [
+    { label: 'Oignons', mapId: 'map-1', mapName: 'Épicerie' },
+    { label: 'Céréales', mapId: 'map-1', mapName: 'Épicerie' },
+    { label: 'Crème', mapId: 'map-2', mapName: 'Produits laitiers' },
+    { label: 'Allée 3', mapId: 'map-2', mapName: 'Produits laitiers' },
+  ];
+
+  beforeEach(() => setAppLanguage('fr'));
+  afterAll(() => setAppLanguage('en'));
+
+  it('folds accents so an accented label matches itself', () => {
+    // Without folding the [^a-z0-9] strip turns "crème" into "cr me".
+    expect(normalizeSpokenLabel('Crème')).toBe('creme');
+    expect(normalizeSpokenLabel('Céréales')).toBe('cereales');
+  });
+
+  it('expands ligatures rather than dropping them', () => {
+    // Swift counts "œ" as alphanumeric and the JS regex does not; expanding
+    // keeps the two phonetic implementations in agreement.
+    expect(foldDiacritics('œuf')).toBe('oeuf');
+    expect(foldDiacritics('bœuf')).toBe('boeuf');
+  });
+
+  it('strips French articles and partitives', () => {
+    expect(normalizeSpokenLabel('les oignons')).toBe('oignons');
+    expect(normalizeSpokenLabel('des oignons')).toBe('oignons');
+    expect(normalizeSpokenLabel('de la crème')).toBe('creme');
+    expect(normalizeSpokenLabel("l'oignon")).toBe('oignon');
+  });
+
+  it('collapses singular and plural onto one phonetic key', () => {
+    // French stacks a plural marker on an already-silent consonant
+    // ("haricots" = haricot + s), so these only collide if the silent-letter
+    // strip runs in the right order.
+    for (const [singular, plural] of [
+      ['oignon', 'oignons'],
+      ['haricot', 'haricots'],
+      ['biscuit', 'biscuits'],
+      ['eau', 'eaux'],
+      ['chou', 'choux'],
+      ['gâteau', 'gâteaux'],
+      ['légume', 'légumes'],
+    ]) {
+      expect([singular, phoneticKey(singular)]).toEqual([
+        singular,
+        phoneticKey(plural),
+      ]);
+    }
+  });
+
+  it('keeps genuinely different words apart', () => {
+    expect(phoneticKey('sel')).not.toBe(phoneticKey('miel'));
+    expect(phoneticKey('beurre')).not.toBe(phoneticKey('poisson'));
+    expect(phoneticKey('farine')).not.toBe(phoneticKey('huile'));
+  });
+
+  it('grounds a partitive request against the saved label', () => {
+    const result = matchTargetAgainstVocabulary(
+      normalizeSpokenLabel('des oignons'),
+      vocabulaire,
+    );
+    expect(result.status).toBe('matched');
+    expect(result.label).toBe('Oignons');
+  });
+
+  it('grounds an unaccented transcript against an accented label', () => {
+    // Recognisers drop accents inconsistently over a Bluetooth mic.
+    const result = matchTargetAgainstVocabulary(
+      normalizeSpokenLabel('cereales'),
+      vocabulaire,
+    );
+    expect(result.status).toBe('matched');
+    expect(result.label).toBe('Céréales');
+  });
+
+  it('keeps numbered aisles distinct in French too', () => {
+    const result = matchTargetAgainstVocabulary(
+      normalizeSpokenLabel('allée 4'),
+      vocabulaire,
+    );
+    expect(result.status).toBe('no_match');
   });
 });

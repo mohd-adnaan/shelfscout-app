@@ -17,6 +17,7 @@
 
 import { ARKitNavigationBridge, ARKitNavigationTargetEntry } from '../native/ARKitNavigationModule';
 import { groqIntentClient } from './GroqIntentClient';
+import { AppLanguage, getAppLanguage } from '../i18n';
 
 export type GroundingMethod = 'exact' | 'fuzzy' | 'phonetic' | 'llm';
 
@@ -30,15 +31,66 @@ export interface GroundingResult {
   availableTargets: string[];
 }
 
-export const normalizeSpokenLabel = (raw: string): string =>
+/**
+ * Fold Latin-1 diacritics to ASCII.
+ *
+ * Applied before the `[^a-z0-9 ]` strip below, which would otherwise turn
+ * "crème" into "cr me" and "pâtes" into "p tes" — every accented French label
+ * would fail to match itself. Harmless for English, where accents are rare.
+ *
+ * Mirrors `SemanticRouteNavigator.foldDiacritics`.
+ */
+export const foldDiacritics = (raw: string): string =>
   raw
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '')
+    // Ligatures are NOT decomposed by NFD and are not diacritics, so they
+    // survive both here and in Swift's .folding(). Expand them explicitly:
+    // "œuf" is a real grocery word, and left alone the two implementations
+    // disagree (Swift counts œ as alphanumeric, the regex below does not).
+    .replace(/œ/g, 'oe')
+    .replace(/Œ/g, 'OE')
+    .replace(/æ/g, 'ae')
+    .replace(/Æ/g, 'AE');
+
+/**
+ * Leading articles dropped from a spoken label, per language.
+ *
+ * French carries partitives that English does not: a shopper asks for "des
+ * oignons" or "de la crème", never the bare noun, so these have to come off
+ * before matching against a route-map label like "oignons".
+ */
+const LEADING_ARTICLES: Record<AppLanguage, string[]> = {
+  en: ['the', 'a', 'an'],
+  fr: ['le', 'la', 'les', 'l', 'un', 'une', 'des', 'du', 'de', 'au', 'aux'],
+};
+
+/** Max leading article tokens to drop — French "de la" needs two. */
+const MAX_LEADING_ARTICLE_TOKENS = 2;
+
+export const normalizeSpokenLabel = (raw: string): string => {
+  const articles = LEADING_ARTICLES[getAppLanguage()];
+  const tokens = foldDiacritics(raw)
     .toLowerCase()
+    // Split elisions so "l'oignon" / "d'eau" become separate tokens and the
+    // article half can be dropped below.
+    .replace(/['’]/g, ' ')
     .replace(/[_-]/g, ' ')
     .replace(/[^a-z0-9 ]/g, ' ')
     .split(/\s+/)
-    .filter(Boolean)
-    .filter((token, index) => !(index === 0 && ['the', 'a', 'an'].includes(token)))
-    .join(' ');
+    .filter(Boolean);
+
+  let start = 0;
+  while (
+    start < tokens.length - 1 &&
+    start < MAX_LEADING_ARTICLE_TOKENS &&
+    articles.includes(tokens[start])
+  ) {
+    start += 1;
+  }
+
+  return tokens.slice(start).join(' ');
+};
 
 export const levenshteinDistance = (a: string, b: string): number => {
   if (!a.length) return b.length;
@@ -56,9 +108,78 @@ export const levenshteinDistance = (a: string, b: string): number => {
   return previous[b.length];
 };
 
+/**
+ * French consonant-skeleton key.
+ *
+ * The English key below encodes English spelling rules (ph→f, kn→n, silent
+ * initial w) which say nothing useful about French. The substitutions that
+ * actually matter in fr-CA grocery speech are:
+ *   - silent final consonants: "oignon" / "oignons" must collide, and so must
+ *     "lait" / "laid"
+ *   - digraphs: ch, gn, qu, ou, au/eau, ai/ei
+ *   - silent h everywhere
+ *
+ * Heuristic, not a real phonemiser — its only job is to make ASR near-misses
+ * collide while keeping genuinely different words apart.
+ *
+ * Mirrors `SemanticRouteNavigator.phoneticKeyFrench`.
+ */
+const phoneticKeyFrench = (raw: string): string =>
+  foldDiacritics(raw)
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter(Boolean)
+    .map(word => {
+      if (/^[0-9]+$/.test(word)) return word;
+
+      let normalized = word
+        // Digraphs first — order matters: 'eau' before 'au', 'ch' before 'c'.
+        .replace(/eau/g, 'o')
+        .replace(/au/g, 'o')
+        .replace(/ou/g, 'u')
+        .replace(/ai|ei|ay|ey/g, 'e')
+        .replace(/ph/g, 'f')
+        .replace(/ch/g, 'S')   // placeholder: 'S' survives the vowel pass
+        .replace(/gn/g, 'N')   // placeholder for the palatal nasal
+        .replace(/qu/g, 'k')
+        .replace(/th/g, 't')
+        .replace(/h/g, '');    // otherwise silent
+
+      // Silent word-final letters, stripped in this order and BEFORE the
+      // single-character swaps below. French stacks them — "haricots" ends in
+      // a plural 's' on top of an already-silent 't' — so a single pass, or a
+      // pass after 'x' has become 'ks', leaves singular and plural with
+      // different keys. That is the exact plural drift this key exists to
+      // absorb, so the order here is load-bearing:
+      //   1. plural marker   haricots → haricot,  eaux → eau
+      //   2. silent final e  creme    → crem
+      //   3. silent final consonant   haricot → harico
+      normalized = normalized
+        .replace(/[sx]$/, '')
+        .replace(/e$/, '')
+        .replace(/[tdpzgs]$/, '');
+
+      normalized = normalized
+        .replace(/c(?=[eiy])/g, 's')
+        .replace(/c/g, 'k')
+        .replace(/z/g, 's')
+        .replace(/x/g, 'ks')
+        .replace(/y/g, 'i');
+
+      let key = '';
+      for (let i = 0; i < normalized.length; i += 1) {
+        const ch = normalized[i];
+        if (i > 0 && 'aeiou'.includes(ch)) continue;
+        if (key.length && key[key.length - 1] === ch) continue;
+        key += ch;
+      }
+      return key;
+    })
+    .join(' ');
+
 // Mirrors SemanticRouteNavigator.phoneticKey so JS grounding and native
 // fallback matching agree on what counts as "the same word".
-export const phoneticKey = (raw: string): string =>
+const phoneticKeyEnglish = (raw: string): string =>
   raw
     .toLowerCase()
     .split(/[^a-z0-9]+/)
@@ -96,6 +217,15 @@ export const phoneticKey = (raw: string): string =>
       return key;
     })
     .join(' ');
+
+/**
+ * Consonant-skeleton key for the active language.
+ *
+ * Kept as a single exported entry point so callers (and the native mirror)
+ * never have to know which ruleset applies.
+ */
+export const phoneticKey = (raw: string): string =>
+  getAppLanguage() === 'fr' ? phoneticKeyFrench(raw) : phoneticKeyEnglish(raw);
 
 const digitTokens = (s: string): string =>
   s.split(' ').filter(token => /^[0-9]+$/.test(token)).join(' ');

@@ -2,6 +2,12 @@
 
 import Tts from 'react-native-tts';
 import { NativeEventEmitter, NativeModules, Platform } from 'react-native';
+import {
+  AppLanguage,
+  LANGUAGE_LOCALES,
+  getAppLanguage,
+  onAppLanguageChange,
+} from '../i18n';
 
 // ========================================================================
 // Event Emitter — fixes "Sending tts-finish with no listeners registered"
@@ -30,18 +36,39 @@ try {
 // ⚠️  Your device has Zoe Premium installed but NOT Samantha Premium.
 //     Keep both listed so whichever is available gets picked.
 // ========================================================================
-const PREFERRED_VOICES = [
-  // Premium (Neural TTS) — most natural, closest to Siri quality
-  'com.apple.voice.premium.en-US.Zoe',
-  'com.apple.voice.premium.en-US.Samantha',
-  // Enhanced — good quality, often pre-installed
-  'com.apple.voice.enhanced.en-US.Samantha',
-  'com.apple.voice.enhanced.en-US.Ava',
-  'com.apple.voice.enhanced.en-AU.Karen',
-  'com.apple.voice.enhanced.en-GB.Serena',
-  // Compact — last resort
-  'com.apple.voice.compact.en-US.Samantha',
-];
+//
+// Per-language preference lists. These are a best-effort fast path: a device
+// only has the voices its owner downloaded, and Apple renames bundles between
+// iOS releases. Whatever is missing falls through to _findVoiceForLanguage(),
+// which picks the best-quality installed voice matching the language prefix,
+// so an unfamiliar voice ID here degrades rather than breaks.
+const PREFERRED_VOICES: Record<AppLanguage, string[]> = {
+  en: [
+    // Premium (Neural TTS) — most natural, closest to Siri quality
+    'com.apple.voice.premium.en-US.Zoe',
+    'com.apple.voice.premium.en-US.Samantha',
+    // Enhanced — good quality, often pre-installed
+    'com.apple.voice.enhanced.en-US.Samantha',
+    'com.apple.voice.enhanced.en-US.Ava',
+    'com.apple.voice.enhanced.en-AU.Karen',
+    'com.apple.voice.enhanced.en-GB.Serena',
+    // Compact — last resort
+    'com.apple.voice.compact.en-US.Samantha',
+  ],
+  fr: [
+    // Quebec French first — a Montreal user should not hear Paris French.
+    'com.apple.voice.premium.fr-CA.Amelie',
+    'com.apple.voice.enhanced.fr-CA.Amelie',
+    'com.apple.voice.enhanced.fr-CA.Nicolas',
+    'com.apple.voice.compact.fr-CA.Amelie',
+    // European French — intelligible in Quebec, used only if no fr-CA voice
+    // is installed.
+    'com.apple.voice.premium.fr-FR.Thomas',
+    'com.apple.voice.enhanced.fr-FR.Thomas',
+    'com.apple.voice.enhanced.fr-FR.Marie',
+    'com.apple.voice.compact.fr-FR.Thomas',
+  ],
+};
 
 // ========================================================================
 // Defaults
@@ -73,6 +100,26 @@ class IOSTtsClient {
   constructor() {
     this._registerEventListeners();
     this._initializeAsync();
+
+    // Re-pick a voice when the user switches language. Long-lived singleton,
+    // so this subscription intentionally lives for the process.
+    onAppLanguageChange(() => {
+      void this._onLanguageChanged();
+    });
+  }
+
+  /**
+   * Cut off any in-flight utterance before re-selecting: the queued text is in
+   * the previous language, and hearing half a sentence in the old voice is
+   * more confusing than silence.
+   */
+  private async _onLanguageChanged(): Promise<void> {
+    try {
+      await this.stop();
+    } catch (error: any) {
+      console.warn('⚠️ TTS stop during language change failed:', error?.message);
+    }
+    await this._selectBestVoice();
   }
 
   // ========================================================================
@@ -143,18 +190,20 @@ class IOSTtsClient {
   private async _selectBestVoice(): Promise<void> {
     if (Platform.OS !== 'ios') return;
 
+    const language = getAppLanguage();
+
     try {
       const voices = await Tts.voices();
       const availableIds = new Set(voices.map((v: any) => v.id));
 
-      // Log available English voices for debugging
-      const englishVoices = voices
-        .filter((v: any) => v.language?.startsWith('en'))
+      // Log available voices for this language for debugging
+      const matching = voices
+        .filter((v: any) => v.language?.startsWith(language))
         .map((v: any) => `${v.id} (q:${v.quality})`);
-      console.log('📋 Available English voices:', englishVoices.join(', '));
+      console.log(`📋 Available ${language} voices:`, matching.join(', '));
 
       // Try preferred voices in order (premium → enhanced → compact)
-      for (const voiceId of PREFERRED_VOICES) {
+      for (const voiceId of PREFERRED_VOICES[language]) {
         if (availableIds.has(voiceId)) {
           try {
             await Tts.setDefaultVoice(voiceId);
@@ -169,30 +218,54 @@ class IOSTtsClient {
         }
       }
 
-      // Fallback: any English voice with reasonable quality (non-network)
-      const englishFallback = voices.find(
-        (v: any) =>
-          v.language?.startsWith('en') &&
-          v.quality != null &&
-          v.quality >= 300 &&
-          !v.networkConnectionRequired,
-      );
+      // Fallback: best installed voice for this language (non-network).
+      const fallback = this._findVoiceForLanguage(voices, language);
 
-      if (englishFallback) {
+      if (fallback) {
         try {
-          await Tts.setDefaultVoice(englishFallback.id);
-          this._selectedVoice = englishFallback.id;
-          console.log('🎤 Selected fallback voice:', englishFallback.id);
+          await Tts.setDefaultVoice(fallback.id);
+          this._selectedVoice = fallback.id;
+          console.log('🎤 Selected fallback voice:', fallback.id);
           return;
         } catch (e: any) {
           console.warn('⚠️ Fallback voice selection failed:', e.message);
         }
       }
 
-      console.log('ℹ️ No preferred voice found — using iOS system default');
+      // No voice at all for this language. Clear any previously selected
+      // voice so we do not read French text with an English voice — the
+      // system default at least follows the utterance language.
+      this._selectedVoice = null;
+      console.log(
+        `ℹ️ No ${language} voice installed — using iOS system default`,
+      );
     } catch (error: any) {
       console.warn('⚠️ Voice selection failed:', error.message);
     }
+  }
+
+  /**
+   * Best installed voice for a language, preferring the exact regional locale
+   * (fr-CA) over other regions (fr-FR) and higher quality over lower.
+   */
+  private _findVoiceForLanguage(voices: any[], language: AppLanguage): any | null {
+    const preferredLocale = LANGUAGE_LOCALES[language].tts.toLowerCase();
+
+    const candidates = voices.filter(
+      (v: any) =>
+        typeof v.language === 'string' &&
+        v.language.toLowerCase().startsWith(language) &&
+        !v.networkConnectionRequired,
+    );
+
+    if (candidates.length === 0) return null;
+
+    const score = (v: any): number => {
+      const exactRegion = v.language.toLowerCase() === preferredLocale ? 1_000_000 : 0;
+      return exactRegion + (typeof v.quality === 'number' ? v.quality : 0);
+    };
+
+    return candidates.reduce((best, v) => (score(v) > score(best) ? v : best));
   }
 
   // ========================================================================

@@ -114,14 +114,16 @@ enum SemanticTurnHint: String, Codable, CaseIterable, Identifiable {
         }
     }
 
+    /// Spoken to the user, so localized. `displayName`/`nodeName` above stay
+    /// English — they label nodes in the route-capture UI, not guidance.
     var spokenInstruction: String {
         switch self {
-        case .left: return "turn left"
-        case .right: return "turn right"
-        case .straight: return "continue straight"
-        case .corner: return "follow the corner"
-        case .cornerLeft: return "take a slight left at the corner"
-        case .cornerRight: return "take a slight right at the corner"
+        case .left: return NavLoc.turnLeft()
+        case .right: return NavLoc.turnRight()
+        case .straight: return NavLoc.continueStraight()
+        case .corner: return NavLoc.followCorner()
+        case .cornerLeft: return NavLoc.slightLeftAtCorner()
+        case .cornerRight: return NavLoc.slightRightAtCorner()
         }
     }
 }
@@ -1448,8 +1450,8 @@ final class SemanticRouteNavigator: ObservableObject {
             return false
         }
         guard let resolved = resolveTargetDetailed(trimmed, in: map) else {
-            currentInstruction = "\(trimmed) is not in this semantic map."
-            speechCue = SemanticSpeechCue(text: "\(trimmed) is not in this semantic map.", priority: .priority)
+            currentInstruction = NavLoc.notInMap(trimmed)
+            speechCue = SemanticSpeechCue(text: NavLoc.notInMap(trimmed), priority: .priority)
             return false
         }
         let targetNode = resolved.node
@@ -1479,13 +1481,13 @@ final class SemanticRouteNavigator: ObservableObject {
                 : SemanticRoutePoint(x: imuState.position.x, y: imuState.position.y)
             let distanceToTarget = pose?.distance(to: targetNode.point)
             guard let distanceToTarget, distanceToTarget <= immediateArrivalMaxMeters else {
-                currentInstruction = "I can't confirm you are at \(targetNode.name) yet. Walk a few steps along the route and ask again."
+                currentInstruction = NavLoc.cannotConfirmAt(targetNode.name)
                 speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
                 return false
             }
             phase = .arrived
             targetName = spokenTarget
-            currentInstruction = "You are already at \(targetNode.name)."
+            currentInstruction = NavLoc.alreadyAt(targetNode.name)
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             rebuildRAGContext()
             return true
@@ -1493,7 +1495,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let steps = buildSteps(for: path, in: map)
         guard !steps.isEmpty else {
-            currentInstruction = "No walkable route to \(trimmed)."
+            currentInstruction = NavLoc.noWalkableRoute(trimmed)
             return false
         }
 
@@ -1540,7 +1542,7 @@ final class SemanticRouteNavigator: ObservableObject {
         ) {
             firstInstruction = "\(headingCue) Then \(firstInstruction.lowercased())"
         }
-        currentInstruction = "Starting at \(startName). \(firstInstruction)"
+        currentInstruction = NavLoc.startingAt(startName, firstInstruction: firstInstruction)
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
@@ -1809,7 +1811,7 @@ final class SemanticRouteNavigator: ObservableObject {
             // move — the pilot heard only turn cues after pausing.
             pendingAlignmentResumeCue = false
             updateInstruction(forceSpeech: false)
-            currentInstruction = "Good. \(currentInstruction)"
+            currentInstruction = NavLoc.goodPrefix() + currentInstruction
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
             // Claim this meter bucket so the routine countdown can't clobber
             // the resume cue later in the same tick.
@@ -2517,7 +2519,7 @@ final class SemanticRouteNavigator: ObservableObject {
         resetRouteBelief(status: .initializing)
         phase = .navigating
         updateInstruction(forceSpeech: false)
-        currentInstruction = "Route realigned from your position. \(currentInstruction)"
+        currentInstruction = NavLoc.routeRealignedPrefix() + currentInstruction
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
@@ -2590,11 +2592,11 @@ final class SemanticRouteNavigator: ObservableObject {
         didRebuildRouteThisUpdate = true
 
         let turn = Self.relativeTurnCommand(from: liveHeading, to: rejoinEdge.bearingDegrees, style: turnPhrasing)
-        let nodeName = Self.sanitizedSpokenLabel(best.node.name, fallback: "the route")
-        let walkText = "Walk \(Self.formatMeters(rejoinEdge.distanceMeters)) to \(nodeName)."
+        let nodeName = Self.sanitizedSpokenLabel(best.node.name, fallback: NavLoc.defaultRouteLabel())
+        let rejoinDistance = Self.formatMeters(rejoinEdge.distanceMeters)
         currentInstruction = turn.key == "straight"
-            ? "Off route. \(walkText)"
-            : "Off route. \(turn.text) Then walk \(Self.formatMeters(rejoinEdge.distanceMeters)) to \(nodeName)."
+            ? NavLoc.rejoinStraight(distance: rejoinDistance, node: nodeName)
+            : NavLoc.rejoinWithTurn(turn: turn.text, distance: rejoinDistance, node: nodeName)
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
@@ -2623,7 +2625,7 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         updateInstruction(forceSpeech: false)
         if announce, hadSpokenCue {
-            currentInstruction = "Back on route. \(currentInstruction)"
+            currentInstruction = NavLoc.backOnRoutePrefix() + currentInstruction
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
         }
     }
@@ -3196,7 +3198,7 @@ final class SemanticRouteNavigator: ObservableObject {
     ) -> RecoveryCueDecision {
         if backwardBad {
             return RecoveryCueDecision(
-                instruction: "Wrong direction.",
+                instruction: NavLoc.wrongDirection(),
                 reason: "Backward movement \(Self.formatShortMeters(backwardDriftMeters)).",
                 key: "wrong_direction"
             )
@@ -3223,7 +3225,7 @@ final class SemanticRouteNavigator: ObservableObject {
                 )
             }
             return RecoveryCueDecision(
-                instruction: "Off route.",
+                instruction: NavLoc.offRoute(),
                 reason: "Off route \(Self.formatShortMeters(observedCrossTrack)).",
                 key: "off_route"
             )
@@ -3240,14 +3242,14 @@ final class SemanticRouteNavigator: ObservableObject {
 
         if localizationBad {
             return RecoveryCueDecision(
-                instruction: "Scan slowly.",
+                instruction: NavLoc.scanSlowly(),
                 reason: "AR localization weak.",
                 key: "localization"
             )
         }
 
         return RecoveryCueDecision(
-            instruction: "Slow down.",
+            instruction: NavLoc.slowDown(),
             reason: "Route confidence low.",
             key: "low_confidence"
         )
@@ -3376,7 +3378,7 @@ final class SemanticRouteNavigator: ObservableObject {
         phase = .navigating
         updateInstruction(forceSpeech: false)
         if announce {
-            currentInstruction = "Guidance realigned. Continue."
+            currentInstruction = NavLoc.guidanceRealigned()
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
         }
         rebuildRAGContext()
@@ -3395,9 +3397,9 @@ final class SemanticRouteNavigator: ObservableObject {
             beliefIssueStartedAt = nil
             arrivalVisualHoldStartedAt = nil
             if let reachingObject = reachingObjectName(forTarget: targetName) {
-                currentInstruction = "Arrived at \(targetName). Switching to reaching guidance for \(reachingObject)."
+                currentInstruction = NavLoc.arrivedAtSwitchingToReaching(target: targetName, object: reachingObject)
             } else {
-                currentInstruction = "Arrived at \(targetName)."
+                currentInstruction = NavLoc.arrivedAt(targetName)
             }
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             rebuildRAGContext()
@@ -3443,7 +3445,7 @@ final class SemanticRouteNavigator: ObservableObject {
         } else {
             landmarkPrefix = ""
         }
-        currentInstruction = "\(landmarkPrefix)\(Self.sentenceCased(turn)). Walk \(Self.formatMeters(next.edge.distanceMeters)), \(nextContext)."
+        currentInstruction = NavLoc.turnThenWalk(prefix: landmarkPrefix, turn: Self.sentenceCased(turn), distance: Self.formatMeters(next.edge.distanceMeters), context: nextContext)
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
     }
 
@@ -3488,21 +3490,23 @@ final class SemanticRouteNavigator: ObservableObject {
             if cueRemainingMeters <= 0.75 {
                 currentInstruction = step.to.turnHint?.isCorner == true
                     ? "\(Self.sentenceCased(turn))."
-                    : "At the turn, \(turn)."
+                    : NavLoc.atTheTurn(turn)
             } else {
-                currentInstruction = "In \(Self.formatMeters(cueRemainingMeters)), \(turn)."
+                currentInstruction = NavLoc.inDistanceTurn(distance: Self.formatMeters(cueRemainingMeters), turn: turn)
             }
         } else if currentStepIndex >= routeSteps.count - 1,
                   (lastARNodeDistanceMeters ?? cueRemainingMeters) <= destinationJustAheadMeters {
             // Final approach: "keep walking X meters" reads as being lost when
             // the target is within arm's-plus reach.
-            currentInstruction = "\(Self.sanitizedSpokenLabel(targetName, fallback: "The destination")) is just ahead."
+            currentInstruction = NavLoc.destinationJustAhead(
+                Self.sanitizedSpokenLabel(targetName, fallback: NavLoc.defaultDestinationLabel())
+            )
         } else {
             let landmarkContext = shouldSpeakLandmarks ? nextLandmarkPhrase(on: step, after: segmentProgressMeters) : nil
             if let landmarkContext {
-                currentInstruction = "Walk \(Self.formatMeters(cueRemainingMeters)), \(context). Passing \(landmarkContext)."
+                currentInstruction = NavLoc.walkDistancePassing(distance: Self.formatMeters(cueRemainingMeters), context: context, landmark: landmarkContext)
             } else {
-                currentInstruction = "Walk \(Self.formatMeters(cueRemainingMeters)), \(context)."
+                currentInstruction = NavLoc.walkDistance(distance: Self.formatMeters(cueRemainingMeters), context: context)
             }
         }
 
@@ -3513,7 +3517,7 @@ final class SemanticRouteNavigator: ObservableObject {
             let prefixAge = lastTrackingLimitedPrefixAt.map { now.timeIntervalSince($0) }
                 ?? .greatestFiniteMagnitude
             if prefixAge >= trackingLimitedPrefixCooldownSeconds {
-                currentInstruction = "Tracking limited, walk slowly. " + currentInstruction
+                currentInstruction = NavLoc.trackingLimitedPrefix() + currentInstruction
                 lastTrackingLimitedPrefixAt = now
             }
         }
@@ -3878,7 +3882,7 @@ final class SemanticRouteNavigator: ObservableObject {
         let now = Date()
         if arrivalVisualHoldStartedAt == nil {
             arrivalVisualHoldStartedAt = now
-            currentInstruction = "Near \(targetName). Look toward the target to confirm arrival."
+            currentInstruction = NavLoc.nearTargetConfirm(targetName)
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
         }
 
@@ -4409,11 +4413,11 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private static func sidePhrase(_ side: SemanticRouteSide) -> String {
         switch side {
-        case .left: return "on your left"
-        case .right: return "on your right"
-        case .center: return "near the center"
-        case .ahead: return "ahead"
-        case .behind: return "behind you"
+        case .left: return NavLoc.onYourLeft()
+        case .right: return NavLoc.onYourRight()
+        case .center: return NavLoc.nearTheCenter()
+        case .ahead: return NavLoc.ahead()
+        case .behind: return NavLoc.behindYou()
         }
     }
 
@@ -4424,23 +4428,23 @@ final class SemanticRouteNavigator: ObservableObject {
     ) -> (text: String, key: String) {
         let diff = SemanticRouteMath.signedAngleDifference(targetBearing, heading)
         let magnitude = abs(diff)
-        if magnitude < 25 { return ("Forward", "forward") }
+        if magnitude < 25 { return (NavLoc.forward(), "forward") }
         if style == .clockFace {
             let hour = clockHour(forSignedDegrees: diff)
-            return ("Head to \(hour) o'clock", "clock_\(hour)")
+            return (NavLoc.clockNudge(hour: hour), "clock_\(hour)")
         }
-        if magnitude < 75 { return diff > 0 ? ("Step right", "right") : ("Step left", "left") }
-        if magnitude < 135 { return diff > 0 ? ("Turn right", "turn_right") : ("Turn left", "turn_left") }
-        return ("Turn around", "turn_around")
+        if magnitude < 75 { return diff > 0 ? (NavLoc.stepRight(), "right") : (NavLoc.stepLeft(), "left") }
+        if magnitude < 135 { return diff > 0 ? (NavLoc.turnRightNudge(), "turn_right") : (NavLoc.turnLeftNudge(), "turn_left") }
+        return (NavLoc.turnAroundNudge(), "turn_around")
     }
 
     private static func compactRecoveryInstruction(_ command: (text: String, key: String), meters: Double) -> String {
         let carriesDistance = command.key == "left" || command.key == "right" ||
             command.key == "forward" || command.key.hasPrefix("clock_")
         guard meters >= 1.5, carriesDistance else {
-            return "\(command.text)."
+            return NavLoc.nudgeWithDistance(command.text, distance: nil)
         }
-        return "\(command.text), \(formatShortMeters(meters))."
+        return NavLoc.nudgeWithDistance(command.text, distance: formatShortMeters(meters))
     }
 
     /// Signed heading offset → clock hour: +90° is 3 o'clock, −90° is 9,
@@ -4459,17 +4463,17 @@ final class SemanticRouteNavigator: ObservableObject {
     ) -> (text: String, key: String) {
         let diff = SemanticRouteMath.signedAngleDifference(targetBearing, heading)
         let magnitude = abs(diff)
-        if magnitude < 25 { return ("Go straight.", "straight") }
+        if magnitude < 25 { return (NavLoc.goStraight(), "straight") }
         if style == .clockFace {
             let hour = clockHour(forSignedDegrees: diff)
-            return ("Turn to \(hour) o'clock.", "clock_\(hour)")
+            return (NavLoc.clockCommand(hour: hour), "clock_\(hour)")
         }
         // A "sharp" band keeps a 130° aisle-end turn from being spoken the
         // same as a gentle 50° one — under-specified turns walked the pilot
         // users into shelves.
-        if magnitude < 110 { return diff > 0 ? ("Turn right.", "right") : ("Turn left.", "left") }
-        if magnitude < 150 { return diff > 0 ? ("Turn sharp right.", "sharp_right") : ("Turn sharp left.", "sharp_left") }
-        return ("Turn around.", "around")
+        if magnitude < 110 { return diff > 0 ? (NavLoc.turnRightCommand(), "right") : (NavLoc.turnLeftCommand(), "left") }
+        if magnitude < 150 { return diff > 0 ? (NavLoc.turnSharpRightCommand(), "sharp_right") : (NavLoc.turnSharpLeftCommand(), "sharp_left") }
+        return (NavLoc.turnAroundCommand(), "around")
     }
 
     private static func routeAlignmentInstruction(
@@ -4480,12 +4484,12 @@ final class SemanticRouteNavigator: ObservableObject {
         let command = relativeTurnCommand(from: heading, to: targetBearing, style: style)
         switch command.key {
         case "straight":
-            return "Face the route."
+            return NavLoc.faceTheRoute()
         case "around":
-            return "Turn around to face the route."
+            return NavLoc.turnAroundToFaceRoute()
         default:
             let text = command.text.hasSuffix(".") ? String(command.text.dropLast()) : command.text
-            return "\(text) to face the route."
+            return NavLoc.alignToRoute(turn: text)
         }
     }
 
@@ -4496,14 +4500,14 @@ final class SemanticRouteNavigator: ObservableObject {
     ) -> String {
         let diff = SemanticRouteMath.signedAngleDifference(nextBearing, currentBearing)
         let magnitude = abs(diff)
-        if magnitude < 18 { return "continue straight" }
+        if magnitude < 18 { return NavLoc.continueStraight() }
         if style == .clockFace {
-            return "turn to \(clockHour(forSignedDegrees: diff)) o'clock"
+            return NavLoc.clockFragment(hour: clockHour(forSignedDegrees: diff))
         }
-        if magnitude < 45 { return diff > 0 ? "take a slight right" : "take a slight left" }
-        if magnitude < 110 { return diff > 0 ? "turn right" : "turn left" }
-        if magnitude < 150 { return diff > 0 ? "turn sharp right" : "turn sharp left" }
-        return "turn around"
+        if magnitude < 45 { return diff > 0 ? NavLoc.slightRight() : NavLoc.slightLeft() }
+        if magnitude < 110 { return diff > 0 ? NavLoc.turnRight() : NavLoc.turnLeft() }
+        if magnitude < 150 { return diff > 0 ? NavLoc.turnSharpRight() : NavLoc.turnSharpLeft() }
+        return NavLoc.turnAroundFragment()
     }
 
     private func turnInstruction(at node: SemanticRouteNode, from currentBearing: Double, to nextBearing: Double) -> String {
@@ -4519,20 +4523,20 @@ final class SemanticRouteNavigator: ObservableObject {
     private static func formatMeters(_ meters: Double) -> String {
         let clamped = max(0, meters)
         if clamped < 1 {
-            return "less than one meter"
+            return NavLoc.lessThanOneMeter()
         }
         if clamped < 1.5 {
-            return "about 1 meter"
+            return NavLoc.aboutOneMeter()
         }
-        return "\(Int(round(clamped))) meters"
+        return NavLoc.meters(Int(round(clamped)))
     }
 
     private static func formatShortMeters(_ meters: Double) -> String {
         let clamped = max(0, meters)
         if clamped < 1.5 {
-            return "1 meter"
+            return NavLoc.oneMeter()
         }
-        return "\(Int(round(clamped))) meters"
+        return NavLoc.meters(Int(round(clamped)))
     }
 
     private static func aliases(for name: String) -> [String] {
@@ -4607,6 +4611,100 @@ final class SemanticRouteNavigator: ObservableObject {
     /// "serial" both reduce to "srl". Digit-only tokens are kept verbatim so
     /// "aisle 3" and "aisle 4" never collide.
     static func phoneticKey(_ raw: String) -> String {
+        AppLocale.current == .fr ? phoneticKeyFrench(raw) : phoneticKeyEnglish(raw)
+    }
+
+    /// Fold Latin-1 diacritics to ASCII so "crème" survives the alphanumeric
+    /// filters below. Mirrors `foldDiacritics` in TargetGroundingService.ts.
+    ///
+    /// Ligatures are expanded explicitly: `.folding(.diacriticInsensitive)`
+    /// leaves "œ" intact, and because Swift counts it as alphanumeric while the
+    /// JS side's ASCII regex does not, "œuf" would key differently on each
+    /// side. Expanding to "oe" makes both agree and is the correct reading.
+    static func foldDiacritics(_ raw: String) -> String {
+        raw
+            .folding(options: [.diacriticInsensitive], locale: Locale(identifier: "en_US_POSIX"))
+            .replacingOccurrences(of: "œ", with: "oe")
+            .replacingOccurrences(of: "Œ", with: "OE")
+            .replacingOccurrences(of: "æ", with: "ae")
+            .replacingOccurrences(of: "Æ", with: "AE")
+    }
+
+    /// French consonant-skeleton key.
+    ///
+    /// ⚠️ Mirrors `phoneticKeyFrench` in `src/services/TargetGroundingService.ts`.
+    /// The two must stay identical — JS grounds the target before the AR
+    /// session opens and native re-matches it afterwards; if they disagree, a
+    /// target that grounds in JS dead-ends natively.
+    static func phoneticKeyFrench(_ raw: String) -> String {
+        var keys: [String] = []
+        for word in foldDiacritics(raw).lowercased()
+            .components(separatedBy: CharacterSet.alphanumerics.inverted) where !word.isEmpty {
+            if word.allSatisfy(\.isNumber) {
+                keys.append(word)
+                continue
+            }
+
+            // Digraphs first — order matters: 'eau' before 'au', 'ch' before 'c'.
+            var normalized = word
+                .replacingOccurrences(of: "eau", with: "o")
+                .replacingOccurrences(of: "au", with: "o")
+                .replacingOccurrences(of: "ou", with: "u")
+                .replacingOccurrences(of: "ai", with: "e")
+                .replacingOccurrences(of: "ei", with: "e")
+                .replacingOccurrences(of: "ay", with: "e")
+                .replacingOccurrences(of: "ey", with: "e")
+                .replacingOccurrences(of: "ph", with: "f")
+                .replacingOccurrences(of: "ch", with: "S")
+                .replacingOccurrences(of: "gn", with: "N")
+                .replacingOccurrences(of: "qu", with: "k")
+                .replacingOccurrences(of: "th", with: "t")
+                .replacingOccurrences(of: "h", with: "")
+
+            // Silent word-final letters, stripped in this order and BEFORE the
+            // single-character swaps below. French stacks them — "haricots"
+            // ends in a plural 's' on top of an already-silent 't' — so a
+            // single pass, or a pass after 'x' has become 'ks', leaves
+            // singular and plural with different keys. Order is load-bearing:
+            //   1. plural marker   haricots → haricot,  eaux → eau
+            //   2. silent final e  creme    → crem
+            //   3. silent final consonant   haricot → harico
+            if let last = normalized.last, "sx".contains(last) {
+                normalized = String(normalized.dropLast())
+            }
+            if normalized.hasSuffix("e") { normalized = String(normalized.dropLast()) }
+            if let last = normalized.last, "tdpzgs".contains(last) {
+                normalized = String(normalized.dropLast())
+            }
+
+            // Soft/hard c, then the remaining one-to-one swaps.
+            let cChars = Array(normalized)
+            var afterC = ""
+            for (index, ch) in cChars.enumerated() {
+                if ch == "c" {
+                    let next = index + 1 < cChars.count ? cChars[index + 1] : " "
+                    afterC.append("eiy".contains(next) ? "s" : "k")
+                } else {
+                    afterC.append(ch)
+                }
+            }
+            normalized = afterC
+                .replacingOccurrences(of: "z", with: "s")
+                .replacingOccurrences(of: "x", with: "ks")
+                .replacingOccurrences(of: "y", with: "i")
+
+            var key = ""
+            for (index, ch) in normalized.enumerated() {
+                if index > 0, "aeiou".contains(ch) { continue }
+                if let last = key.last, last == ch { continue }
+                key.append(ch)
+            }
+            keys.append(key)
+        }
+        return keys.joined(separator: " ")
+    }
+
+    static func phoneticKeyEnglish(_ raw: String) -> String {
         var keys: [String] = []
         for word in raw.lowercased().components(separatedBy: CharacterSet.alphanumerics.inverted) where !word.isEmpty {
             if word.allSatisfy(\.isNumber) {
@@ -4649,8 +4747,17 @@ final class SemanticRouteNavigator: ObservableObject {
         return keys.joined(separator: " ")
     }
 
+    /// Leading articles stripped before lookup, per language. French adds the
+    /// partitives ("des oignons", "de la crème") — a shopper never says the
+    /// bare noun, so without these the target misses its own map label.
+    private static var lookupArticles: Set<String> {
+        AppLocale.current == .fr
+            ? ["le", "la", "les", "l", "un", "une", "des", "du", "de", "au", "aux"]
+            : ["the", "a", "an"]
+    }
+
     private static func normalizedLookupKey(_ raw: String) -> String {
-        let tokens = sanitizedSpokenLabel(raw)
+        let tokens = foldDiacritics(sanitizedSpokenLabel(raw))
             .lowercased()
             .replacingOccurrences(of: "doorknob", with: "door knob")
             .replacingOccurrences(of: "doorhandle", with: "door handle")
@@ -4659,7 +4766,8 @@ final class SemanticRouteNavigator: ObservableObject {
             .components(separatedBy: CharacterSet.alphanumerics.inverted)
             .filter { !$0.isEmpty }
         let lookupNoise = Set(["room", "rm", "suite", "office"])
-        let withoutArticles = tokens.drop { ["the", "a", "an"].contains($0) }
+        let articles = lookupArticles
+        let withoutArticles = tokens.drop { articles.contains($0) }
         let meaningfulTokens = withoutArticles.filter { lookupNoise.contains($0) == false }
         return canonicalizedLookupTokens(Array(meaningfulTokens)).joined(separator: " ")
     }

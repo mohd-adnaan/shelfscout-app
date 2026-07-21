@@ -25,6 +25,24 @@ final class ARKitNavigationModule: NSObject {
         resolve(ARWorldTrackingConfiguration.isSupported)
     }
 
+    /// Set the language for ALL native speech — route guidance, reaching, and
+    /// the AVSpeechSynthesisVoice picked by TTSManager.
+    ///
+    /// JS calls this at startup and on every Settings change, so native never
+    /// has to guess and never falls back to the system locale (which the app
+    /// language deliberately overrides).
+    @objc(setLanguage:resolver:rejecter:)
+    func setLanguage(
+        _ code: String,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        let language = AppLanguage(code: code)
+        AppLocale.current = language
+        NSLog("🌐 [ARKitNavigationModule] Native speech language → \(language.rawValue)")
+        resolve(language.rawValue)
+    }
+
     /// Spoken-label vocabulary across every saved route map. The JS layer
     /// grounds ASR targets against this before launching the AR session, so
     /// "serial" resolves to "cereal" instead of dead-ending guidance.
@@ -146,6 +164,12 @@ final class ARKitNavigationModule: NSObject {
             let clockFaceDirections = (config["clockFaceDirections"] as? NSNumber)?.boolValue ?? false
             let voiceOverEnabled = (config["voiceOverEnabled"] as? NSNumber)?.boolValue ?? UIAccessibility.isVoiceOverRunning
             let ttsRate = (config["ttsRate"] as? NSNumber)?.doubleValue
+
+            // Per-session language, so a session launched right after a
+            // Settings change cannot race the setLanguage() call.
+            if let languageCode = config["language"] as? String {
+                AppLocale.current = AppLanguage(code: languageCode)
+            }
 
             let host = ARKitRouteHostView(
                 launchTargetName: targetName,

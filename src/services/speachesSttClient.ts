@@ -1,5 +1,6 @@
 import RNFS from 'react-native-fs';
 import AudioRecord from 'react-native-audio-record';
+import { AppLanguage, LANGUAGE_LOCALES, getAppLanguage } from '../i18n';
 
 /**
  * Configuration matching N8N STT workflow
@@ -7,14 +8,31 @@ import AudioRecord from 'react-native-audio-record';
 const SPEACHES_STT_CONFIG = {
   // ✅ Public endpoint for transcription
   sttUrl: 'https://cybersight.cim.mcgill.ca/speaches/v1/audio/transcriptions',
-  
-  // ✅ STT Parameters (from N8N workflow)
-  model: 'Systran/faster-distil-whisper-small.en',
-  language: 'en',
-  
+
   // ✅ API Key (same as TTS)
   apiKey: 'dev-test-key-change-in-production',
 };
+
+/**
+ * Whisper model per language.
+ *
+ * The `.en` distil models are English-ONLY — they cannot transcribe French at
+ * all (they emit English-looking garbage rather than failing), so French must
+ * use a multilingual checkpoint. English keeps the distil model because it is
+ * faster and more accurate on the language it was specialised for.
+ */
+const STT_MODELS: Record<AppLanguage, string> = {
+  en: 'Systran/faster-distil-whisper-small.en',
+  fr: 'Systran/faster-whisper-small',
+};
+
+function sttParamsForCurrentLanguage(): { model: string; language: string } {
+  const language = getAppLanguage();
+  return {
+    model: STT_MODELS[language],
+    language: LANGUAGE_LOCALES[language].speaches,
+  };
+}
 
 /**
  * Speaches STT Client
@@ -147,8 +165,15 @@ class SpeachesSttClient {
 
       // ✅ Create FormData (multipart/form-data)
       const formData = new FormData();
-      
-      formData.append('model', SPEACHES_STT_CONFIG.model);
+
+      const { model, language } = sttParamsForCurrentLanguage();
+      formData.append('model', model);
+      // Pin the language rather than letting Whisper auto-detect: a short
+      // grocery query ("des oignons") is easy to misidentify, and a
+      // misdetected language returns a translated-looking transcript that
+      // then fails target grounding.
+      formData.append('language', language);
+      console.log(`🌐 STT model=${model} language=${language}`);
 
       // ✅ Add audio file
       formData.append('file', {

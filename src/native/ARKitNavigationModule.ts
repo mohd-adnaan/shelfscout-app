@@ -1,4 +1,5 @@
 import { NativeModules, Platform } from 'react-native';
+import type { AppLanguage } from '../i18n';
 
 export type ARKitNavigationReason =
   | 'arrived'
@@ -21,6 +22,8 @@ export interface ARKitNavigationConfig {
   clockFaceDirections?: boolean;
   voiceOverEnabled?: boolean;
   ttsRate?: number;
+  /** Language for native spoken guidance ('en' | 'fr'). */
+  language?: AppLanguage;
 }
 
 /** One spoken destination label from a saved semantic route map. */
@@ -53,6 +56,8 @@ interface NativeARKitNavigationModule {
   stopNavigation(): Promise<void>;
   isAvailable(): Promise<boolean>;
   availableNavigationTargets(): Promise<ARKitNavigationTargetEntry[]>;
+  /** Set the language for all native spoken guidance. Resolves with the code actually applied. */
+  setLanguage(code: AppLanguage): Promise<string>;
 }
 
 const nativeModule = NativeModules.ARKitNavigationModule as NativeARKitNavigationModule | undefined;
@@ -85,6 +90,11 @@ const unavailableModule: NativeARKitNavigationModule = {
   },
   async availableNavigationTargets(): Promise<ARKitNavigationTargetEntry[]> {
     return [];
+  },
+  async setLanguage(code: AppLanguage): Promise<string> {
+    // No native module (Android, or an iOS build without it linked) — the JS
+    // i18n store still holds the language, so this is a silent no-op.
+    return code;
   },
 };
 
