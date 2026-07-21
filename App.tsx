@@ -770,7 +770,10 @@ function AppInner(): React.JSX.Element {
     return '';
   }, []);
 
-  const maybeAnnouncePosture = useCallback(async (context: 'capture' | 'continuous') => {
+  const maybeAnnouncePosture = useCallback(async (
+    context: 'capture' | 'continuous',
+    options?: { force?: boolean },
+  ) => {
     const status = getPostureStatus();
     if (status.ok) return false;
 
@@ -785,7 +788,7 @@ function AppInner(): React.JSX.Element {
       lastPostureLogRef.current = now;
     }
 
-    if (now - lastPostureWarningRef.current < POSTURE_WARNING_COOLDOWN_MS) return false;
+    if (!options?.force && now - lastPostureWarningRef.current < POSTURE_WARNING_COOLDOWN_MS) return false;
 
     const message = buildPostureMessage(status);
     if (!message) return false;
@@ -834,7 +837,16 @@ function AppInner(): React.JSX.Element {
       if (getPostureStatus().ok) return true;
     }
 
-    return getPostureStatus().ok;
+    if (getPostureStatus().ok) return true;
+
+    // The capture is being abandoned and every caller drops straight to
+    // "Ready. Tap to speak." The warning above is throttled to 6s, which is
+    // shorter than this wait — so a second attempt inside that window said
+    // nothing at all, and the user's query vanished with no explanation.
+    // Force the reason on the way out; the throttle still covers repeats
+    // during the wait itself.
+    await maybeAnnouncePosture(context, { force: true });
+    return false;
   }, [getPostureStatus, maybeAnnouncePosture]);
 
   // Keep a stable ref for callbacks that are intentionally []-memoized.
@@ -2364,8 +2376,15 @@ function AppInner(): React.JSX.Element {
       // When present, navigation hands off into in-device spatial-target
       // reaching for THAT object — not the destination POI itself.
       const reachingObjectName = normalizeTextValue(navResult.reachingObjectName);
-      const willAutoReach =
-        !!reachingObjectName || settingsRef.current.reachingPipeline !== 'spatialTarget';
+      // Resolve the pipeline exactly the way handleiOSReaching does. Reading
+      // settings.reachingPipeline raw misses In-Device Mode, which overrides
+      // the stored preference without rewriting it — the default stays
+      // 'visionBox', so every in-device arrival looked like a backend pipeline
+      // and auto-reached, including destinations with no reaching object
+      // pinned during capture.
+      const isSpatialTargetReaching =
+        resolveReachingPipeline({ reaching_ios: true, reaching: true }) === 'spatialTarget';
+      const willAutoReach = !!reachingObjectName || !isSpatialTargetReaching;
 
       stopContinuousMode('ARKit navigation arrived', false);
       setIsReaching(willAutoReach);
@@ -2417,7 +2436,7 @@ function AppInner(): React.JSX.Element {
         return true;
       }
 
-      if (settingsRef.current.reachingPipeline === 'spatialTarget') {
+      if (isSpatialTargetReaching) {
         // In-device mode with no reaching object marked: arrival is final.
         // Reaching only activates for destinations with a pinned object.
         setIsReaching(false);
@@ -2564,6 +2583,7 @@ function AppInner(): React.JSX.Element {
     handleiOSReaching,
     resetContinuousSpeechQueue,
     resolveNavigationPipeline,
+    resolveReachingPipeline,
     speakContinuousSpeechAndWait,
     stopRtabFeed,
   ]);

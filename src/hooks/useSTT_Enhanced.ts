@@ -24,6 +24,7 @@ import Voice, {
 } from '@react-native-voice/voice';
 import { openAIVADService } from '../services/OpenAIVADService';
 import { currentLocales } from '../i18n';
+import { setMicrophoneListening } from '../utils/soundEffects';
 
 // ============================================================================
 // Types
@@ -363,8 +364,29 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     clearSilenceTimer();
     openAIVadRequestSeqRef.current += 1;
     setIsListening(false);
+    setMicrophoneListening(false);
     hasHeardSpeechRef.current = false;
-  }, [clearSilenceTimer]);
+
+    // ✅ FIX: Don't throw away a transcript we already have.
+    // iOS routinely ends an utterance with a kAFAssistantErrorDomain error
+    // (216 / 1110) AFTER it has delivered results. The old code cleared the
+    // pending silence timer and flipped isListening to false, so the app slid
+    // from Listening straight back to Ready with the user's query dropped and
+    // nothing spoken — intermittent, because it depends on whether the error
+    // beats the silence timer. Submit what we heard instead; the guards in
+    // triggerAutoSubmit still prevent a duplicate submit.
+    const pendingTranscript = transcriptRef.current.trim();
+    if (
+      pendingTranscript &&
+      !isManualStopRef.current &&
+      !hasAutoSubmittedRef.current &&
+      enableAutoSubmit &&
+      onAutoSubmit
+    ) {
+      console.log('🎯 Speech error with pending transcript — submitting instead of dropping');
+      triggerAutoSubmit('iOS_onSpeechError');
+    }
+  }, [clearSilenceTimer, enableAutoSubmit, onAutoSubmit, triggerAutoSubmit]);
 
   // ============================================================================
   // Setup Voice Listeners
@@ -445,7 +467,11 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
 
       await Voice.start(currentLocales().stt);
       setIsListening(true);
-      
+      // Suppress the thinking loop for as long as the mic is open — a stray
+      // start from an async path would otherwise play over the user and be
+      // recorded back into the transcript.
+      setMicrophoneListening(true);
+
       console.log('✅ iOS voice started - waiting for speech...');
       if (gracePeriodMs > 0) {
         console.log(`♿ Grace period active: ${gracePeriodMs}ms (discarding VoiceOver noise)`);
@@ -455,6 +481,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       console.error('❌ Failed to start voice:', err);
       setError(err.message || 'Failed to start voice recognition');
       setIsListening(false);
+      setMicrophoneListening(false);
     }
   }, [
     enableAutoSubmit,
@@ -479,7 +506,8 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       
       await Voice.stop();
       setIsListening(false);
-      
+      setMicrophoneListening(false);
+
       const finalTranscript = transcriptRef.current;
       console.log('📝 Final transcript:', finalTranscript);
       
@@ -487,6 +515,7 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
     } catch (err: any) {
       console.error('❌ Failed to stop voice:', err);
       setIsListening(false);
+      setMicrophoneListening(false);
       return transcriptRef.current;
     }
   }, [clearSilenceTimer]);
@@ -507,11 +536,13 @@ export const useSTT = (options: UseSTTOptions = {}): UseSTTReturn => {
       try { await Voice.destroy(); } catch { }
       
       setIsListening(false);
+      setMicrophoneListening(false);
       setTranscript('');
       transcriptRef.current = '';
     } catch (err: any) {
       console.error('❌ Failed to cancel voice:', err);
       setIsListening(false);
+      setMicrophoneListening(false);
     }
   }, [clearSilenceTimer]);
 

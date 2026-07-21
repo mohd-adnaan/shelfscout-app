@@ -351,6 +351,38 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertTrue(navigator.currentInstruction.contains("not in this semantic map"))
     }
 
+    func testExtraSpokenWordResolvesToMappedLabel() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.loungeMap()])
+
+        let started = navigator.startNavigation(
+            to: "400 lounge room",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertEqual(navigator.targetName, "400 Lounge")
+    }
+
+    func testAmbiguousContainmentRefusesToGuessDestination() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.twoLoungeMap()])
+
+        let started = navigator.startNavigation(
+            to: "lounge",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertFalse(started)
+        XCTAssertTrue(navigator.currentInstruction.contains("not in this semantic map"))
+    }
+
     // MARK: - Instant-arrival gating
 
     func testFarPoseWithSingleNodePathRefusesInstantArrival() {
@@ -461,6 +493,19 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         let start = node(id: "start", name: "Cereal", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
         let target = node(id: "onions", name: "Onions", point: SemanticRoutePoint(x: 0, y: 8), kind: .destination)
         return map(id: "onions-route", coordinateSpace: "pdr_xy", nodes: [start, target])
+    }
+
+    private static func loungeMap() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let target = node(id: "lounge", name: "400 Lounge", point: SemanticRoutePoint(x: 0, y: 8), kind: .destination)
+        return map(id: "lounge-route", coordinateSpace: "pdr_xy", nodes: [start, target])
+    }
+
+    private static func twoLoungeMap() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let north = node(id: "north", name: "North Lounge", point: SemanticRoutePoint(x: 0, y: 8), kind: .destination)
+        let south = node(id: "south", name: "South Lounge", point: SemanticRoutePoint(x: 0, y: 16), kind: .destination)
+        return map(id: "two-lounge-route", coordinateSpace: "pdr_xy", nodes: [start, north, south])
     }
 
     private static func straightMap(coordinateSpace: String) -> SemanticRouteMap {

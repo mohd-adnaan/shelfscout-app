@@ -4054,7 +4054,48 @@ final class SemanticRouteNavigator: ObservableObject {
         }) {
             return (node, false)
         }
+        // Extra-word tolerance ("400 lounge room" → "400 lounge"), last because
+        // it is the loosest rule — every exact/fuzzy/phonetic hit outranks it.
+        if let node = bestContainmentMatch(for: target, in: map) {
+            return (node, false)
+        }
         return nil
+    }
+
+    /// Most specific label whose tokens are contained in the spoken target (or
+    /// vice versa). A tie between two different labels resolves to nothing:
+    /// walking a blind user to the wrong room is worse than asking again.
+    private func bestContainmentMatch(for target: String, in map: SemanticRouteMap) -> SemanticRouteNode? {
+        var best: (node: SemanticRouteNode, key: String, score: Int)?
+        var isAmbiguous = false
+
+        func consider(_ node: SemanticRouteNode, name: String, aliases: [String]) {
+            let score = ([name] + aliases)
+                .map { Self.containmentScore($0, target) }
+                .max() ?? 0
+            guard score > 0 else { return }
+            let key = Self.normalizedLookupKey(name)
+            guard let current = best else {
+                best = (node, key, score)
+                return
+            }
+            if score > current.score {
+                best = (node, key, score)
+                isAmbiguous = false
+            } else if score == current.score, key != current.key {
+                isAmbiguous = true
+            }
+        }
+
+        for landmark in map.landmarks {
+            guard let node = map.nodes.first(where: { $0.id == landmark.nodeID }) else { continue }
+            consider(node, name: landmark.name, aliases: landmark.aliases)
+        }
+        for node in map.nodes {
+            consider(node, name: node.name, aliases: node.aliases)
+        }
+
+        return isAmbiguous ? nil : best?.node
     }
 
     private func resolveNavigationStart(
@@ -4580,6 +4621,37 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         let phoneticA = phoneticKey(a)
         return phoneticA.count >= 2 && phoneticA == phoneticKey(b)
+    }
+
+    /// Token-containment score between a saved label and a spoken target.
+    ///
+    /// Edit distance and the phonetic key both compare whole strings, so
+    /// "400 lounge room" never reaches the saved "400 lounge". Treat the
+    /// shorter token list being wholly contained in the longer one as a match
+    /// and return how many tokens lined up, so the caller can prefer the most
+    /// specific label and refuse ties. Digit tokens must agree exactly, or
+    /// "lounge" would match "400 lounge" and "500 lounge" equally well.
+    ///
+    /// ⚠️ Mirrors `containmentScore` in `src/services/TargetGroundingService.ts`.
+    static func containmentScore(_ lhs: String, _ rhs: String) -> Int {
+        let a = normalizedLookupKey(lhs)
+        let b = normalizedLookupKey(rhs)
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        guard digitTokens(a) == digitTokens(b) else { return 0 }
+
+        let lhsTokens = a.split(separator: " ").map(String.init)
+        let rhsTokens = b.split(separator: " ").map(String.init)
+        guard !lhsTokens.isEmpty, !rhsTokens.isEmpty else { return 0 }
+
+        let shorter = lhsTokens.count <= rhsTokens.count ? lhsTokens : rhsTokens
+        var pool = lhsTokens.count <= rhsTokens.count ? rhsTokens : lhsTokens
+
+        // Consume matches so a repeated token needs a partner on both sides.
+        for token in shorter {
+            guard let index = pool.firstIndex(of: token) else { return 0 }
+            pool.remove(at: index)
+        }
+        return shorter.count
     }
 
     private static func digitTokens(_ s: String) -> String {

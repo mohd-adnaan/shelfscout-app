@@ -10,7 +10,8 @@
 //   1. exact normalized match
 //   2. bounded edit distance (plural drift, one-letter slips)
 //   3. phonetic consonant-skeleton key ("serial" ↔ "cereal")
-//   4. Groq LLM label resolution against the candidate list
+//   4. token containment ("400 lounge room" ↔ "400 lounge")
+//   5. Groq LLM label resolution against the candidate list
 //
 // The pure matching functions are exported separately so they are testable
 // without the native bridge.
@@ -19,7 +20,7 @@ import { ARKitNavigationBridge, ARKitNavigationTargetEntry } from '../native/ARK
 import { groqIntentClient } from './GroqIntentClient';
 import { AppLanguage, getAppLanguage } from '../i18n';
 
-export type GroundingMethod = 'exact' | 'fuzzy' | 'phonetic' | 'llm';
+export type GroundingMethod = 'exact' | 'fuzzy' | 'phonetic' | 'contains' | 'llm';
 
 export interface GroundingResult {
   status: 'matched' | 'no_match' | 'no_vocabulary';
@@ -239,6 +240,52 @@ const fuzzyMatches = (a: string, b: string): boolean => {
   return allowedEdits > 0 && levenshteinDistance(a, b) <= allowedEdits;
 };
 
+/**
+ * Token-containment score between a saved label and a spoken target.
+ *
+ * Edit distance and the phonetic key both compare whole strings, so a spoken
+ * target that carries the saved label plus a filler word — "400 lounge room"
+ * for the saved "400 lounge" — misses every earlier rung of the cascade by a
+ * wide margin (five edits, different consonant skeleton) and dead-ends with
+ * "not found". People describe destinations that way constantly, so treat the
+ * shorter token list being wholly contained in the longer one as a match.
+ *
+ * Returns the number of tokens that had to line up (0 when they don't), which
+ * the caller uses to prefer the most specific label and to detect ties.
+ *
+ * Digit tokens must still agree exactly on both sides: without that guard
+ * "lounge" would match "400 lounge" and "500 lounge" equally, and "aisle 3"
+ * would match "aisle 4 shelf".
+ *
+ * Mirrors `SemanticRouteNavigator.containmentScore`.
+ */
+export const containmentScore = (label: string, requested: string): number => {
+  // Normalizing here (rather than trusting the caller) keeps this function
+  // interchangeable with its Swift mirror; it is idempotent on the already-
+  // normalized strings the cascade passes in.
+  const a = normalizeSpokenLabel(label);
+  const b = normalizeSpokenLabel(requested);
+  if (!a || !b) return 0;
+  if (digitTokens(a) !== digitTokens(b)) return 0;
+
+  const labelTokens = a.split(' ').filter(Boolean);
+  const requestedTokens = b.split(' ').filter(Boolean);
+  if (!labelTokens.length || !requestedTokens.length) return 0;
+
+  const [shorter, longer] = labelTokens.length <= requestedTokens.length
+    ? [labelTokens, requestedTokens]
+    : [requestedTokens, labelTokens];
+
+  // Consume matches so a repeated token needs a partner on both sides.
+  const pool = [...longer];
+  for (const token of shorter) {
+    const index = pool.indexOf(token);
+    if (index === -1) return 0;
+    pool.splice(index, 1);
+  }
+  return shorter.length;
+};
+
 const uniqueLabels = (entries: ARKitNavigationTargetEntry[]): string[] => {
   const seen = new Set<string>();
   const labels: string[] = [];
@@ -289,6 +336,27 @@ export const matchTargetAgainstVocabulary = (
       }
     }
   }
+
+  // Containment runs last of the local rungs: it is the loosest rule, so an
+  // exact/fuzzy/phonetic hit on any entry must win over it. The most specific
+  // label wins ("400 lounge" over a bare "lounge"), and a tie between two
+  // different labels is left unresolved for the LLM rather than guessed at —
+  // walking a blind user to the wrong room is worse than asking again.
+  let best: { entry: ARKitNavigationTargetEntry; score: number } | null = null;
+  let bestIsAmbiguous = false;
+  for (const entry of entries) {
+    const label = normalizeSpokenLabel(entry.label);
+    const score = containmentScore(label, requested);
+    if (!score) continue;
+    if (!best || score > best.score) {
+      best = { entry, score };
+      bestIsAmbiguous = false;
+    } else if (score === best.score && label !== normalizeSpokenLabel(best.entry.label)) {
+      bestIsAmbiguous = true;
+    }
+  }
+  if (best && !bestIsAmbiguous) return matched(best.entry, 'contains');
+
   return { status: 'no_match', availableTargets };
 };
 

@@ -66,6 +66,45 @@ describe('TargetGroundingService', () => {
     expect(result.status).toBe('no_match');
   });
 
+  it('tolerates an extra spoken word around a saved label', () => {
+    const rooms = [
+      { label: '400 Lounge', mapId: 'map-3', mapName: 'Office Route' },
+      { label: 'Kitchen', mapId: 'map-3', mapName: 'Office Route' },
+    ];
+    const result = matchTargetAgainstVocabulary('400 lounge room', rooms);
+    expect(result.status).toBe('matched');
+    expect(result.label).toBe('400 Lounge');
+    expect(result.method).toBe('contains');
+  });
+
+  it('prefers the most specific label when several are contained', () => {
+    const rooms = [
+      { label: 'Lounge', mapId: 'map-3', mapName: 'Office Route' },
+      { label: '400 Lounge', mapId: 'map-3', mapName: 'Office Route' },
+    ];
+    const result = matchTargetAgainstVocabulary('the 400 lounge room', rooms);
+    expect(result.status).toBe('matched');
+    expect(result.label).toBe('400 Lounge');
+  });
+
+  it('refuses to guess when containment is ambiguous', () => {
+    const rooms = [
+      { label: 'North Lounge', mapId: 'map-3', mapName: 'Office Route' },
+      { label: 'South Lounge', mapId: 'map-3', mapName: 'Office Route' },
+    ];
+    const result = matchTargetAgainstVocabulary('lounge', rooms);
+    expect(result.status).toBe('no_match');
+  });
+
+  it('never lets containment cross a room number', () => {
+    const rooms = [
+      { label: '400 Lounge', mapId: 'map-3', mapName: 'Office Route' },
+      { label: '500 Lounge', mapId: 'map-3', mapName: 'Office Route' },
+    ];
+    expect(matchTargetAgainstVocabulary('500 lounge room', rooms).label).toBe('500 Lounge');
+    expect(matchTargetAgainstVocabulary('lounge room', rooms).status).toBe('no_match');
+  });
+
   it('reports available targets for spoken feedback on a miss', () => {
     const result = matchTargetAgainstVocabulary('quinoa', vocabulary);
     expect(result.status).toBe('no_match');

@@ -45,7 +45,11 @@
       "Bash(echo \"--- exit: $? ---\")",
       "Bash(git -C /Users/mohammadadnaan/Projects/ic4u diff --stat)",
       "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout diff --stat)",
-      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout diff .claude/settings.local.json)"
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout diff .claude/settings.local.json)",
+      "Bash(echo \"=== TSC EXIT: $? ===\")",
+      "Bash(awk 'NR>=2230 && NR<=2300' App.tsx)",
+      "Bash(awk 'NR<=2380 && /useCallback|const handle|^  const /{print NR\": \"$0}' App.tsx)",
+      "Bash(awk 'NR>=2560 && NR<=2660' App.tsx)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

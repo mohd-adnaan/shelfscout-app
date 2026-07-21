@@ -134,6 +134,53 @@ let _listenPlaying = false;
  */
 let latencyGen = 0;
 
+/**
+ * Timestamp of the last `setMicrophoneListening(true)`, or 0 when the mic is
+ * closed.
+ *
+ * The thinking loop means "we are waiting on a backend answer", so it must
+ * never overlap the microphone being open. Callers already stop it on the way
+ * into listening, but the loop is started from several asynchronous places
+ * (continuous-navigation cycles, ARKit arrival handoff, queued TTS drains)
+ * whose timing the listening path cannot control — any of them landing a beat
+ * after the mic opens is the reported "thinking sound during listening", and
+ * it also feeds the loop straight back into the recogniser.
+ *
+ * Gating the start here catches every caller in one place rather than
+ * asking each one to re-check.
+ */
+let _micOpenSince = 0;
+
+/**
+ * Safety valve: if a listening session ever ends without its matching
+ * `setMicrophoneListening(false)` (a native crash mid-session, say), the gate
+ * would silence the thinking loop for the rest of the app's life. iOS ends
+ * speech recognition after ~60s regardless, so anything older than this is
+ * stale bookkeeping, not an open mic.
+ */
+const MIC_GATE_MAX_AGE_MS = 90_000;
+
+const _isMicrophoneListening = (): boolean =>
+  _micOpenSince > 0 && Date.now() - _micOpenSince < MIC_GATE_MAX_AGE_MS;
+
+/**
+ * Report whether the speech recogniser currently holds the microphone.
+ *
+ * Called by the STT hooks around `Voice.start()` / stop / cancel / error.
+ * Opening the mic also stops any latency loop still running, so a loop
+ * started just before the mic opened cannot bleed into the recording.
+ */
+export const setMicrophoneListening = (active: boolean): void => {
+  if (active) {
+    _micOpenSince = Date.now();
+    if (latencyLooping) {
+      stopLatencyLoop().catch(() => { });
+    }
+    return;
+  }
+  _micOpenSince = 0;
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 // init — call once at app startup (e.g. in App.tsx useEffect)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -333,6 +380,12 @@ export const configureRecordingSession = async (
  * replaying during the listening→thinking transition).
  */
 export const playThinkingStarted = (): void => {
+    // The mic is open — a thinking loop now would play over the user and be
+    // recorded by the recogniser. See `setMicrophoneListening`.
+    if (_isMicrophoneListening()) {
+      console.log('🔇 [SFX] Thinking loop suppressed — microphone is listening');
+      return;
+    }
     // Ensure the listen flag is cleared (defensive, in case caller skipped stopListenSound).
     _listenPlaying = false;
     // Bump the generation so any in-flight callbacks from a previous loop

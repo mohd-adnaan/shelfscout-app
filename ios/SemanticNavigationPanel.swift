@@ -279,10 +279,16 @@ struct SemanticNavigationPanel: View {
                 .routeTextField()
 
             Button {
-                captureLandmark(destinationName, selectedSide, landmarkNote, true)
+                let capturedName = destinationName
+                captureLandmark(capturedName, selectedSide, landmarkNote, true)
                 if targetName.isEmpty {
-                    targetName = destinationName
+                    targetName = capturedName
                 }
+                // Clear the form the way the landmark "Add" button does. Left
+                // populated, the next destination has to be typed over the
+                // previous one, which reads as "only one destination per map".
+                destinationName = ""
+                landmarkNote = ""
             } label: {
                 Label("Set Destination", systemImage: "scope")
                     .frame(maxWidth: .infinity)
