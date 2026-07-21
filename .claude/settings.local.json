@@ -2,7 +2,27 @@
   "permissions": {
     "allow": [
       "Bash(npx tsc *)",
-      "Bash(git stash *)"
+      "Bash(git stash *)",
+      "Bash(cd /Users/mohammadadnaan/Projects/ic4u *)",
+      "Read(//Users/mohammadadnaan/Projects/ic4u/**)",
+      "Bash(npm install *)",
+      "Read(//Users/mohammadadnaan/Projects/**)",
+      "Bash(md5 shelfscout/patches/react-native-vision-camera+4.7.3.patch ic4u/patches/react-native-vision-camera+4.7.3.patch)",
+      "Bash(cp /Users/mohammadadnaan/Projects/shelfscout/node_modules/react-native-vision-camera/ios/Core/CameraSession+Photo.swift /Users/mohammadadnaan/Projects/ic4u/node_modules/react-native-vision-camera/ios/Core/CameraSession+Photo.swift)",
+      "Bash(cp /Users/mohammadadnaan/Projects/shelfscout/node_modules/react-native-vision-camera/ios/Core/PhotoCaptureDelegate.swift /Users/mohammadadnaan/Projects/ic4u/node_modules/react-native-vision-camera/ios/Core/PhotoCaptureDelegate.swift)",
+      "Bash(cp /Users/mohammadadnaan/Projects/shelfscout/node_modules/react-native-vision-camera/src/types/PhotoFile.ts /Users/mohammadadnaan/Projects/ic4u/node_modules/react-native-vision-camera/src/types/PhotoFile.ts)",
+      "Bash(cp /Users/mohammadadnaan/Projects/shelfscout/node_modules/react-native-vision-camera/lib/typescript/types/PhotoFile.d.ts /Users/mohammadadnaan/Projects/ic4u/node_modules/react-native-vision-camera/lib/typescript/types/PhotoFile.d.ts)",
+      "Bash(npx patch-package *)",
+      "Bash(git commit *)",
+      "Bash(md5 -q /Users/mohammadadnaan/Projects/shelfscout/patches/react-native-vision-camera+4.7.3.patch)",
+      "Bash(git ls-remote *)",
+      "Bash(awk '{print $2}')",
+      "Bash(md5 -q)",
+      "Bash(md5 -q patches/react-native-vision-camera+4.7.3.patch)"
+    ],
+    "additionalDirectories": [
+      "/Users/mohammadadnaan/Projects/ic4u/src/utils",
+      "/Users/mohammadadnaan/Projects/ic4u"
     ]
   }
 }
