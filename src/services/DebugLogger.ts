@@ -364,7 +364,7 @@ class DebugLoggerClass {
       }
 
       // Delay to avoid Google Apps Script rate limits (concurrent executions)
-      await new Promise(resolve => setTimeout(resolve, 500));
+      await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
     }
 
     this.isUploading = false;

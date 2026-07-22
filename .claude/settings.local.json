@@ -49,7 +49,8 @@
       "Bash(echo \"=== TSC EXIT: $? ===\")",
       "Bash(awk 'NR>=2230 && NR<=2300' App.tsx)",
       "Bash(awk 'NR<=2380 && /useCallback|const handle|^  const /{print NR\": \"$0}' App.tsx)",
-      "Bash(awk 'NR>=2560 && NR<=2660' App.tsx)"
+      "Bash(awk 'NR>=2560 && NR<=2660' App.tsx)",
+      "Bash(echo \"=== tsc exit: $? ===\")"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

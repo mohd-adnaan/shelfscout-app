@@ -1,6 +1,14 @@
 import { NativeModules, Platform } from 'react-native';
 
-export type LocalLLMProvider = 'apple_foundation_models' | 'heuristic' | 'none';
+// 'groq' is produced by GroqIntentClient, which resolves the same
+// LocalLLMNativeResult shape as the native providers. Omitting it here made
+// the `provider === 'groq'` checks in MobileOrchestrator look unreachable to
+// the compiler even though they fire at runtime.
+export type LocalLLMProvider =
+  | 'apple_foundation_models'
+  | 'groq'
+  | 'heuristic'
+  | 'none';
 
 export interface LocalLLMNativeResult {
   available: boolean;
