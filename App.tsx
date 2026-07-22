@@ -3626,12 +3626,17 @@ function AppInner(): React.JSX.Element {
           }
         }}
       >
-        <View
-          ref={containerRef}
-          style={StyleSheet.absoluteFill}
-          accessible={false}
-          importantForAccessibility="no-hide-descendants"
-        >
+        {/*
+          Do NOT set accessible / importantForAccessibility here: TouchableWithoutFeedback
+          clones this child and overwrites both (accessible -> true,
+          importantForAccessibility -> undefined), so anything set here is silently
+          discarded. That clone is what makes the whole screen a single VoiceOver
+          button labelled `effectiveLabel` — which is the intent — but it also means
+          every descendant is absorbed into that one element and can never take
+          VoiceOver focus. Interactive controls must live OUTSIDE this subtree
+          (see the settings gear below).
+        */}
+        <View ref={containerRef} style={StyleSheet.absoluteFill}>
           <StatusBar barStyle="light-content" backgroundColor="#000" />
 
           {/* Camera */}
@@ -3668,23 +3673,27 @@ function AppInner(): React.JSX.Element {
             glassesDebugRaw={wakeWordDebugRaw}
           />
 
-          {/* ── Settings Gear Button (top-right) ── */}
-          <TouchableOpacity
-            style={styles.settingsGearButton}
-            onPress={(event) => {
-              event.stopPropagation();
-              setShowSettings(true);
-            }}
-            accessible={true}
-            accessibilityRole="button"
-            accessibilityLabel="Open settings"
-            accessibilityHint="Double tap to open settings for voice speed and reaching pipeline"
-          >
-            <Text style={styles.settingsGear} accessible={false}>⚙</Text>
-          </TouchableOpacity>
-
         </View>
       </TouchableWithoutFeedback>
+
+      {/* ── Settings Gear Button (top-right) ──
+          Sibling of the tap surface, never a child: inside it the gear is swallowed
+          by the screen-wide accessibility element and cannot be reached by VoiceOver
+          swipe. Declared after the tap surface so it still paints on top and keeps
+          winning the touch, and so VoiceOver reads the main button first. */}
+      <TouchableOpacity
+        style={styles.settingsGearButton}
+        onPress={(event) => {
+          event.stopPropagation();
+          setShowSettings(true);
+        }}
+        accessible={true}
+        accessibilityRole="button"
+        accessibilityLabel="Open settings"
+        accessibilityHint="Double tap to open settings for voice speed and reaching pipeline"
+      >
+        <Text style={styles.settingsGear} accessible={false}>⚙</Text>
+      </TouchableOpacity>
 
       {/* ── Debug Overlay (outside TouchableWithoutFeedback so touches work) ── */}
       {settings.developerMode && <DebugOverlay />}
