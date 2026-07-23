@@ -884,6 +884,7 @@ struct ARMappingView: View {
                 mapName: $mapName,
                 arStatusText: statusText,
                 activeARMapName: mappingManager.activeMapName,
+                activeARWorldMapID: mappingManager.activeMapID,
                 closestPOI: mappingManager.closestPOI,
                 savedARMaps: mappingManager.savedMaps,
                 selectedARMapID: mappingManager.selectedMapID,
@@ -1443,10 +1444,16 @@ struct ARMappingView: View {
         )
     }
 
-    private func beginSemanticEnrichmentWalk() {
-        guard let route = semanticNavigator.activeMap else { return }
+    private func beginSemanticEnrichmentWalk(routeID: String) {
+        guard let route = semanticNavigator.maps.first(where: { $0.id == routeID }) else { return }
         guard mappingManager.isLocalized else {
             mappingManager.statusMessage = "Load and localize the AR map before improving it."
+            return
+        }
+        // Samples are poses in the loaded map's frame. Appending them to a
+        // route captured in a different frame would corrupt that route.
+        guard route.arWorldMapId == mappingManager.activeMapID else {
+            mappingManager.statusMessage = "Load the AR map linked to \(route.name) before improving it."
             return
         }
         semanticNavigator.beginEnrichmentWalk(mapID: route.id)

@@ -63,7 +63,8 @@
       "Bash(git --no-pager diff ios/SemanticRouteNavigator.swift)",
       "Bash(rg -n 'enum SemanticRouteMath|struct SemanticRouteMath' ios/*.swift)",
       "Bash(git --no-pager diff ios/ARMappingView.swift ios/SemanticNavigationPanel.swift)",
-      "Bash(rg -rn 'replaceMapsForTesting' --include='*.swift' .)"
+      "Bash(rg -rn 'replaceMapsForTesting' --include='*.swift' .)",
+      "Bash(awk 'NR>=5480 && NR<=5545' ios/SemanticRouteNavigator.swift)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

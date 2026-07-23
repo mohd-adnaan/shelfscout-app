@@ -552,7 +552,7 @@ final class SemanticRouteNavigator: ObservableObject {
     /// Live keyframe matches whose stored heading differs from the camera
     /// heading by more than this cannot be looking at the same scene; they
     /// only add aliasing noise once both walking directions are captured.
-    private let visualMatchHeadingGateDegrees = 100.0
+    private static let visualMatchHeadingGateDegrees = 100.0
     /// Enrichment walk sampling: keyframes while moving along the route,
     /// plus stationary samples while the user turns in place at a POI dwell.
     private let enrichmentSampleDistanceMeters = 0.75
@@ -4005,7 +4005,7 @@ final class SemanticRouteNavigator: ObservableObject {
                 // produce false matches. Heading-less keyframes stay eligible.
                 if let liveHeading,
                    let keyframeHeading = keyframe.headingDegrees,
-                   abs(SemanticRouteMath.signedAngleDifference(liveHeading, keyframeHeading)) > visualMatchHeadingGateDegrees {
+                   abs(SemanticRouteMath.signedAngleDifference(liveHeading, keyframeHeading)) > Self.visualMatchHeadingGateDegrees {
                     continue
                 }
                 guard let progress = keyframeProgressMeters(
@@ -5527,6 +5527,41 @@ extension SemanticRouteNavigator {
         SemanticRouteFrameStore.pruneThumbnails(keeping: referenced)
     }
 
+    /// Per-segment count of how many segments hold a keyframe shot facing the
+    /// way you walk it, and how many hold one facing the way you walk it back.
+    /// The live matcher gates keyframes on heading, so a segment with no
+    /// reverse keyframe contributes nothing to a destination → start journey —
+    /// this is the readout that says whether an enrichment walk landed.
+    private static func directionCoverage(
+        for map: SemanticRouteMap,
+        keyframes: [SemanticRouteKeyframe]
+    ) -> (forward: Int, reverse: Int, total: Int) {
+        let nodeByID = Dictionary(uniqueKeysWithValues: map.nodes.map { ($0.id, $0) })
+        var forward = 0
+        var reverse = 0
+
+        for edge in map.edges {
+            guard let from = nodeByID[edge.fromNodeID], let to = nodeByID[edge.toNodeID] else { continue }
+            let onSegment = keyframes.filter { keyframe in
+                guard keyframe.headingDegrees != nil else { return false }
+                let projection = project(keyframe.pose, from: from.point, to: to.point, distance: edge.distanceMeters)
+                return projection.crossTrackMeters <= 1.5 &&
+                    projection.alongTrackMeters >= -0.5 &&
+                    projection.alongTrackMeters <= edge.distanceMeters + 0.5
+            }
+            func sees(_ bearing: Double) -> Bool {
+                onSegment.contains { keyframe in
+                    guard let heading = keyframe.headingDegrees else { return false }
+                    return abs(SemanticRouteMath.signedAngleDifference(heading, bearing)) <= visualMatchHeadingGateDegrees
+                }
+            }
+            if sees(edge.bearingDegrees) { forward += 1 }
+            if sees(edge.reverseBearingDegrees) { reverse += 1 }
+        }
+
+        return (forward, reverse, map.edges.count)
+    }
+
     private static func debugReportHTML(for map: SemanticRouteMap) -> String {
         let quality = map.captureQuality
         let aliasGroups = map.visualAliasGroups ?? visualAliasGroups(in: map)
@@ -5578,6 +5613,15 @@ extension SemanticRouteNavigator {
             if !quality.warnings.isEmpty {
                 html += "<ul>" + quality.warnings.map { "<li class=\"warn\">\(htmlEscape($0))</li>" }.joined() + "</ul>"
             }
+        }
+
+        let coverage = directionCoverage(for: map, keyframes: keyframes)
+        html += "<div class=\"badges\">"
+        html += "<span class=\"\(coverage.forward == coverage.total ? "ok" : "bad")\">Forward coverage: \(coverage.forward)/\(coverage.total) segments</span>"
+        html += "<span class=\"\(coverage.reverse == coverage.total ? "ok" : "bad")\">Reverse coverage: \(coverage.reverse)/\(coverage.total) segments</span>"
+        html += "</div>"
+        if coverage.reverse < coverage.total {
+            html += "<ul><li class=\"warn\">Guidance from a destination back toward the start will run without visual matching on the uncovered segments. Load this AR map, relocalize, and run Map → Improve (Walk It Back).</li></ul>"
         }
 
         html += "<h2>Top-down route</h2>" + svgRoutePlot(for: map, aliasGroups: aliasGroups)

@@ -7,6 +7,7 @@ struct SemanticNavigationPanel: View {
 
     let arStatusText: String
     let activeARMapName: String?
+    let activeARWorldMapID: String?
     let closestPOI: String?
     let savedARMaps: [ARStoredMapSummary]
     let selectedARMapID: String?
@@ -28,7 +29,7 @@ struct SemanticNavigationPanel: View {
     let startNavigation: (String, Bool, Bool) -> Void
     let snapToRoute: () -> Void
     let startReachingHandoff: () -> Void
-    let beginEnrichmentWalk: () -> Void
+    let beginEnrichmentWalk: (String) -> Void
     let finishEnrichmentWalk: () -> Void
     let cancelEnrichmentWalk: () -> Void
 
@@ -87,6 +88,12 @@ struct SemanticNavigationPanel: View {
         .onChange(of: navigator.phase) { phase in
             if phase == .navigating || phase == .recovering || phase == .arrived {
                 mode = .guide
+            }
+            // The enrichment progress counter and its Save button live in the
+            // Map flow. Started from anywhere else the walk would bank
+            // keyframes with no reachable way to persist them.
+            if phase == .enriching || phase == .mapping {
+                mode = .map
             }
         }
         .alert("Delete route?", isPresented: $showsDeleteRouteConfirm) {
@@ -162,6 +169,16 @@ struct SemanticNavigationPanel: View {
         }
     }
 
+    /// The route an enrichment walk would improve: the one linked to the AR
+    /// map currently loaded and relocalized. Enrichment samples are poses in
+    /// that map's frame, so any other route is the wrong thing to append to —
+    /// picking by `activeMap` alone silently attaches them to whichever route
+    /// the Guide tab happened to have selected.
+    private var enrichmentTargetRoute: SemanticRouteMap? {
+        guard let activeARWorldMapID else { return nil }
+        return navigator.maps.first { $0.arWorldMapId == activeARWorldMapID }
+    }
+
     /// Offered only once relocalized into the saved map an existing route is
     /// linked to: enrichment samples are meaningless outside that frame.
     @ViewBuilder
@@ -170,16 +187,22 @@ struct SemanticNavigationPanel: View {
            navigator.phase != .navigating,
            navigator.phase != .recovering,
            canUseARPose,
-           let activeRoute = navigator.activeMap,
-           activeRoute.arWorldMapId != nil {
-            Button {
-                beginEnrichmentWalk()
-            } label: {
-                Label("Improve Map (Walk It Back)", systemImage: "arrow.triangle.2.circlepath")
-                    .frame(maxWidth: .infinity)
+           let route = enrichmentTargetRoute {
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    beginEnrichmentWalk(route.id)
+                } label: {
+                    Label("Improve \(route.name) (Walk It Back)", systemImage: "arrow.triangle.2.circlepath")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+
+                Text("Adds the reverse-direction views this route was never mapped from. Needed before guidance can run destination → start.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.large)
         }
     }
 
@@ -236,6 +259,8 @@ struct SemanticNavigationPanel: View {
                 }
                 .font(.subheadline.weight(.semibold))
             }
+
+            enrichmentEntryButton
         }
     }
 
@@ -531,7 +556,10 @@ struct SemanticNavigationPanel: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .controlSize(.large)
-                    .disabled(targetName.trimmedRouteText.isEmpty || !canUseARPose || navigator.phase == .mapping)
+                    .disabled(
+                        targetName.trimmedRouteText.isEmpty || !canUseARPose ||
+                        navigator.phase == .mapping || navigator.phase == .enriching
+                    )
 
                     Button {
                         snapToRoute()
@@ -563,8 +591,6 @@ struct SemanticNavigationPanel: View {
                     .buttonStyle(.bordered)
                     .frame(maxWidth: .infinity)
                 }
-
-                enrichmentEntryButton
 
                 exportMapReportButton
             }
