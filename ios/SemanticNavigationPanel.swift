@@ -28,6 +28,9 @@ struct SemanticNavigationPanel: View {
     let startNavigation: (String, Bool, Bool) -> Void
     let snapToRoute: () -> Void
     let startReachingHandoff: () -> Void
+    let beginEnrichmentWalk: () -> Void
+    let finishEnrichmentWalk: () -> Void
+    let cancelEnrichmentWalk: () -> Void
 
     @State private var mode: RoutePanelMode = .map
     @State private var startName = ""
@@ -105,15 +108,78 @@ struct SemanticNavigationPanel: View {
     private var mapFlow: some View {
         VStack(alignment: .leading, spacing: 16) {
             flowHeader(
-                title: navigator.phase == .mapping ? navigator.mappingStageTitle : "Map a Route",
+                title: mapFlowTitle,
                 subtitle: mapSubtitle
             )
 
             if navigator.phase == .mapping {
                 activeMapFlow
+            } else if navigator.phase == .enriching {
+                enrichmentFlow
             } else {
                 startMapFlow
             }
+        }
+    }
+
+    private var mapFlowTitle: String {
+        switch navigator.phase {
+        case .mapping: return navigator.mappingStageTitle
+        case .enriching: return "Improving Map"
+        default: return "Map a Route"
+        }
+    }
+
+    /// Reverse-direction enrichment pass. Nothing here marks geometry — the
+    /// walk only banks visual keyframes and ARKit features for the viewing
+    /// directions the original one-way capture never saw.
+    private var enrichmentFlow: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            statusLine
+
+            Text("Walk the route in the opposite direction. At each destination, stop and turn a slow full circle.")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+
+            Text("\(navigator.enrichmentKeyframesAdded) new keyframes")
+                .font(.headline.weight(.semibold))
+
+            Button {
+                finishEnrichmentWalk()
+            } label: {
+                Label("Save Improved Map", systemImage: "square.and.arrow.down")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(navigator.enrichmentKeyframesAdded == 0)
+
+            Button("Cancel", role: .destructive) {
+                cancelEnrichmentWalk()
+            }
+            .buttonStyle(.bordered)
+            .frame(maxWidth: .infinity)
+        }
+    }
+
+    /// Offered only once relocalized into the saved map an existing route is
+    /// linked to: enrichment samples are meaningless outside that frame.
+    @ViewBuilder
+    private var enrichmentEntryButton: some View {
+        if navigator.phase != .mapping,
+           navigator.phase != .navigating,
+           navigator.phase != .recovering,
+           canUseARPose,
+           let activeRoute = navigator.activeMap,
+           activeRoute.arWorldMapId != nil {
+            Button {
+                beginEnrichmentWalk()
+            } label: {
+                Label("Improve Map (Walk It Back)", systemImage: "arrow.triangle.2.circlepath")
+                    .frame(maxWidth: .infinity)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.large)
         }
     }
 
@@ -497,6 +563,8 @@ struct SemanticNavigationPanel: View {
                     .buttonStyle(.bordered)
                     .frame(maxWidth: .infinity)
                 }
+
+                enrichmentEntryButton
 
                 exportMapReportButton
             }

@@ -243,6 +243,9 @@ struct SemanticRouteMap: Identifiable, Codable, Equatable {
 enum SemanticNavigationPhase: String {
     case idle
     case mapping
+    /// Re-walking a saved route to add visual keyframes (typically in the
+    /// reverse direction) without touching the route geometry.
+    case enriching
     case ready
     case navigating
     case recovering
@@ -252,6 +255,7 @@ enum SemanticNavigationPhase: String {
         switch self {
         case .idle: return "No semantic map"
         case .mapping: return "Mapping route"
+        case .enriching: return "Improving map"
         case .ready: return "Ready"
         case .navigating: return "Guiding"
         case .recovering: return "Recovering"
@@ -384,6 +388,7 @@ final class SemanticRouteNavigator: ObservableObject {
     @Published private(set) var capturedDistanceMeters: Double = 0
     @Published private(set) var currentSegmentDraftMeters: Double = 0
     @Published private(set) var mappingQualityText: String = "Not mapping"
+    @Published private(set) var enrichmentKeyframesAdded: Int = 0
     @Published var speechCue: SemanticSpeechCue?
 
     private let store = SemanticRouteMapStore()
@@ -434,6 +439,10 @@ final class SemanticRouteNavigator: ObservableObject {
     private var pendingAlignmentResumeCue = false
     private var didRebuildRouteThisUpdate = false
     private var turnPhrasing: SemanticTurnPhrasing = .leftRight
+    private var enrichmentVisitedDwellNodeIDs: Set<String> = []
+    private var lastEnrichmentSampledPoint: SemanticRoutePoint?
+    private var lastEnrichmentSampledHeading: Double?
+    private var lastEnrichmentSampledAt: Date?
 
     private let arrivalThresholdMeters = 0.55
     private let destinationProximityMeters = 0.75
@@ -529,6 +538,30 @@ final class SemanticRouteNavigator: ObservableObject {
     /// New nodes landing this close to an already-mapped node get a
     /// connector edge — crossings become routable junctions.
     private let junctionSnapRadiusMeters = 0.9
+    /// Keyframe density pruning (see prunedVisualKeyframes). Static because
+    /// the pruning itself is static for testability.
+    private static let keyframePruneCellMeters = 0.6
+    private static let keyframePruneHeadingBucketDegrees = 60.0
+    /// Enough for both directions of a long route at the pruning density
+    /// (a 77m route samples ≈130 keyframes per direction). Kept bounded
+    /// because alias detection is O(n²) over the fingerprint set.
+    private static let maxStoredKeyframes = 320
+    /// Alias detection skips pairs whose capture headings differ by more than
+    /// this — see `visualAliasGroups`.
+    private static let aliasHeadingGateDegrees = 100.0
+    /// Live keyframe matches whose stored heading differs from the camera
+    /// heading by more than this cannot be looking at the same scene; they
+    /// only add aliasing noise once both walking directions are captured.
+    private let visualMatchHeadingGateDegrees = 100.0
+    /// Enrichment walk sampling: keyframes while moving along the route,
+    /// plus stationary samples while the user turns in place at a POI dwell.
+    private let enrichmentSampleDistanceMeters = 0.75
+    private let enrichmentDwellHeadingDegrees = 40.0
+    private let enrichmentDwellMaxMoveMeters = 0.35
+    /// Samples only count while near the mapped corridor; wandering into a
+    /// side room must not pollute the route's visual evidence.
+    private let enrichmentMaxCrossTrackMeters = 2.0
+    private let enrichmentDwellPromptRadiusMeters = 1.6
 
     private typealias RouteProjection = (
         alongTrackMeters: Double,
@@ -856,6 +889,63 @@ final class SemanticRouteNavigator: ObservableObject {
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
         rebuildRAGContext()
         return true
+    }
+
+    /// Enrichment walk: re-walk an already-saved route (normally in the
+    /// reverse direction) to bank visual keyframes from the other viewing
+    /// direction. Geometry is never touched — no nodes, no edges — so the
+    /// route graph stays exactly as captured while the visual evidence layer
+    /// doubles. Requires an already-relocalized AR session, because samples
+    /// are only meaningful in the saved map's coordinate frame.
+    @discardableResult
+    func beginEnrichmentWalk(mapID: String) -> Bool {
+        guard let existing = maps.first(where: { $0.id == mapID }) else { return false }
+        stopNavigation(resetInstruction: false)
+        activeMap = existing
+        activeMapDraft = existing
+        enrichmentKeyframesAdded = 0
+        enrichmentVisitedDwellNodeIDs.removeAll()
+        lastEnrichmentSampledPoint = nil
+        lastEnrichmentSampledHeading = nil
+        lastEnrichmentSampledAt = nil
+        phase = .enriching
+        refreshCaptureMetrics(for: existing)
+        currentInstruction = NavLoc.enrichmentStarted(existing.name)
+        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        mappingQualityText = "Improving \(existing.name)"
+        rebuildRAGContext()
+        return true
+    }
+
+    /// Persists the keyframes gathered during an enrichment walk. The caller
+    /// must also re-save the ARWorldMap so the enlarged feature set (captured
+    /// by ARKit during the same walk) is stored alongside them.
+    @discardableResult
+    func finishEnrichmentWalk() -> Bool {
+        guard phase == .enriching, var map = activeMapDraft ?? activeMap else { return false }
+        map.updatedAt = Date()
+        let cleaned = Self.sanitizedMap(map)
+        upsertMap(cleaned, persist: true)
+        activeMap = cleaned
+        activeMapDraft = nil
+        phase = .ready
+        refreshCaptureMetrics(for: cleaned)
+        let added = enrichmentKeyframesAdded
+        currentInstruction = NavLoc.enrichmentSaved(keyframeCount: added)
+        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        rebuildRAGContext()
+        return true
+    }
+
+    func cancelEnrichmentWalk() {
+        guard phase == .enriching else { return }
+        activeMapDraft = nil
+        activeMap = maps.first(where: { $0.id == activeMap?.id }) ?? activeMap
+        enrichmentKeyframesAdded = 0
+        enrichmentVisitedDwellNodeIDs.removeAll()
+        phase = activeMap == nil ? .idle : .ready
+        currentInstruction = "Map improvement cancelled."
+        rebuildRAGContext()
     }
 
     @discardableResult
@@ -1615,6 +1705,17 @@ final class SemanticRouteNavigator: ObservableObject {
             return
         }
 
+        if phase == .enriching {
+            updatePassiveObservation(imuState: imuState, arPosition: arPosition, arHeading: arHeading, arLocalized: arLocalized)
+            sampleEnrichmentWalk(
+                arPosition: arPosition,
+                arHeading: arHeading,
+                arLocalized: arLocalized,
+                capturedImage: capturedImage
+            )
+            return
+        }
+
         guard phase == .navigating || phase == .recovering else {
             lastIMUStepCount = imuState.stepCount
             lastIMUPosition = imuState.position
@@ -1625,7 +1726,8 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let visualMatch = currentVisualRouteMatch(
             capturedImage: capturedImage,
-            timestamp: Date().timeIntervalSinceReferenceDate
+            timestamp: Date().timeIntervalSinceReferenceDate,
+            liveHeading: arHeading ?? imuState.bearing
         )
         let pdrDelta = pdrDistanceDelta(from: imuState)
         lastRouteUpdatePDRDelta = pdrDelta
@@ -2061,6 +2163,96 @@ final class SemanticRouteNavigator: ObservableObject {
         rebuildRAGContext()
     }
 
+    /// Enrichment sampling. Two triggers, both requiring a localized pose near
+    /// the mapped corridor:
+    ///  • walking — a keyframe every `enrichmentSampleDistanceMeters`
+    ///  • dwelling — a keyframe every `enrichmentDwellHeadingDegrees` of
+    ///    in-place rotation, which is what fills in the 360° coverage at the
+    ///    destinations journeys actually start from.
+    /// `segmentID` is deliberately nil: keyframes attach to edges by geometric
+    /// projection at match time (keyframeProgressMeters), so a reverse-walk
+    /// sample lands on the right segment without any edge bookkeeping.
+    private func sampleEnrichmentWalk(
+        arPosition: simd_float3?,
+        arHeading: Double?,
+        arLocalized: Bool,
+        capturedImage: CVPixelBuffer?
+    ) {
+        guard arLocalized,
+              let pose = Self.routePoint(from: arPosition),
+              var workingMap = activeMapDraft ?? activeMap else {
+            mappingQualityText = "Waiting for AR tracking"
+            return
+        }
+
+        // Off-corridor frames describe somewhere the route does not go.
+        guard let nearest = nearestEdge(in: workingMap, to: pose),
+              nearest.crossTrackMeters <= enrichmentMaxCrossTrackMeters else {
+            mappingQualityText = "Walk back onto the mapped route"
+            return
+        }
+
+        let now = Date()
+        let heading = arHeading ?? lastEnrichmentSampledHeading
+        promptEnrichmentDwellIfNeeded(at: pose, in: workingMap)
+
+        let movedMeters = lastEnrichmentSampledPoint.map { pose.distance(to: $0) } ?? .greatestFiniteMagnitude
+        let turnedDegrees: Double = {
+            guard let heading, let previous = lastEnrichmentSampledHeading else { return 0 }
+            return abs(SemanticRouteMath.signedAngleDifference(heading, previous))
+        }()
+        let sampledByWalking = movedMeters >= enrichmentSampleDistanceMeters
+        let sampledByTurning = movedMeters <= enrichmentDwellMaxMoveMeters &&
+            turnedDegrees >= enrichmentDwellHeadingDegrees
+        let timeDelta = now.timeIntervalSince(lastEnrichmentSampledAt ?? .distantPast)
+        guard timeDelta >= 0.25, sampledByWalking || sampledByTurning else {
+            mappingQualityText = String(
+                format: "Improving map, %d new keyframes",
+                enrichmentKeyframesAdded
+            )
+            return
+        }
+
+        appendVisualKeyframe(
+            to: &workingMap,
+            pose: pose,
+            heading: heading,
+            distanceFromSegmentStart: nearest.alongTrackMeters,
+            segmentID: nil,
+            capturedImage: capturedImage,
+            capturedAt: now
+        )
+        workingMap.updatedAt = now
+        activeMapDraft = workingMap
+        activeMap = workingMap
+        lastEnrichmentSampledPoint = pose
+        lastEnrichmentSampledHeading = heading
+        lastEnrichmentSampledAt = now
+        enrichmentKeyframesAdded += 1
+        refreshCaptureMetrics(for: workingMap)
+        mappingQualityText = String(
+            format: "Improving map, %d new keyframes",
+            enrichmentKeyframesAdded
+        )
+    }
+
+    /// Speaks the turn-in-place prompt once per destination per walk. These
+    /// are the spots a later journey starts from, so all-direction coverage
+    /// here is what removes the cold-start relocalization stall.
+    private func promptEnrichmentDwellIfNeeded(at pose: SemanticRoutePoint, in map: SemanticRouteMap) {
+        let dwellKinds: Set<SemanticRouteNodeKind> = [.destination, .entrance]
+        guard let node = map.nodes
+            .filter({ dwellKinds.contains($0.kind) })
+            .min(by: { $0.point.distance(to: pose) < $1.point.distance(to: pose) }),
+              node.point.distance(to: pose) <= enrichmentDwellPromptRadiusMeters,
+              !enrichmentVisitedDwellNodeIDs.contains(node.id) else {
+            return
+        }
+        enrichmentVisitedDwellNodeIDs.insert(node.id)
+        currentInstruction = NavLoc.enrichmentDwellPrompt(node.name)
+        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+    }
+
     private func ensureDestinationNode(
         named name: String,
         in map: inout SemanticRouteMap,
@@ -2186,7 +2378,39 @@ final class SemanticRouteNavigator: ObservableObject {
         )
         var keyframes = map.keyframes ?? []
         keyframes.append(keyframe)
-        map.keyframes = Array(keyframes.suffix(120))
+        map.keyframes = Self.prunedVisualKeyframes(keyframes)
+    }
+
+    /// Bounds keyframe growth by density, not recency. The old
+    /// `suffix(120)` cap silently evicted the entire forward pass as soon as
+    /// a reverse enrichment walk appended its keyframes, trading one viewing
+    /// direction for the other. Instead keep at most one keyframe per
+    /// ~0.6m grid cell per 60° heading bucket, newest wins — forward and
+    /// reverse imagery of the same corridor occupy different buckets and
+    /// coexist.
+    static func prunedVisualKeyframes(_ keyframes: [SemanticRouteKeyframe]) -> [SemanticRouteKeyframe] {
+        guard keyframes.count > 1 else { return keyframes }
+        var kept: [SemanticRouteKeyframe] = []
+        kept.reserveCapacity(keyframes.count)
+        var seenBuckets: Set<String> = []
+        for keyframe in keyframes.reversed() {
+            let cellX = Int((keyframe.pose.x / keyframePruneCellMeters).rounded())
+            let cellY = Int((keyframe.pose.y / keyframePruneCellMeters).rounded())
+            let headingBucket = keyframe.headingDegrees.map { heading -> Int in
+                let normalized = (heading.truncatingRemainder(dividingBy: 360) + 360)
+                    .truncatingRemainder(dividingBy: 360)
+                return Int(normalized / keyframePruneHeadingBucketDegrees) % 6
+            } ?? -1
+            let bucket = "\(cellX)|\(cellY)|\(headingBucket)"
+            if seenBuckets.insert(bucket).inserted {
+                kept.append(keyframe)
+            }
+        }
+        kept.reverse()
+        if kept.count > maxStoredKeyframes {
+            kept.removeFirst(kept.count - maxStoredKeyframes)
+        }
+        return kept
     }
 
     private func resetRouteBelief(status: RouteLocalizationStatus = .initializing) {
@@ -3672,7 +3896,8 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private func currentVisualRouteMatch(
         capturedImage: CVPixelBuffer?,
-        timestamp: TimeInterval
+        timestamp: TimeInterval,
+        liveHeading: Double? = nil
     ) -> VisualRouteMatch? {
         guard let map = activeMap,
               let fingerprints = map.visualFingerprints,
@@ -3693,7 +3918,7 @@ final class SemanticRouteNavigator: ObservableObject {
             return nil
         }
 
-        let matches = visualRouteCandidates(in: map, fingerprints: fingerprints)
+        let matches = visualRouteCandidates(in: map, fingerprints: fingerprints, liveHeading: liveHeading)
             .compactMap { candidate -> VisualRouteMatch? in
                 let similarity = frameFingerprinter.similarity(liveFingerprint, candidate.fingerprint)
                 let isAliased = isVisualFingerprintAliased(candidate.fingerprintID, in: map)
@@ -3761,7 +3986,8 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private func visualRouteCandidates(
         in map: SemanticRouteMap,
-        fingerprints: [String: ARVisualFingerprint]
+        fingerprints: [String: ARVisualFingerprint],
+        liveHeading: Double? = nil
     ) -> [VisualRouteCandidate] {
         var candidates: [VisualRouteCandidate] = []
         let keyframes = map.keyframes ?? []
@@ -3774,6 +4000,14 @@ final class SemanticRouteNavigator: ObservableObject {
             let reversed = step.edge.id.hasSuffix(".reverse")
 
             for keyframe in keyframes {
+                // A keyframe facing the opposite way photographed a different
+                // scene; with both walking directions captured it can only
+                // produce false matches. Heading-less keyframes stay eligible.
+                if let liveHeading,
+                   let keyframeHeading = keyframe.headingDegrees,
+                   abs(SemanticRouteMath.signedAngleDifference(liveHeading, keyframeHeading)) > visualMatchHeadingGateDegrees {
+                    continue
+                }
                 guard let progress = keyframeProgressMeters(
                         for: keyframe,
                         on: step,
@@ -4878,6 +5112,7 @@ final class SemanticRouteNavigator: ObservableObject {
         let fingerprinter = ARFrameFingerprinter()
         let ordered = fingerprints.keys.sorted()
         let capturePositions = fingerprintCapturePositions(in: map)
+        let captureHeadings = fingerprintCaptureHeadings(in: map)
         // Unarchive each Vision feature print once, not once per pair.
         let observations = Dictionary(uniqueKeysWithValues: ordered.compactMap { id in
             fingerprints[id].flatMap { fingerprinter.featurePrintObservation(for: $0).map { obs in (id, obs) } }
@@ -4895,6 +5130,16 @@ final class SemanticRouteNavigator: ObservableObject {
                 if let leftPoint = capturePositions[leftID],
                    let rightPoint = capturePositions[rightID],
                    leftPoint.distance(to: rightPoint) < aliasMinimumSeparationMeters {
+                    continue
+                }
+                // Opposite-facing keyframes are never candidates in the same
+                // live match (visualRouteCandidates gates on heading), so they
+                // cannot confuse guidance and are not an alias pair. Skipping
+                // them also keeps this O(n²) pass affordable once a route
+                // carries both walking directions.
+                if let leftHeading = captureHeadings[leftID],
+                   let rightHeading = captureHeadings[rightID],
+                   abs(SemanticRouteMath.signedAngleDifference(leftHeading, rightHeading)) > aliasHeadingGateDegrees {
                     continue
                 }
                 let similarity = fingerprinter.similarity(
@@ -4940,6 +5185,19 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
         return positions
+    }
+
+    /// Capture heading per fingerprint. Only keyframes record one; landmark
+    /// samples have no heading and stay eligible for every alias pair.
+    private static func fingerprintCaptureHeadings(in map: SemanticRouteMap) -> [String: Double] {
+        var headings: [String: Double] = [:]
+        for keyframe in map.keyframes ?? [] {
+            if let fingerprintID = keyframe.visualFingerprintId,
+               let heading = keyframe.headingDegrees {
+                headings[fingerprintID] = heading
+            }
+        }
+        return headings
     }
 
     private static func representativeName(forFingerprintID fingerprintID: String, in map: SemanticRouteMap) -> String? {

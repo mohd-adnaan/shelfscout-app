@@ -454,6 +454,61 @@ enum NavLoc {
         }
     }
 
+    // ── Relocalization and map improvement ──────────────────────────────────
+
+    static func relocLoadingCue() -> String {
+        switch lang {
+        case .en: return "Loading the saved route. Hold the phone at chest height and slowly pan left and right."
+        case .fr: return "Chargement du trajet enregistré. Tenez le téléphone à hauteur de poitrine et balayez lentement de gauche à droite."
+        }
+    }
+
+    /// Second relocalization cue. A full in-place turn is the cue that
+    /// actually works when the user faces opposite to the capture direction:
+    /// panning left and right never brings a mapped viewpoint into frame,
+    /// turning around does.
+    static func relocTurnFullCircleCue() -> String {
+        switch lang {
+        case .en: return "Still matching the map. Turn slowly in a full circle, keeping the phone at chest height."
+        case .fr: return "Je cherche encore la carte. Tournez lentement sur vous-même, un tour complet, en gardant le téléphone à hauteur de poitrine."
+        }
+    }
+
+    static func relocStepAndTurnCue() -> String {
+        switch lang {
+        case .en: return "Still searching. Take a small step forward, then turn slowly in a circle again."
+        case .fr: return "Je cherche toujours. Faites un petit pas en avant, puis tournez lentement sur vous-même encore une fois."
+        }
+    }
+
+    static func relocFailedMessage() -> String {
+        switch lang {
+        case .en: return "I could not match the saved route map from here. Walk to a spot on the mapped route, hold the phone at chest height, and try again."
+        case .fr: return "Je n’ai pas pu reconnaître la carte du trajet d’ici. Placez-vous sur le trajet cartographié, tenez le téléphone à hauteur de poitrine, et réessayez."
+        }
+    }
+
+    static func enrichmentStarted(_ mapName: String) -> String {
+        switch lang {
+        case .en: return "Improving \(mapName). Walk the route in the opposite direction. At each destination, stop and turn a slow full circle."
+        case .fr: return "Amélioration de \(mapName). Parcourez le trajet en sens inverse. À chaque destination, arrêtez-vous et faites lentement un tour complet."
+        }
+    }
+
+    static func enrichmentDwellPrompt(_ nodeName: String) -> String {
+        switch lang {
+        case .en: return "At \(nodeName). Stand still and turn a slow full circle so I can capture this spot from every direction."
+        case .fr: return "Vous êtes à \(nodeName). Restez sur place et tournez lentement sur vous-même pour que je capture cet endroit dans toutes les directions."
+        }
+    }
+
+    static func enrichmentSaved(keyframeCount: Int) -> String {
+        switch lang {
+        case .en: return "Map improved with \(keyframeCount) new keyframes."
+        case .fr: return "Carte améliorée avec \(keyframeCount) nouvelles images clés."
+        }
+    }
+
     // ── Status prefixes ─────────────────────────────────────────────────────
 
     static func trackingLimitedPrefix() -> String {

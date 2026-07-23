@@ -433,6 +433,9 @@ function AppInner(): React.JSX.Element {
   const rtabFrameSeqRef = useRef(0);
   const rtabSubmittedFrameUrisRef = useRef<Set<string>>(new Set());
   const rtabSubmittedFrameQueueRef = useRef<string[]>([]);
+  /** The native ARKit navigation screen is still mounted and localized, so
+   *  the next destination can continue on it instead of relocalizing. */
+  const arSessionAliveRef = useRef(false);
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -2347,19 +2350,31 @@ function AppInner(): React.JSX.Element {
     rtabLastObjectRef.current = targetName;
 
     let navResult: ARKitNavigationResult;
+    const navConfig = {
+      targetName,
+      routeMapId: normalizeTextValue(result.route_map_id) || groundedRouteMapId || undefined,
+      routeMapName: normalizeTextValue(result.route_map_name) || undefined,
+      sessionId: getSessionId(),
+      speakLandmarks: true,
+      errorRecovery: settingsRef.current.navigationErrorRecovery,
+      clockFaceDirections: settingsRef.current.navigationClockFaceDirections,
+      voiceOverEnabled: screenReaderEnabledRef.current,
+      ttsRate: settingsRef.current.ttsRate,
+      language: settingsRef.current.language,
+      // Only the in-device pipeline can leave the session warm: the backend
+      // reaching pipelines capture photos after arrival and need the RN
+      // camera, which the mounted ARKit session would still be holding.
+      keepSessionAlive:
+        resolveReachingPipeline({ reaching_ios: true, reaching: true }) === 'spatialTarget',
+    };
     try {
-      navResult = await ARKitNavigationBridge.startNavigation({
-        targetName,
-        routeMapId: normalizeTextValue(result.route_map_id) || groundedRouteMapId || undefined,
-        routeMapName: normalizeTextValue(result.route_map_name) || undefined,
-        sessionId: getSessionId(),
-        speakLandmarks: true,
-        errorRecovery: settingsRef.current.navigationErrorRecovery,
-        clockFaceDirections: settingsRef.current.navigationClockFaceDirections,
-        voiceOverEnabled: screenReaderEnabledRef.current,
-        ttsRate: settingsRef.current.ttsRate,
-        language: settingsRef.current.language,
-      });
+      // A previous leg that arrived without a reaching handoff left the AR
+      // session mounted and localized. Continuing on it is what makes a
+      // destination-to-destination hop skip relocalization — the step that
+      // fails when the user stands at a destination facing the way they came.
+      navResult = arSessionAliveRef.current
+        ? await ARKitNavigationBridge.continueNavigation(navConfig)
+        : await ARKitNavigationBridge.startNavigation(navConfig);
     } catch (e: any) {
       navResult = {
         success: false,
@@ -2368,6 +2383,8 @@ function AppInner(): React.JSX.Element {
         message: e?.message || 'ARKit navigation ended with an error.',
       };
     }
+
+    arSessionAliveRef.current = navResult?.sessionAlive === true;
 
     console.log('🧭 [ARKitNavigation] Native result:', navResult);
 
@@ -2441,7 +2458,11 @@ function AppInner(): React.JSX.Element {
         // Reaching only activates for destinations with a pinned object.
         setIsReaching(false);
         setIsProcessing(false);
-        setIsCameraActive(true);
+        // A warm session means the ARKit screen is still up and still holding
+        // the camera; turning the RN camera on here would fight it for the
+        // device. Leave it off and let the next destination continue on the
+        // live session (or an explicit stop tear it down).
+        setIsCameraActive(!arSessionAliveRef.current);
         if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
         announceTapToStart('Ready.');
         return true;
@@ -2604,6 +2625,7 @@ function AppInner(): React.JSX.Element {
       reacquiringRef.current;
     continuousModeAbortRef.current = true;
     stopRtabFeed();
+    arSessionAliveRef.current = false;
     try { await ARKitNavigationBridge.stopNavigation(); } catch { }
 
     if (abortControllerRef.current) {
@@ -2635,6 +2657,7 @@ function AppInner(): React.JSX.Element {
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
     stopRtabFeed();
+    arSessionAliveRef.current = false;
     try { await ARKitNavigationBridge.stopNavigation(); } catch { }
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
     await stopLatencyLoop(); // FIX: was missing — latency SFX survived nav interrupt
@@ -3372,6 +3395,7 @@ function AppInner(): React.JSX.Element {
     isEmergencyStopped.current = true;
     isStartingRef.current = false; // ← release re-entry guard
     continuousModeAbortRef.current = true;
+    arSessionAliveRef.current = false;
     try { await ARKitNavigationBridge.stopNavigation(); } catch { }
 
     if (abortControllerRef.current) {

@@ -483,6 +483,94 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertNotNil(navigator.speechCue?.text.range(of: "walk", options: .caseInsensitive))
     }
 
+    // MARK: - Bidirectional map coverage
+
+    /// The old `suffix(120)` cap evicted the forward pass as soon as a reverse
+    /// enrichment walk appended its own keyframes, so a two-way map silently
+    /// became one-way again. Density pruning must keep both directions.
+    func testReverseKeyframesDoNotEvictForwardKeyframes() {
+        var keyframes: [SemanticRouteKeyframe] = []
+        for index in 0..<140 {
+            keyframes.append(Self.keyframe(
+                id: "fwd-\(index)",
+                x: 0,
+                y: Double(index) * 0.7,
+                heading: 0
+            ))
+        }
+        for index in 0..<140 {
+            keyframes.append(Self.keyframe(
+                id: "rev-\(index)",
+                x: 0,
+                y: Double(139 - index) * 0.7,
+                heading: 180
+            ))
+        }
+
+        let pruned = SemanticRouteNavigator.prunedVisualKeyframes(keyframes)
+        let keptIDs = Set(pruned.map(\.id))
+
+        XCTAssertTrue(keptIDs.contains { $0.hasPrefix("fwd-") }, "forward pass was evicted")
+        XCTAssertTrue(keptIDs.contains { $0.hasPrefix("rev-") }, "reverse pass was evicted")
+        // Same corridor, opposite headings → both survive as distinct evidence.
+        XCTAssertGreaterThan(pruned.filter { $0.headingDegrees == 0 }.count, 100)
+        XCTAssertGreaterThan(pruned.filter { $0.headingDegrees == 180 }.count, 100)
+    }
+
+    /// Repeated passes down the same corridor facing the same way are
+    /// redundant; only the newest survives so the map cannot grow without
+    /// bound across many enrichment walks.
+    func testSameDirectionResamplingCollapsesToNewest() {
+        let first = Self.keyframe(id: "old", x: 0, y: 0, heading: 0)
+        let second = Self.keyframe(id: "new", x: 0.05, y: 0.05, heading: 5)
+
+        let pruned = SemanticRouteNavigator.prunedVisualKeyframes([first, second])
+
+        XCTAssertEqual(pruned.map(\.id), ["new"])
+    }
+
+    /// The reverse leg of a journey: standing at the far destination and
+    /// asking for the start must route backwards along the captured edges,
+    /// not snap to the original capture start.
+    func testReverseDirectionJourneyRoutesBackFromDestination() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+
+        // Standing at Milk (0, 8) — the captured destination — heading back.
+        let started = navigator.startNavigation(
+            to: "Entrance",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 8, bearing: 180),
+            speakLandmarks: false,
+            arHeading: 180
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertEqual(navigator.phase, .navigating)
+        XCTAssertEqual(navigator.routeSteps.first?.from.name, "Milk")
+        XCTAssertEqual(navigator.routeSteps.last?.to.name, "Entrance")
+        // Already facing the way the reverse route runs: no turn-around cue.
+        XCTAssertFalse(navigator.currentInstruction.contains("Turn around"))
+    }
+
+    private static func keyframe(
+        id: String,
+        x: Double,
+        y: Double,
+        heading: Double
+    ) -> SemanticRouteKeyframe {
+        SemanticRouteKeyframe(
+            id: id,
+            segmentID: nil,
+            pose: SemanticRoutePoint(x: x, y: y),
+            headingDegrees: heading,
+            distanceFromSegmentStart: y,
+            visualFingerprintId: "fp-\(id)",
+            trackingQuality: "ar_world_tracking_visual",
+            capturedAt: Date(timeIntervalSince1970: 0)
+        )
+    }
+
     private static func cerealMap() -> SemanticRouteMap {
         let start = node(id: "start", name: "Produce", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
         let target = node(id: "cereal", name: "Cereal", point: SemanticRoutePoint(x: 0, y: 8), kind: .destination)

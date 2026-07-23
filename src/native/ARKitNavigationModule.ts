@@ -24,6 +24,12 @@ export interface ARKitNavigationConfig {
   ttsRate?: number;
   /** Language for native spoken guidance ('en' | 'fr'). */
   language?: AppLanguage;
+  /**
+   * Keep the AR screen mounted and relocalized after arriving, so the next
+   * leg can start with `continueNavigation` and skip relocalization. Ignored
+   * when the arrival hands off to reaching, which needs the camera back.
+   */
+  keepSessionAlive?: boolean;
 }
 
 /** One spoken destination label from a saved semantic route map. */
@@ -47,11 +53,23 @@ export interface ARKitNavigationResult {
    */
   reachingObjectName?: string;
   reachingObjectWorldPosition?: { x: number; y: number; z: number } | [number, number, number];
+  /**
+   * The AR session stayed mounted and localized after this result. The next
+   * leg should be launched with `continueNavigation` so it reuses the live
+   * pose instead of relocalizing from scratch.
+   */
+  sessionAlive?: boolean;
   message?: string;
 }
 
 interface NativeARKitNavigationModule {
   startNavigation(config: ARKitNavigationConfig): Promise<ARKitNavigationResult>;
+  /**
+   * Start the next leg on an already-running, already-localized AR session.
+   * Falls back to a normal `startNavigation` when no warm session exists, so
+   * callers can always use it for a follow-up destination.
+   */
+  continueNavigation(config: ARKitNavigationConfig): Promise<ARKitNavigationResult>;
   presentRouteManager(): Promise<void>;
   stopNavigation(): Promise<void>;
   isAvailable(): Promise<boolean>;
@@ -74,6 +92,9 @@ const unavailableModule: NativeARKitNavigationModule = {
         ? 'ARKit navigation is not linked in this build.'
         : 'ARKit navigation is available on iPhone only.',
     };
+  },
+  async continueNavigation(config: ARKitNavigationConfig): Promise<ARKitNavigationResult> {
+    return this.startNavigation(config);
   },
   async presentRouteManager(): Promise<void> {
     throw new Error(

@@ -52,7 +52,18 @@
       "Bash(awk 'NR>=2560 && NR<=2660' App.tsx)",
       "Bash(echo \"=== tsc exit: $? ===\")",
       "Bash(echo \"restored, tsc exit: $?\")",
-      "Bash(npx eslint *)"
+      "Bash(npx eslint *)",
+      "Bash(rg -rn 'arkitNavigation|ARKitNavigation' /Users/mohammadadnaan/Projects/shelfscout/src --include='*.ts' -l)",
+      "Bash(rg -n 'SemanticNavigationPanel|beginSemanticWalkthrough|saveSemanticWalkthrough|func loadSelectedMap|startSemanticNavigation|snapSemanticNavigationToRoute' /Users/mohammadadnaan/Projects/shelfscout/ios/*.swift)",
+      "Bash(perl -0pi -e 's/try \\\\{ await ARKitNavigationBridge\\\\.stopNavigation\\\\\\(\\\\\\); \\\\} catch \\\\{ \\\\}/arSessionAliveRef.current = false;\\\\n    try { await ARKitNavigationBridge.stopNavigation\\(\\); } catch { }/g' App.tsx)",
+      "Bash(rg -n 'SemanticNavigationPanel\\(' -F /Users/mohammadadnaan/Projects/shelfscout/ios/*.swift)",
+      "Bash(git --no-pager diff ios/ARKitNavigationModule.swift)",
+      "Bash(git --no-pager diff ios/ARMappingManager.swift)",
+      "Bash(perl -0pi -e 's/^\\\\s*wasInterrupted = false\\\\n//m; s/^\\\\s*self\\\\.wasInterrupted = false\\\\n//m; s/^\\\\s*self\\\\.wasInterrupted = true\\\\n//m' ios/ARMappingManager.swift)",
+      "Bash(git --no-pager diff ios/SemanticRouteNavigator.swift)",
+      "Bash(rg -n 'enum SemanticRouteMath|struct SemanticRouteMath' ios/*.swift)",
+      "Bash(git --no-pager diff ios/ARMappingView.swift ios/SemanticNavigationPanel.swift)",
+      "Bash(rg -rn 'replaceMapsForTesting' --include='*.swift' .)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

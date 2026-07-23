@@ -11,6 +11,10 @@ final class ARKitNavigationModule: NSObject {
     private var presentedController: UIViewController?
     private var pendingResolve: RCTPromiseResolveBlock?
     private var activeTargetName: String?
+    /// Set by the launching config; when true an `arrived` result that needs
+    /// no reaching handoff leaves the screen mounted so the next leg can
+    /// retarget without paying another relocalization.
+    private var keepSessionAlive = false
 
     @objc
     static func requiresMainQueueSetup() -> Bool {
@@ -65,30 +69,50 @@ final class ARKitNavigationModule: NSObject {
                 return
             }
 
-            guard let presenter = Self.topViewController() else {
-                reject("presentation_error", "Could not find a view controller for AR route mapping.", nil)
-                return
+            // The route manager is a manual screen. A warm navigation session
+            // left mounted would both be stranded by presenting on top of it
+            // and make this screen behave as an automated run, so tear it
+            // down first — and only look up the presenter afterwards, since
+            // the controller being dismissed cannot present anything.
+            let teardownNeeded = self.presentedController != nil
+            if teardownNeeded {
+                self.dismissPresentedController(resolveCancelledNavigation: self.pendingResolve != nil)
+            }
+            ARKitNavigationSession.shared.end()
+
+            let present = {
+                guard let presenter = Self.topViewController() else {
+                    reject("presentation_error", "Could not find a view controller for AR route mapping.", nil)
+                    return
+                }
+
+                let host = ARKitRouteHostView(
+                    launchTargetName: nil,
+                    launchRouteMapId: nil,
+                    launchRouteMapName: nil,
+                    speakLandmarks: true,
+                    errorRecovery: true,
+                    clockFaceDirections: false,
+                    ttsRate: nil,
+                    onDone: { [weak self] in
+                        self?.dismissPresentedController(resolveCancelledNavigation: false)
+                    },
+                    onAutomationComplete: nil
+                )
+
+                let controller = UIHostingController(rootView: host)
+                controller.modalPresentationStyle = .fullScreen
+                self.presentedController = controller
+                presenter.present(controller, animated: true) {
+                    resolve(nil)
+                }
             }
 
-            let host = ARKitRouteHostView(
-                launchTargetName: nil,
-                launchRouteMapId: nil,
-                launchRouteMapName: nil,
-                speakLandmarks: true,
-                errorRecovery: true,
-                clockFaceDirections: false,
-                ttsRate: nil,
-                onDone: { [weak self] in
-                    self?.dismissPresentedController(resolveCancelledNavigation: false)
-                },
-                onAutomationComplete: nil
-            )
-
-            let controller = UIHostingController(rootView: host)
-            controller.modalPresentationStyle = .fullScreen
-            self.presentedController = controller
-            presenter.present(controller, animated: true) {
-                resolve(nil)
+            if teardownNeeded {
+                // Let the dismissal animation finish before presenting.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.45, execute: present)
+            } else {
+                present()
             }
         }
     }
@@ -156,6 +180,8 @@ final class ARKitNavigationModule: NSObject {
 
             self.pendingResolve = resolve
             self.activeTargetName = targetName
+            self.keepSessionAlive = (config["keepSessionAlive"] as? NSNumber)?.boolValue ?? false
+            ARKitNavigationSession.shared.begin(target: targetName)
 
             let routeMapId = config["routeMapId"] as? String
             let routeMapName = config["routeMapName"] as? String
@@ -203,6 +229,62 @@ final class ARKitNavigationModule: NSObject {
         }
     }
 
+    /// Start the next leg of a journey on the AR screen already on top.
+    ///
+    /// The whole point is to skip relocalization: the session is still
+    /// tracking the loaded world map, so the live pose is known and guidance
+    /// can start from where the user actually stands — the exact case that
+    /// fails on a cold start when they face against the capture direction.
+    /// Falls back to a normal launch when no warm session is mounted.
+    @objc(continueNavigation:resolver:rejecter:)
+    func continueNavigation(
+        _ config: NSDictionary,
+        resolver resolve: @escaping RCTPromiseResolveBlock,
+        rejecter reject: @escaping RCTPromiseRejectBlock
+    ) {
+        DispatchQueue.main.async {
+            let targetName = (config["targetName"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+
+            guard !targetName.isEmpty else {
+                resolve(ARKitNavigationNativeResult(
+                    success: false,
+                    reason: "target_not_found",
+                    targetName: nil,
+                    routeMapId: nil,
+                    routeName: nil,
+                    targetWorldPosition: nil,
+                    message: "No navigation target was provided."
+                ).dictionary())
+                return
+            }
+
+            let canRetarget = self.presentedController != nil &&
+                self.pendingResolve == nil &&
+                ARKitNavigationSession.shared.isWarm
+
+            guard canRetarget else {
+                // A screen left mounted by a warm arrival that has since lost
+                // tracking cannot be retargeted, and presenting on top of it
+                // would strand it. Tear it down first, then launch normally.
+                if self.presentedController != nil, self.pendingResolve == nil {
+                    self.dismissPresentedController(resolveCancelledNavigation: false)
+                }
+                self.startNavigation(config, resolver: resolve, rejecter: reject)
+                return
+            }
+
+            if let languageCode = config["language"] as? String {
+                AppLocale.current = AppLanguage(code: languageCode)
+            }
+
+            self.pendingResolve = resolve
+            self.activeTargetName = targetName
+            self.keepSessionAlive = (config["keepSessionAlive"] as? NSNumber)?.boolValue ?? false
+            ARKitNavigationSession.shared.retarget(to: targetName)
+        }
+    }
+
     @objc(stopNavigation:rejecter:)
     func stopNavigation(
         _ resolve: @escaping RCTPromiseResolveBlock,
@@ -219,6 +301,23 @@ final class ARKitNavigationModule: NSObject {
             let resolver = self.pendingResolve
             self.pendingResolve = nil
             self.activeTargetName = nil
+
+            // Reaching runs its own AR session and needs the camera, so a
+            // handoff arrival must still tear this screen down.
+            let canStayWarm = self.keepSessionAlive &&
+                result.success &&
+                result.reason == "arrived" &&
+                result.reachingObjectName == nil &&
+                self.presentedController != nil
+
+            if canStayWarm {
+                var warmResult = result
+                warmResult.sessionAlive = true
+                resolver?(warmResult.dictionary())
+                return
+            }
+
+            ARKitNavigationSession.shared.end()
             let shouldResolveBeforeDismiss = result.success && result.reason == "arrived"
 
             let resolveResult: () -> Void = {
@@ -244,6 +343,8 @@ final class ARKitNavigationModule: NSObject {
         let targetName = activeTargetName
         pendingResolve = nil
         activeTargetName = nil
+        keepSessionAlive = false
+        ARKitNavigationSession.shared.end()
 
         if let controller = presentedController {
             presentedController = nil

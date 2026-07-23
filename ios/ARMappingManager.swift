@@ -35,6 +35,11 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     @Published var arHeadingDegrees: Double?
     @Published var poiInspectionList: [ARMapPOIInspection] = []
     @Published var localizationCandidates: [ARLocalizationCandidate] = []
+    /// Bumped when the already-localized pose jumps by more than
+    /// `postLocalizationJumpMeters` shortly after localization — ARKit
+    /// finishing its real world-map alignment after a premature `.normal`.
+    /// Observers must re-resolve anything derived from the earlier pose.
+    @Published private(set) var localizationRevision = 0
     
     let session = ARSession()
     private let sessionDelegateQueue = DispatchQueue(label: "placefinder.arkit.mapping.session", qos: .userInitiated)
@@ -81,6 +86,22 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private let imuMotionMinimumDistance: Float = 0.8
     private let imuMotionDirectionMinimumDistance: Float = 1.15
     private let imuMotionDirectionToleranceDegrees: Double = 48
+    /// ARKit can report `.normal` tracking briefly BEFORE it has truly aligned
+    /// to the loaded world map; trusting the first `.normal` published a
+    /// session-origin pose (≈ the route start) and started guidance from the
+    /// wrong place. `.normal` must now hold this long — with a settled pose —
+    /// before isLocalized flips.
+    private let relocalizationConfirmationSeconds: TimeInterval = 0.9
+    /// worldMappingStatus normally reaches .mapped/.extending once the loaded
+    /// map is matched; a feature-poor corridor can lag, so a longer stable
+    /// window promotes without it rather than blocking forever.
+    private let relocalizationStatusFallbackSeconds: TimeInterval = 2.7
+    private let postLocalizationJumpMeters: Float = 1.5
+    private let postLocalizationJumpWindowSeconds: TimeInterval = 30
+    private var relocalizationNormalSince: Date?
+    private var preLocalizationPosition: simd_float3?
+    private var previousPublishedPosition: simd_float3?
+    private var localizedAt: Date?
     
     override init() {
         super.init()
@@ -121,6 +142,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         isMapping = true
         isRelocalizing = false
         isLocalized = false
+        relocalizationNormalSince = nil
+        preLocalizationPosition = nil
+        previousPublishedPosition = nil
+        localizedAt = nil
         sessionMode = .mapping
         mappingStatus = .notAvailable
         activeMapMetadata = nil
@@ -155,6 +180,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         isRelocalizing = false
         isLocalized = false
         isSavingMap = false
+        relocalizationNormalSince = nil
+        preLocalizationPosition = nil
+        previousPublishedPosition = nil
+        localizedAt = nil
         sessionMode = .idle
         mappingStatus = .notAvailable
         currentPositionText = ""
@@ -279,6 +308,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     self.isRelocalizing = true
                     self.isMapping = false
                     self.isLocalized = false
+                    self.relocalizationNormalSince = nil
+                    self.preLocalizationPosition = nil
+                    self.previousPublishedPosition = nil
+                    self.localizedAt = nil
                     self.sessionMode = .relocalizing
                     self.mappingStatus = .notAvailable
                     self.currentPositionText = ""
@@ -633,6 +666,13 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         let z = transform.columns.3.z
 
         DispatchQueue.main.async {
+            self.confirmRelocalizationIfStable(
+                cameraPosition: cameraPosition,
+                cameraForward: cameraForward,
+                arHeading: arHeading,
+                mappingStatus: mappingStatus
+            )
+            self.detectPostLocalizationJump(cameraPosition: cameraPosition)
             self.mappingStatus = mappingStatus
             self.cameraMapPosition = cameraPosition
             self.cameraMapForward = cameraForward
@@ -693,33 +733,19 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             if self.isRelocalizing {
                 switch camera.trackingState {
                 case .normal:
-                    if !self.isLocalized {
-                        // Publish a post-relocalization pose BEFORE isLocalized:
-                        // the published cameraMapPosition is frame-throttled and
-                        // can still hold the pre-relocalization pose (≈ session
-                        // origin ≈ route start). Observers react to isLocalized
-                        // immediately and would start guidance from that stale
-                        // point instead of where the user actually stands.
-                        if let frame = self.session.currentFrame {
-                            let transform = frame.camera.transform
-                            let position = simd_make_float3(
-                                transform.columns.3.x,
-                                transform.columns.3.y,
-                                transform.columns.3.z
-                            )
-                            let forward = simd_make_float3(
-                                -transform.columns.2.x,
-                                -transform.columns.2.y,
-                                -transform.columns.2.z
-                            )
-                            self.cameraMapPosition = position
-                            self.cameraMapForward = forward
-                            self.arHeadingDegrees = self.headingDegrees(for: forward)
-                        }
-                        self.isLocalized = true
-                        self.statusMessage = "Localized against saved map."
+                    // Do NOT flip isLocalized on the first `.normal`: ARKit can
+                    // report it before the loaded map is truly aligned, and the
+                    // camera pose is then still session-origin-relative. Open a
+                    // confirmation window; the frame handler promotes once the
+                    // pose has held steady (confirmRelocalizationIfStable).
+                    if !self.isLocalized, self.relocalizationNormalSince == nil {
+                        self.relocalizationNormalSince = Date()
+                        self.preLocalizationPosition = nil
+                        self.statusMessage = "Matching the saved map..."
                     }
                 default:
+                    self.relocalizationNormalSince = nil
+                    self.preLocalizationPosition = nil
                     if self.isLocalized {
                         self.isLocalized = false
                         self.closestPOI = nil
@@ -729,6 +755,63 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 }
             }
         }
+    }
+
+    /// Runs on every throttled frame while a confirmation window is open.
+    /// Promotes to isLocalized only after `.normal` has held long enough with
+    /// a settled pose; a pose jump inside the window means alignment happened
+    /// mid-window, so the clock restarts to let the corrected pose stand.
+    private func confirmRelocalizationIfStable(
+        cameraPosition: simd_float3,
+        cameraForward: simd_float3,
+        arHeading: Double?,
+        mappingStatus: ARFrame.WorldMappingStatus
+    ) {
+        guard isRelocalizing, !isLocalized, let normalSince = relocalizationNormalSince else { return }
+
+        if let previous = preLocalizationPosition,
+           simd_distance(previous, cameraPosition) > postLocalizationJumpMeters {
+            relocalizationNormalSince = Date()
+            preLocalizationPosition = cameraPosition
+            return
+        }
+        preLocalizationPosition = cameraPosition
+
+        let heldSeconds = Date().timeIntervalSince(normalSince)
+        let statusConfirms = mappingStatus == .mapped || mappingStatus == .extending
+        let promoted = statusConfirms
+            ? heldSeconds >= relocalizationConfirmationSeconds
+            : heldSeconds >= relocalizationStatusFallbackSeconds
+        guard promoted else { return }
+
+        relocalizationNormalSince = nil
+        preLocalizationPosition = nil
+        cameraMapPosition = cameraPosition
+        cameraMapForward = cameraForward
+        arHeadingDegrees = arHeading
+        previousPublishedPosition = cameraPosition
+        localizedAt = Date()
+        isLocalized = true
+        statusMessage = "Localized against saved map."
+    }
+
+    /// A large pose jump shortly after localization is ARKit correcting a
+    /// premature alignment. The published pose is already correct; bump the
+    /// revision so guidance built on the stale pose re-resolves itself.
+    private func detectPostLocalizationJump(cameraPosition: simd_float3) {
+        guard isRelocalizing, isLocalized else {
+            previousPublishedPosition = cameraPosition
+            return
+        }
+        defer { previousPublishedPosition = cameraPosition }
+        guard let localizedAt,
+              Date().timeIntervalSince(localizedAt) <= postLocalizationJumpWindowSeconds,
+              let previous = previousPublishedPosition,
+              simd_distance(previous, cameraPosition) > postLocalizationJumpMeters else {
+            return
+        }
+        localizationRevision += 1
+        statusMessage = "Map alignment corrected."
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
@@ -747,6 +830,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         DispatchQueue.main.async {
             self.statusMessage = "AR session interrupted."
             self.isLocalized = false
+            self.relocalizationNormalSince = nil
+            self.preLocalizationPosition = nil
             self.closestPOI = nil
             self.poiMatchStatusText = nil
         }

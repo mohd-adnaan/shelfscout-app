@@ -1,5 +1,44 @@
 import Foundation
 import simd
+import Combine
+
+/// Shared handle on a live ARKit navigation screen.
+///
+/// Cold-starting a leg costs a full relocalization, which is exactly the
+/// step that fails when the user stands at a destination facing opposite to
+/// the capture direction. Destination-to-destination hops therefore keep the
+/// AR session presented and relocalized, and retarget it in place: the pose
+/// is already known, so the next leg starts instantly and correctly.
+final class ARKitNavigationSession: ObservableObject {
+    static let shared = ARKitNavigationSession()
+
+    /// Target for the leg currently being guided. Nil when no automated
+    /// navigation screen is mounted.
+    @Published private(set) var activeTarget: String?
+    /// Bumped on every retarget so the mounted view can restart its
+    /// automation state machine for the new leg.
+    @Published private(set) var retargetRevision = 0
+    /// True while an automated navigation screen is mounted AND its AR
+    /// session is relocalized, i.e. a retarget can skip relocalization.
+    @Published var isWarm = false
+
+    private init() {}
+
+    func begin(target: String?) {
+        activeTarget = target
+        isWarm = false
+    }
+
+    func retarget(to target: String) {
+        activeTarget = target
+        retargetRevision += 1
+    }
+
+    func end() {
+        activeTarget = nil
+        isWarm = false
+    }
+}
 
 struct Position: Equatable {
     var x: Double
@@ -128,12 +167,17 @@ struct ARKitNavigationNativeResult {
     /// for this object instead of the destination itself.
     var reachingObjectName: String? = nil
     var reachingObjectWorldPosition: simd_float3? = nil
+    /// True when the AR session stayed alive and relocalized after this
+    /// result, so the next leg can be started with `continueNavigation`
+    /// and skip relocalization entirely.
+    var sessionAlive: Bool = false
     let message: String?
 
     func dictionary() -> [String: Any] {
         var output: [String: Any] = [
             "success": success,
-            "reason": reason
+            "reason": reason,
+            "sessionAlive": sessionAlive
         ]
         if let targetName { output["targetName"] = targetName }
         if let routeMapId { output["routeMapId"] = routeMapId }

@@ -67,6 +67,7 @@ struct ARMappingView: View {
     @EnvironmentObject private var ttsManager: TTSManager
     @StateObject private var mappingManager = ARMappingManager()
     @StateObject private var semanticNavigator = SemanticRouteNavigator()
+    @ObservedObject private var navigationSession = ARKitNavigationSession.shared
     @Binding private var sourceSelection: String
     private let launchTargetName: String?
     private let launchRouteMapId: String?
@@ -89,6 +90,9 @@ struct ARMappingView: View {
     @State private var automatedRelocalizationStartedAt: Date?
     @State private var lastRelocalizationVoiceCueAt: Date?
     @State private var relocalizationVoiceCueCount: Int = 0
+    /// AR world map whose async load has been requested but not yet reflected
+    /// in `mappingManager.activeMapID`.
+    @State private var requestedARMapLoadID: String?
 
     /// The coaching overlay is visual-only; a blind user standing in silence
     /// while the map searches gets spoken guidance instead, then a hard
@@ -132,6 +136,52 @@ struct ARMappingView: View {
             .onReceive(sensorManager.$imuState, perform: handleIMUStateChanged)
             .onChange(of: semanticNavigator.speechCue?.id) { _ in handleSpeechCueChanged() }
             .onChange(of: semanticNavigator.phase) { handleNavigationPhaseChange($0) }
+            .onChange(of: mappingManager.localizationRevision) { _ in handleLocalizationRevisionChanged() }
+            .onChange(of: navigationSession.retargetRevision) { _ in handleRetarget() }
+    }
+
+    /// ARKit corrected a premature alignment after guidance had already
+    /// started, so the route was resolved from a stale pose. Re-resolve the
+    /// whole route from the corrected pose rather than letting the user walk
+    /// a path built for somewhere they were never standing.
+    private func handleLocalizationRevisionChanged() {
+        guard didStartAutomatedGuidance || semanticNavigator.phase == .navigating
+                || semanticNavigator.phase == .recovering else {
+            return
+        }
+        guard let target = automatedTargetName ?? semanticNavigator.targetName.nilIfRouteBlank else { return }
+        semanticNavigator.startNavigation(
+            to: target,
+            arPosition: mappingManager.cameraMapPosition,
+            imuState: sensorManager.imuState,
+            activeARWorldMapID: mappingManager.activeMapID,
+            speakLandmarks: launchSpeakLandmarks,
+            errorRecovery: launchErrorRecovery,
+            clockFaceDirections: launchClockFaceDirections,
+            arHeading: mappingManager.arHeadingDegrees
+        )
+    }
+
+    /// Next leg of a chained journey on the already-relocalized session.
+    /// Only the automation state machine resets — the AR session, the loaded
+    /// world map and the live pose all carry over, which is what lets this
+    /// leg start without another relocalization.
+    private func handleRetarget() {
+        didResolveAutomation = false
+        didStartAutomatedGuidance = false
+        didTriggerReachingHandoff = false
+        automatedRelocalizationStartedAt = nil
+        lastRelocalizationVoiceCueAt = nil
+        relocalizationVoiceCueCount = 0
+        // The route map for the new target may differ from the current one,
+        // so route selection re-runs; the AR world map stays loaded.
+        didAttemptAutomatedRouteSelection = false
+        semanticNavigator.stopNavigation(resetInstruction: false)
+        // First call performs route selection and returns; the second starts
+        // guidance. On a warm session isLocalized never changes, so nothing
+        // else would drive the second call.
+        attemptAutomatedNavigationIfNeeded()
+        attemptAutomatedNavigationIfNeeded()
     }
 
     private var routeSceneWithNavigationChrome: some View {
@@ -183,6 +233,7 @@ struct ARMappingView: View {
     }
 
     private func handleDisappear() {
+        navigationSession.isWarm = false
         mappingManager.stopMapping()
     }
 
@@ -288,6 +339,10 @@ struct ARMappingView: View {
     }
 
     private func handleLocalizationChanged(_ isLocalized: Bool) {
+        // A warm session is only reusable while it is actually localized;
+        // losing tracking must force the next leg back through a normal
+        // (re)localizing launch instead of silently retargeting a lost pose.
+        navigationSession.isWarm = isLocalized && isAutomatedNavigation
         guard isLocalized else { return }
         didSeedIMUBearing = false
         seedIMUBearingIfNeeded(mappingManager.arHeadingDegrees)
@@ -314,6 +369,9 @@ struct ARMappingView: View {
     }
 
     private func handleActiveMapIDChanged(_ newValue: String?) {
+        if let newValue, newValue == requestedARMapLoadID {
+            requestedARMapLoadID = nil
+        }
         semanticNavigator.linkActiveRouteToARWorldMap(id: newValue)
         attemptAutomatedNavigationIfNeeded()
     }
@@ -366,7 +424,7 @@ struct ARMappingView: View {
             resolveAutomation(
                 success: false,
                 reason: "relocalization_failed",
-                message: "I could not match the saved route map from here. Walk to a spot on the mapped route, hold the phone at chest height facing the shelves, and try again."
+                message: NavLoc.relocFailedMessage()
             )
             return
         }
@@ -380,11 +438,11 @@ struct ARMappingView: View {
         let cue: String
         switch relocalizationVoiceCueCount {
         case 1:
-            cue = "Loading the saved route. Hold the phone at chest height and slowly pan left and right."
+            cue = NavLoc.relocLoadingCue()
         case 2:
-            cue = "Still matching the map. Keep panning slowly, and point the camera at the shelves ahead."
+            cue = NavLoc.relocTurnFullCircleCue()
         default:
-            cue = "Still searching. Take a small step forward or turn slightly, then pan slowly again."
+            cue = NavLoc.relocStepAndTurnCue()
         }
         announceAutomatedStatus(cue)
     }
@@ -426,7 +484,12 @@ struct ARMappingView: View {
         didSeedIMUBearing = true
     }
 
+    /// The leg currently being guided. The shared session wins over the
+    /// launch value so a retargeted second leg guides to the NEW destination
+    /// while the same screen and AR session stay mounted.
     private var automatedTargetName: String? {
+        let live = navigationSession.activeTarget?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !live.isEmpty { return live }
         let trimmed = launchTargetName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return trimmed.isEmpty ? nil : trimmed
     }
@@ -494,7 +557,15 @@ struct ARMappingView: View {
             if mappingManager.selectedMapID != arWorldMapId {
                 mappingManager.selectedMapID = arWorldMapId
             }
-            if mappingManager.activeMapID != arWorldMapId && mappingManager.sessionMode != .relocalizing {
+            // A retargeted leg keeps a live session, so "already relocalizing"
+            // is no longer a reason to skip the load: when the new target
+            // lives in a DIFFERENT world map, that map must still be loaded
+            // or guidance would wait forever on a map it will never match.
+            // `requestedARMapLoadID` keeps the async load from being fired
+            // twice while activeMapID is still catching up.
+            if mappingManager.activeMapID != arWorldMapId,
+               requestedARMapLoadID != arWorldMapId {
+                requestedARMapLoadID = arWorldMapId
                 loadSelectedMap()
             }
             return
@@ -837,7 +908,10 @@ struct ARMappingView: View {
                 saveWalkthrough: saveSemanticWalkthrough,
                 startNavigation: startSemanticNavigation,
                 snapToRoute: snapSemanticNavigationToRoute,
-                startReachingHandoff: startReachingHandoff
+                startReachingHandoff: startReachingHandoff,
+                beginEnrichmentWalk: beginSemanticEnrichmentWalk,
+                finishEnrichmentWalk: finishSemanticEnrichmentWalk,
+                cancelEnrichmentWalk: { semanticNavigator.cancelEnrichmentWalk() }
             )
         }
     }
@@ -1367,6 +1441,28 @@ struct ARMappingView: View {
             arPosition: mappingManager.cameraMapPosition,
             imuState: sensorManager.imuState
         )
+    }
+
+    private func beginSemanticEnrichmentWalk() {
+        guard let route = semanticNavigator.activeMap else { return }
+        guard mappingManager.isLocalized else {
+            mappingManager.statusMessage = "Load and localize the AR map before improving it."
+            return
+        }
+        semanticNavigator.beginEnrichmentWalk(mapID: route.id)
+    }
+
+    /// Persists the enrichment pass. The ARWorldMap is re-saved from the SAME
+    /// live session, so `getCurrentWorldMap` returns the original features
+    /// plus everything ARKit observed while walking back — which is what makes
+    /// reverse-direction relocalization work. Re-saving keeps the existing map
+    /// id (ARMapStore replaces by metadata), so the route's arWorldMapId link
+    /// and every pinned POI anchor survive.
+    private func finishSemanticEnrichmentWalk() {
+        guard semanticNavigator.finishEnrichmentWalk() else { return }
+        guard mappingManager.sessionMode != .idle else { return }
+        let resolvedName = mappingManager.activeMapName ?? semanticNavigator.activeMap?.name ?? mapName
+        mappingManager.saveMap(named: resolvedName)
     }
 
     private func capturePOIEvidence(named name: String) {
