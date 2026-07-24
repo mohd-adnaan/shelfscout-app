@@ -64,7 +64,12 @@
       "Bash(rg -n 'enum SemanticRouteMath|struct SemanticRouteMath' ios/*.swift)",
       "Bash(git --no-pager diff ios/ARMappingView.swift ios/SemanticNavigationPanel.swift)",
       "Bash(rg -rn 'replaceMapsForTesting' --include='*.swift' .)",
-      "Bash(awk 'NR>=5480 && NR<=5545' ios/SemanticRouteNavigator.swift)"
+      "Bash(awk 'NR>=5480 && NR<=5545' ios/SemanticRouteNavigator.swift)",
+      "Bash(ping -c 2 8.8.8.8)",
+      "Bash(dig +short central.sonatype.com)",
+      "Bash(scutil --dns)",
+      "Bash(curl -sI --max-time 5 https://central.sonatype.com)",
+      "Bash(bundle exec *)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

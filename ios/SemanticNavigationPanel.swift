@@ -8,6 +8,7 @@ struct SemanticNavigationPanel: View {
     let arStatusText: String
     let activeARMapName: String?
     let activeARWorldMapID: String?
+    let enrichmentBlockedReason: String?
     let closestPOI: String?
     let savedARMaps: [ARStoredMapSummary]
     let selectedARMapID: String?
@@ -170,45 +171,73 @@ struct SemanticNavigationPanel: View {
     }
 
     /// The route an enrichment walk would improve: the one linked to the AR
-    /// map currently loaded and relocalized. Enrichment samples are poses in
-    /// that map's frame, so any other route is the wrong thing to append to —
-    /// picking by `activeMap` alone silently attaches them to whichever route
-    /// the Guide tab happened to have selected.
+    /// map in the live session. Enrichment samples are poses in that map's
+    /// frame, so any other route is the wrong thing to append to — picking by
+    /// `activeMap` alone silently attaches them to whichever route the Guide
+    /// tab happened to have selected.
+    ///
+    /// With no live session there is no frame to match against; the last-used
+    /// route still stands in so the offer does not silently vanish the moment
+    /// AR stops — the button explains what to do instead of disappearing.
     private var enrichmentTargetRoute: SemanticRouteMap? {
-        guard let activeARWorldMapID else { return nil }
-        return navigator.maps.first { $0.arWorldMapId == activeARWorldMapID }
+        if let activeARWorldMapID,
+           let linked = navigator.maps.first(where: { $0.arWorldMapId == activeARWorldMapID }) {
+            return linked
+        }
+        guard !isARSessionActive,
+              let fallback = navigator.activeMap ?? navigator.maps.first,
+              fallback.arWorldMapId != nil else {
+            return nil
+        }
+        return fallback
     }
 
-    /// Offered only once relocalized into the saved map an existing route is
-    /// linked to: enrichment samples are meaningless outside that frame.
+    /// Step 2 of mapping, presented as a completion card the moment a route is
+    /// saved: a route captured one way can only be guided one way, so this is
+    /// part of finishing the map, not an optional extra somewhere else.
+    ///
+    /// Disabled — with the reason on screen — rather than dead or hidden when
+    /// the session is not in a state where enrichment samples would mean
+    /// anything.
     @ViewBuilder
     private var enrichmentEntryButton: some View {
         if navigator.phase != .mapping,
            navigator.phase != .navigating,
            navigator.phase != .recovering,
-           canUseARPose,
            let route = enrichmentTargetRoute {
-            VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Make \(route.name) bidirectional")
+                    .font(.headline.weight(.semibold))
+
+                Text(enrichmentBlockedReason ?? "You mapped this route one way, so guidance only works that way. Walk it back now — same session, no reload — to add the reverse views. Then it guides destination → start too.")
+                    .font(.footnote)
+                    .foregroundStyle(enrichmentBlockedReason == nil ? Color.secondary : Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+
                 Button {
                     beginEnrichmentWalk(route.id)
                 } label: {
-                    Label("Improve \(route.name) (Walk It Back)", systemImage: "arrow.triangle.2.circlepath")
+                    Label("Improve Map (Walk It Back)", systemImage: "arrow.triangle.2.circlepath")
                         .frame(maxWidth: .infinity)
                 }
-                .buttonStyle(.bordered)
+                .buttonStyle(.borderedProminent)
                 .controlSize(.large)
-
-                Text("Adds the reverse-direction views this route was never mapped from. Needed before guidance can run destination → start.")
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
+                .disabled(enrichmentBlockedReason != nil)
             }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(uiColor: .secondarySystemBackground))
+            .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
         }
     }
 
     private var startMapFlow: some View {
         VStack(alignment: .leading, spacing: 12) {
             statusLine
+
+            // Sits above "start a new route": right after a save this is the
+            // step the user is actually in the middle of.
+            enrichmentEntryButton
 
             TextField("Route name", text: $mapName)
                 .routeTextField()
@@ -259,8 +288,6 @@ struct SemanticNavigationPanel: View {
                 }
                 .font(.subheadline.weight(.semibold))
             }
-
-            enrichmentEntryButton
         }
     }
 

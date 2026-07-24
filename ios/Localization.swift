@@ -481,6 +481,15 @@ enum NavLoc {
         }
     }
 
+    /// Spoken when an attempt times out but the AR session is left searching,
+    /// so asking again continues the same attempt rather than restarting it.
+    static func relocStillSearchingMessage() -> String {
+        switch lang {
+        case .en: return "I have not found your position yet, but I am still looking. Keep walking along the mapped route and ask me again — I will pick up where I left off."
+        case .fr: return "Je n’ai pas encore trouvé votre position, mais je continue de chercher. Continuez le long du trajet cartographié et redemandez-moi — je reprendrai où j’en étais."
+        }
+    }
+
     static func relocFailedMessage() -> String {
         switch lang {
         case .en: return "I could not match the saved route map from here. Walk to a spot on the mapped route, hold the phone at chest height, and try again."

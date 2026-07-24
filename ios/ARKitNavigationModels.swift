@@ -21,12 +21,23 @@ final class ARKitNavigationSession: ObservableObject {
     /// True while an automated navigation screen is mounted AND its AR
     /// session is relocalized, i.e. a retarget can skip relocalization.
     @Published var isWarm = false
+    /// True while a mounted screen is still working on relocalization and has
+    /// not given up on the ARKit session.
+    ///
+    /// Relocalization against a saved map is cumulative: ARKit keeps matching
+    /// incoming frames until it finds the map. Tearing the screen down on a
+    /// timeout and relaunching runs `.resetTracking`, which throws that
+    /// accumulated work away — so N retries are N independent cold attempts
+    /// rather than one long one. Retargeting a searching session instead lets
+    /// attempt N+1 continue attempt N.
+    @Published var isSearching = false
 
     private init() {}
 
     func begin(target: String?) {
         activeTarget = target
         isWarm = false
+        isSearching = false
     }
 
     func retarget(to target: String) {
@@ -37,6 +48,7 @@ final class ARKitNavigationSession: ObservableObject {
     func end() {
         activeTarget = nil
         isWarm = false
+        isSearching = false
     }
 }
 

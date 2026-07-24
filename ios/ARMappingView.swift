@@ -90,6 +90,10 @@ struct ARMappingView: View {
     @State private var automatedRelocalizationStartedAt: Date?
     @State private var lastRelocalizationVoiceCueAt: Date?
     @State private var relocalizationVoiceCueCount: Int = 0
+    /// When this mounted screen first started searching for the saved map.
+    /// Unlike `automatedRelocalizationStartedAt` it survives a retarget, so it
+    /// bounds the total warm search rather than one attempt.
+    @State private var relocalizationSearchStartedAt: Date?
     /// AR world map whose async load has been requested but not yet reflected
     /// in `mappingManager.activeMapID`.
     @State private var requestedARMapLoadID: String?
@@ -99,6 +103,12 @@ struct ARMappingView: View {
     /// timeout so the JS side can recover rather than waiting forever.
     private let relocalizationVoiceCueIntervalSeconds: TimeInterval = 8.0
     private let automatedRelocalizationTimeoutSeconds: TimeInterval = 35.0
+    /// Total time this mounted screen may keep an unlocalized ARKit session
+    /// searching across retries before it is genuinely given up on. Each
+    /// individual attempt still reports back at
+    /// `automatedRelocalizationTimeoutSeconds` so the user is never left in
+    /// silence — this only bounds how long the session stays warm underneath.
+    private let automatedRelocalizationWarmBudgetSeconds: TimeInterval = 180.0
 
     init(
         sourceSelection: Binding<String> = .constant(""),
@@ -234,6 +244,8 @@ struct ARMappingView: View {
 
     private func handleDisappear() {
         navigationSession.isWarm = false
+        navigationSession.isSearching = false
+        relocalizationSearchStartedAt = nil
         mappingManager.stopMapping()
     }
 
@@ -344,6 +356,9 @@ struct ARMappingView: View {
         // (re)localizing launch instead of silently retargeting a lost pose.
         navigationSession.isWarm = isLocalized && isAutomatedNavigation
         guard isLocalized else { return }
+        // The search this screen was holding the session warm for succeeded.
+        navigationSession.isSearching = false
+        relocalizationSearchStartedAt = nil
         didSeedIMUBearing = false
         seedIMUBearingIfNeeded(mappingManager.arHeadingDegrees)
         attemptAutomatedNavigationIfNeeded()
@@ -415,16 +430,30 @@ struct ARMappingView: View {
         }
 
         let now = Date()
+        if relocalizationSearchStartedAt == nil {
+            relocalizationSearchStartedAt = now
+        }
+        navigationSession.isSearching = true
         guard let startedAt = automatedRelocalizationStartedAt else {
             automatedRelocalizationStartedAt = now
             return
         }
 
         if now.timeIntervalSince(startedAt) >= automatedRelocalizationTimeoutSeconds {
+            // Report the attempt so the user is not left standing in silence,
+            // but leave ARKit searching: the retry retargets this session and
+            // continues the same relocalization instead of resetting tracking
+            // and starting cold. Past the total budget, give up for real.
+            let searchedFor = now.timeIntervalSince(relocalizationSearchStartedAt ?? now)
+            let staysWarm = searchedFor < automatedRelocalizationWarmBudgetSeconds
+            if !staysWarm {
+                navigationSession.isSearching = false
+            }
             resolveAutomation(
                 success: false,
                 reason: "relocalization_failed",
-                message: NavLoc.relocFailedMessage()
+                message: staysWarm ? NavLoc.relocStillSearchingMessage() : NavLoc.relocFailedMessage(),
+                keepSessionAlive: staysWarm
             )
             return
         }
@@ -713,14 +742,15 @@ struct ARMappingView: View {
         success: Bool,
         reason: String,
         routeName: String? = nil,
-        message: String? = nil
+        message: String? = nil,
+        keepSessionAlive: Bool = false
     ) {
         guard didResolveAutomation == false else { return }
         didResolveAutomation = true
         let reachingObjectName = success && reason == "arrived"
             ? arrivedReachingObjectName
             : nil
-        let result = ARKitNavigationNativeResult(
+        var result = ARKitNavigationNativeResult(
             success: success,
             reason: reason,
             targetName: automatedTargetName,
@@ -731,6 +761,7 @@ struct ARMappingView: View {
             reachingObjectWorldPosition: reachingObjectName.flatMap { reachingObjectWorldPosition(for: $0) },
             message: message
         )
+        result.sessionAlive = keepSessionAlive
         onAutomationComplete?(result)
     }
 
@@ -885,6 +916,7 @@ struct ARMappingView: View {
                 arStatusText: statusText,
                 activeARMapName: mappingManager.activeMapName,
                 activeARWorldMapID: mappingManager.activeMapID,
+                enrichmentBlockedReason: enrichmentBlockedReason,
                 closestPOI: mappingManager.closestPOI,
                 savedARMaps: mappingManager.savedMaps,
                 selectedARMapID: mappingManager.selectedMapID,
@@ -1444,16 +1476,40 @@ struct ARMappingView: View {
         )
     }
 
+    /// nil when an enrichment walk can begin right now, otherwise the reason
+    /// it cannot — shown on the button and spoken, never swallowed.
+    ///
+    /// A session that just *mapped* the route needs no relocalization: it is
+    /// already in the route's own frame, and that is the best moment to walk
+    /// it back. Only a session that loaded a saved map has to localize first.
+    private var enrichmentBlockedReason: String? {
+        switch mappingManager.sessionMode {
+        case .idle:
+            return "Start or load this route's AR map first, then walk it back."
+        case .relocalizing where !mappingManager.isLocalized:
+            return "Waiting to localize against the saved map. Pan slowly across the shelves you mapped."
+        case .relocalizing, .mapping:
+            break
+        }
+        if mappingManager.cameraMapPosition == nil {
+            return "Waiting for AR tracking. Move the phone slowly until tracking recovers."
+        }
+        return nil
+    }
+
     private func beginSemanticEnrichmentWalk(routeID: String) {
         guard let route = semanticNavigator.maps.first(where: { $0.id == routeID }) else { return }
-        guard mappingManager.isLocalized else {
-            mappingManager.statusMessage = "Load and localize the AR map before improving it."
+        if let reason = enrichmentBlockedReason {
+            mappingManager.statusMessage = reason
+            speakSemanticCue(SemanticSpeechCue(text: reason, priority: .priority))
             return
         }
         // Samples are poses in the loaded map's frame. Appending them to a
         // route captured in a different frame would corrupt that route.
         guard route.arWorldMapId == mappingManager.activeMapID else {
-            mappingManager.statusMessage = "Load the AR map linked to \(route.name) before improving it."
+            let reason = "Load the AR map linked to \(route.name) before improving it."
+            mappingManager.statusMessage = reason
+            speakSemanticCue(SemanticSpeechCue(text: reason, priority: .priority))
             return
         }
         semanticNavigator.beginEnrichmentWalk(mapID: route.id)

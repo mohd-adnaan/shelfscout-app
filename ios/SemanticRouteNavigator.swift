@@ -5626,15 +5626,38 @@ extension SemanticRouteNavigator {
 
         html += "<h2>Top-down route</h2>" + svgRoutePlot(for: map, aliasGroups: aliasGroups)
 
-        html += "<h2>Route structure</h2><table><tr><th>Segment</th><th>Distance</th><th>Bearing</th><th>Keyframes</th></tr>"
-        let keyframesByEdge = Dictionary(grouping: keyframes) { $0.segmentID ?? "" }
+        // Keyframes are counted per direction, by heading against the segment.
+        // The old single "Keyframes" column both double-counted (a keyframe
+        // carrying `segmentID` is usually also listed in `edge.keyframeIds`)
+        // and omitted enrichment keyframes entirely, since those carry no
+        // segmentID — so a successful walk-back left the table unchanged.
+        html += "<h2>Route structure</h2><table><tr><th>Segment</th><th>Distance</th><th>Bearing</th><th>Forward keyframes</th><th>Reverse keyframes</th></tr>"
+        let nodeByID = Dictionary(uniqueKeysWithValues: map.nodes.map { ($0.id, $0) })
         for edge in map.edges {
-            let from = map.nodes.first { $0.id == edge.fromNodeID }?.name ?? "?"
-            let to = map.nodes.first { $0.id == edge.toNodeID }?.name ?? "?"
-            let attached = (keyframesByEdge[edge.id]?.count ?? 0) + (edge.keyframeIds?.count ?? 0)
+            let from = nodeByID[edge.fromNodeID]
+            let to = nodeByID[edge.toNodeID]
+            var forward = 0
+            var reverse = 0
+            if let from, let to {
+                for keyframe in keyframes {
+                    guard let heading = keyframe.headingDegrees else { continue }
+                    let projection = project(keyframe.pose, from: from.point, to: to.point, distance: edge.distanceMeters)
+                    guard projection.crossTrackMeters <= 1.5,
+                          projection.alongTrackMeters >= -0.5,
+                          projection.alongTrackMeters <= edge.distanceMeters + 0.5 else { continue }
+                    if abs(SemanticRouteMath.signedAngleDifference(heading, edge.bearingDegrees)) <= visualMatchHeadingGateDegrees {
+                        forward += 1
+                    }
+                    if abs(SemanticRouteMath.signedAngleDifference(heading, edge.reverseBearingDegrees)) <= visualMatchHeadingGateDegrees {
+                        reverse += 1
+                    }
+                }
+            }
             html += String(
-                format: "<tr><td>%@ → %@</td><td>%.1fm</td><td>%.0f°</td><td>%d</td></tr>",
-                htmlEscape(from), htmlEscape(to), edge.distanceMeters, edge.bearingDegrees, attached
+                format: "<tr><td>%@ → %@</td><td>%.1fm</td><td>%.0f°</td><td>%d</td><td class=\"%@\">%d</td></tr>",
+                htmlEscape(from?.name ?? "?"), htmlEscape(to?.name ?? "?"),
+                edge.distanceMeters, edge.bearingDegrees,
+                forward, reverse == 0 ? "warn" : "", reverse
             )
         }
         html += "</table>"

@@ -2565,7 +2565,11 @@ function AppInner(): React.JSX.Element {
     }
 
     setIsNavigation(false);
-    setIsCameraActive(true);
+    // A relocalization attempt that timed out can leave the ARKit screen
+    // mounted and still searching, so asking again continues that attempt
+    // instead of resetting tracking. It is still holding the camera —
+    // grabbing it here would fight the very session we kept alive.
+    setIsCameraActive(!arSessionAliveRef.current);
 
     if (navResult.reason === 'ar_unavailable') {
       await speakContinuousSpeechAndWait(

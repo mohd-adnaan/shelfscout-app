@@ -259,9 +259,12 @@ final class ARKitNavigationModule: NSObject {
                 return
             }
 
+            // A still-searching session is retargetable too: continuing its
+            // relocalization is strictly better than resetting tracking, even
+            // though (unlike a warm arrival) the pose is not yet known.
             let canRetarget = self.presentedController != nil &&
                 self.pendingResolve == nil &&
-                ARKitNavigationSession.shared.isWarm
+                (ARKitNavigationSession.shared.isWarm || ARKitNavigationSession.shared.isSearching)
 
             guard canRetarget else {
                 // A screen left mounted by a warm arrival that has since lost
@@ -304,10 +307,16 @@ final class ARKitNavigationModule: NSObject {
 
             // Reaching runs its own AR session and needs the camera, so a
             // handoff arrival must still tear this screen down.
-            let canStayWarm = self.keepSessionAlive &&
-                result.success &&
+            let arrivedWarm = result.success &&
                 result.reason == "arrived" &&
-                result.reachingObjectName == nil &&
+                result.reachingObjectName == nil
+            // A relocalization attempt that timed out but is still searching:
+            // keeping the screen mounted is the whole point, because tearing
+            // it down would reset tracking and make the retry start cold.
+            let searchingWarm = result.reason == "relocalization_failed" && result.sessionAlive
+
+            let canStayWarm = self.keepSessionAlive &&
+                (arrivedWarm || searchingWarm) &&
                 self.presentedController != nil
 
             if canStayWarm {
