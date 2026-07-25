@@ -15,6 +15,54 @@ import { groqVisionClient } from './GroqVisionClient';
 
 type SessionMode = 'default' | 'navigation' | 'reaching' | 'reaching_ios';
 
+/// Leading phrasings that unambiguously mean "guide me there". Ordered longest
+/// first so "take me back to" is consumed before "take me to".
+const EXPLICIT_NAVIGATION_PREFIXES = [
+  'take me back to',
+  'can you take me to',
+  'please take me to',
+  'i want to go to',
+  'i need to get to',
+  'take me to',
+  'guide me to',
+  'navigate me to',
+  'navigate to',
+  'lead me to',
+  'walk me to',
+  'bring me to',
+  'go to',
+];
+
+/// Trailing filler that survives dictation ("take me to the bananas please").
+const NAVIGATION_TRAILING_NOISE = /\s*(please|now|thanks|thank you)\s*$/i;
+
+/**
+ * Deterministic navigation-intent parser. Returns the destination when the
+ * utterance is an explicit "take me to X" style command, otherwise null so the
+ * LLM classifier keeps its normal role. Kept dependency-free and synchronous:
+ * the whole point is that the app's primary command cannot fail because a model
+ * call was slow, offline, or misclassified.
+ */
+export function parseExplicitNavigationCommand(
+  rawText: string | undefined,
+): { target: string } | null {
+  const text = rawText?.trim().toLowerCase().replace(/[.!?]+$/, '');
+  if (!text) return null;
+
+  for (const prefix of EXPLICIT_NAVIGATION_PREFIXES) {
+    if (!text.startsWith(`${prefix} `)) continue;
+    let target = text.slice(prefix.length).trim();
+    target = target.replace(NAVIGATION_TRAILING_NOISE, '').trim();
+    // Strip a leading article: destinations are stored as "Bananas", not
+    // "the bananas", and grounding matches better without it.
+    target = target.replace(/^(the|a|an|my)\s+/i, '').trim();
+    if (!target) return null;
+    return { target };
+  }
+
+  return null;
+}
+
 export interface MobileSessionMemory {
   sessionId: string;
   mode: SessionMode;
@@ -249,8 +297,17 @@ class MobileOrchestrator {
     const localIntent = await this.classifyIntentInDevice(request, trace);
     await this.persistRequestState(memory, request, localIntent, sessionId, continuous);
 
-    const intent = localIntent.json?.intent;
-    const target = localIntent.json?.target?.trim() || undefined;
+    // "Take me to X" is THE primary command of this app. Routing it through an
+    // LLM classifier means a misfire answers a navigation request with "I could
+    // not analyze the image" or "I did not catch that", which strands a blind
+    // user mid-store. Explicit navigation phrasings are therefore resolved
+    // deterministically and override the classifier; anything not matching
+    // still falls through to the model exactly as before.
+    const explicitNav = parseExplicitNavigationCommand(request.text);
+    const intent = explicitNav ? 'navigation' : localIntent.json?.intent;
+    const target = explicitNav
+      ? explicitNav.target
+      : localIntent.json?.target?.trim() || undefined;
     const provider = localIntent.usedProvider;
 
     // ── Reaching → in-device spatial-target ARKit reaching (bbox-free) ───────

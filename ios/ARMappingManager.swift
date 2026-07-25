@@ -107,6 +107,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// Conservative on purpose — measured counts surface in the inspector so the
     /// floor can be tuned against real maps.
     private let minPOIRelocalizationFeatures = 45
+    /// How far a candidate pose may sit from a POI the camera is confidently
+    /// recognizing before the pose is treated as being in the wrong frame.
+    private let visualPoseContradictionDistance: Float = 12.0
     private let imuMotionMinimumSteps = 2
     private let imuMotionMinimumDistance: Float = 0.8
     private let imuMotionDirectionMinimumDistance: Float = 1.15
@@ -126,6 +129,14 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// True once the lean relocalization config has been swapped back to the
     /// full mapping config for this session.
     private var didUpgradeSessionFidelity = false
+    /// When the fidelity re-run happened, so a transient tracking blip caused by
+    /// the configuration change is not mistaken for lost tracking.
+    /// How many named POI anchors the loaded map is expected to restore. Set on
+    /// load, before the session runs, and read on the session queue; zero means
+    /// the map carries no anchors and cannot supply relocalization proof.
+    private var expectedRestoredPOICount = 0
+    private var fidelityUpgradeAt: Date?
+    private let fidelityUpgradeSettleSeconds: TimeInterval = 2.0
     private var relocalizationNormalSince: Date?
     private var preLocalizationPosition: simd_float3?
     private var previousPublishedPosition: simd_float3?
@@ -164,6 +175,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             return
         }
 
+        // A fresh capture defines its own frame; there is no map to prove
+        // alignment against.
+        expectedRestoredPOICount = 0
         let config = makeWorldTrackingConfiguration()
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
         lastUpdateTime = 0
@@ -379,6 +393,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                         : "Map loaded with \(loadedPOIs.count) POIs."
 
                     self.didUpgradeSessionFidelity = false
+                    self.expectedRestoredPOICount = loadedPOIs.count
                     let config = self.makeWorldTrackingConfiguration(initialWorldMap: map, lightweight: true)
                     self.session.run(config, options: [.resetTracking, .removeExistingAnchors])
                 }
@@ -716,6 +731,13 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // while the world-map pose is still garbage.
         let visuallyRecognizedPlace = lastVisualMatchResult?.match?.name
 
+        // Hard proof of map alignment. ARKit only restores a saved map's named
+        // ARAnchors once relocalization actually matches; while it is still
+        // searching, the session carries none of them. Plane/mesh anchors are
+        // unnamed, so a named anchor during relocalization can only have come
+        // from the loaded map.
+        let hasRestoredMapAnchors = frame.anchors.contains { ($0.name?.isEmpty == false) }
+
 
         let x = transform.columns.3.x
         let z = transform.columns.3.z
@@ -725,7 +747,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 cameraPosition: cameraPosition,
                 cameraForward: cameraForward,
                 arHeading: arHeading,
-                mappingStatus: mappingStatus
+                mappingStatus: mappingStatus,
+                hasRestoredMapAnchors: hasRestoredMapAnchors
             )
             self.detectPostLocalizationJump(cameraPosition: cameraPosition)
             self.mappingStatus = mappingStatus
@@ -803,7 +826,14 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 default:
                     self.relocalizationNormalSince = nil
                     self.preLocalizationPosition = nil
-                    if self.isLocalized {
+                    // Re-running the session to restore plane/mesh fidelity can
+                    // blip tracking for a frame or two. That is a configuration
+                    // change, not a lost map, so it must not tear down a
+                    // relocalization the user just spent time earning.
+                    let isFidelitySettling = self.fidelityUpgradeAt.map {
+                        Date().timeIntervalSince($0) < self.fidelityUpgradeSettleSeconds
+                    } ?? false
+                    if self.isLocalized, !isFidelitySettling {
                         self.isLocalized = false
                         self.closestPOI = nil
                         self.poiMatchStatusText = nil
@@ -822,9 +852,28 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         cameraPosition: simd_float3,
         cameraForward: simd_float3,
         arHeading: Double?,
-        mappingStatus: ARFrame.WorldMappingStatus
+        mappingStatus: ARFrame.WorldMappingStatus,
+        hasRestoredMapAnchors: Bool
     ) {
         guard isRelocalizing, !isLocalized, let normalSince = relocalizationNormalSince else { return }
+
+        // ── Map-alignment proof ─────────────────────────────────────────────
+        // Without this, `.normal` tracking alone promotes ARKit's OWN session
+        // frame as if it were the map frame. The distance-based visual veto
+        // cannot catch that when the journey starts at the route's first node,
+        // because the session origin sits right on top of it — position looks
+        // perfect while heading is arbitrary (`.gravity` yaw is relative to
+        // wherever the session started, not the map's north-aligned capture
+        // frame). That is the "Localized, but turn around" failure: right place,
+        // heading 180° out. Restored named anchors only exist once ARKit has
+        // genuinely matched the map, so they are the proof that the frame — and
+        // therefore every bearing derived from it — is real.
+        if expectedRestoredPOICount > 0, !hasRestoredMapAnchors {
+            relocalizationNormalSince = Date()
+            let waiting = "Matching the saved map. Keep the camera up and turn slowly."
+            if statusMessage != waiting { statusMessage = waiting }
+            return
+        }
 
         if let previous = preLocalizationPosition,
            simd_distance(previous, cameraPosition) > postLocalizationJumpMeters {
@@ -833,6 +882,24 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             return
         }
         preLocalizationPosition = cameraPosition
+
+        // ── Wrong-frame veto ────────────────────────────────────────────────
+        // `.normal` tracking does NOT prove ARKit matched the saved map: while
+        // relocalization has not landed, ARKit keeps tracking in its OWN session
+        // frame whose origin is wherever the session started. Promoting that pose
+        // is exactly the "wrong initial localization" failure — the user gets
+        // placed near the route beginning no matter where they really are, so the
+        // first cue is "turn around" while the real route runs straight ahead.
+        // The visual fingerprint match is pose-INDEPENDENT, so it can veto a pose
+        // that lands far from the place the camera is actually looking at. Keep
+        // searching instead of starting guidance from a frame known to be wrong.
+        if let contradiction = visualEvidenceContradiction(for: cameraPosition) {
+            relocalizationNormalSince = Date()
+            if statusMessage != contradiction {
+                statusMessage = contradiction
+            }
+            return
+        }
 
         let heldSeconds = Date().timeIntervalSince(normalSince)
         let statusConfirms = mappingStatus == .mapped || mappingStatus == .extending
@@ -959,6 +1026,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private func upgradeSessionToFullFidelity() {
         guard !didUpgradeSessionFidelity else { return }
         didUpgradeSessionFidelity = true
+        fidelityUpgradeAt = Date()
         let config = makeWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         session.run(config)
@@ -1238,6 +1306,27 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         }
 
         return (sampledPoints, totalCount)
+    }
+
+    /// Non-nil when the candidate relocalized pose disagrees with the place the
+    /// camera is visually recognizing right now. Gated on the HIGH visual
+    /// confidence bar (`visualPoseRequiredConfidence`) and a deliberately
+    /// generous distance so this only vetoes gross frame errors — the tens of
+    /// metres kind that come from tracking in the session frame instead of the
+    /// map frame — never ordinary pose noise near the right place.
+    private func visualEvidenceContradiction(for cameraPosition: simd_float3) -> String? {
+        guard let seen = lastVisualMatchResult?.match,
+              seen.confidence >= visualPoseRequiredConfidence,
+              let record = currentPOIRecords().first(where: { $0.name == seen.name }) else {
+            return nil
+        }
+        let distance = simd_distance(cameraPosition, record.position)
+        guard distance > visualPoseContradictionDistance else { return nil }
+        return String(
+            format: "Camera sees %@ but the map pose is %.0fm away — still matching.",
+            seen.name,
+            distance
+        )
     }
 
     /// Counts saved feature points within `poiRelocalizationRadiusMeters` of each

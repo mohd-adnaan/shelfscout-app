@@ -2338,12 +2338,14 @@ final class SemanticRouteNavigator: ObservableObject {
         }
     }
 
-    /// Clears per-session anchoring progress at the start of a capture or an
-    /// enrichment walk so each pass coaches the sweep afresh.
+    /// Clears in-progress sweep state but KEEPS nodes already anchored in this
+    /// map. Re-prompting a full 360° at a node that was anchored during capture
+    /// — again on the walk back, and again when the route is re-run in reverse —
+    /// is pure redundancy: the features are already banked, and asking a user to
+    /// spin repeatedly at the same shelf destroys trust in the instructions.
     private func resetEndpointAnchoring() {
-        anchoringHeadingBuckets.removeAll()
-        anchoringPromptedNodeIDs.removeAll()
-        anchoredNodeIDs.removeAll()
+        anchoringHeadingBuckets = anchoringHeadingBuckets.filter { anchoredNodeIDs.contains($0.key) }
+        anchoringPromptedNodeIDs = anchoringPromptedNodeIDs.intersection(anchoredNodeIDs)
     }
 
     private func ensureDestinationNode(
