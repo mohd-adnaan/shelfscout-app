@@ -114,6 +114,18 @@ enum SemanticTurnHint: String, Codable, CaseIterable, Identifiable {
         }
     }
 
+    /// The same physical turn seen walking the other way. Handedness-free
+    /// hints are their own mirror.
+    var mirrored: SemanticTurnHint {
+        switch self {
+        case .left: return .right
+        case .right: return .left
+        case .cornerLeft: return .cornerRight
+        case .cornerRight: return .cornerLeft
+        case .straight, .corner: return self
+        }
+    }
+
     /// Spoken to the user, so localized. `displayName`/`nodeName` above stay
     /// English — they label nodes in the route-capture UI, not guidance.
     var spokenInstruction: String {
@@ -294,11 +306,33 @@ struct SemanticSpeechCue: Identifiable, Equatable {
     let priority: SemanticSpeechPriority
 }
 
+/// Where one captured edge sits inside a step that merged several of them.
+/// Keyframes and landmarks store their offset relative to the edge they were
+/// captured on, so a merged step has to translate those offsets instead of
+/// reading them as if they started at the step.
+struct SemanticRouteEdgeSpan: Equatable {
+    var startMeters: Double
+    var lengthMeters: Double
+    /// True when the merged step walks this captured edge backwards.
+    var reversed: Bool
+}
+
+/// Which way the destination sits from the last node the user actually walks
+/// to. Narrow aisles mean the final metre of a captured route is a turn to
+/// face the shelf, not a leg to walk.
+struct SemanticRouteArrivalFacing: Equatable {
+    var side: SemanticRouteSide
+    var meters: Double
+}
+
 struct SemanticRouteStep: Identifiable, Equatable {
     var id: String { edge.id }
     let edge: SemanticRouteEdge
     let from: SemanticRouteNode
     let to: SemanticRouteNode
+    /// Empty for a plain one-edge step; populated when route shaping folded a
+    /// stub leg into this one, keyed by captured edge id.
+    var edgeSpans: [String: SemanticRouteEdgeSpan] = [:]
 }
 
 struct SemanticRouteObservation: Equatable {
@@ -380,6 +414,9 @@ final class SemanticRouteNavigator: ObservableObject {
     @Published private(set) var recoveryReason: String?
     @Published private(set) var lastObservation: SemanticRouteObservation?
     @Published private(set) var routeLocalizationStatus: RouteLocalizationStatus = .initializing
+    /// Set when route shaping removed a final stub leg: the destination is that
+    /// far to the given side of the last node the user walks to.
+    @Published private(set) var arrivalFacing: SemanticRouteArrivalFacing?
     @Published private(set) var ragContextJSON: String = "{}"
     @Published private(set) var capturedPointCount: Int = 0
     @Published private(set) var capturedTurnCount: Int = 0
@@ -491,6 +528,24 @@ final class SemanticRouteNavigator: ObservableObject {
     private let targetNodeSnapDistance = 0.35
     private let manualNodeSnapDistance = 0.28
     private let routeStartEdgeSnapThreshold = 1.6
+    /// A leg this short was never a walk. In a narrow aisle the mapper pins a
+    /// node at arm's length from the shelf so arrival can say which way to
+    /// face, and a straight point dropped one step after the previous one
+    /// leaves the same stub. Guiding them as segments produces "walk less than
+    /// one meter, toward the next turn" as the opening cue of a 20 m journey.
+    private let stubLegMaxMeters = 1.5
+    /// Bearing change small enough that a stub leg and its neighbour are one
+    /// straight walk, so folding them keeps the projection geometry honest:
+    /// the folded node sits at most `stubLegMaxMeters * sin(25°)` ≈ 0.63 m off
+    /// the merged chord, inside every cross-track gate.
+    private let stubLegMergeMaxTurnDegrees = 25.0
+    /// A leading stub is only dropped when the node it starts from stays inside
+    /// the corridor of the leg that becomes the first step; otherwise guidance
+    /// would open already in cross-track recovery.
+    private let leadingStubDropMaxCrossTrackMeters = 1.1
+    /// Below this the geometry has no handedness worth arguing with, so a
+    /// recorded turn hint is never overridden.
+    private static let hintContradictionMinimumDegrees = 25.0
     private let visualRouteMatchInterval: TimeInterval = 0.45
     private let visualRouteMinimumConfidence = 0.68
     private let visualRouteSnapConfidence = 0.88
@@ -1602,13 +1657,16 @@ final class SemanticRouteNavigator: ObservableObject {
             }
             phase = .arrived
             targetName = spokenTarget
+            // No route was built, so nothing describes a facing here.
+            arrivalFacing = nil
             currentInstruction = NavLoc.alreadyAt(targetNode.name)
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             rebuildRAGContext()
             return true
         }
 
-        let steps = buildSteps(for: path, in: map)
+        let shaped = shapeRouteSteps(buildSteps(for: path, in: map), allowLeadingStubDrop: true)
+        let steps = shaped.steps
         guard !steps.isEmpty else {
             currentInstruction = NavLoc.noWalkableRoute(trimmed)
             return false
@@ -1616,8 +1674,11 @@ final class SemanticRouteNavigator: ObservableObject {
 
         targetName = spokenTarget
         routeSteps = steps
+        arrivalFacing = shaped.arrivalFacing
         currentStepIndex = 0
-        segmentProgressMeters = min(max(start.initialProgressMeters, 0), steps.first?.edge.distanceMeters ?? 0)
+        segmentProgressMeters = shaped.droppedLeadingStub
+            ? 0
+            : min(max(start.initialProgressMeters, 0), steps.first?.edge.distanceMeters ?? 0)
         lastIMUStepCount = imuState.stepCount
         lastIMUPosition = imuState.position
         lastAnnouncedRemainingMeter = nil
@@ -1657,7 +1718,15 @@ final class SemanticRouteNavigator: ObservableObject {
         ) {
             firstInstruction = "\(headingCue) Then \(firstInstruction.lowercased())"
         }
-        currentInstruction = NavLoc.startingAt(startName, firstInstruction: firstInstruction)
+        // The opening cue has to state the whole journey. Without it the first
+        // thing a user hears on a 22 m route can be a single leg's countdown,
+        // which reads as "this thing has no idea where it is sending me".
+        currentInstruction = NavLoc.startingJourney(
+            start: startName,
+            destination: spokenTarget,
+            distance: Self.formatMeters(totalRemainingMeters),
+            firstInstruction: firstInstruction
+        )
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
@@ -1665,6 +1734,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
     func stopNavigation(resetInstruction: Bool = true) {
         routeSteps.removeAll()
+        arrivalFacing = nil
         currentStepIndex = 0
         segmentProgressMeters = 0
         segmentRemainingMeters = 0
@@ -2817,12 +2887,16 @@ final class SemanticRouteNavigator: ObservableObject {
               start.nodePath.count >= 2 else {
             return false
         }
-        let steps = buildSteps(for: start.nodePath, in: map)
+        let shaped = shapeRouteSteps(buildSteps(for: start.nodePath, in: map), allowLeadingStubDrop: true)
+        let steps = shaped.steps
         guard let firstStep = steps.first else { return false }
 
         routeSteps = steps
+        arrivalFacing = shaped.arrivalFacing
         currentStepIndex = 0
-        segmentProgressMeters = min(max(start.initialProgressMeters, 0), firstStep.edge.distanceMeters)
+        segmentProgressMeters = shaped.droppedLeadingStub
+            ? 0
+            : min(max(start.initialProgressMeters, 0), firstStep.edge.distanceMeters)
         segmentRemainingMeters = max(0, firstStep.edge.distanceMeters - segmentProgressMeters)
         lastAnnouncedRemainingMeter = nil
         lastAnnouncedLandmarkID = nil
@@ -2889,8 +2963,12 @@ final class SemanticRouteNavigator: ObservableObject {
             spokenContext: "back to the route",
             confidence: 0.6
         )
-        let tailSteps = buildSteps(for: best.path, in: map)
-        routeSteps = [SemanticRouteStep(edge: rejoinEdge, from: hereNode, to: best.node)] + tailSteps
+        // The tail is shaped like any other route, but its first leg follows the
+        // rejoin hop rather than the user's own position, so it is never a
+        // leading stub to drop.
+        let shapedTail = shapeRouteSteps(buildSteps(for: best.path, in: map), allowLeadingStubDrop: false)
+        routeSteps = [SemanticRouteStep(edge: rejoinEdge, from: hereNode, to: best.node)] + shapedTail.steps
+        arrivalFacing = shapedTail.arrivalFacing
         currentStepIndex = 0
         segmentProgressMeters = 0
         segmentRemainingMeters = rejoinEdge.distanceMeters
@@ -3720,11 +3798,17 @@ final class SemanticRouteNavigator: ObservableObject {
             recoveryReason = nil
             beliefIssueStartedAt = nil
             arrivalVisualHoldStartedAt = nil
-            if let reachingObject = reachingObjectName(forTarget: targetName) {
-                currentInstruction = NavLoc.arrivedAtSwitchingToReaching(target: targetName, object: reachingObject)
-            } else {
-                currentInstruction = NavLoc.arrivedAt(targetName)
+            // The final stub leg was never walked, so arrival is where the user
+            // is standing and the facing tells them which way to turn — the
+            // whole reason that node was pinned during capture.
+            let facingSentence = arrivalFacing.map {
+                NavLoc.destinationOnSide(Self.sidePhrase($0.side))
             }
+            let reachingSentence = reachingObjectName(forTarget: targetName)
+                .map { NavLoc.switchingToReaching(object: $0) }
+            currentInstruction = [NavLoc.arrivedAt(targetName), facingSentence, reachingSentence]
+                .compactMap { $0 }
+                .joined(separator: " ")
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             rebuildRAGContext()
             return
@@ -3752,14 +3836,7 @@ final class SemanticRouteNavigator: ObservableObject {
         stillnessStartedAt = nil
         lastStillnessRepromptAt = nil
         if phase == .recovering { phase = .navigating }
-        let nextContext: String
-        if let hint = next.to.turnHint, hint.isCorner {
-            nextContext = "toward the corner"
-        } else if next.to.turnHint != nil {
-            nextContext = "toward the next turn"
-        } else {
-            nextContext = "toward \(Self.sanitizedSpokenLabel(next.to.name, fallback: "the next point"))"
-        }
+        let nextContext = walkContext(for: next)
         let landmarkPrefix: String
         if let decisionLandmarkCue,
            !announcedLandmarkIDs.contains(decisionLandmarkCue.id) {
@@ -3780,6 +3857,16 @@ final class SemanticRouteNavigator: ObservableObject {
         return first.uppercased() + raw.dropFirst()
     }
 
+    /// What this leg is walked toward: a corner, the next turn, a named place,
+    /// or just straight on. Straight points are capture artefacts, not places —
+    /// "toward Straight point 1" means nothing to someone who can't see it.
+    private func walkContext(for step: SemanticRouteStep) -> String {
+        if let hint = step.to.turnHint, hint.isCorner { return NavLoc.towardTheCorner() }
+        if let hint = step.to.turnHint, hint != .straight { return NavLoc.towardTheNextTurn() }
+        if step.to.turnHint == .straight { return NavLoc.straightAheadContext() }
+        return NavLoc.towardPlace(Self.sanitizedSpokenLabel(step.to.name, fallback: NavLoc.theNextPointLabel()))
+    }
+
     private func updateInstruction(forceSpeech: Bool) {
         guard let step = activeStep else {
             currentInstruction = activeMap == nil ? "Capture or load a semantic map." : "Semantic map ready."
@@ -3795,19 +3882,15 @@ final class SemanticRouteNavigator: ObservableObject {
 
         // Countdown cues are floored by the live AR distance to the node:
         // dead-reckoned progress alone announces turns early when the step
-        // model overshoots.
-        let cueRemainingMeters = lastARNodeDistanceMeters.map { max(segmentRemainingMeters, $0) }
+        // model overshoots. Capped at the leg length so a pose that disagrees
+        // with the route belief can't speak a distance the leg doesn't have —
+        // "walk 10 meters" on a 1.4 m leg is how the belief error reaches the
+        // user as a bogus instruction instead of as recovery.
+        let cueRemainingMeters = lastARNodeDistanceMeters
+            .map { min(step.edge.distanceMeters, max(segmentRemainingMeters, $0)) }
             ?? segmentRemainingMeters
 
-        // Use turn direction for intersection nodes, destination name for destinations
-        let context: String
-        if let hint = step.to.turnHint, hint.isCorner {
-            context = "toward the corner"
-        } else if step.to.turnHint != nil {
-            context = "toward the next turn"
-        } else {
-            context = "toward \(Self.sanitizedSpokenLabel(step.to.name, fallback: "the next point"))"
-        }
+        let context = walkContext(for: step)
         if cueRemainingMeters <= turnAnnouncementThresholdMeters, currentStepIndex < routeSteps.count - 1 {
             let next = routeSteps[currentStepIndex + 1]
             let turn = turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees)
@@ -3821,10 +3904,13 @@ final class SemanticRouteNavigator: ObservableObject {
         } else if currentStepIndex >= routeSteps.count - 1,
                   (lastARNodeDistanceMeters ?? cueRemainingMeters) <= destinationJustAheadMeters {
             // Final approach: "keep walking X meters" reads as being lost when
-            // the target is within arm's-plus reach.
-            currentInstruction = NavLoc.destinationJustAhead(
-                Self.sanitizedSpokenLabel(targetName, fallback: NavLoc.defaultDestinationLabel())
-            )
+            // the target is within arm's-plus reach. With a facing the target
+            // is beside the route, not down it — saying "just ahead" would walk
+            // the user straight past it.
+            let destination = Self.sanitizedSpokenLabel(targetName, fallback: NavLoc.defaultDestinationLabel())
+            currentInstruction = arrivalFacing.map {
+                NavLoc.destinationAheadOnSide(destination, side: Self.sidePhrase($0.side))
+            } ?? NavLoc.destinationJustAhead(destination)
         } else {
             let landmarkContext = shouldSpeakLandmarks ? nextLandmarkPhrase(on: step, after: segmentProgressMeters) : nil
             if let landmarkContext {
@@ -4064,6 +4150,11 @@ final class SemanticRouteNavigator: ObservableObject {
         keyframeIDs: Set<String>,
         reversed: Bool
     ) -> Double? {
+        if let segmentID = keyframe.segmentID,
+           let span = step.edgeSpans[segmentID] {
+            return Self.progress(inside: span, atEdgeOffset: keyframe.distanceFromSegmentStart, on: step)
+        }
+
         if keyframe.segmentID == baseEdgeID || keyframeIDs.contains(keyframe.id) {
             return reversed
                 ? max(0, step.edge.distanceMeters - keyframe.distanceFromSegmentStart)
@@ -4340,6 +4431,14 @@ final class SemanticRouteNavigator: ObservableObject {
         baseEdgeID: String,
         reversed: Bool
     ) -> Double? {
+        if let landmarkEdgeID = landmark.edgeID,
+           let span = step.edgeSpans[landmarkEdgeID] {
+            guard let offset = landmark.offsetMeters else {
+                return min(span.startMeters + span.lengthMeters * 0.5, step.edge.distanceMeters)
+            }
+            return Self.progress(inside: span, atEdgeOffset: offset, on: step)
+        }
+
         // A landmark assigned to a segment belongs ONLY to that segment. Its
         // anchor node is usually the turn that starts the segment, and the
         // node fallbacks below would otherwise surface it near the END of the
@@ -4448,7 +4547,12 @@ final class SemanticRouteNavigator: ObservableObject {
             var options: [(path: [String], progress: Double, cost: Double)] = []
 
             let forwardTail = shortestPath(in: map, from: edgeMatch.edge.toNodeID, to: targetNodeID)
-            if !forwardTail.isEmpty {
+            // A tail that immediately doubles back through the node behind the
+            // user describes the reverse option with a pointless out-and-back
+            // leg bolted on. Their costs tie when the user stands on the node,
+            // so the heading penalty alone could pick the U-turn.
+            let forwardTailDoublesBack = forwardTail.count >= 2 && forwardTail[1] == edgeMatch.edge.fromNodeID
+            if !forwardTail.isEmpty, !forwardTailDoublesBack {
                 let path = [edgeMatch.edge.fromNodeID] + forwardTail
                 let progress = edgeMatch.alongTrackMeters
                 let headingPenalty = routeStartHeadingPenalty(
@@ -4462,7 +4566,8 @@ final class SemanticRouteNavigator: ObservableObject {
             }
 
             let reverseTail = shortestPath(in: map, from: edgeMatch.edge.fromNodeID, to: targetNodeID)
-            if !reverseTail.isEmpty {
+            let reverseTailDoublesBack = reverseTail.count >= 2 && reverseTail[1] == edgeMatch.edge.toNodeID
+            if !reverseTail.isEmpty, !reverseTailDoublesBack {
                 let path = [edgeMatch.edge.toNodeID] + reverseTail
                 let progress = max(0, edgeMatch.edge.distanceMeters - edgeMatch.alongTrackMeters)
                 let headingPenalty = routeStartHeadingPenalty(
@@ -4597,6 +4702,166 @@ final class SemanticRouteNavigator: ObservableObject {
             steps.append(SemanticRouteStep(edge: edge, from: from, to: to))
         }
         return steps
+    }
+
+    private struct ShapedRoute {
+        var steps: [SemanticRouteStep]
+        var arrivalFacing: SemanticRouteArrivalFacing?
+        /// True when a stub first leg was removed, so the caller must not carry
+        /// the along-track progress it had measured on that leg.
+        var droppedLeadingStub: Bool
+    }
+
+    /// Turns the raw captured graph path into legs a person can actually walk.
+    ///
+    /// Capture in a narrow aisle produces sub-metre legs that are orientation,
+    /// not travel: a node pinned an arm's length off the shelf so arrival can
+    /// say "on your left", and straight points dropped a step apart. Walking
+    /// guidance over those legs is what makes a short route unusable — the
+    /// first cue of a 22 m journey becomes "walk less than one meter, toward
+    /// the next turn", and the last one sends the user walking into a shelf.
+    ///
+    /// Three passes: fold stub legs into the neighbour they are collinear with,
+    /// convert a final stub into an arrival facing, and drop a leading stub the
+    /// user is already standing beside.
+    private func shapeRouteSteps(
+        _ raw: [SemanticRouteStep],
+        allowLeadingStubDrop: Bool
+    ) -> ShapedRoute {
+        var shaped: [SemanticRouteStep] = []
+        for step in raw {
+            guard let previous = shaped.last else {
+                shaped.append(step)
+                continue
+            }
+            let turn = abs(SemanticRouteMath.signedAngleDifference(
+                step.edge.bearingDegrees,
+                previous.edge.bearingDegrees
+            ))
+            let hasStub = previous.edge.distanceMeters <= stubLegMaxMeters ||
+                step.edge.distanceMeters <= stubLegMaxMeters
+            // Never merge across a destination: its name is what the user is
+            // told to walk toward, and passing one silently loses that cue.
+            if hasStub, turn <= stubLegMergeMaxTurnDegrees, previous.to.kind != .destination {
+                shaped[shaped.count - 1] = Self.mergedStep(previous, step)
+            } else {
+                shaped.append(step)
+            }
+        }
+
+        var arrivalFacing: SemanticRouteArrivalFacing?
+        if shaped.count >= 2, let last = shaped.last, last.edge.distanceMeters <= stubLegMaxMeters {
+            // Collinear stubs were folded above, so a stub still standing here
+            // is a real turn onto the target: the user faces it, they don't
+            // walk it. The last walked node becomes the arrival point.
+            let previous = shaped[shaped.count - 2]
+            let diff = SemanticRouteMath.signedAngleDifference(
+                last.edge.bearingDegrees,
+                previous.edge.bearingDegrees
+            )
+            arrivalFacing = SemanticRouteArrivalFacing(
+                side: Self.facingSide(forSignedDegrees: diff),
+                meters: last.edge.distanceMeters
+            )
+            shaped.removeLast()
+        }
+
+        var droppedLeadingStub = false
+        if allowLeadingStubDrop,
+           shaped.count >= 2,
+           let first = shaped.first,
+           first.edge.distanceMeters <= stubLegMaxMeters {
+            // Mirror case: the user is standing at the shelf they mapped and
+            // the stub is the hop back into the aisle. Only drop it when they
+            // are already beside the next leg — a stub that runs back along
+            // that leg's axis is real walking and has to stay.
+            let offset = Self.projectDetailed(first.from.point, onto: shaped[1]).crossTrackMeters
+            if offset <= leadingStubDropMaxCrossTrackMeters {
+                shaped.removeFirst()
+                droppedLeadingStub = true
+            }
+        }
+
+        return ShapedRoute(
+            steps: shaped,
+            arrivalFacing: arrivalFacing,
+            droppedLeadingStub: droppedLeadingStub
+        )
+    }
+
+    /// Folds two consecutive steps into one straight leg. The merged edge gets
+    /// a synthetic id and no keyframe/landmark ids so nothing resolves through
+    /// the by-id fast path with the wrong origin; `edgeSpans` carries the exact
+    /// offsets instead, and anything not listed there still lands by geometry.
+    private static func mergedStep(
+        _ first: SemanticRouteStep,
+        _ second: SemanticRouteStep
+    ) -> SemanticRouteStep {
+        let distance = max(first.from.point.distance(to: second.to.point), 0.1)
+        let bearing = first.from.point.bearingDegrees(to: second.to.point)
+        let dominant = first.edge.distanceMeters >= second.edge.distanceMeters ? first : second
+        let edge = SemanticRouteEdge(
+            id: "\(first.edge.id)+\(second.edge.id)",
+            fromNodeID: first.from.id,
+            toNodeID: second.to.id,
+            distanceMeters: distance,
+            bearingDegrees: bearing,
+            reverseBearingDegrees: second.to.point.bearingDegrees(to: first.from.point),
+            walkableWidthMeters: dominant.edge.walkableWidthMeters,
+            leftContext: dominant.edge.leftContext,
+            rightContext: dominant.edge.rightContext,
+            spokenContext: dominant.edge.spokenContext,
+            isBidirectional: first.edge.isBidirectional && second.edge.isBidirectional,
+            confidence: min(first.edge.confidence, second.edge.confidence),
+            keyframeIds: nil,
+            landmarkIds: nil
+        )
+        var spans = edgeSpans(of: first, startingAt: 0)
+        for (id, span) in edgeSpans(of: second, startingAt: first.edge.distanceMeters) {
+            spans[id] = span
+        }
+        return SemanticRouteStep(edge: edge, from: first.from, to: second.to, edgeSpans: spans)
+    }
+
+    private static func edgeSpans(
+        of step: SemanticRouteStep,
+        startingAt offset: Double
+    ) -> [String: SemanticRouteEdgeSpan] {
+        guard step.edgeSpans.isEmpty else {
+            return step.edgeSpans.mapValues {
+                SemanticRouteEdgeSpan(
+                    startMeters: $0.startMeters + offset,
+                    lengthMeters: $0.lengthMeters,
+                    reversed: $0.reversed
+                )
+            }
+        }
+        return [
+            baseEdgeID(step.edge.id): SemanticRouteEdgeSpan(
+                startMeters: offset,
+                lengthMeters: step.edge.distanceMeters,
+                reversed: step.edge.id.hasSuffix(".reverse")
+            )
+        ]
+    }
+
+    /// Translates an offset measured along a captured edge into progress along
+    /// the merged step that swallowed it.
+    private static func progress(
+        inside span: SemanticRouteEdgeSpan,
+        atEdgeOffset offset: Double,
+        on step: SemanticRouteStep
+    ) -> Double {
+        let local = min(max(offset, 0), span.lengthMeters)
+        let alongSpan = span.reversed ? span.lengthMeters - local : local
+        return min(max(span.startMeters + alongSpan, 0), step.edge.distanceMeters)
+    }
+
+    private static func facingSide(forSignedDegrees diff: Double) -> SemanticRouteSide {
+        let magnitude = abs(diff)
+        if magnitude < 25 { return .ahead }
+        if magnitude > 150 { return .behind }
+        return diff > 0 ? .right : .left
     }
 
     private func upsertMap(_ map: SemanticRouteMap, persist: Bool) {
@@ -4890,9 +5155,31 @@ final class SemanticRouteNavigator: ObservableObject {
         // left/right hints lose to computed geometry in clock-face mode
         // because the hint carries no magnitude.
         if let hint = node.turnHint, turnPhrasing == .leftRight || hint.isCorner {
-            return hint.spokenInstruction
+            return Self.directionCorrected(hint, from: currentBearing, to: nextBearing).spokenInstruction
         }
         return Self.turnInstruction(from: currentBearing, to: nextBearing, style: turnPhrasing)
+    }
+
+    /// A recorded hint is a label from the capture walk. Walked the other way
+    /// the same node turns the opposite way, and the stored hint does not move
+    /// — so on every return journey "Left turn 2" was spoken as "turn left"
+    /// while the user had to go right. Mirror the hint when the live geometry
+    /// clearly contradicts it, which keeps its phrasing (a corner stays a
+    /// corner) while pointing the right way. Only a decisive disagreement
+    /// counts: near-straight geometry has no handedness to contradict, and the
+    /// mapper's label is the better guide there.
+    private static func directionCorrected(
+        _ hint: SemanticTurnHint,
+        from currentBearing: Double,
+        to nextBearing: Double
+    ) -> SemanticTurnHint {
+        let diff = SemanticRouteMath.signedAngleDifference(nextBearing, currentBearing)
+        guard abs(diff) >= hintContradictionMinimumDegrees else { return hint }
+        switch hint {
+        case .left, .cornerLeft: return diff > 0 ? hint.mirrored : hint
+        case .right, .cornerRight: return diff < 0 ? hint.mirrored : hint
+        case .straight, .corner: return hint
+        }
     }
 
     private static func formatMeters(_ meters: Double) -> String {

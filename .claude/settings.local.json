@@ -72,7 +72,8 @@
       "Bash(bundle exec *)",
       "Bash(xcrun --show-sdk-path --sdk iphonesimulator)",
       "Bash(grep -E 'warning:' /tmp/tc.log)",
-      "Read(//private/tmp/**)"
+      "Read(//private/tmp/**)",
+      "Bash(xcrun swift *)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

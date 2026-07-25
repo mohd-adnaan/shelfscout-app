@@ -553,6 +553,197 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertFalse(navigator.currentInstruction.contains("Turn around"))
     }
 
+    // MARK: - Narrow-aisle stub legs
+
+    func testFacingStubAtDestinationBecomesArrivalFacingNotAWalk() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()])
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 0, bearing: 217),
+            speakLandmarks: false,
+            arHeading: 217
+        ))
+
+        // The 1.0 m hop onto the shelf is a facing, so the last leg walked ends
+        // at the turn in the aisle, not at the shelf itself.
+        XCTAssertEqual(navigator.routeSteps.last?.to.name, "Left turn 4")
+        XCTAssertEqual(navigator.arrivalFacing?.side, .left)
+        XCTAssertEqual(navigator.arrivalFacing?.meters ?? 0, 1.0, accuracy: 0.15)
+    }
+
+    func testJourneyOpensWithDestinationAndDistanceNotAStubCountdown() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()])
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 0, bearing: 217),
+            speakLandmarks: false,
+            arHeading: 217
+        ))
+
+        XCTAssertTrue(navigator.currentInstruction.contains("Onions is 21 meters away."))
+        // The old failure: the whole 22 m route opened on the 1.4 m stub.
+        XCTAssertFalse(navigator.currentInstruction.contains("less than one meter"))
+    }
+
+    func testCollinearStubLegMergesIntoTheLegItContinues() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()])
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 0, bearing: 217),
+            speakLandmarks: false,
+            arHeading: 217
+        ))
+
+        // Cereals → Straight point 1 → Left turn 2 is one 5.5 m walk, not a
+        // 1.4 m leg with a turn cue at the end of it.
+        XCTAssertEqual(navigator.routeSteps.first?.from.name, "Cereals")
+        XCTAssertEqual(navigator.routeSteps.first?.to.name, "Left turn 2")
+        XCTAssertEqual(navigator.routeSteps.first?.edge.distanceMeters ?? 0, 5.5, accuracy: 0.2)
+        XCTAssertEqual(navigator.routeSteps.count, 3)
+    }
+
+    func testStartingAtAShelfDropsTheHopBackIntoTheAisle() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()])
+
+        // Standing at Onions facing the shelf, asking to go back to Cereals.
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Cereals",
+            arPosition: nil,
+            imuState: Self.imu(x: -0.93, y: -16.63, bearing: 121),
+            speakLandmarks: false,
+            arHeading: 121
+        ))
+
+        XCTAssertEqual(navigator.routeSteps.first?.from.name, "Left turn 4")
+        XCTAssertEqual(navigator.routeSteps.last?.to.name, "Cereals")
+        // Facing the shelf, the first thing to do is turn back to the aisle —
+        // not walk a metre into it.
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn left to face the route."))
+        XCTAssertFalse(navigator.currentInstruction.contains("less than one meter"))
+    }
+
+    func testArrivalSpeaksWhichWayTheShelfIs() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 217),
+            speakLandmarks: false,
+            arHeading: 217
+        ))
+
+        let lastStep = navigator.routeSteps.count - 1
+        navigator.setRouteProgressForTesting(
+            stepIndex: lastStep,
+            progressMeters: navigator.routeSteps[lastStep].edge.distanceMeters
+        )
+        // Standing on Left turn 4, the last node of the walked route.
+        navigator.update(
+            imuState: Self.imu(isMoving: true, bearing: 212),
+            arPosition: simd_float3(-1.78, 0, 16.11),
+            arHeading: 212,
+            arLocalized: true
+        )
+
+        XCTAssertEqual(navigator.phase, .arrived)
+        XCTAssertTrue(navigator.currentInstruction.contains("Arrived at Onions."))
+        XCTAssertTrue(navigator.currentInstruction.contains("It is on your left."))
+    }
+
+    func testStraightPointIsNeverSpokenAsAPlaceOrATurn() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 0, bearing: 217),
+            speakLandmarks: false,
+            arHeading: 217
+        ))
+
+        XCTAssertFalse(navigator.currentInstruction.contains("Straight point"))
+    }
+
+    func testReturnJourneyMirrorsTurnHintsRecordedOnTheWayOut() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Cereals",
+            arPosition: nil,
+            imuState: Self.imu(x: -0.93, y: -16.63, bearing: 32),
+            speakLandmarks: false,
+            arHeading: 32
+        ))
+
+        // "Right turn 3" was labelled walking out from Cereals. Coming back the
+        // other way through the same node the user has to turn LEFT — speaking
+        // the stored label sends them into the wrong aisle.
+        let first = navigator.routeSteps[0]
+        XCTAssertEqual(first.to.name, "Right turn 3")
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: first.edge.distanceMeters)
+        navigator.update(
+            imuState: Self.imu(x: -0.93, y: -16.63, bearing: 32),
+            arPosition: nil,
+            arHeading: 32,
+            arLocalized: false
+        )
+
+        XCTAssertEqual(navigator.currentStepIndex, 1)
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Turn left."))
+    }
+
+    /// The July 25 IGA capture: two shelf destinations joined by a zig-zag of
+    /// aisles, with a stub leg pinned at each end so arrival can say which way
+    /// to face. Distances and bearings are the ones in the saved route report.
+    private static func igaMap(coordinateSpace: String = "pdr_xy") -> SemanticRouteMap {
+        let cereals = node(id: "cereals", name: "Cereals", point: SemanticRoutePoint(x: 0, y: 0), kind: .destination)
+        let straight = node(
+            id: "straight1",
+            name: "Straight point 1",
+            point: SemanticRoutePoint(x: -0.84, y: -1.12),
+            kind: .waypoint,
+            turnHint: .straight
+        )
+        let left2 = node(
+            id: "left2",
+            name: "Left turn 2",
+            point: SemanticRoutePoint(x: -3.37, y: -4.35),
+            kind: .intersection,
+            turnHint: .left
+        )
+        let right3 = node(
+            id: "right3",
+            name: "Right turn 3",
+            point: SemanticRoutePoint(x: 2.35, y: -9.50),
+            kind: .intersection,
+            turnHint: .right
+        )
+        let left4 = node(
+            id: "left4",
+            name: "Left turn 4",
+            point: SemanticRoutePoint(x: -1.78, y: -16.11),
+            kind: .intersection,
+            turnHint: .left
+        )
+        let onions = node(id: "onions", name: "Onions", point: SemanticRoutePoint(x: -0.93, y: -16.63), kind: .destination)
+        return map(
+            id: "iga",
+            coordinateSpace: coordinateSpace,
+            nodes: [cereals, straight, left2, right3, left4, onions]
+        )
+    }
+
     private static func keyframe(
         id: String,
         x: Double,

@@ -320,10 +320,56 @@ enum NavLoc {
 
     // ── Progress and arrival ────────────────────────────────────────────────
 
-    static func startingAt(_ start: String, firstInstruction: String) -> String {
+    /// Opening cue of a journey. States where the route ends and how far it is
+    /// before the first leg, so the user can judge the guidance against what
+    /// they expect instead of hearing one leg's countdown out of context.
+    static func startingJourney(
+        start: String,
+        destination: String,
+        distance: String,
+        firstInstruction: String
+    ) -> String {
         switch lang {
-        case .en: return "Starting at \(start). \(firstInstruction)"
-        case .fr: return "Départ à \(start). \(firstInstruction)"
+        case .en: return "Starting at \(start). \(destination) is \(distance) away. \(firstInstruction)"
+        case .fr: return "Départ à \(start). \(destination) est à \(distance). \(firstInstruction)"
+        }
+    }
+
+    // ── Walk-leg context ────────────────────────────────────────────────────
+
+    static func towardTheCorner() -> String {
+        switch lang {
+        case .en: return "toward the corner"
+        case .fr: return "vers le coin"
+        }
+    }
+
+    static func towardTheNextTurn() -> String {
+        switch lang {
+        case .en: return "toward the next turn"
+        case .fr: return "vers le prochain virage"
+        }
+    }
+
+    static func towardPlace(_ place: String) -> String {
+        switch lang {
+        case .en: return "toward \(place)"
+        case .fr: return "vers \(place)"
+        }
+    }
+
+    /// Used where the route just continues: no turn, no place worth naming.
+    static func straightAheadContext() -> String {
+        switch lang {
+        case .en: return "straight ahead"
+        case .fr: return "tout droit"
+        }
+    }
+
+    static func theNextPointLabel() -> String {
+        switch lang {
+        case .en: return "the next point"
+        case .fr: return "le point suivant"
         }
     }
 
@@ -417,15 +463,27 @@ enum NavLoc {
         }
     }
 
-    static func arrivedAtSwitchingToReaching(
-        target: String,
-        object: String
-    ) -> String {
+    static func switchingToReaching(object: String) -> String {
         switch lang {
-        case .en:
-            return "Arrived at \(target). Switching to reaching guidance for \(object)."
-        case .fr:
-            return "Vous êtes arrivé à \(target). Je passe au guidage vers \(object)."
+        case .en: return "Switching to reaching guidance for \(object)."
+        case .fr: return "Je passe au guidage vers \(object)."
+        }
+    }
+
+    /// Arrival where the target sits beside the last walked node rather than at
+    /// the end of the route: `side` comes from the directional-context family
+    /// ("on your left"). The user turns, they do not keep walking.
+    static func destinationOnSide(_ side: String) -> String {
+        switch lang {
+        case .en: return "It is \(side)."
+        case .fr: return "C’est \(side)."
+        }
+    }
+
+    static func destinationAheadOnSide(_ destination: String, side: String) -> String {
+        switch lang {
+        case .en: return "\(destination) is just ahead, \(side)."
+        case .fr: return "\(destination) est juste devant, \(side)."
         }
     }
 
