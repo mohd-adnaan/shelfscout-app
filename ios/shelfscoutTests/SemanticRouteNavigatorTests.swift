@@ -319,6 +319,26 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertEqual(navigator.targetName, "Cereal")
     }
 
+    func testPhoneticSlipStackedOnPluralDriftResolvesToMappedLabel() {
+        // "cereals" (spoken) misheard as "serials" carries both a plural 's'
+        // the saved singular "Cereal" doesn't have AND the c/s phonetic swap.
+        // Either drift alone lands on an earlier cascade rung; stacked
+        // together they used to miss every rung.
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.cerealMap()])
+
+        let started = navigator.startNavigation(
+            to: "serials",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertEqual(navigator.targetName, "Cereal")
+    }
+
     func testPluralDriftResolvesToMappedLabel() {
         let navigator = SemanticRouteNavigator()
         navigator.replaceMapsForTesting([Self.onionsMap()])

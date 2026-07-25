@@ -5410,6 +5410,14 @@ final class SemanticRouteNavigator: ObservableObject {
                 .replacingOccurrences(of: "wh", with: "w")
             if normalized.hasPrefix("wr") { normalized = String(normalized.dropFirst()) }
             if normalized.hasPrefix("kn") { normalized = String(normalized.dropFirst()) }
+            // Strip a single trailing plural 's' before the skeleton is built,
+            // the same silent-letter pass phoneticKeyFrench already does.
+            // Without it a spoken plural ("cereals") stacked on a phonetic
+            // slip ("serials") keys differently from a singular saved label
+            // ("Cereal") — "srls" vs "srl" — even though fuzzyMatchesSpokenTarget's
+            // edit-distance rung already absorbs plural drift on its own for
+            // words with no phonetic slip.
+            if normalized.hasSuffix("s") { normalized = String(normalized.dropLast()) }
 
             let chars = Array(normalized)
             var mapped = ""

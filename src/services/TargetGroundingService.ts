@@ -192,7 +192,14 @@ const phoneticKeyEnglish = (raw: string): string =>
         .replace(/gh/g, 'g')
         .replace(/wh/g, 'w')
         .replace(/^wr/, 'r')
-        .replace(/^kn/, 'n');
+        .replace(/^kn/, 'n')
+        // Strip a single trailing plural 's' before the skeleton is built, the
+        // same silent-letter pass phoneticKeyFrench already does. Without it
+        // a spoken plural ("cereals") stacked on a phonetic slip ("serials")
+        // keys differently from a singular saved label ("Cereal") — "srls"
+        // vs "srl" — even though the fuzzy/edit-distance rung above already
+        // absorbs plural drift on its own for words with no phonetic slip.
+        .replace(/s$/, '');
       let mapped = '';
       for (let i = 0; i < normalized.length; i += 1) {
         const ch = normalized[i];

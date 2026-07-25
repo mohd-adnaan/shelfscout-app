@@ -56,6 +56,17 @@ describe('TargetGroundingService', () => {
     expect(result.method).toBe('phonetic');
   });
 
+  it('resolves a phonetic slip stacked on plural drift', () => {
+    // "cereals" (spoken) misheard as "serials" carries both a plural 's' the
+    // saved singular "Cereal" doesn't have AND the c/s phonetic swap — either
+    // drift alone is absorbed by an earlier rung, but stacked together they
+    // used to miss every rung and dead-end with "not found".
+    const result = matchTargetAgainstVocabulary('serials', vocabulary);
+    expect(result.status).toBe('matched');
+    expect(result.label).toBe('Cereal');
+    expect(result.method).toBe('phonetic');
+  });
+
   it('never lets short labels cross to different words', () => {
     const result = matchTargetAgainstVocabulary('silk', vocabulary);
     expect(result.status).toBe('no_match');
