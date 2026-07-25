@@ -461,6 +461,14 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastPDRDeltaWasCapped = false
     private var lastHeadingAlignmentCueAt: Date?
     private var lastHeadingAlignmentCueKey: String?
+    /// Heading error at the last alignment cue, so a turn already underway is
+    /// not interrupted by a fresh one.
+    private var lastHeadingAlignmentErrorDegrees: Double?
+    /// When any turn instruction was last spoken, from whichever subsystem.
+    /// The TTS layer queues criticals back to back rather than dropping them,
+    /// so two systems each cueing "reasonably often" still reach the user as
+    /// one run-on contradiction. This is the floor under all of them.
+    private var lastTurnCueAt: Date?
     /// Straight-line AR distance to the current step's end node, set every
     /// navigation update while AR is localized. Floors spoken turn/arrival
     /// countdowns so PDR overshoot cannot announce a turn the AR pose clearly
@@ -528,21 +536,18 @@ final class SemanticRouteNavigator: ObservableObject {
     private let targetNodeSnapDistance = 0.35
     private let manualNodeSnapDistance = 0.28
     private let routeStartEdgeSnapThreshold = 1.6
-    /// A leg this short was never a walk. In a narrow aisle the mapper pins a
-    /// node at arm's length from the shelf so arrival can say which way to
-    /// face, and a straight point dropped one step after the previous one
-    /// leaves the same stub. Guiding them as segments produces "walk less than
-    /// one meter, toward the next turn" as the opening cue of a 20 m journey.
+    /// A final leg this short was never a walk: in a narrow aisle the mapper
+    /// pins a node at arm's length from the shelf so arrival can say which way
+    /// to face. Guiding it as a segment sends the user walking into the shelf.
     private let stubLegMaxMeters = 1.5
-    /// Bearing change small enough that a stub leg and its neighbour are one
-    /// straight walk, so folding them keeps the projection geometry honest:
-    /// the folded node sits at most `stubLegMaxMeters * sin(25°)` ≈ 0.63 m off
-    /// the merged chord, inside every cross-track gate.
-    private let stubLegMergeMaxTurnDegrees = 25.0
-    /// A leading stub is only dropped when the node it starts from stays inside
-    /// the corridor of the leg that becomes the first step; otherwise guidance
-    /// would open already in cross-track recovery.
-    private let leadingStubDropMaxCrossTrackMeters = 1.1
+    /// Below this a node is not a decision point, so its two legs are one walk.
+    /// Matches the band `turnInstruction` already speaks as "continue
+    /// straight" — anything it would not announce is not worth a leg boundary.
+    private let mergeMaxTurnDegrees = 18.0
+    /// How far a folded node may sit off the merged chord. Keeps the merged
+    /// leg's geometry inside the cross-track gates that keyframe matching,
+    /// progress projection and recovery all measure against.
+    private let mergeMaxChordOffsetMeters = 0.6
     /// Below this the geometry has no handedness worth arguing with, so a
     /// recorded turn hint is never overridden.
     private static let hintContradictionMinimumDegrees = 25.0
@@ -568,7 +573,15 @@ final class SemanticRouteNavigator: ObservableObject {
     private let routeStartAlignmentThresholdDegrees = 20.0
     private let routeTurnAlignmentThresholdDegrees = 55.0
     private let routeAlignmentProgressWindowMeters = 1.10
-    private let routeAlignmentCueCooldownSeconds: TimeInterval = 1.4
+    private let routeAlignmentCueCooldownSeconds: TimeInterval = 3.0
+    /// Two alignment cues never land on top of each other, whatever changed.
+    /// A person needs about this long to start acting on the first one.
+    private let routeAlignmentCueMinimumGapSeconds: TimeInterval = 1.8
+    /// Heading error must close by at least this much to count as "already
+    /// turning" — smaller than that is head sway, not a turn.
+    private let routeAlignmentImprovementDegrees = 15.0
+    /// A turn that stops part-way gets one repeat after this long.
+    private let routeAlignmentStalledCueSeconds: TimeInterval = 6.0
     private let maxPDRDeltaPerUpdateMeters = 1.20
     private let offAxisProgressExtraMeters = 1.25
     private let offAxisProgressMaxMeters = 3.4
@@ -1698,6 +1711,8 @@ final class SemanticRouteNavigator: ObservableObject {
         lastPDRDeltaWasCapped = false
         lastHeadingAlignmentCueAt = nil
         lastHeadingAlignmentCueKey = nil
+        lastHeadingAlignmentErrorDegrees = nil
+        lastTurnCueAt = nil
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
         lastRouteRebuildAttemptAt = nil
@@ -1710,13 +1725,27 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryReason = nil
         phase = .navigating
         updateInstruction(forceSpeech: false)
-        let startName = Self.sanitizedSpokenLabel(steps.first?.from.name, fallback: "your current location")
+        let startName = Self.sanitizedSpokenLabel(
+            shaped.startNodeName ?? steps.first?.from.name,
+            fallback: "your current location"
+        )
+        let startHeading = arHeading ?? imuState.bearing
         var firstInstruction = currentInstruction
         if let headingCue = initialHeadingAlignmentInstruction(
             on: steps[0],
-            liveHeading: arHeading ?? imuState.bearing
+            liveHeading: startHeading
         ) {
             firstInstruction = "\(headingCue) Then \(firstInstruction.lowercased())"
+            // This sentence IS an alignment cue. Without claiming the cue slot,
+            // the very next update tick spoke the same turn again on top of the
+            // opening announcement.
+            lastHeadingAlignmentCueAt = Date()
+            lastHeadingAlignmentCueKey = "align_\(Self.relativeTurnCommand(from: startHeading, to: steps[0].edge.bearingDegrees, style: turnPhrasing).key)_0"
+            lastHeadingAlignmentErrorDegrees = abs(
+                SemanticRouteMath.signedAngleDifference(startHeading, steps[0].edge.bearingDegrees)
+            )
+            lastTurnCueAt = Date()
+            pendingAlignmentResumeCue = true
         }
         // The opening cue has to state the whole journey. Without it the first
         // thing a user hears on a 22 m route can be a single leg's countdown,
@@ -1758,6 +1787,8 @@ final class SemanticRouteNavigator: ObservableObject {
         lastRouteAdvanceAt = nil
         lastHeadingAlignmentCueAt = nil
         lastHeadingAlignmentCueKey = nil
+        lastHeadingAlignmentErrorDegrees = nil
+        lastTurnCueAt = nil
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
         lastRouteRebuildAttemptAt = nil
@@ -2865,6 +2896,37 @@ final class SemanticRouteNavigator: ObservableObject {
         return true
     }
 
+    /// ARKit finished aligning to the saved map after guidance had already
+    /// started, so the route was resolved from a pose the user was never
+    /// standing at. Re-resolve it from the corrected pose.
+    ///
+    /// This is deliberately NOT `startNavigation`. Restarting the journey
+    /// re-announces it from the top ("Starting at X, N meters away, turn …"),
+    /// and because the corrected pose can resolve a different start edge, the
+    /// turn word changes too. Doing that two or three times while a blind user
+    /// is trying to take their first step is how a working route turned into
+    /// contradictory turn commands. A realignment is a correction to a journey
+    /// already under way: same target, one "route realigned" cue, no restart.
+    @discardableResult
+    func realignRouteToCorrectedPose(
+        arPosition: simd_float3?,
+        imuState: IMUState,
+        heading: Double?
+    ) -> Bool {
+        guard phase == .navigating || phase == .recovering else { return false }
+        let now = Date()
+        if let last = lastRouteRebuildAttemptAt,
+           now.timeIntervalSince(last) < routeRebuildRetrySeconds {
+            return false
+        }
+        lastRouteRebuildAttemptAt = now
+        return rebuildRouteFromCurrentPose(
+            arPosition: arPosition,
+            imuState: imuState,
+            heading: heading
+        )
+    }
+
     /// Re-resolves the path to the current target from the live pose and
     /// restarts guidance on it. Last-resort recovery when route belief cannot
     /// converge; announces the realignment so the user knows why the
@@ -2914,6 +2976,13 @@ final class SemanticRouteNavigator: ObservableObject {
         updateInstruction(forceSpeech: false)
         currentInstruction = NavLoc.routeRealignedPrefix() + currentInstruction
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        // The realignment cue carries the new direction, so it claims the turn
+        // slot: an alignment nudge on the very next tick would stack a second
+        // turn command onto it.
+        lastTurnCueAt = Date()
+        lastHeadingAlignmentCueAt = Date()
+        lastHeadingAlignmentCueKey = nil
+        lastHeadingAlignmentErrorDegrees = nil
         rebuildRAGContext()
         return true
     }
@@ -3100,10 +3169,33 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryReason = nil
         guidanceIntroProtectedUntil = nil
 
-        if cueChanged || cueAge >= routeAlignmentCueCooldownSeconds {
+        // A user part-way through a turn sweeps across every band — around,
+        // sharp left, left — and the old rule spoke on each crossing because
+        // the cue text had changed. What reached the user was "turn around…
+        // turn sharp left… turn left" inside three seconds, which sounds like
+        // the app contradicting itself and is worse than saying nothing.
+        // One cue, then room to act on it.
+        let isTurningTowardRoute = lastHeadingAlignmentErrorDegrees.map {
+            headingError <= $0 - routeAlignmentImprovementDegrees
+        } ?? false
+        let sinceAnyTurnCue = lastTurnCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        let shouldSpeak: Bool
+        if sinceAnyTurnCue < routeAlignmentCueMinimumGapSeconds {
+            shouldSpeak = false
+        } else if isTurningTowardRoute {
+            // They are already turning the right way; only speak again if the
+            // turn stalls part-way.
+            shouldSpeak = cueAge >= routeAlignmentStalledCueSeconds
+        } else {
+            shouldSpeak = cueChanged || cueAge >= routeAlignmentCueCooldownSeconds
+        }
+
+        if shouldSpeak {
             speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
             lastHeadingAlignmentCueAt = now
             lastHeadingAlignmentCueKey = key
+            lastHeadingAlignmentErrorDegrees = headingError
+            lastTurnCueAt = now
             // Once the user finishes this turn, follow up with an explicit
             // "walk" resumption instead of going silent.
             pendingAlignmentResumeCue = true
@@ -3575,14 +3667,27 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
 
+        // The banner belongs to whatever phase is showing. Throttling used to
+        // return before this line, leaving the previous phase's sentence under
+        // a "Recovering" badge — the screen said "Turn right to face the
+        // route" while the navigator had already given up on that instruction.
+        // Throttle the speech, never the displayed truth.
+        currentInstruction = cue.instruction
+
+        // Recovery cues are turn commands too, and they change key on every
+        // band the user's heading sweeps through while turning. Same floor as
+        // the alignment cue, and shared with it: alternating between the two
+        // subsystems was still a run-on contradiction to the person listening.
+        let sinceAnyTurnCue = lastTurnCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        guard sinceAnyTurnCue >= routeAlignmentCueMinimumGapSeconds else { return }
         guard cueChanged || cueAge >= recoveryCueCooldownSeconds else {
             return
         }
 
-        currentInstruction = cue.instruction
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
         lastRecoveryCueAt = now
         lastRecoveryCueKey = cue.key
+        lastTurnCueAt = now
     }
 
     private func recoveryCue(
@@ -3848,6 +3953,12 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         currentInstruction = NavLoc.turnThenWalk(prefix: landmarkPrefix, turn: Self.sentenceCased(turn), distance: Self.formatMeters(next.edge.distanceMeters), context: nextContext)
         speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        // This already told them which way to turn, so the alignment cue must
+        // not repeat it a tick later while they are still turning.
+        lastHeadingAlignmentCueAt = Date()
+        lastHeadingAlignmentCueKey = nil
+        lastHeadingAlignmentErrorDegrees = nil
+        lastTurnCueAt = Date()
     }
 
     /// Uppercases only the first letter — String.capitalized would title-case
@@ -4707,6 +4818,9 @@ final class SemanticRouteNavigator: ObservableObject {
     private struct ShapedRoute {
         var steps: [SemanticRouteStep]
         var arrivalFacing: SemanticRouteArrivalFacing?
+        /// Where a dropped leading stub started — still the place the user is
+        /// standing, and so still the place to name when guidance opens.
+        var startNodeName: String?
         /// True when a stub first leg was removed, so the caller must not carry
         /// the along-track progress it had measured on that leg.
         var droppedLeadingStub: Bool
@@ -4734,15 +4848,7 @@ final class SemanticRouteNavigator: ObservableObject {
                 shaped.append(step)
                 continue
             }
-            let turn = abs(SemanticRouteMath.signedAngleDifference(
-                step.edge.bearingDegrees,
-                previous.edge.bearingDegrees
-            ))
-            let hasStub = previous.edge.distanceMeters <= stubLegMaxMeters ||
-                step.edge.distanceMeters <= stubLegMaxMeters
-            // Never merge across a destination: its name is what the user is
-            // told to walk toward, and passing one silently loses that cue.
-            if hasStub, turn <= stubLegMergeMaxTurnDegrees, previous.to.kind != .destination {
+            if canMerge(previous, step) {
                 shaped[shaped.count - 1] = Self.mergedStep(previous, step)
             } else {
                 shaped.append(step)
@@ -4767,16 +4873,24 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         var droppedLeadingStub = false
+        var startNodeName: String?
         if allowLeadingStubDrop,
            shaped.count >= 2,
            let first = shaped.first,
            first.edge.distanceMeters <= stubLegMaxMeters {
             // Mirror case: the user is standing at the shelf they mapped and
-            // the stub is the hop back into the aisle. Only drop it when they
-            // are already beside the next leg — a stub that runs back along
-            // that leg's axis is real walking and has to stay.
+            // the stub is the hop back into the aisle. Only drop it when where
+            // they stand is somewhere the navigator would call on-route anyway
+            // — dropping a stub that leaves them outside the corridor opens
+            // guidance already in recovery, and a stub running back along the
+            // next leg's own axis is real walking that has to stay. The bound
+            // is the corridor width the rest of the system measures against,
+            // not a number of its own.
             let offset = Self.projectDetailed(first.from.point, onto: shaped[1]).crossTrackMeters
-            if offset <= leadingStubDropMaxCrossTrackMeters {
+            if offset <= crossTrackRecoveryThreshold {
+                // They are still standing at the shelf, whatever the route now
+                // starts from: "Starting at Onions", not "at Left turn 4".
+                startNodeName = first.from.name
                 shaped.removeFirst()
                 droppedLeadingStub = true
             }
@@ -4785,8 +4899,43 @@ final class SemanticRouteNavigator: ObservableObject {
         return ShapedRoute(
             steps: shaped,
             arrivalFacing: arrivalFacing,
+            startNodeName: startNodeName,
             droppedLeadingStub: droppedLeadingStub
         )
+    }
+
+    /// A node only earns a leg boundary if it is a decision point. When the
+    /// bearing barely changes and the mapper marked no turn there, the two legs
+    /// are one straight walk, and splitting them just adds a "continue
+    /// straight" nobody needed plus a fresh chance to re-cue an alignment.
+    ///
+    /// Deliberately not a length rule: the first field map's shelf stub was
+    /// 1.4 m and the next capture of the same aisle measured 1.6 m, so any
+    /// threshold sits right where the data does. Collinearity is what actually
+    /// defines the artefact.
+    private func canMerge(_ first: SemanticRouteStep, _ second: SemanticRouteStep) -> Bool {
+        // Never merge across a destination: its name is what the user is told
+        // to walk toward, and passing one silently loses that cue.
+        guard first.to.kind != .destination else { return false }
+        // A hint recorded at the node means the mapper called it a turn, even
+        // if the geometry looks mild. Their judgement wins.
+        if let hint = first.to.turnHint, hint != .straight { return false }
+        let turn = abs(SemanticRouteMath.signedAngleDifference(
+            second.edge.bearingDegrees,
+            first.edge.bearingDegrees
+        ))
+        guard turn <= mergeMaxTurnDegrees else { return false }
+        // Merging replaces the bend with its chord, and every projection gate
+        // downstream measures cross-track against that line. Keep the folded
+        // node close enough to it that a keyframe captured at the bend still
+        // lands on the merged step.
+        let offset = Self.project(
+            first.to.point,
+            from: first.from.point,
+            to: second.to.point,
+            distance: first.from.point.distance(to: second.to.point)
+        ).crossTrackMeters
+        return offset <= mergeMaxChordOffsetMeters
     }
 
     /// Folds two consecutive steps into one straight leg. The merged edge gets

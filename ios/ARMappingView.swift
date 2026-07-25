@@ -154,21 +154,19 @@ struct ARMappingView: View {
     /// started, so the route was resolved from a stale pose. Re-resolve the
     /// whole route from the corrected pose rather than letting the user walk
     /// a path built for somewhere they were never standing.
+    ///
+    /// A realignment, not a restart: `startNavigation` here re-announced the
+    /// journey from the top every time ARKit nudged the pose, and each
+    /// re-resolve could pick a different start edge and so a different turn.
     private func handleLocalizationRevisionChanged() {
-        guard didStartAutomatedGuidance || semanticNavigator.phase == .navigating
+        guard semanticNavigator.phase == .navigating
                 || semanticNavigator.phase == .recovering else {
             return
         }
-        guard let target = automatedTargetName ?? semanticNavigator.targetName.nilIfRouteBlank else { return }
-        semanticNavigator.startNavigation(
-            to: target,
+        semanticNavigator.realignRouteToCorrectedPose(
             arPosition: mappingManager.cameraMapPosition,
             imuState: sensorManager.imuState,
-            activeARWorldMapID: mappingManager.activeMapID,
-            speakLandmarks: launchSpeakLandmarks,
-            errorRecovery: launchErrorRecovery,
-            clockFaceDirections: launchClockFaceDirections,
-            arHeading: mappingManager.arHeadingDegrees
+            heading: mappingManager.arHeadingDegrees
         )
     }
 

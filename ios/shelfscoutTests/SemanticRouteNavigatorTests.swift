@@ -650,6 +650,8 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // not walk a metre into it.
         XCTAssertTrue(navigator.currentInstruction.contains("Turn left to face the route."))
         XCTAssertFalse(navigator.currentInstruction.contains("less than one meter"))
+        // The dropped stub must not move where the user is told they are.
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Starting at Onions."))
     }
 
     func testArrivalSpeaksWhichWayTheShelfIs() {
@@ -695,6 +697,100 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertFalse(navigator.currentInstruction.contains("Straight point"))
     }
 
+    func testPoseCorrectionRealignsTheRouteInsteadOfRestartingIt() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 218),
+            speakLandmarks: false,
+            arHeading: 218
+        ))
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Starting at"))
+
+        // ARKit finishes aligning to the saved map: the user was really 8 m
+        // along, not at the route start.
+        navigator.speechCue = nil
+        XCTAssertTrue(navigator.realignRouteToCorrectedPose(
+            arPosition: simd_float3(-3.37, 0, 4.35),
+            imuState: Self.imu(bearing: 132),
+            heading: 132
+        ))
+
+        // One correction cue, not a fresh journey announcement — restarting
+        // re-resolves the start edge and can speak a different turn each time.
+        XCTAssertFalse(navigator.currentInstruction.hasPrefix("Starting at"))
+        XCTAssertEqual(navigator.speechCue?.text, navigator.currentInstruction)
+        // Re-resolved from where they actually are, not from the route start.
+        XCTAssertNotEqual(navigator.routeSteps.first?.from.name, "Cereals")
+
+        // ARKit keeps nudging the pose; that must not re-resolve the route
+        // again while the user is acting on the cue they just heard.
+        navigator.speechCue = nil
+        XCTAssertFalse(navigator.realignRouteToCorrectedPose(
+            arPosition: simd_float3(-3.37, 0, 4.35),
+            imuState: Self.imu(bearing: 132),
+            heading: 132
+        ))
+        XCTAssertNil(navigator.speechCue)
+    }
+
+    func testStraightPointMergesOnCollinearityNotLength() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.narrowAisleStartMap()])
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 0, bearing: 233),
+            speakLandmarks: false,
+            arHeading: 233
+        ))
+
+        // The straight point sits 1.6 m in — longer than any stub threshold,
+        // and still not a decision point. Re-capturing the same aisle moves
+        // that number around, so the rule cannot depend on it.
+        XCTAssertEqual(navigator.routeSteps.count, 2)
+        XCTAssertEqual(navigator.routeSteps.first?.to.name, "Left turn 2")
+        XCTAssertEqual(navigator.routeSteps.first?.edge.distanceMeters ?? 0, 5.6, accuracy: 0.1)
+    }
+
+    func testTurningUserIsNotBuriedInContradictoryAlignmentCues() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()])
+
+        // Standing at Cereals facing the shelf: the route runs behind them.
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 0, bearing: 51),
+            speakLandmarks: false,
+            arHeading: 51
+        ))
+        XCTAssertTrue(navigator.currentInstruction.contains("face the route"))
+
+        navigator.speechCue = nil
+        navigator.update(
+            imuState: Self.imu(x: 0, y: 0, bearing: 51),
+            arPosition: nil,
+            arHeading: 51,
+            arLocalized: false
+        )
+        XCTAssertNil(navigator.speechCue, "the opening cue must not be spoken again a tick later")
+
+        // Part-way round the turn the band changes from "turn around" to
+        // "turn sharp left". Announcing that crossing is what stacked three
+        // contradicting instructions on top of each other in the store.
+        navigator.update(
+            imuState: Self.imu(x: 0, y: 0, bearing: 120),
+            arPosition: nil,
+            arHeading: 120,
+            arLocalized: false
+        )
+        XCTAssertNil(navigator.speechCue, "a user already turning must not be re-cued")
+    }
+
     func testReturnJourneyMirrorsTurnHintsRecordedOnTheWayOut() {
         let navigator = SemanticRouteNavigator()
         navigator.replaceMapsForTesting([Self.igaMap()])
@@ -721,6 +817,28 @@ final class SemanticRouteNavigatorTests: XCTestCase {
 
         XCTAssertEqual(navigator.currentStepIndex, 1)
         XCTAssertTrue(navigator.currentInstruction.hasPrefix("Turn left."))
+    }
+
+    /// The July 25 evening re-capture of the same aisle, where the straight
+    /// point landed 1.6 m from the shelf instead of 1.4 m.
+    private static func narrowAisleStartMap() -> SemanticRouteMap {
+        let cereals = node(id: "cereals", name: "Cereals", point: SemanticRoutePoint(x: 0, y: 0), kind: .destination)
+        let straight = node(
+            id: "straight1",
+            name: "Straight point 1",
+            point: SemanticRoutePoint(x: -1.28, y: -0.96),
+            kind: .waypoint,
+            turnHint: .straight
+        )
+        let left2 = node(
+            id: "left2",
+            name: "Left turn 2",
+            point: SemanticRoutePoint(x: -4.34, y: -3.53),
+            kind: .intersection,
+            turnHint: .left
+        )
+        let onions = node(id: "onions", name: "Onions", point: SemanticRoutePoint(x: 0.30, y: -9.92), kind: .destination)
+        return map(id: "narrow-aisle", coordinateSpace: "pdr_xy", nodes: [cereals, straight, left2, onions])
     }
 
     /// The July 25 IGA capture: two shelf destinations joined by a zig-zag of

@@ -39,7 +39,15 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// `postLocalizationJumpMeters` shortly after localization — ARKit
     /// finishing its real world-map alignment after a premature `.normal`.
     /// Observers must re-resolve anything derived from the earlier pose.
+    ///
+    /// At most ONCE per relocalization. ARKit refines its alignment several
+    /// times over the first seconds, and every bump used to re-resolve the
+    /// whole route from a different pose — which changed the resolved start
+    /// edge, and therefore the spoken turn, several times in a row right as
+    /// the user was being oriented. Ongoing drift after the first correction
+    /// belongs to the navigator's own recovery path, not to a route rebuild.
     @Published private(set) var localizationRevision = 0
+    private var didReportLocalizationJump = false
     /// Per-POI count of saved feature points within `poiRelocalizationRadiusMeters`,
     /// measured at the last save. These POIs (route start + destinations) are the
     /// spots a journey begins from; a low count predicts the cold-start "pan
@@ -915,6 +923,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         arHeadingDegrees = arHeading
         previousPublishedPosition = cameraPosition
         localizedAt = Date()
+        didReportLocalizationJump = false
         isLocalized = true
         statusMessage = "Localized against saved map."
         // Relocalization is done, so the mapping features that were held back to
@@ -931,12 +940,14 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             return
         }
         defer { previousPublishedPosition = cameraPosition }
-        guard let localizedAt,
+        guard !didReportLocalizationJump,
+              let localizedAt,
               Date().timeIntervalSince(localizedAt) <= postLocalizationJumpWindowSeconds,
               let previous = previousPublishedPosition,
               simd_distance(previous, cameraPosition) > postLocalizationJumpMeters else {
             return
         }
+        didReportLocalizationJump = true
         localizationRevision += 1
         statusMessage = "Map alignment corrected."
     }
