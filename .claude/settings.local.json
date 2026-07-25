@@ -69,7 +69,10 @@
       "Bash(dig +short central.sonatype.com)",
       "Bash(scutil --dns)",
       "Bash(curl -sI --max-time 5 https://central.sonatype.com)",
-      "Bash(bundle exec *)"
+      "Bash(bundle exec *)",
+      "Bash(xcrun --show-sdk-path --sdk iphonesimulator)",
+      "Bash(grep -E 'warning:' /tmp/tc.log)",
+      "Read(//private/tmp/**)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

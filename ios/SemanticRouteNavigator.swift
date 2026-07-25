@@ -436,16 +436,33 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastRouteRebuildAttemptAt: Date?
     private var stillnessStartedAt: Date?
     private var lastStillnessRepromptAt: Date?
+    /// When the user first stopped moving while standing near the destination —
+    /// the fallback that completes the route when the tight arrival window can't
+    /// be satisfied after a sharp turn into a short final segment.
+    private var destinationStillnessSince: Date?
     private var pendingAlignmentResumeCue = false
     private var didRebuildRouteThisUpdate = false
     private var turnPhrasing: SemanticTurnPhrasing = .leftRight
-    private var enrichmentVisitedDwellNodeIDs: Set<String> = []
+    /// Heading buckets faced while standing at an endpoint (destination or start),
+    /// keyed by node id. A near-full set means the user turned a circle there,
+    /// banking the all-direction features cold-start relocalization needs — the
+    /// fix for the "pan around then time out" stall when a later journey starts
+    /// from this spot.
+    private var anchoringHeadingBuckets: [String: Set<Int>] = [:]
+    /// Endpoints already prompted to anchor this capture/enrichment session.
+    private var anchoringPromptedNodeIDs: Set<String> = []
+    /// Endpoints that reached `anchoringRequiredBuckets` this session.
+    private var anchoredNodeIDs: Set<String> = []
     private var lastEnrichmentSampledPoint: SemanticRoutePoint?
     private var lastEnrichmentSampledHeading: Double?
     private var lastEnrichmentSampledAt: Date?
 
     private let arrivalThresholdMeters = 0.55
     private let destinationProximityMeters = 0.75
+    /// Stillness-fallback arrival: near the destination and stopped this long
+    /// completes the route even when the strict arrival window can't be met.
+    private let destinationStillnessRadiusMeters = 0.9
+    private let destinationStillnessArrivalSeconds: TimeInterval = 2.0
     private let turnAnnouncementThresholdMeters = 0.75
     private let crossTrackRecoveryThreshold = 1.35
     private let recoverySnapThreshold = 1.15
@@ -562,6 +579,12 @@ final class SemanticRouteNavigator: ObservableObject {
     /// side room must not pollute the route's visual evidence.
     private let enrichmentMaxCrossTrackMeters = 2.0
     private let enrichmentDwellPromptRadiusMeters = 1.6
+    /// Endpoint anchoring (deliberate turn-in-place). Heading is quantized into
+    /// `360 / anchoringBucketDegrees` buckets; covering `anchoringRequiredBuckets`
+    /// of them near an endpoint counts as a full-enough sweep.
+    private let anchoringBucketDegrees = 30.0
+    private let anchoringRequiredBuckets = 9   // ~270° of a 360° sweep
+    private let anchoringPromptRadiusMeters = 1.6
 
     private typealias RouteProjection = (
         alongTrackMeters: Double,
@@ -858,6 +881,7 @@ final class SemanticRouteNavigator: ObservableObject {
         capturedDestinationCount = 0
         capturedDistanceMeters = 0
         currentSegmentDraftMeters = 0
+        resetEndpointAnchoring()
         mappingQualityText = "Mark Point A"
         stopNavigation(resetInstruction: false)
         phase = .mapping
@@ -882,6 +906,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastAutoSampledHeading = nil
         lastAutoSampledAt = nil
         currentSegmentDraftMeters = 0
+        resetEndpointAnchoring()
         refreshCaptureMetrics(for: existing)
         phase = .mapping
         mappingQualityText = "Extending \(existing.name)"
@@ -904,7 +929,7 @@ final class SemanticRouteNavigator: ObservableObject {
         activeMap = existing
         activeMapDraft = existing
         enrichmentKeyframesAdded = 0
-        enrichmentVisitedDwellNodeIDs.removeAll()
+        resetEndpointAnchoring()
         lastEnrichmentSampledPoint = nil
         lastEnrichmentSampledHeading = nil
         lastEnrichmentSampledAt = nil
@@ -942,7 +967,7 @@ final class SemanticRouteNavigator: ObservableObject {
         activeMapDraft = nil
         activeMap = maps.first(where: { $0.id == activeMap?.id }) ?? activeMap
         enrichmentKeyframesAdded = 0
-        enrichmentVisitedDwellNodeIDs.removeAll()
+        resetEndpointAnchoring()
         phase = activeMap == nil ? .idle : .ready
         currentInstruction = "Map improvement cancelled."
         rebuildRAGContext()
@@ -1868,6 +1893,33 @@ final class SemanticRouteNavigator: ObservableObject {
             evidenceSummary: routeBeliefState.evidenceSummary
         )
 
+        // ── Stillness-fallback arrival ───────────────────────────────
+        // A sharp turn into a short final segment can leave the AR pose just
+        // outside even the widened arrival window while the user is physically
+        // standing at the target. If they are near the destination and have
+        // stopped moving, complete the route rather than leaving them waiting on
+        // a cue that never comes.
+        if currentStepIndex >= routeSteps.count - 1,
+           arLocalized,
+           let stillPoint = arPoint,
+           stillPoint.distance(to: step.to.point) <= destinationStillnessRadiusMeters {
+            if imuState.isMoving {
+                destinationStillnessSince = nil
+            } else {
+                let now = Date()
+                let since = destinationStillnessSince ?? now
+                destinationStillnessSince = since
+                if now.timeIntervalSince(since) >= destinationStillnessArrivalSeconds {
+                    destinationStillnessSince = nil
+                    advanceStepOrArrive()
+                    rebuildRAGContext()
+                    return
+                }
+            }
+        } else {
+            destinationStillnessSince = nil
+        }
+
         // ── Destination proximity check ──────────────────────────────
         // Runs before the belief hold on purpose: standing at the target
         // with ambiguous evidence must still complete the route instead of
@@ -2116,6 +2168,11 @@ final class SemanticRouteNavigator: ObservableObject {
         let now = Date()
         let heading = arHeading ?? lastAutoSampledHeading ?? 0
 
+        // Coach the endpoint anchor whenever the user is standing at a start or
+        // destination during capture — the last 0.6 m into a destination banks
+        // too few features on its own to cold-relocalize from later.
+        updateEndpointAnchoring(at: pose, heading: arHeading, in: workingMap)
+
         if workingMap.nodes.isEmpty {
             mappingQualityText = "Ready for Point A"
             currentInstruction = "Mark Point A before walking."
@@ -2194,7 +2251,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let now = Date()
         let heading = arHeading ?? lastEnrichmentSampledHeading
-        promptEnrichmentDwellIfNeeded(at: pose, in: workingMap)
+        updateEndpointAnchoring(at: pose, heading: arHeading, in: workingMap)
 
         let movedMeters = lastEnrichmentSampledPoint.map { pose.distance(to: $0) } ?? .greatestFiniteMagnitude
         let turnedDegrees: Double = {
@@ -2236,21 +2293,57 @@ final class SemanticRouteNavigator: ObservableObject {
         )
     }
 
-    /// Speaks the turn-in-place prompt once per destination per walk. These
-    /// are the spots a later journey starts from, so all-direction coverage
-    /// here is what removes the cold-start relocalization stall.
-    private func promptEnrichmentDwellIfNeeded(at pose: SemanticRoutePoint, in map: SemanticRouteMap) {
-        let dwellKinds: Set<SemanticRouteNodeKind> = [.destination, .entrance]
+    /// Drives the deliberate turn-in-place anchor at an endpoint (destination or
+    /// route start). Standing there and sweeping the phone through a full circle
+    /// banks features from every direction — the fix for the cold-start "pan
+    /// around then time out" stall a later journey hits when it begins from this
+    /// spot. Tracks which heading buckets have been covered, prompts once on
+    /// arrival, and announces completion. Runs during both initial capture and
+    /// the enrichment walk; only the endpoint kinds get anchored, never turns.
+    private func updateEndpointAnchoring(at pose: SemanticRoutePoint, heading: Double?, in map: SemanticRouteMap) {
+        let anchorKinds: Set<SemanticRouteNodeKind> = [.destination, .entrance]
         guard let node = map.nodes
-            .filter({ dwellKinds.contains($0.kind) })
+            .filter({ anchorKinds.contains($0.kind) })
             .min(by: { $0.point.distance(to: pose) < $1.point.distance(to: pose) }),
-              node.point.distance(to: pose) <= enrichmentDwellPromptRadiusMeters,
-              !enrichmentVisitedDwellNodeIDs.contains(node.id) else {
+              node.point.distance(to: pose) <= anchoringPromptRadiusMeters,
+              !anchoredNodeIDs.contains(node.id) else {
             return
         }
-        enrichmentVisitedDwellNodeIDs.insert(node.id)
-        currentInstruction = NavLoc.enrichmentDwellPrompt(node.name)
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+
+        // Prompt the sweep the first time we stand at this endpoint.
+        if !anchoringPromptedNodeIDs.contains(node.id) {
+            anchoringPromptedNodeIDs.insert(node.id)
+            currentInstruction = NavLoc.anchorEndpointPrompt(node.name)
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        }
+
+        guard let heading else { return }
+        let normalizedHeading = (heading.truncatingRemainder(dividingBy: 360) + 360)
+            .truncatingRemainder(dividingBy: 360)
+        let bucket = Int(normalizedHeading / anchoringBucketDegrees)
+        var buckets = anchoringHeadingBuckets[node.id] ?? []
+        let addedBucket = buckets.insert(bucket).inserted
+        anchoringHeadingBuckets[node.id] = buckets
+
+        if buckets.count >= anchoringRequiredBuckets {
+            anchoredNodeIDs.insert(node.id)
+            currentInstruction = NavLoc.anchorEndpointComplete(node.name)
+            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+        } else if addedBucket {
+            mappingQualityText = NavLoc.anchorEndpointProgress(
+                node.name,
+                covered: buckets.count,
+                required: anchoringRequiredBuckets
+            )
+        }
+    }
+
+    /// Clears per-session anchoring progress at the start of a capture or an
+    /// enrichment walk so each pass coaches the sweep afresh.
+    private func resetEndpointAnchoring() {
+        anchoringHeadingBuckets.removeAll()
+        anchoringPromptedNodeIDs.removeAll()
+        anchoredNodeIDs.removeAll()
     }
 
     private func ensureDestinationNode(
@@ -3026,7 +3119,12 @@ final class SemanticRouteNavigator: ObservableObject {
     }
 
     private func destinationArrivalRadiusMeters(for step: SemanticRouteStep) -> Double {
-        min(destinationProximityMeters, max(0.24, step.edge.distanceMeters * 0.30))
+        // Floor kept at 0.45 m, not 0.24 m: a short final segment (e.g. 0.6 m
+        // right after a sharp turn) collapses the scaled radius so tight that the
+        // AR pose at the user's real stopping point — after 50 m of accumulated
+        // drift — never lands inside it, and "arrived" never fires. Only affects
+        // destination arrival; mid-route turns use nodeArrivalRadiusMeters.
+        min(destinationProximityMeters, max(0.45, step.edge.distanceMeters * 0.30))
     }
 
     private func stepCompletionWindowMeters(for step: SemanticRouteStep) -> Double {

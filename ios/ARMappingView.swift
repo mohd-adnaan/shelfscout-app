@@ -1187,6 +1187,10 @@ struct ARMappingView: View {
                     }
                 }
             }
+
+            if !mappingManager.poiRelocalizationCounts.isEmpty {
+                anchorStatusRow
+            }
         }
         .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1195,6 +1199,51 @@ struct ARMappingView: View {
             RoundedRectangle(cornerRadius: 8)
                 .stroke(Color.white.opacity(0.12), lineWidth: 1)
         )
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+    }
+
+    /// Per-endpoint feature density behind the save-time relocalization gate.
+    /// A weak (orange) POI is the one that will stall on "pan around" when a
+    /// journey later starts from it — anchor it and re-save.
+    private var anchorStatusRow: some View {
+        let counts = mappingManager.poiRelocalizationCounts
+        let weak = Set(mappingManager.weakRelocalizationPOIs)
+        return VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 4) {
+                Image(systemName: weak.isEmpty ? "checkmark.seal.fill" : "exclamationmark.triangle.fill")
+                    .font(.caption2)
+                    .foregroundColor(weak.isEmpty ? .green.opacity(0.85) : .orange)
+                Text(weak.isEmpty
+                     ? "Endpoints anchored for relocalization"
+                     : "Weak anchor — stand there, turn a full circle, then re-save")
+                    .font(.caption2.weight(.medium))
+                    .foregroundColor(.white.opacity(0.72))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.72)
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 8) {
+                    ForEach(counts.sorted(by: { $0.key < $1.key }), id: \.key) { entry in
+                        anchorPill(name: entry.key, count: entry.value, isWeak: weak.contains(entry.key))
+                    }
+                }
+            }
+        }
+    }
+
+    private func anchorPill(name: String, count: Int, isWeak: Bool) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(name)
+                .font(.caption2.weight(.semibold))
+                .lineLimit(1)
+                .minimumScaleFactor(0.78)
+            Text("\(count) pts")
+                .font(.system(.caption2, design: .monospaced).weight(.semibold))
+        }
+        .foregroundColor(isWeak ? .orange : .white.opacity(0.82))
+        .padding(.vertical, 6)
+        .padding(.horizontal, 8)
+        .background((isWeak ? Color.orange : Color.white).opacity(isWeak ? 0.16 : 0.08))
         .clipShape(RoundedRectangle(cornerRadius: 8))
     }
 

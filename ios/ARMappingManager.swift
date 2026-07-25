@@ -40,7 +40,17 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// finishing its real world-map alignment after a premature `.normal`.
     /// Observers must re-resolve anything derived from the earlier pose.
     @Published private(set) var localizationRevision = 0
-    
+    /// Per-POI count of saved feature points within `poiRelocalizationRadiusMeters`,
+    /// measured at the last save. These POIs (route start + destinations) are the
+    /// spots a journey begins from; a low count predicts the cold-start "pan
+    /// around then time out" relocalization stall there. Keyframe coverage in the
+    /// route report does NOT measure this — that is a different layer.
+    @Published private(set) var poiRelocalizationCounts: [String: Int] = [:]
+    /// Pinned POIs whose feature density fell below the gate at the last save.
+    /// Non-empty ⇒ the last plain `saveMap()` was blocked; `saveMap(force: true)`
+    /// overrides.
+    @Published private(set) var weakRelocalizationPOIs: [String] = []
+
     let session = ARSession()
     private let sessionDelegateQueue = DispatchQueue(label: "placefinder.arkit.mapping.session", qos: .userInitiated)
     private let poiRecordsQueue = DispatchQueue(label: "placefinder.arkit.mapping.poi-records", attributes: .concurrent)
@@ -82,6 +92,16 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private let poseBeliefMinimumAcceptanceConfidence: Float = 0.84
     private let poseBeliefMaximumCandidates = 6
     private let maxInspectableFeaturePoints = 1800
+    /// Radius around a pinned POI within which saved feature points count toward
+    /// cold-start relocalizability.
+    private let poiRelocalizationRadiusMeters: Float = 1.6
+    /// Minimum saved feature points within that radius for a POI to be treated as
+    /// reliably relocalizable. A rushed pass-through (e.g. the last 0.6 m into a
+    /// destination) banks far fewer than a deliberate turn-in-place anchor, so a
+    /// POI below this floor is the one that stalls on "pan around" later.
+    /// Conservative on purpose — measured counts surface in the inspector so the
+    /// floor can be tuned against real maps.
+    private let minPOIRelocalizationFeatures = 45
     private let imuMotionMinimumSteps = 2
     private let imuMotionMinimumDistance: Float = 0.8
     private let imuMotionDirectionMinimumDistance: Float = 1.15
@@ -215,11 +235,27 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 }
                 return
             }
-            
+
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let loadedPOIs = self.deduplicatedPOIs(self.extractPOIs(from: map))
                     let featureSnapshot = self.sampledFeaturePoints(from: map.rawFeaturePoints)
+
+                    // Relocalization advisory (NEVER blocks the save): journeys
+                    // start at these POIs and ARKit cold-relocalizes best where the
+                    // feature cloud is dense, so a thin endpoint is flagged for
+                    // re-anchoring — but the ARWorldMap is always written. Blocking
+                    // here once orphaned the map: the semantic layer saves first in
+                    // saveSemanticWalkthrough, so a blocked save left a perfect route
+                    // report sitting on a map that had no world map to relocalize.
+                    let relocalizationCounts = self.poiFeatureDensity(
+                        pois: loadedPOIs.map { (name: $0.name, position: $0.position) },
+                        cloud: map.rawFeaturePoints
+                    )
+                    let weak = relocalizationCounts
+                        .filter { $0.value < self.minPOIRelocalizationFeatures }
+                        .keys.sorted()
+
                     let recordsByName = Dictionary(uniqueKeysWithValues: recordsSnapshot.map { ($0.name, $0) })
                     let storedPOIs = loadedPOIs.map { poi in
                         ARStoredPOI(
@@ -247,9 +283,14 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                         self.selectedMapID = metadata.id
                         self.mapFeaturePoints = featureSnapshot.points
                         self.mapFeaturePointCount = featureSnapshot.totalCount
+                        self.poiRelocalizationCounts = relocalizationCounts
+                        self.weakRelocalizationPOIs = weak
                         self.refreshPOIInspectionList()
                         self.refreshSavedMaps()
-                        self.statusMessage = "Saved \(metadata.name) with \(metadata.pois.count) POIs."
+                        let weakNote = weak.isEmpty
+                            ? ""
+                            : " \(self.listPhrase(weak)) weakly anchored — re-anchor for reliable relocalization from there."
+                        self.statusMessage = "Saved \(metadata.name) with \(metadata.pois.count) POIs.\(weakNote)"
                     }
                 } catch {
                     DispatchQueue.main.async {
@@ -1152,6 +1193,38 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         }
 
         return (sampledPoints, totalCount)
+    }
+
+    /// Counts saved feature points within `poiRelocalizationRadiusMeters` of each
+    /// pinned POI — the cold-start relocalizability proxy the keyframe report
+    /// cannot see. Runs over the full cloud (not the render-sampled subset) for an
+    /// honest count; called once per save on a background queue.
+    private func poiFeatureDensity(
+        pois: [(name: String, position: simd_float3)],
+        cloud: ARPointCloud?
+    ) -> [String: Int] {
+        guard let cloud, !pois.isEmpty else { return [:] }
+        let points = cloud.points
+        let radiusSquared = poiRelocalizationRadiusMeters * poiRelocalizationRadiusMeters
+        var counts: [String: Int] = [:]
+        for poi in pois {
+            var nearby = 0
+            for point in points where simd_distance_squared(point, poi.position) <= radiusSquared {
+                nearby += 1
+            }
+            counts[poi.name] = max(counts[poi.name] ?? 0, nearby)
+        }
+        return counts
+    }
+
+    /// "A", "A and B", "A, B, and C".
+    private func listPhrase(_ names: [String]) -> String {
+        switch names.count {
+        case 0: return ""
+        case 1: return names[0]
+        case 2: return "\(names[0]) and \(names[1])"
+        default: return names.dropLast().joined(separator: ", ") + ", and " + names[names.count - 1]
+        }
     }
 
     private func currentIMUMotion() -> ARIMUMotionState? {

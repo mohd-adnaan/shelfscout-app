@@ -518,6 +518,27 @@ enum NavLoc {
         }
     }
 
+    static func anchorEndpointPrompt(_ nodeName: String) -> String {
+        switch lang {
+        case .en: return "You're at \(nodeName). Anchor it — hold the phone up and turn a slow full circle so this spot can be found again from any direction."
+        case .fr: return "Vous êtes à \(nodeName). Ancrez ce point : tenez le téléphone levé et faites lentement un tour complet pour que cet endroit soit reconnu depuis n'importe quelle direction."
+        }
+    }
+
+    static func anchorEndpointProgress(_ nodeName: String, covered: Int, required: Int) -> String {
+        switch lang {
+        case .en: return "Anchoring \(nodeName): keep turning (\(covered) of \(required))."
+        case .fr: return "Ancrage de \(nodeName) : continuez à tourner (\(covered) sur \(required))."
+        }
+    }
+
+    static func anchorEndpointComplete(_ nodeName: String) -> String {
+        switch lang {
+        case .en: return "\(nodeName) anchored."
+        case .fr: return "\(nodeName) ancré."
+        }
+    }
+
     // ── Status prefixes ─────────────────────────────────────────────────────
 
     static func trackingLimitedPrefix() -> String {
