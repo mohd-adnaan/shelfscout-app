@@ -170,7 +170,9 @@ extension ReachingViewController {
 
     switch frame.camera.trackingState {
     case .normal:
-      break
+      // Relocalization landed; restore the mapping features that were held back
+      // to get here quickly (surface snap and extent refinement need them).
+      upgradeToFullFidelityAfterRelocalization()
     default:
       speakSpatialTargetRelocalizationCueIfNeeded()
       if arFrameCount % 30 == 0 {

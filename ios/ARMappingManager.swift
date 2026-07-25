@@ -50,6 +50,11 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// Non-empty ⇒ the last plain `saveMap()` was blocked; `saveMap(force: true)`
     /// overrides.
     @Published private(set) var weakRelocalizationPOIs: [String] = []
+    /// Place the camera visually recognizes while ARKit is still relocalizing.
+    /// Image-fingerprint matching is pose-independent, so it can name where the
+    /// user is standing seconds before the world map matches — that is what the
+    /// waiting user hears instead of a blind "keep panning".
+    @Published private(set) var recognizedPlaceName: String?
 
     let session = ARSession()
     private let sessionDelegateQueue = DispatchQueue(label: "placefinder.arkit.mapping.session", qos: .userInitiated)
@@ -118,6 +123,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private let relocalizationStatusFallbackSeconds: TimeInterval = 2.7
     private let postLocalizationJumpMeters: Float = 1.5
     private let postLocalizationJumpWindowSeconds: TimeInterval = 30
+    /// True once the lean relocalization config has been swapped back to the
+    /// full mapping config for this session.
+    private var didUpgradeSessionFidelity = false
     private var relocalizationNormalSince: Date?
     private var preLocalizationPosition: simd_float3?
     private var previousPublishedPosition: simd_float3?
@@ -370,7 +378,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                         ? "Map loaded. No POIs are pinned yet."
                         : "Map loaded with \(loadedPOIs.count) POIs."
 
-                    let config = self.makeWorldTrackingConfiguration(initialWorldMap: map)
+                    self.didUpgradeSessionFidelity = false
+                    let config = self.makeWorldTrackingConfiguration(initialWorldMap: map, lightweight: true)
                     self.session.run(config, options: [.resetTracking, .removeExistingAnchors])
                 }
             } catch {
@@ -702,7 +711,12 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             capturedImage: frame.capturedImage,
             timestamp: currentTime
         )
-        
+        // Read on the session queue, where visualPOIMatches just wrote it. This
+        // is the pose-independent half of the match, so it stays meaningful
+        // while the world-map pose is still garbage.
+        let visuallyRecognizedPlace = lastVisualMatchResult?.match?.name
+
+
         let x = transform.columns.3.x
         let z = transform.columns.3.z
 
@@ -723,7 +737,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 self.mapFeaturePointCount = liveFeatureSnapshot.totalCount
             }
             self.localizationCandidates = poiMatchResult.candidates
-            
+            self.recognizedPlaceName = self.isLocalized ? nil : visuallyRecognizedPlace
+
+
             if self.isLocalized {
                 if let match = poiMatchResult.match {
                     self.closestPOI = match.name
@@ -834,6 +850,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         localizedAt = Date()
         isLocalized = true
         statusMessage = "Localized against saved map."
+        // Relocalization is done, so the mapping features that were held back to
+        // keep the match fast can come back on now.
+        upgradeSessionToFullFidelity()
     }
 
     /// A large pose jump shortly after localization is ARKit correcting a
@@ -891,7 +910,16 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         return paths[0]
     }
 
-    private func makeWorldTrackingConfiguration(initialWorldMap: ARWorldMap? = nil) -> ARWorldTrackingConfiguration {
+    /// `lightweight` strips everything ARKit does NOT need in order to match the
+    /// saved feature cloud: scene mesh reconstruction, plane detection and scene
+    /// depth all run per frame and compete with relocalization for the same CPU/
+    /// GPU budget, which is why a large store map could sit on "pan around" for
+    /// tens of seconds. Relocalize lean, then `upgradeSessionToFullFidelity()`
+    /// turns the mapping features back on once tracking is established.
+    private func makeWorldTrackingConfiguration(
+        initialWorldMap: ARWorldMap? = nil,
+        lightweight: Bool = false
+    ) -> ARWorldTrackingConfiguration {
         let config = ARWorldTrackingConfiguration()
         config.initialWorldMap = initialWorldMap
         // Relocalizing to a saved map must use .gravity: with .gravityAndHeading
@@ -904,19 +932,36 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // heading-aligned from capture time. (Same rule as the reaching
         // session — see Reachingviewcontroller+ar.swift startAR.)
         config.worldAlignment = initialWorldMap != nil ? .gravity : .gravityAndHeading
-        config.planeDetection = [.horizontal, .vertical]
         config.environmentTexturing = .none
         config.isLightEstimationEnabled = false
         config.providesAudioData = false
         config.frameSemantics = []
-        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-            config.frameSemantics.insert(.sceneDepth)
-        }
-        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-            config.sceneReconstruction = .mesh
+        if lightweight {
+            config.planeDetection = []
+        } else {
+            config.planeDetection = [.horizontal, .vertical]
+            if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+                config.frameSemantics.insert(.sceneDepth)
+            }
+            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+                config.sceneReconstruction = .mesh
+            }
         }
         applyEfficientVideoFormat(to: config)
         return config
+    }
+
+    /// Re-enables plane detection, scene depth and mesh once relocalization has
+    /// succeeded. Runs WITHOUT reset options so ARKit keeps the tracking state
+    /// and restored map anchors it just worked to establish; `worldAlignment` is
+    /// pinned to the relocalized session's `.gravity` because changing alignment
+    /// mid-session would move the world origin out from under the route frame.
+    private func upgradeSessionToFullFidelity() {
+        guard !didUpgradeSessionFidelity else { return }
+        didUpgradeSessionFidelity = true
+        let config = makeWorldTrackingConfiguration()
+        config.worldAlignment = .gravity
+        session.run(config)
     }
 
     private func applyEfficientVideoFormat(to config: ARWorldTrackingConfiguration) {

@@ -464,14 +464,22 @@ struct ARMappingView: View {
         lastRelocalizationVoiceCueAt = now
         relocalizationVoiceCueCount += 1
 
+        // When the camera recognizes a mapped place, say so. The visual match is
+        // pose-independent and lands well before ARKit's world-map match, so this
+        // is the difference between "it knows where I am, keep going" and
+        // standing in a store being told to pan at nothing.
         let cue: String
-        switch relocalizationVoiceCueCount {
-        case 1:
-            cue = NavLoc.relocLoadingCue()
-        case 2:
-            cue = NavLoc.relocTurnFullCircleCue()
-        default:
-            cue = NavLoc.relocStepAndTurnCue()
+        if let recognized = mappingManager.recognizedPlaceName {
+            cue = NavLoc.relocRecognizedPlaceCue(recognized)
+        } else {
+            switch relocalizationVoiceCueCount {
+            case 1:
+                cue = NavLoc.relocLoadingCue()
+            case 2:
+                cue = NavLoc.relocTurnFullCircleCue()
+            default:
+                cue = NavLoc.relocStepAndTurnCue()
+            }
         }
         announceAutomatedStatus(cue)
     }

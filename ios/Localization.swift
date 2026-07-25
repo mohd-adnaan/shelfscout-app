@@ -518,6 +518,16 @@ enum NavLoc {
         }
     }
 
+    /// Spoken while ARKit is still matching the saved map but the camera has
+    /// already visually recognized a mapped place — tells the waiting user the
+    /// app knows roughly where they are instead of coaching a blind pan.
+    static func relocRecognizedPlaceCue(_ placeName: String) -> String {
+        switch lang {
+        case .en: return "I can see \(placeName). Keep turning slowly, lining up the map."
+        case .fr: return "Je reconnais \(placeName). Continuez à tourner lentement, alignement de la carte en cours."
+        }
+    }
+
     static func anchorEndpointPrompt(_ nodeName: String) -> String {
         switch lang {
         case .en: return "You're at \(nodeName). Anchor it — hold the phone up and turn a slow full circle so this spot can be found again from any direction."

@@ -281,6 +281,9 @@ class ReachingViewController: UIViewController {
   var arFrameCount = 0
   let anchorWaitFrames = 15
   var meshReconstructionEnabled = false
+  /// Set when the AR session started lean to speed up relocalization against a
+  /// saved map; cleared once the mapping features are switched back on.
+  var pendingFidelityUpgrade = false
   var lastFrameProcessedAt: TimeInterval = 0
   let frameProcessInterval: TimeInterval = 0.05
   /// Prevents ARFrame retention: skip new frames while visionQ is still processing

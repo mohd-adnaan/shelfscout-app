@@ -39,24 +39,36 @@ extension ReachingViewController {
     } else {
       config.worldAlignment = .gravityAndHeading
     }
-    config.planeDetection = [.horizontal, .vertical]
-
-    if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-      config.frameSemantics.insert(.sceneDepth)
-      hasLiDAR = true
+    hasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+    if hasLiDAR {
       NSLog("📷 [ReachingVC] ✅ LiDAR DETECTED (Pro device) — using LiDAR metric depth for anchor seeding")
       NSLog("📷 [ReachingVC] 🔬 Depth source: LiDAR sceneDepth (metric, no calibration needed)")
     } else {
-      hasLiDAR = false
       NSLog("📷 [ReachingVC] ❌ No LiDAR (non-Pro device) — using Qwen backend depth + ARKit raycast refinement")
       NSLog("📷 [ReachingVC] 🔬 Depth source: Qwen/backend relative depth → ARKit estimatedPlane refinement")
     }
-    if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-      config.sceneReconstruction = .mesh
-      meshReconstructionEnabled = true
-      NSLog("📷 [ReachingVC] Mesh reconstruction ENABLED")
+
+    // Relocalizing against a saved map is the slow, blocking step here: the
+    // target box cannot be placed until tracking reaches .normal. Plane
+    // detection, scene depth and mesh reconstruction all run per frame and
+    // compete with ARKit's feature matching for the same budget, so hold them
+    // back until relocalization lands (upgradeToFullFidelityAfterRelocalization)
+    // rather than making the user wait on "pan around" with no box.
+    if initialWorldMap != nil {
+      config.planeDetection = []
+      pendingFidelityUpgrade = true
     } else {
-      NSLog("📷 [ReachingVC] No mesh — using plane estimation + LiDAR fallback")
+      config.planeDetection = [.horizontal, .vertical]
+      if hasLiDAR {
+        config.frameSemantics.insert(.sceneDepth)
+      }
+      if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+        config.sceneReconstruction = .mesh
+        meshReconstructionEnabled = true
+        NSLog("📷 [ReachingVC] Mesh reconstruction ENABLED")
+      } else {
+        NSLog("📷 [ReachingVC] No mesh — using plane estimation + LiDAR fallback")
+      }
     }
 
     sceneView.session.run(config, options: [.resetTracking, .removeExistingAnchors])
@@ -69,6 +81,29 @@ extension ReachingViewController {
       NSLog("📷 [ReachingVC] AR session started — mode=%@ hasLiDAR=%@",
             mode.rawValue, hasLiDAR ? "YES" : "NO")
     }
+  }
+
+  /// Switches the lean relocalization session back to the full mapping feature
+  /// set once tracking is established. Runs WITHOUT reset options so the hard-won
+  /// relocalized tracking state and the restored POI anchors survive; the
+  /// `.gravity` alignment is preserved because changing it mid-session would
+  /// move the world origin the placed anchor is expressed in.
+  func upgradeToFullFidelityAfterRelocalization() {
+    guard pendingFidelityUpgrade else { return }
+    pendingFidelityUpgrade = false
+
+    let config = ARWorldTrackingConfiguration()
+    config.worldAlignment = .gravity
+    config.planeDetection = [.horizontal, .vertical]
+    if hasLiDAR {
+      config.frameSemantics.insert(.sceneDepth)
+    }
+    if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+      config.sceneReconstruction = .mesh
+      meshReconstructionEnabled = true
+    }
+    sceneView.session.run(config)
+    NSLog("📷 [ReachingVC] Relocalized — plane detection, depth and mesh re-enabled")
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
