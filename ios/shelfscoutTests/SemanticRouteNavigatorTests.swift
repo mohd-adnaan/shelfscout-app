@@ -819,6 +819,144 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertTrue(navigator.currentInstruction.hasPrefix("Turn left."))
     }
 
+    /// Walking is not evidence of being lost.
+    ///
+    /// Route evidence used to be bucketed by the progress it had when it was
+    /// captured, so a walking user's own trail spread across several buckets
+    /// and the ones far enough apart registered as rival claims about where
+    /// they were. At normal pace the status sat on "ambiguous" for the whole
+    /// leg, which put guidance into the belief hold ("Hold on. Pan the phone
+    /// slowly." / "Route lost.") and swallowed the turn cue at the end of it.
+    /// AR and PDR agreeing perfectly, on the mapped IGA route, must read as
+    /// locked the whole way down the leg.
+    func testWalkingALegDoesNotMakeTheUsersOwnTrailARivalPosition() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 218),
+            speakLandmarks: false,
+            arHeading: 218
+        ))
+
+        let leg = navigator.routeSteps[0]
+        XCTAssertEqual(leg.to.name, "Left turn 2")
+        let bearing = leg.edge.bearingDegrees
+        let radians = bearing * .pi / 180
+        // Stop short of the leg end so the assertion reads the belief while
+        // walking, not the reset that a step advance performs.
+        let stride = 0.275
+        let ticks = 14
+
+        for tick in 1...ticks {
+            let travelled = Double(tick) * stride
+            let x = sin(radians) * travelled
+            let y = cos(radians) * travelled
+            navigator.update(
+                imuState: Self.imu(isMoving: true, x: x, y: y, bearing: bearing),
+                arPosition: simd_float3(Float(x), 0, Float(-y)),
+                arHeading: bearing,
+                arLocalized: true
+            )
+        }
+
+        XCTAssertEqual(navigator.routeLocalizationStatus, .locked)
+        XCTAssertEqual(navigator.lastObservation?.isInstructionSafe, true)
+        XCTAssertEqual(navigator.phase, .navigating)
+        XCTAssertFalse(navigator.currentInstruction.contains("Pan the phone"))
+        XCTAssertFalse(navigator.currentInstruction.contains("Route lost"))
+    }
+
+    /// A localized AR pose standing on the turn node is direct evidence, and
+    /// must be acted on before any corrective nudge claims the tick. The
+    /// alignment cue used to run first and return, so a user who had already
+    /// started turning was told to face the leg they had just finished instead
+    /// of being given the turn.
+    func testPoseOnTheTurnNodeGivesTheTurnRatherThanANudgeBackToTheOldLeg() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 3.2, markRecentAdvance: true)
+
+        // Standing on the turn node, already swung onto the next leg's bearing
+        // — 90° off the leg being walked, inside the alignment cue's window.
+        navigator.update(
+            imuState: Self.imu(isMoving: true, bearing: 90),
+            arPosition: simd_float3(0, 0, -3.9),
+            arHeading: 90,
+            arLocalized: true
+        )
+
+        XCTAssertEqual(navigator.currentStepIndex, 1)
+        XCTAssertTrue(
+            navigator.currentInstruction.hasPrefix("Turn right."),
+            "expected the turn, got: \(navigator.currentInstruction)"
+        )
+    }
+
+    /// One saved image is one place. Every step is offered every keyframe, so
+    /// the images either side of a turn node were claimed by both the step
+    /// ending there and the step starting there. The duplicates scored
+    /// identically against the live frame, the ambiguity guard saw a tie
+    /// across two step indices, and the match was thrown away — silencing
+    /// visual matching at exactly the decision points it exists to confirm.
+    func testKeyframesAtATurnNodeAreNotClaimedByTwoStepsAtOnce() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnMapWithKeyframesAtTheTurn()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        let attribution = navigator.visualCandidateAttributionForTesting()
+        XCTAssertFalse(attribution.isEmpty, "keyframes near the turn produced no candidates")
+        let ids = attribution.map { $0.fingerprintID }
+        XCTAssertEqual(
+            ids.count,
+            Set(ids).count,
+            "a fingerprint was offered to more than one step: \(attribution)"
+        )
+    }
+
+    /// The metre either side of a turn node is one place. Two legs that merely
+    /// run close together are not.
+    func testTurnNodeStraddleIsOnePlaceButParallelLegsAreNot() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        // End of leg 1 and start of leg 2 are the same node.
+        XCTAssertTrue(navigator.isSameRoutePlace(
+            stepIndex: 0,
+            progressMeters: 4.0,
+            otherStepIndex: 1,
+            otherProgressMeters: 0.0
+        ))
+        // Opposite ends of the L are 4 m apart and stay a real ambiguity.
+        XCTAssertFalse(navigator.isSameRoutePlace(
+            stepIndex: 0,
+            progressMeters: 0.0,
+            otherStepIndex: 1,
+            otherProgressMeters: 4.0
+        ))
+    }
+
     /// The July 25 evening re-capture of the same aisle, where the straight
     /// point landed 1.6 m from the shelf instead of 1.4 m.
     private static func narrowAisleStartMap() -> SemanticRouteMap {
@@ -879,6 +1017,35 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             id: "iga",
             coordinateSpace: coordinateSpace,
             nodes: [cereals, straight, left2, right3, left4, onions]
+        )
+    }
+
+    /// An L route whose saved images sit within a metre of the turn node —
+    /// close enough for the geometric fallback on both the step that ends
+    /// there and the step that starts there to claim them.
+    private static func lTurnMapWithKeyframesAtTheTurn() -> SemanticRouteMap {
+        var map = lTurnARMap()
+        let poses = [(0.0, 3.4), (0.0, 3.8), (0.0, 4.0), (0.35, 4.0)]
+        let keyframes = poses.enumerated().map { index, pose in
+            keyframe(id: "turn-\(index)", x: pose.0, y: pose.1, heading: 45)
+        }
+        map.keyframes = keyframes
+        map.visualFingerprints = Dictionary(
+            uniqueKeysWithValues: keyframes.compactMap { frame in
+                frame.visualFingerprintId.map { ($0, fingerprint()) }
+            }
+        )
+        return map
+    }
+
+    private static func fingerprint() -> ARVisualFingerprint {
+        ARVisualFingerprint(
+            dimension: 2,
+            luma: [0, 0, 0, 0],
+            colorMean: [0, 0, 0],
+            averageHash: 0,
+            featurePrintData: nil,
+            createdAt: Date(timeIntervalSince1970: 0)
         )
     }
 

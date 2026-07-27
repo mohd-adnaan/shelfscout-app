@@ -1011,6 +1011,22 @@ struct ARMappingView: View {
                     .stroke(automatedAccent.opacity(0.34), lineWidth: 1)
             )
             .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+
+            // The automated flow is the one that goes wrong in a store, and it
+            // never shows the full route panel — without this the log can only
+            // be fetched from a screen the failing session never reaches.
+            Button {
+                exportSessionTrace()
+            } label: {
+                Label("Export Session Log", systemImage: "doc.text.magnifyingglass")
+                    .font(.subheadline.weight(.semibold))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 9)
+                    .foregroundColor(.white)
+                    .background(Color.white.opacity(0.12))
+                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            }
+            .accessibilityHint("Shares a log of this guidance run and the mapping walk behind it.")
         }
         .padding(16)
         .frame(maxWidth: .infinity, alignment: .leading)
@@ -1030,6 +1046,24 @@ struct ARMappingView: View {
         )
         .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .shadow(color: Color.black.opacity(0.24), radius: 20, x: 0, y: 10)
+    }
+
+    private func exportSessionTrace() {
+        guard let url = NavigationTrace.shared.exportURL(),
+              let scene = UIApplication.shared.connectedScenes
+                .compactMap({ $0 as? UIWindowScene })
+                .first(where: { $0.activationState == .foregroundActive }),
+              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+            return
+        }
+        var top = root
+        while let presented = top.presentedViewController { top = presented }
+        let activity = UIActivityViewController(activityItems: [url], applicationActivities: nil)
+        activity.popoverPresentationController?.sourceView = top.view
+        activity.popoverPresentationController?.sourceRect = CGRect(
+            x: top.view.bounds.midX, y: top.view.bounds.midY, width: 1, height: 1
+        )
+        top.present(activity, animated: true)
     }
 
     private var idleControls: some View {

@@ -47,6 +47,7 @@
 		5FA100092FC0000000000009 /* SemanticRouteNavigator.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FA200092FC0000000000009 /* SemanticRouteNavigator.swift */; };
 		5FA1000A2FC00000000000A /* TTSManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FA2000A2FC00000000000A /* TTSManager.swift */; };
 		5FA1000B2FC000000000000B /* Localization.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FA2000B2FC000000000000B /* Localization.swift */; };
+		5FA1000C2FC000000000000C /* NavigationTrace.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FA2000C2FC000000000000C /* NavigationTrace.swift */; };
 		5FC043E82F59264600DA3B66 /* Reachingviewcontroller.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC043E72F59264300DA3B66 /* Reachingviewcontroller.swift */; };
 		5FC043EA2F59269800DA3B66 /* Reachingviewcontroller+processing.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC043E92F59269500DA3B66 /* Reachingviewcontroller+processing.swift */; };
 		5FC043EC2F5926D100DA3B66 /* Reachingviewcontroller+ar.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FC043EB2F5926D000DA3B66 /* Reachingviewcontroller+ar.swift */; };
@@ -118,6 +119,7 @@
 		5FA200092FC0000000000009 /* SemanticRouteNavigator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SemanticRouteNavigator.swift; sourceTree = "<group>"; };
 		5FA2000A2FC00000000000A /* TTSManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TTSManager.swift; sourceTree = "<group>"; };
 		5FA2000B2FC000000000000B /* Localization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Localization.swift; sourceTree = "<group>"; };
+		5FA2000C2FC000000000000C /* NavigationTrace.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NavigationTrace.swift; sourceTree = "<group>"; };
 		5FC043E72F59264300DA3B66 /* Reachingviewcontroller.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Reachingviewcontroller.swift; sourceTree = "<group>"; };
 		5FC043E92F59269500DA3B66 /* Reachingviewcontroller+processing.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+processing.swift"; sourceTree = "<group>"; };
 		5FC043EB2F5926D000DA3B66 /* Reachingviewcontroller+ar.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+ar.swift"; sourceTree = "<group>"; };
@@ -180,6 +182,7 @@
 				5FA200092FC0000000000009 /* SemanticRouteNavigator.swift */,
 				5FA2000A2FC00000000000A /* TTSManager.swift */,
 				5FA2000B2FC000000000000B /* Localization.swift */,
+				5FA2000C2FC000000000000C /* NavigationTrace.swift */,
 				5F92E8252F784DA80036D6A4 /* Reachingviewcontroller+withHand.swift */,
 				5F92E8232F784D830036D6A4 /* Reachingviewcontroller+handFree.swift */,
 				5F5174CC2FC642B400A192AF /* soundshelfstudio-ui-notification-listening-start.mp3 */,
@@ -522,6 +525,7 @@
 				5FA100092FC0000000000009 /* SemanticRouteNavigator.swift in Sources */,
 				5FA1000A2FC00000000000A /* TTSManager.swift in Sources */,
 				5FA1000B2FC000000000000B /* Localization.swift in Sources */,
+				5FA1000C2FC000000000000C /* NavigationTrace.swift in Sources */,
 				5FC2638B2F395B19006AEE6F /* ReachingModule.swift in Sources */,
 				5FC095F72FA082DD00D015AC /* Reachingviewcontroller+visualTracking.swift in Sources */,
 				5F20C32D2FBB6DD10066A43D /* DepthAnythingV2SmallF16.mlpackage in Sources */,

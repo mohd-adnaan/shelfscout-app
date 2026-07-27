@@ -75,7 +75,11 @@
       "Read(//private/tmp/**)",
       "Bash(xcrun swift *)",
       "Bash(sed -i '' 's/leadDrop = 1.1/leadDrop = 1.35/' geom3.swift)",
-      "Bash(sed -i '' 's/leadDrop = 1.1/leadDrop = 1.35/' geom2.swift)"
+      "Bash(sed -i '' 's/leadDrop = 1.1/leadDrop = 1.35/' geom2.swift)",
+      "Bash(python3 belief_sim.py)",
+      "Bash(python3 belief_fix_sim.py)",
+      "Bash(xcrun swiftc *)",
+      "Bash(perl -0pi -e 's/speechCue = SemanticSpeechCue\\\\\\(text: \\([^\\\\n]*?\\), priority: \\(\\\\.\\\\w+\\)\\\\\\)/emitCue\\($1, priority: $2\\)/g' ios/SemanticRouteNavigator.swift)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

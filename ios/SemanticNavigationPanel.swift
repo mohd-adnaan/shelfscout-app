@@ -508,6 +508,7 @@ struct SemanticNavigationPanel: View {
             }
 
             exportMapReportButton
+            exportSessionTraceButton
         }
     }
 
@@ -523,8 +524,33 @@ struct SemanticNavigationPanel: View {
         .accessibilityHint("Shares an HTML report with the route plot and the camera frames captured while mapping.")
     }
 
+    /// The mapping walk and the guidance walk in one file. Kept beside the map
+    /// report in both flows because it is only useful straight after the run
+    /// that went wrong — walking back to a desk to fetch it means the session
+    /// that misled you has already rotated out.
+    private var exportSessionTraceButton: some View {
+        Button {
+            exportSessionTrace()
+        } label: {
+            Label("Export Session Log", systemImage: "doc.text.magnifyingglass")
+                .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .disabled(!NavigationTrace.shared.hasRecordedSessions)
+        .accessibilityHint("Shares a log of the mapping walk and the guidance it produced, for diagnosing wrong directions.")
+    }
+
     private func exportMapReport() {
         guard let url = navigator.exportDebugReportURL() else { return }
+        share(url)
+    }
+
+    private func exportSessionTrace() {
+        guard let url = NavigationTrace.shared.exportURL() else { return }
+        share(url)
+    }
+
+    private func share(_ url: URL) {
         guard let scene = UIApplication.shared.connectedScenes
                 .compactMap({ $0 as? UIWindowScene })
                 .first(where: { $0.activationState == .foregroundActive }),
@@ -620,6 +646,7 @@ struct SemanticNavigationPanel: View {
                 }
 
                 exportMapReportButton
+                exportSessionTraceButton
             }
         }
     }

@@ -457,6 +457,26 @@ final class SemanticRouteNavigator: ObservableObject {
     private var shouldEnableErrorRecovery = true
     private var routeEvidenceWindow: [RouteEvidence] = []
     private var routeBeliefState = RouteBeliefState.empty
+    /// Gated PDR distance walked since guidance started — the same quantity
+    /// that drives `segmentProgressMeters`. Route evidence stamps it so the
+    /// belief filter can predict an old sample forward to now instead of
+    /// treating where the user *was* as a rival claim about where they *are*.
+    private var cumulativeTravelMeters: Double = 0
+    /// Last navigation-update inputs, kept only so every trace line — a cue or
+    /// a decision — carries the state that produced it. Reading a log where
+    /// the cue text is divorced from the heading and leg that caused it is how
+    /// two field sessions were spent guessing.
+    private var traceLiveHeading: Double?
+    private var traceHeadingError: Double?
+    private var traceCrossTrack: Double?
+    private var traceAlongTrack: Double?
+    private var traceARLocalized = false
+    private var tracePose: SemanticRoutePoint?
+    private var traceLastTickAt: Date?
+    private var traceLastStepIndex = -1
+    private var traceLastPhase: SemanticNavigationPhase?
+    private var traceLastRouteStatus: RouteLocalizationStatus?
+    private var traceLastCaptureSampleAt: Date?
     private var lastRouteUpdatePDRDelta: Double = 0
     private var lastPDRDeltaWasCapped = false
     private var lastHeadingAlignmentCueAt: Date?
@@ -556,6 +576,10 @@ final class SemanticRouteNavigator: ObservableObject {
     private let visualRouteSnapConfidence = 0.88
     private let visualRouteArrivalConfidence = 0.76
     private let visualRouteAmbiguousGap = 0.20
+    /// How far apart two near-tied visual matches may sit and still describe
+    /// one place. Keyframes are captured about a third of a metre apart, so
+    /// several always land inside it.
+    private let visualSameRoutePlaceMeters = 1.5
     private let visualRouteAdvanceCooldownSeconds: TimeInterval = 1.4
     /// Kept short: at the finish line a long visual-confirmation hold reads
     /// as "the app is lost" and delays the reaching handoff.
@@ -605,6 +629,11 @@ final class SemanticRouteNavigator: ObservableObject {
     private let routeBeliefLargeCorrectionMinimumSamples = 3
     private let routeBeliefLargeCorrectionMinimumDuration: TimeInterval = 0.75
     private let routeBeliefPhysicalSlackMeters = 0.85
+    /// Predicting an old sample forward inherits the dead-reckoning error of
+    /// the distance it was carried over, so its uncertainty grows with that
+    /// distance. Keeps a sample from two seconds ago from counting as if it
+    /// had just been measured.
+    private let routeBeliefPropagationUncertaintyPerMeter = 0.15
     /// A single-node path means "already there" — only believable when the
     /// live pose is genuinely this close to the target node.
     private let immediateArrivalMaxMeters = 2.0
@@ -689,6 +718,9 @@ final class SemanticRouteNavigator: ObservableObject {
         let uncertaintyMeters: Double
         let source: String
         let capturedAt: Date
+        /// `cumulativeTravelMeters` when this sample was taken, so the belief
+        /// filter can carry it forward to the present.
+        let travelledMeters: Double
         let visualConfidence: Double?
         let crossTrackMeters: Double?
         let summary: String
@@ -757,6 +789,10 @@ final class SemanticRouteNavigator: ObservableObject {
         let landmarkID: String?
         let landmarkName: String?
         let cue: String?
+        /// True when the step actually owns this sample (captured on its edge
+        /// or listed in its keyframe ids) rather than merely passing close
+        /// enough to it for the geometric fallback to claim it.
+        let isOwnedByStep: Bool
     }
 
     init() {
@@ -899,7 +935,7 @@ final class SemanticRouteNavigator: ObservableObject {
             currentInstruction = "Route deleted. No saved semantic routes."
         }
 
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .regular)
+        emitCue(currentInstruction, priority: .regular)
         rebuildRAGContext()
     }
 
@@ -954,7 +990,7 @@ final class SemanticRouteNavigator: ObservableObject {
         stopNavigation(resetInstruction: false)
         phase = .mapping
         currentInstruction = "Mark Point A. Use the detected POI if it is correct, or type a start label."
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+        emitCue(currentInstruction, priority: .priority)
         rebuildRAGContext()
     }
 
@@ -979,7 +1015,7 @@ final class SemanticRouteNavigator: ObservableObject {
         phase = .mapping
         mappingQualityText = "Extending \(existing.name)"
         currentInstruction = "Extending \(existing.name). Walk near the mapped route and mark points; new paths connect to the nearest mapped point."
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+        emitCue(currentInstruction, priority: .priority)
         rebuildRAGContext()
         return true
     }
@@ -1004,7 +1040,7 @@ final class SemanticRouteNavigator: ObservableObject {
         phase = .enriching
         refreshCaptureMetrics(for: existing)
         currentInstruction = NavLoc.enrichmentStarted(existing.name)
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        emitCue(currentInstruction, priority: .critical)
         mappingQualityText = "Improving \(existing.name)"
         rebuildRAGContext()
         return true
@@ -1025,7 +1061,7 @@ final class SemanticRouteNavigator: ObservableObject {
         refreshCaptureMetrics(for: cleaned)
         let added = enrichmentKeyframesAdded
         currentInstruction = NavLoc.enrichmentSaved(keyframeCount: added)
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        emitCue(currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
     }
@@ -1140,7 +1176,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastAutoSampledAt = Date()
         phase = .mapping
         currentInstruction = "Captured \(trimmed)."
-        speechCue = SemanticSpeechCue(text: "Captured \(trimmed).", priority: .regular)
+        emitCue("Captured \(trimmed).", priority: .regular)
         refreshCaptureMetrics(for: workingMap)
         rebuildRAGContext()
         return true
@@ -1204,7 +1240,7 @@ final class SemanticRouteNavigator: ObservableObject {
         guard var workingMap = activeMapDraft ?? activeMap else { return false }
         if workingMap.nodes.isEmpty, kind != .entrance {
             currentInstruction = "Mark Point A before adding turns, landmarks, or the destination."
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
             return false
         }
 
@@ -1248,7 +1284,7 @@ final class SemanticRouteNavigator: ObservableObject {
             currentInstruction = kind == .intersection
                 ? "Marked \(name). Continue walking after the \(turnHint?.isCorner == true ? "corner" : "turn")."
                 : "Updated route point \(name)."
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .regular)
+            emitCue(currentInstruction, priority: .regular)
             rebuildRAGContext()
             return true
         }
@@ -1288,7 +1324,7 @@ final class SemanticRouteNavigator: ObservableObject {
             guard let anchor = nearestNode(in: workingMap, to: pose),
                   anchor.point.distance(to: pose) <= appendConnectRadiusMeters else {
                 currentInstruction = "Walk within \(Int(appendConnectRadiusMeters)) meters of the mapped route first so the new path connects, then mark the point again."
-                speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+                emitCue(currentInstruction, priority: .priority)
                 return false
             }
             var edge = Self.makeEdge(
@@ -1306,6 +1342,35 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         workingMap.nodes.append(node)
+        // The mapping-side counterpart of `nav.advance`: what the mapper stood
+        // at, faced, and labelled, plus the edge geometry that label produced.
+        // Diffing these against the guidance run is the whole point of the
+        // trace, so it records the incoming edge as well as the node.
+        let incomingEdge = workingMap.edges.last
+        let precedingEdge = workingMap.edges.dropLast().last
+        var mapNodeFields: [String: Any] = [
+            "name": name,
+            "kind": kind.rawValue,
+            "turnHint": turnHint?.rawValue ?? "none",
+            "x": pose.x,
+            "y": pose.y,
+            "headingDeg": heading,
+            "hasARPose": arPosition != nil,
+            "nodeCount": workingMap.nodes.count
+        ]
+        if let incomingEdge {
+            mapNodeFields["incomingEdgeId"] = incomingEdge.id
+            mapNodeFields["incomingBearing"] = incomingEdge.bearingDegrees
+            mapNodeFields["incomingDistM"] = incomingEdge.distanceMeters
+        }
+        if let incomingEdge, let precedingEdge {
+            mapNodeFields["precedingBearing"] = precedingEdge.bearingDegrees
+            mapNodeFields["signedTurnDeg"] = SemanticRouteMath.signedAngleDifference(
+                incomingEdge.bearingDegrees,
+                precedingEdge.bearingDegrees
+            )
+        }
+        NavigationTrace.shared.log("map.node", mapNodeFields)
         stitchJunctionIfNeeded(for: node, in: &workingMap)
         appendVisualKeyframe(
             to: &workingMap,
@@ -1337,7 +1402,7 @@ final class SemanticRouteNavigator: ObservableObject {
                 : kind == .destination
                     ? "Destination \(name) captured. Keep walking to add more stops, or save the map."
                     : "Captured route point \(name)."
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .regular)
+        emitCue(currentInstruction, priority: .regular)
         rebuildRAGContext()
         return true
     }
@@ -1457,7 +1522,7 @@ final class SemanticRouteNavigator: ObservableObject {
         currentInstruction = isDestination
             ? "Marked \(trimmed) as a navigation target."
             : "Added \(trimmed) near \(node.name)."
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .regular)
+        emitCue(currentInstruction, priority: .regular)
         rebuildRAGContext()
         return true
     }
@@ -1480,7 +1545,7 @@ final class SemanticRouteNavigator: ObservableObject {
         guard var workingMap = activeMapDraft ?? activeMap else { return false }
         guard let destinationIndex = latestDestinationNodeIndex(in: workingMap) else {
             currentInstruction = "Set the destination before pinning its reaching object."
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
             return false
         }
 
@@ -1515,8 +1580,8 @@ final class SemanticRouteNavigator: ObservableObject {
         activeMap = workingMap
         refreshCaptureMetrics(for: workingMap)
         currentInstruction = "Linked reaching object \(trimmed) to \(destinationNode.name)."
-        speechCue = SemanticSpeechCue(
-            text: "Reaching object \(trimmed) linked to \(destinationNode.name). After arrival, reaching guidance will target it.",
+        emitCue(
+            "Reaching object \(trimmed) linked to \(destinationNode.name). After arrival, reaching guidance will target it.",
             priority: .regular
         )
         rebuildRAGContext()
@@ -1564,7 +1629,7 @@ final class SemanticRouteNavigator: ObservableObject {
         guard var map = activeMapDraft ?? activeMap else { return false }
         guard canSaveCapturedMap else {
             currentInstruction = "Capture Point A, at least one measured segment, and a destination before saving."
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
             return false
         }
         map.updatedAt = Date()
@@ -1572,7 +1637,7 @@ final class SemanticRouteNavigator: ObservableObject {
         if let quality = cleaned.captureQuality,
            !quality.isSufficientForGuidance {
             currentInstruction = quality.warnings.first ?? "Add more visual route evidence before saving."
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
             activeMapDraft = cleaned
             activeMap = cleaned
             refreshCaptureMetrics(for: cleaned)
@@ -1580,13 +1645,18 @@ final class SemanticRouteNavigator: ObservableObject {
             return false
         }
         upsertMap(cleaned, persist: true)
+        NavigationTrace.shared.log("map.saved", [
+            "graph": traceMapGraph(cleaned),
+            "captureQualityPass": cleaned.captureQuality?.isSufficientForGuidance ?? false,
+            "warnings": cleaned.captureQuality?.warnings ?? []
+        ])
         activeMap = cleaned
         activeMapDraft = nil
         phase = .ready
         pruneFrameThumbnails()
         refreshCaptureMetrics(for: cleaned)
         currentInstruction = "Saved local map: \(capturedPointCount) points, \(Self.formatMeters(capturedDistanceMeters))."
-        speechCue = SemanticSpeechCue(text: "Local navigation map saved.", priority: .regular)
+        emitCue("Local navigation map saved.", priority: .regular)
         rebuildRAGContext()
         return true
     }
@@ -1624,17 +1694,17 @@ final class SemanticRouteNavigator: ObservableObject {
         if let requiredARMapID = map.arWorldMapId,
            requiredARMapID != activeARWorldMapID {
             currentInstruction = "Load the matching AR map for this route before guiding."
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
             return false
         }
         if map.coordinateSpace == "ar_world_xz", arPosition == nil {
             currentInstruction = "Load or start the AR map first so I can localize on the captured route."
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
             return false
         }
         guard let resolved = resolveTargetDetailed(trimmed, in: map) else {
             currentInstruction = NavLoc.notInMap(trimmed)
-            speechCue = SemanticSpeechCue(text: NavLoc.notInMap(trimmed), priority: .priority)
+            emitCue(NavLoc.notInMap(trimmed), priority: .priority)
             return false
         }
         let targetNode = resolved.node
@@ -1665,7 +1735,7 @@ final class SemanticRouteNavigator: ObservableObject {
             let distanceToTarget = pose?.distance(to: targetNode.point)
             guard let distanceToTarget, distanceToTarget <= immediateArrivalMaxMeters else {
                 currentInstruction = NavLoc.cannotConfirmAt(targetNode.name)
-                speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+                emitCue(currentInstruction, priority: .priority)
                 return false
             }
             phase = .arrived
@@ -1673,7 +1743,7 @@ final class SemanticRouteNavigator: ObservableObject {
             // No route was built, so nothing describes a facing here.
             arrivalFacing = nil
             currentInstruction = NavLoc.alreadyAt(targetNode.name)
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+            emitCue(currentInstruction, priority: .critical)
             rebuildRAGContext()
             return true
         }
@@ -1694,6 +1764,7 @@ final class SemanticRouteNavigator: ObservableObject {
             : min(max(start.initialProgressMeters, 0), steps.first?.edge.distanceMeters ?? 0)
         lastIMUStepCount = imuState.stepCount
         lastIMUPosition = imuState.position
+        cumulativeTravelMeters = 0
         lastAnnouncedRemainingMeter = nil
         lastAnnouncedLandmarkID = nil
         announcedLandmarkIDs.removeAll()
@@ -1756,7 +1827,26 @@ final class SemanticRouteNavigator: ObservableObject {
             distance: Self.formatMeters(totalRemainingMeters),
             firstInstruction: firstInstruction
         )
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        NavigationTrace.shared.log("nav.start", [
+            "requestedTarget": requestedTarget,
+            "resolvedTarget": spokenTarget,
+            "targetNode": targetNode.name,
+            "exactMatch": resolved.isExact,
+            "startName": startName,
+            "startHeadingDeg": startHeading,
+            "arHeadingDeg": arHeading ?? NSNull(),
+            "imuBearingDeg": imuState.bearing,
+            "arPoseX": Self.routePoint(from: arPosition)?.x ?? NSNull(),
+            "arPoseY": Self.routePoint(from: arPosition)?.y ?? NSNull(),
+            "nodePath": path,
+            "droppedLeadingStub": shaped.droppedLeadingStub,
+            "initialProgressM": segmentProgressMeters,
+            "arrivalFacing": shaped.arrivalFacing.map { "\($0.side.rawValue) \($0.meters)m" } ?? NSNull(),
+            "legs": traceLegs(),
+            "map": activeMap.map { traceMapGraph($0) } ?? NSNull(),
+            "openingInstruction": currentInstruction
+        ])
+        emitCue(currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
     }
@@ -1773,6 +1863,7 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryReason = nil
         lastIMUStepCount = nil
         lastIMUPosition = nil
+        cumulativeTravelMeters = 0
         lastPDRDeltaWasCapped = false
         lastAnnouncedRemainingMeter = nil
         lastAnnouncedLandmarkID = nil
@@ -1864,6 +1955,9 @@ final class SemanticRouteNavigator: ObservableObject {
         let progressScale = max(0, cos(min(headingError, 90) * .pi / 180.0))
         let gatedDelta = headingError > 65 ? pdrDelta * 0.2 : pdrDelta * progressScale
         segmentProgressMeters += max(0, gatedDelta)
+        // Same quantity, kept as a journey-long odometer so route evidence can
+        // be predicted forward to the present in `refreshRouteBeliefState`.
+        cumulativeTravelMeters += max(0, gatedDelta)
         recordRouteEvidence(
             stepIndex: currentStepIndex,
             progressMeters: segmentProgressMeters,
@@ -1873,10 +1967,15 @@ final class SemanticRouteNavigator: ObservableObject {
             summary: lastPDRDeltaWasCapped ? "PDR capped" : "PDR"
         )
 
+        traceLiveHeading = liveHeading
+        traceHeadingError = headingError
+        traceARLocalized = arLocalized
+
         var crossTrackError: Double?
         var routeProjection: RouteProjection?
         var observationConfidence = 0.58
         let arPoint = Self.routePoint(from: arPosition)
+        tracePose = arPoint
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
         if let arPoint,
@@ -1970,6 +2069,9 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
 
+        traceCrossTrack = routeProjection?.crossTrackMeters
+        traceAlongTrack = routeProjection?.alongTrackMeters
+
         segmentProgressMeters = min(segmentProgressMeters, step.edge.distanceMeters)
         segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
         confidence = Self.confidence(
@@ -1992,6 +2094,13 @@ final class SemanticRouteNavigator: ObservableObject {
             uncertaintyMeters: routeBeliefState.uncertaintyMeters,
             isInstructionSafe: routeBeliefState.isInstructionSafe,
             evidenceSummary: routeBeliefState.evidenceSummary
+        )
+
+        traceNavigationTick(
+            visualMatch: visualMatch,
+            pdrDelta: pdrDelta,
+            gatedDelta: gatedDelta,
+            isMoving: imuState.isMoving
         )
 
         // ── Stillness-fallback arrival ───────────────────────────────
@@ -2039,6 +2148,29 @@ final class SemanticRouteNavigator: ObservableObject {
             return
         }
 
+        // ── Turn/node proximity check ────────────────────────────────
+        // If AR pose is close to the next node, advance the step even
+        // if PDR progress is lagging due to heading gating after a turn.
+        //
+        // Runs ahead of the belief hold and the alignment nudge for the same
+        // reason destination proximity does: a localized pose standing on the
+        // turn node is direct evidence, and holding it back means the user
+        // walks through the turn hearing "pan the phone slowly" — or gets
+        // nagged to face a leg they have already finished.
+        if let arPoint,
+           arLocalized,
+           arPoint.distance(to: step.to.point) <= nodeArrivalRadiusMeters(for: step),
+           shouldAdvanceFromARNodeProximity(on: step, visualMatch: visualMatch) {
+            if currentStepIndex >= routeSteps.count - 1,
+               shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
+                rebuildRAGContext()
+                return
+            }
+            advanceStepOrArrive()
+            rebuildRAGContext()
+            return
+        }
+
         if handleRouteBeliefHoldIfNeeded(
             arPosition: arPosition,
             arPoint: arPoint,
@@ -2067,7 +2199,7 @@ final class SemanticRouteNavigator: ObservableObject {
             pendingAlignmentResumeCue = false
             updateInstruction(forceSpeech: false)
             currentInstruction = NavLoc.goodPrefix() + currentInstruction
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
             // Claim this meter bucket so the routine countdown can't clobber
             // the resume cue later in the same tick.
             lastAnnouncedRemainingMeter = Int(ceil(segmentRemainingMeters))
@@ -2102,23 +2234,6 @@ final class SemanticRouteNavigator: ObservableObject {
                 rebuildRAGContext()
                 return
             }
-        }
-
-        // ── Turn/node proximity check ────────────────────────────────
-        // If AR pose is close to the next node, advance the step even
-        // if PDR progress is lagging due to heading gating after a turn.
-        if let arPoint = Self.routePoint(from: arPosition),
-           arLocalized,
-           arPoint.distance(to: step.to.point) <= nodeArrivalRadiusMeters(for: step),
-           shouldAdvanceFromARNodeProximity(on: step, visualMatch: visualMatch) {
-            if currentStepIndex >= routeSteps.count - 1,
-               shouldHoldForVisualArrival(on: step, visualMatch: visualMatch) {
-                rebuildRAGContext()
-                return
-            }
-            advanceStepOrArrive()
-            rebuildRAGContext()
-            return
         }
 
         if phase == .recovering {
@@ -2236,8 +2351,28 @@ final class SemanticRouteNavigator: ObservableObject {
         rebuildRAGContext()
     }
 
+    /// The walked path during mapping and enrichment, at the same cadence the
+    /// guidance trail is sampled. Without it the log can say what the graph
+    /// ended up as but not what the mapper actually walked to produce it.
+    private func traceCaptureSample(pose: SemanticRoutePoint, heading: Double?, arLocalized: Bool) {
+        let now = Date()
+        guard traceLastCaptureSampleAt.map({ now.timeIntervalSince($0) >= 0.25 }) ?? true else { return }
+        traceLastCaptureSampleAt = now
+        NavigationTrace.shared.tick("map.pose", [
+            "phase": phase.rawValue,
+            "x": pose.x,
+            "y": pose.y,
+            "headingDeg": heading ?? NSNull(),
+            "arLocalized": arLocalized,
+            "segmentDraftM": currentSegmentDraftMeters
+        ])
+    }
+
     private func updatePassiveObservation(imuState: IMUState, arPosition: simd_float3?, arHeading: Double?, arLocalized: Bool) {
         let pose = Self.routePoint(from: arPosition) ?? SemanticRoutePoint(x: imuState.position.x, y: imuState.position.y)
+        if phase == .mapping || phase == .enriching {
+            traceCaptureSample(pose: pose, heading: arHeading ?? imuState.bearing, arLocalized: arLocalized)
+        }
         lastObservation = SemanticRouteObservation(
             pose: pose,
             headingDegrees: arHeading ?? imuState.bearing,
@@ -2415,7 +2550,7 @@ final class SemanticRouteNavigator: ObservableObject {
         if !anchoringPromptedNodeIDs.contains(node.id) {
             anchoringPromptedNodeIDs.insert(node.id)
             currentInstruction = NavLoc.anchorEndpointPrompt(node.name)
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+            emitCue(currentInstruction, priority: .critical)
         }
 
         guard let heading else { return }
@@ -2429,7 +2564,7 @@ final class SemanticRouteNavigator: ObservableObject {
         if buckets.count >= anchoringRequiredBuckets {
             anchoredNodeIDs.insert(node.id)
             currentInstruction = NavLoc.anchorEndpointComplete(node.name)
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
         } else if addedBucket {
             mappingQualityText = NavLoc.anchorEndpointProgress(
                 node.name,
@@ -2636,6 +2771,7 @@ final class SemanticRouteNavigator: ObservableObject {
             uncertaintyMeters: max(0.20, uncertaintyMeters),
             source: source,
             capturedAt: Date(),
+            travelledMeters: cumulativeTravelMeters,
             visualConfidence: visualConfidence,
             crossTrackMeters: crossTrackMeters,
             summary: summary
@@ -2663,12 +2799,31 @@ final class SemanticRouteNavigator: ObservableObject {
 
         var accumulators: [String: Accumulator] = [:]
         for evidence in routeEvidenceWindow {
-            let bucket = Int((evidence.progressMeters / routeBeliefBucketMeters).rounded())
+            // ── Motion compensation ──────────────────────────────────────
+            // Every sample in the window is a claim about where the user was
+            // when it was taken, not where they are now. Bucketing the raw
+            // value made a walking user's own trail compete with itself: at
+            // 1.2 m/s the 2.4 s window spans three buckets, two of them far
+            // enough apart to count as rival places, so the status sat on
+            // "ambiguous" for the whole leg and the belief hold swallowed the
+            // turn cues. Carry each sample forward by the distance walked
+            // since it was taken, and charge it the dead-reckoning error of
+            // that carry. A trajectory then collapses to one candidate, while
+            // sources that genuinely disagree still stand apart.
+            let carriedMeters = max(0, cumulativeTravelMeters - evidence.travelledMeters)
+            let stepLength = routeSteps.indices.contains(evidence.stepIndex)
+                ? routeSteps[evidence.stepIndex].edge.distanceMeters
+                : evidence.progressMeters
+            let predictedProgress = min(max(evidence.progressMeters + carriedMeters, 0), stepLength)
+            let predictedUncertainty = evidence.uncertaintyMeters +
+                carriedMeters * routeBeliefPropagationUncertaintyPerMeter
+
+            let bucket = Int((predictedProgress / routeBeliefBucketMeters).rounded())
             let key = "\(evidence.stepIndex):\(bucket)"
             var accumulator = accumulators[key] ?? Accumulator()
-            accumulator.weightedProgress += evidence.progressMeters * max(evidence.confidence, 0.05)
+            accumulator.weightedProgress += predictedProgress * max(evidence.confidence, 0.05)
             accumulator.confidenceSum += evidence.confidence
-            accumulator.uncertaintySum += evidence.uncertaintyMeters
+            accumulator.uncertaintySum += predictedUncertainty
             accumulator.supportCount += 1
             accumulator.sources.insert(evidence.source)
             accumulator.latestSummary = evidence.summary
@@ -2878,6 +3033,19 @@ final class SemanticRouteNavigator: ObservableObject {
 
         phase = .recovering
         recoveryReason = routeBeliefState.evidenceSummary
+        NavigationTrace.shared.log("nav.beliefHold", traceState(extra: [
+            "holdSeconds": holdDuration,
+            "candidates": routeBeliefState.candidates.prefix(4).map { candidate in
+                [
+                    "step": candidate.stepIndex,
+                    "progressM": candidate.progressMeters,
+                    "conf": candidate.confidence,
+                    "uncM": candidate.uncertaintyMeters,
+                    "support": candidate.supportCount,
+                    "sources": candidate.sources.sorted()
+                ] as [String: Any]
+            }
+        ]))
         var instruction = routeLocalizationStatus == .lost
             ? "Route lost. Stop and slowly look around."
             : "Hold on. Pan the phone slowly."
@@ -2889,7 +3057,7 @@ final class SemanticRouteNavigator: ObservableObject {
         currentInstruction = instruction
 
         if cueChanged || cueAge >= beliefHoldRepeatSeconds {
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+            emitCue(currentInstruction, priority: .critical)
             lastRecoveryCueAt = now
             lastRecoveryCueKey = key
         }
@@ -2975,7 +3143,12 @@ final class SemanticRouteNavigator: ObservableObject {
         phase = .navigating
         updateInstruction(forceSpeech: false)
         currentInstruction = NavLoc.routeRealignedPrefix() + currentInstruction
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        NavigationTrace.shared.log("nav.rebuild", traceState(extra: [
+            "nodePath": start.nodePath,
+            "droppedLeadingStub": shaped.droppedLeadingStub,
+            "legs": traceLegs()
+        ]))
+        emitCue(currentInstruction, priority: .critical)
         // The realignment cue carries the new direction, so it claims the turn
         // slot: an alignment nudge on the very next tick would stack a second
         // turn command onto it.
@@ -3063,7 +3236,15 @@ final class SemanticRouteNavigator: ObservableObject {
         currentInstruction = turn.key == "straight"
             ? NavLoc.rejoinStraight(distance: rejoinDistance, node: nodeName)
             : NavLoc.rejoinWithTurn(turn: turn.text, distance: rejoinDistance, node: nodeName)
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        NavigationTrace.shared.log("nav.rejoin", traceState(extra: [
+            "rejoinNode": best.node.name,
+            "rejoinDistM": rejoinEdge.distanceMeters,
+            "rejoinBearing": rejoinEdge.bearingDegrees,
+            "liveHeading": liveHeading,
+            "turnKey": turn.key,
+            "legs": traceLegs()
+        ]))
+        emitCue(currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
     }
@@ -3092,7 +3273,7 @@ final class SemanticRouteNavigator: ObservableObject {
         updateInstruction(forceSpeech: false)
         if announce, hadSpokenCue {
             currentInstruction = NavLoc.backOnRoutePrefix() + currentInstruction
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
         }
     }
 
@@ -3168,6 +3349,14 @@ final class SemanticRouteNavigator: ObservableObject {
         confidence = min(confidence, 0.48)
         recoveryReason = nil
         guidanceIntroProtectedUntil = nil
+        NavigationTrace.shared.log("nav.alignmentCue", traceState(extra: [
+            "instruction": instruction,
+            "key": key,
+            "targetBearing": step.edge.bearingDegrees,
+            "nearStepStart": nearStepStart,
+            "recentlyAdvanced": recentlyAdvanced,
+            "recentlyRecovered": recentlyRecovered
+        ]))
 
         // A user part-way through a turn sweeps across every band — around,
         // sharp left, left — and the old rule spoke on each crossing because
@@ -3191,7 +3380,7 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         if shouldSpeak {
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+            emitCue(currentInstruction, priority: .critical)
             lastHeadingAlignmentCueAt = now
             lastHeadingAlignmentCueKey = key
             lastHeadingAlignmentErrorDegrees = headingError
@@ -3650,6 +3839,20 @@ final class SemanticRouteNavigator: ObservableObject {
 
         phase = .recovering
         recoveryReason = cue.reason
+        NavigationTrace.shared.log("nav.recovery", traceState(extra: [
+            "instruction": cue.instruction,
+            "key": cue.key,
+            "reason": cue.reason,
+            "crossTrackBad": crossTrackBad,
+            "backwardBad": backwardBad,
+            "headingBad": headingBad,
+            "lowConfidenceBad": lowConfidenceBad,
+            "localizationBad": localizationBad,
+            "observedCrossTrackM": observedCrossTrack,
+            "crossTrackLimitM": crossTrackLimit,
+            "backwardDriftM": backwardDriftMeters,
+            "targetBearing": step.edge.bearingDegrees
+        ]))
 
         // Escalation past orientation nudges: still off the corridor after
         // several seconds of cues means the user walked off the mapped path
@@ -3684,7 +3887,7 @@ final class SemanticRouteNavigator: ObservableObject {
             return
         }
 
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        emitCue(currentInstruction, priority: .critical)
         lastRecoveryCueAt = now
         lastRecoveryCueKey = cue.key
         lastTurnCueAt = now
@@ -3866,6 +4069,15 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private func applyRecoverySnap(_ candidate: RecoverySnapCandidate, announce: Bool) {
         guard candidate.stepIndex >= 0, candidate.stepIndex < routeSteps.count else { return }
+        NavigationTrace.shared.log("nav.snap", traceState(extra: [
+            "toStep": candidate.stepIndex,
+            "toProgressM": candidate.progressMeters,
+            "snapCrossM": candidate.crossTrackMeters,
+            "snapHeadingErrDeg": candidate.headingError,
+            "snapScore": candidate.score,
+            "snapVisualConf": candidate.visualConfidence ?? NSNull(),
+            "announce": announce
+        ]))
         let step = routeSteps[candidate.stepIndex]
         currentStepIndex = candidate.stepIndex
         segmentProgressMeters = min(max(candidate.progressMeters, 0), step.edge.distanceMeters)
@@ -3886,7 +4098,7 @@ final class SemanticRouteNavigator: ObservableObject {
         updateInstruction(forceSpeech: false)
         if announce {
             currentInstruction = NavLoc.guidanceRealigned()
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
         }
         rebuildRAGContext()
     }
@@ -3914,7 +4126,7 @@ final class SemanticRouteNavigator: ObservableObject {
             currentInstruction = [NavLoc.arrivedAt(targetName), facingSentence, reachingSentence]
                 .compactMap { $0 }
                 .joined(separator: " ")
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+            emitCue(currentInstruction, priority: .critical)
             rebuildRAGContext()
             return
         }
@@ -3922,6 +4134,18 @@ final class SemanticRouteNavigator: ObservableObject {
         let current = routeSteps[currentStepIndex]
         let next = routeSteps[currentStepIndex + 1]
         let turn = turnInstruction(at: current.to, from: current.edge.bearingDegrees, to: next.edge.bearingDegrees)
+        NavigationTrace.shared.log("nav.advance", traceState(extra: [
+            "atNode": current.to.name,
+            "recordedTurnHint": current.to.turnHint?.rawValue ?? "none",
+            "incomingBearing": current.edge.bearingDegrees,
+            "outgoingBearing": next.edge.bearingDegrees,
+            "signedTurnDeg": SemanticRouteMath.signedAngleDifference(
+                next.edge.bearingDegrees,
+                current.edge.bearingDegrees
+            ),
+            "spokenTurn": turn,
+            "nextLegDistM": next.edge.distanceMeters
+        ]))
         let decisionLandmarkCue = shouldSpeakLandmarks
             ? nearbyLandmarkCue(on: current, after: max(segmentProgressMeters, current.edge.distanceMeters - 0.75))
             : nil
@@ -3952,7 +4176,7 @@ final class SemanticRouteNavigator: ObservableObject {
             landmarkPrefix = ""
         }
         currentInstruction = NavLoc.turnThenWalk(prefix: landmarkPrefix, turn: Self.sentenceCased(turn), distance: Self.formatMeters(next.edge.distanceMeters), context: nextContext)
-        speechCue = SemanticSpeechCue(text: currentInstruction, priority: .critical)
+        emitCue(currentInstruction, priority: .critical)
         // This already told them which way to turn, so the alignment cue must
         // not repeat it a tick later while they are still turning.
         lastHeadingAlignmentCueAt = Date()
@@ -3976,6 +4200,162 @@ final class SemanticRouteNavigator: ObservableObject {
         if let hint = step.to.turnHint, hint != .straight { return NavLoc.towardTheNextTurn() }
         if step.to.turnHint == .straight { return NavLoc.straightAheadContext() }
         return NavLoc.towardPlace(Self.sanitizedSpokenLabel(step.to.name, fallback: NavLoc.theNextPointLabel()))
+    }
+
+    // MARK: - Session trace
+
+    /// Every spoken cue goes through here so the trace records which function
+    /// produced it. "Turn right" and "turn around" arriving back to back are
+    /// indistinguishable in a log that only has the words — knowing one came
+    /// from `issueHeadingAlignmentCueIfNeeded` and the other from
+    /// `updateRecoveryIfNeeded` is the whole diagnosis.
+    private func emitCue(
+        _ text: String,
+        priority: SemanticSpeechPriority,
+        caller: String = #function,
+        line: Int = #line
+    ) {
+        speechCue = SemanticSpeechCue(text: text, priority: priority)
+        NavigationTrace.shared.log("cue", traceState(extra: [
+            "text": text,
+            "priority": String(describing: priority),
+            "from": caller,
+            "line": line
+        ]))
+    }
+
+    /// Guidance state at ~4 Hz, plus an immediate sample whenever the leg, the
+    /// phase or the belief status changes so no transition can hide between
+    /// two throttled ticks.
+    private func traceNavigationTick(
+        visualMatch: VisualRouteMatch?,
+        pdrDelta: Double,
+        gatedDelta: Double,
+        isMoving: Bool
+    ) {
+        let now = Date()
+        let changed = currentStepIndex != traceLastStepIndex ||
+            phase != traceLastPhase ||
+            routeLocalizationStatus != traceLastRouteStatus
+        let due = traceLastTickAt.map { now.timeIntervalSince($0) >= 0.25 } ?? true
+        guard changed || due else { return }
+        traceLastTickAt = now
+        traceLastStepIndex = currentStepIndex
+        traceLastPhase = phase
+        traceLastRouteStatus = routeLocalizationStatus
+
+        var extra: [String: Any] = [
+            "pdrDeltaM": pdrDelta,
+            "gatedDeltaM": gatedDelta,
+            "pdrCapped": lastPDRDeltaWasCapped,
+            "moving": isMoving,
+            "instruction": currentInstruction
+        ]
+        if let visualMatch {
+            extra["visualStep"] = visualMatch.stepIndex
+            extra["visualProgressM"] = visualMatch.progressMeters
+            extra["visualConf"] = visualMatch.confidence
+            extra["visualAliased"] = visualMatch.isAliased
+            extra["visualLandmark"] = visualMatch.landmarkName ?? NSNull()
+        }
+        if changed { extra["transition"] = true }
+        NavigationTrace.shared.tick("nav.tick", traceState(extra: extra))
+    }
+
+    private func traceState(extra: [String: Any] = [:]) -> [String: Any] {
+        var fields: [String: Any] = [
+            "phase": phase.rawValue,
+            "target": targetName,
+            "stepIndex": currentStepIndex,
+            "stepCount": routeSteps.count,
+            "progressM": segmentProgressMeters,
+            "remainingM": segmentRemainingMeters,
+            "totalRemainingM": totalRemainingMeters,
+            "beliefStatus": routeLocalizationStatus.rawValue,
+            "beliefConf": routeBeliefState.confidence,
+            "beliefMargin": routeBeliefState.margin,
+            "beliefUncM": routeBeliefState.uncertaintyMeters,
+            "beliefSafe": routeBeliefState.isInstructionSafe,
+            "beliefEvidence": routeBeliefState.evidenceSummary,
+            "arLocalized": traceARLocalized,
+            "confidence": confidence,
+            "travelledM": cumulativeTravelMeters
+        ]
+        if let step = activeStep {
+            fields["legFrom"] = step.from.name
+            fields["legTo"] = step.to.name
+            fields["legBearing"] = step.edge.bearingDegrees
+            fields["legDistM"] = step.edge.distanceMeters
+            fields["legEdgeId"] = step.edge.id
+            fields["legTurnHint"] = step.to.turnHint?.rawValue ?? "none"
+        }
+        if let heading = traceLiveHeading { fields["heading"] = heading }
+        if let headingError = traceHeadingError { fields["headingErrDeg"] = headingError }
+        if let crossTrack = traceCrossTrack { fields["crossM"] = crossTrack }
+        if let alongTrack = traceAlongTrack { fields["alongM"] = alongTrack }
+        if let pose = tracePose {
+            fields["x"] = pose.x
+            fields["y"] = pose.y
+        }
+        if let recoveryReason { fields["recoveryReason"] = recoveryReason }
+        for (key, value) in extra { fields[key] = value }
+        return fields
+    }
+
+    /// The shaped legs guidance will actually walk, as spoken distances and
+    /// bearings — the thing to diff against the captured graph.
+    private func traceLegs() -> [[String: Any]] {
+        routeSteps.enumerated().map { index, step in
+            [
+                "i": index,
+                "from": step.from.name,
+                "to": step.to.name,
+                "distM": step.edge.distanceMeters,
+                "bearing": step.edge.bearingDegrees,
+                "edgeId": step.edge.id,
+                "turnHintAtEnd": step.to.turnHint?.rawValue ?? "none",
+                "spokenTurnAtEnd": index + 1 < routeSteps.count
+                    ? turnInstruction(
+                        at: step.to,
+                        from: step.edge.bearingDegrees,
+                        to: routeSteps[index + 1].edge.bearingDegrees
+                    )
+                    : "arrive"
+            ]
+        }
+    }
+
+    private func traceMapGraph(_ map: SemanticRouteMap) -> [String: Any] {
+        [
+            "id": map.id,
+            "name": map.name,
+            "coordinateSpace": map.coordinateSpace,
+            "axisConvention": map.axisConvention ?? 1,
+            "arWorldMapId": map.arWorldMapId ?? NSNull(),
+            "nodes": map.nodes.map { node in
+                [
+                    "id": node.id,
+                    "name": node.name,
+                    "kind": node.kind.rawValue,
+                    "turnHint": node.turnHint?.rawValue ?? "none",
+                    "x": node.point.x,
+                    "y": node.point.y,
+                    "headingDeg": node.headingDegrees ?? NSNull()
+                ] as [String: Any]
+            },
+            "edges": map.edges.map { edge in
+                [
+                    "id": edge.id,
+                    "from": edge.fromNodeID,
+                    "to": edge.toNodeID,
+                    "distM": edge.distanceMeters,
+                    "bearing": edge.bearingDegrees,
+                    "reverseBearing": edge.reverseBearingDegrees
+                ] as [String: Any]
+            },
+            "keyframeCount": map.keyframes?.count ?? 0,
+            "fingerprintCount": map.visualFingerprints?.count ?? 0
+        ]
     }
 
     private func updateInstruction(forceSpeech: Bool) {
@@ -4048,14 +4428,14 @@ final class SemanticRouteNavigator: ObservableObject {
         guard routineSpeechAllowed else { return }
 
         if forceSpeech {
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
             lastAnnouncedRemainingMeter = bucket
         } else if shouldSpeakLandmarks,
                   let landmarkCue = nearbyLandmarkCue(on: step, after: segmentProgressMeters),
                   !announcedLandmarkIDs.contains(landmarkCue.id) {
             lastAnnouncedLandmarkID = landmarkCue.id
             announcedLandmarkIDs.insert(landmarkCue.id)
-            speechCue = SemanticSpeechCue(text: landmarkCue.phrase, priority: .priority)
+            emitCue(landmarkCue.phrase, priority: .priority)
         } else if bucket != lastAnnouncedRemainingMeter && bucket <= 8 && bucket >= 1 {
             lastAnnouncedRemainingMeter = bucket
             let cue: String
@@ -4067,7 +4447,7 @@ final class SemanticRouteNavigator: ObservableObject {
             } else {
                 cue = "\(bucket) meters."
             }
-            speechCue = SemanticSpeechCue(text: cue, priority: .priority)
+            emitCue(cue, priority: .priority)
         }
     }
 
@@ -4242,9 +4622,12 @@ final class SemanticRouteNavigator: ObservableObject {
 
         if let second = matches.dropFirst().first,
            best.confidence - second.confidence < visualRouteAmbiguousGap {
-            let sameRoutePlace = second.stepIndex == best.stepIndex &&
-                abs(second.progressMeters - best.progressMeters) <= 1.5
-            guard sameRoutePlace else {
+            guard isSameRoutePlace(
+                stepIndex: best.stepIndex,
+                progressMeters: best.progressMeters,
+                otherStepIndex: second.stepIndex,
+                otherProgressMeters: second.progressMeters
+            ) else {
                 lastVisualRouteMatch = nil
                 return nil
             }
@@ -4254,22 +4637,60 @@ final class SemanticRouteNavigator: ObservableObject {
         return best
     }
 
+    /// Two near-tied matches describe one place, not a real ambiguity.
+    ///
+    /// Comparing step indices alone treated the metre either side of a turn
+    /// node as two different places, so keyframes captured a third of a metre
+    /// apart across a node vetoed each other — silencing visual matching at
+    /// every decision point. Adjacent steps share that node, so compare where
+    /// the two matches actually sit. Non-adjacent legs stay a real ambiguity
+    /// even when they run close together: parallel aisles are exactly the case
+    /// this guard exists for.
+    func isSameRoutePlace(
+        stepIndex: Int,
+        progressMeters: Double,
+        otherStepIndex: Int,
+        otherProgressMeters: Double
+    ) -> Bool {
+        if stepIndex == otherStepIndex {
+            return abs(progressMeters - otherProgressMeters) <= visualSameRoutePlaceMeters
+        }
+        guard abs(stepIndex - otherStepIndex) == 1,
+              let left = routeWorldPoint(stepIndex: stepIndex, progressMeters: progressMeters),
+              let right = routeWorldPoint(stepIndex: otherStepIndex, progressMeters: otherProgressMeters) else {
+            return false
+        }
+        return left.distance(to: right) <= visualSameRoutePlaceMeters
+    }
+
+    /// Where a point at `progressMeters` along a step sits in the route frame.
+    private func routeWorldPoint(stepIndex: Int, progressMeters: Double) -> SemanticRoutePoint? {
+        guard routeSteps.indices.contains(stepIndex) else { return nil }
+        let step = routeSteps[stepIndex]
+        let fraction = min(max(progressMeters / max(step.edge.distanceMeters, 0.0001), 0), 1)
+        return SemanticRoutePoint(
+            x: step.from.point.x + (step.to.point.x - step.from.point.x) * fraction,
+            y: step.from.point.y + (step.to.point.y - step.from.point.y) * fraction
+        )
+    }
+
     private func keyframeProgressMeters(
         for keyframe: SemanticRouteKeyframe,
         on step: SemanticRouteStep,
         baseEdgeID: String,
         keyframeIDs: Set<String>,
         reversed: Bool
-    ) -> Double? {
+    ) -> (progressMeters: Double, isOwned: Bool)? {
         if let segmentID = keyframe.segmentID,
            let span = step.edgeSpans[segmentID] {
-            return Self.progress(inside: span, atEdgeOffset: keyframe.distanceFromSegmentStart, on: step)
+            return (Self.progress(inside: span, atEdgeOffset: keyframe.distanceFromSegmentStart, on: step), true)
         }
 
         if keyframe.segmentID == baseEdgeID || keyframeIDs.contains(keyframe.id) {
-            return reversed
+            let progress = reversed
                 ? max(0, step.edge.distanceMeters - keyframe.distanceFromSegmentStart)
                 : min(max(keyframe.distanceFromSegmentStart, 0), step.edge.distanceMeters)
+            return (progress, true)
         }
 
         let projection = Self.project(keyframe.pose, onto: step)
@@ -4281,9 +4702,9 @@ final class SemanticRouteNavigator: ObservableObject {
 
         guard nearFrom || nearTo || nearSegment else { return nil }
 
-        if nearTo { return step.edge.distanceMeters }
-        if nearFrom { return 0 }
-        return min(max(projection.alongTrackMeters, 0), step.edge.distanceMeters)
+        if nearTo { return (step.edge.distanceMeters, false) }
+        if nearFrom { return (0, false) }
+        return (min(max(projection.alongTrackMeters, 0), step.edge.distanceMeters), false)
     }
 
     private func visualRouteCandidates(
@@ -4310,7 +4731,7 @@ final class SemanticRouteNavigator: ObservableObject {
                    abs(SemanticRouteMath.signedAngleDifference(liveHeading, keyframeHeading)) > Self.visualMatchHeadingGateDegrees {
                     continue
                 }
-                guard let progress = keyframeProgressMeters(
+                guard let attribution = keyframeProgressMeters(
                         for: keyframe,
                         on: step,
                         baseEdgeID: baseEdgeID,
@@ -4325,13 +4746,14 @@ final class SemanticRouteNavigator: ObservableObject {
                 candidates.append(
                     VisualRouteCandidate(
                         stepIndex: stepIndex,
-                        progressMeters: progress,
+                        progressMeters: attribution.progressMeters,
                         fingerprint: fingerprint,
                         fingerprintID: fingerprintID,
                         keyframeID: keyframe.id,
                         landmarkID: nil,
                         landmarkName: nil,
-                        cue: nil
+                        cue: nil,
+                        isOwnedByStep: attribution.isOwned
                     )
                 )
             }
@@ -4361,14 +4783,50 @@ final class SemanticRouteNavigator: ObservableObject {
                             keyframeID: nil,
                             landmarkID: landmark.id,
                             landmarkName: name,
-                            cue: cue
+                            cue: cue,
+                            isOwnedByStep: (step.edge.landmarkIds ?? []).contains(landmark.id)
                         )
                     )
                 }
             }
         }
 
-        return candidates
+        return deduplicatedByFingerprint(candidates)
+    }
+
+    /// One saved image belongs to one place, so it must enter the ranking once.
+    ///
+    /// Every step is offered every keyframe, and the geometric fallback in
+    /// `keyframeProgressMeters` claims any sample lying near the step's line —
+    /// which at a shared node is guaranteed: the same image is `nearTo` the
+    /// step that ends there and `nearFrom` the step that starts there. Both
+    /// copies then scored identically against the live frame, so the ambiguity
+    /// guard in `currentVisualRouteMatch` saw a dead tie between two different
+    /// step indices and threw the match away. Visual evidence was therefore
+    /// discarded at exactly the turns and destinations it exists to confirm.
+    ///
+    /// Attribution order: the step that actually recorded the sample wins;
+    /// failing that, the step nearest the one being guided.
+    private func deduplicatedByFingerprint(_ candidates: [VisualRouteCandidate]) -> [VisualRouteCandidate] {
+        var best: [String: VisualRouteCandidate] = [:]
+        var order: [String] = []
+        for candidate in candidates {
+            guard let incumbent = best[candidate.fingerprintID] else {
+                best[candidate.fingerprintID] = candidate
+                order.append(candidate.fingerprintID)
+                continue
+            }
+            if incumbent.isOwnedByStep != candidate.isOwnedByStep {
+                if candidate.isOwnedByStep { best[candidate.fingerprintID] = candidate }
+                continue
+            }
+            let incumbentDistance = abs(incumbent.stepIndex - currentStepIndex)
+            let candidateDistance = abs(candidate.stepIndex - currentStepIndex)
+            if candidateDistance < incumbentDistance {
+                best[candidate.fingerprintID] = candidate
+            }
+        }
+        return order.compactMap { best[$0] }
     }
 
     private func visualConfidence(from similarity: Float) -> Double {
@@ -4398,7 +4856,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
         announcedLandmarkIDs.insert(landmarkID)
         lastAnnouncedLandmarkID = landmarkID
-        speechCue = SemanticSpeechCue(text: cue, priority: .priority)
+        emitCue(cue, priority: .priority)
     }
 
     private func shouldHoldForVisualArrival(
@@ -4419,7 +4877,7 @@ final class SemanticRouteNavigator: ObservableObject {
         if arrivalVisualHoldStartedAt == nil {
             arrivalVisualHoldStartedAt = now
             currentInstruction = NavLoc.nearTargetConfirm(targetName)
-            speechCue = SemanticSpeechCue(text: currentInstruction, priority: .priority)
+            emitCue(currentInstruction, priority: .priority)
         }
 
         if let started = arrivalVisualHoldStartedAt,
@@ -4690,6 +5148,25 @@ final class SemanticRouteNavigator: ObservableObject {
                 options.append((path, progress, cost))
             }
 
+            NavigationTrace.shared.log("nav.start.resolve", [
+                "mode": "edge_snap",
+                "poseX": pose?.x ?? NSNull(),
+                "poseY": pose?.y ?? NSNull(),
+                "headingDeg": headingDegrees ?? NSNull(),
+                "snappedEdge": edgeMatch.edge.id,
+                "snappedEdgeBearing": edgeMatch.edge.bearingDegrees,
+                "snappedEdgeReverseBearing": edgeMatch.edge.reverseBearingDegrees,
+                "alongTrackM": edgeMatch.alongTrackMeters,
+                "crossTrackM": edgeMatch.crossTrackMeters,
+                "options": options.map { option in
+                    [
+                        "path": option.path,
+                        "initialProgressM": option.progress,
+                        "cost": option.cost
+                    ] as [String: Any]
+                },
+                "chosen": options.min(by: { $0.cost < $1.cost })?.path ?? []
+            ])
             if let best = options.min(by: { $0.cost < $1.cost }) {
                 return NavigationStart(nodePath: best.path, initialProgressMeters: best.progress)
             }
@@ -4698,11 +5175,27 @@ final class SemanticRouteNavigator: ObservableObject {
         if let pose, let nearest = nearestNode(in: map, to: pose) {
             let path = shortestPath(in: map, from: nearest.id, to: targetNodeID)
             if !path.isEmpty {
+                NavigationTrace.shared.log("nav.start.resolve", [
+                    "mode": "nearest_node",
+                    "poseX": pose.x,
+                    "poseY": pose.y,
+                    "headingDeg": headingDegrees ?? NSNull(),
+                    "nearestNode": nearest.name,
+                    "nearestNodeDistM": pose.distance(to: nearest.point),
+                    "chosen": path
+                ])
                 return NavigationStart(nodePath: path, initialProgressMeters: 0)
             }
         }
 
         let fallbackPath = shortestPath(in: map, from: map.nodes.first?.id ?? "", to: targetNodeID)
+        NavigationTrace.shared.log("nav.start.resolve", [
+            "mode": "map_first_node_fallback",
+            "poseX": pose?.x ?? NSNull(),
+            "poseY": pose?.y ?? NSNull(),
+            "headingDeg": headingDegrees ?? NSNull(),
+            "chosen": fallbackPath
+        ])
         return fallbackPath.isEmpty ? nil : NavigationStart(nodePath: fallbackPath, initialProgressMeters: 0)
     }
 
@@ -6017,6 +6510,14 @@ extension SemanticRouteNavigator {
     func forceStillnessRepromptWindowForTesting() {
         stillnessStartedAt = Date().addingTimeInterval(-(stillnessRepromptAfterSeconds + 1))
         lastStillnessRepromptAt = nil
+    }
+
+    /// Which step each saved image is attributed to, without needing a camera
+    /// frame to score it.
+    func visualCandidateAttributionForTesting() -> [(fingerprintID: String, stepIndex: Int)] {
+        guard let map = activeMap, let fingerprints = map.visualFingerprints else { return [] }
+        return visualRouteCandidates(in: map, fingerprints: fingerprints)
+            .map { (fingerprintID: $0.fingerprintID, stepIndex: $0.stepIndex) }
     }
 }
 #endif

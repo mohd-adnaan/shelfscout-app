@@ -143,6 +143,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// load, before the session runs, and read on the session queue; zero means
     /// the map carries no anchors and cannot supply relocalization proof.
     private var expectedRestoredPOICount = 0
+    private var lastTracedFrameAt: Date?
+    private var lastTracedVetoReason: String?
     private var fidelityUpgradeAt: Date?
     private let fidelityUpgradeSettleSeconds: TimeInterval = 2.0
     private var relocalizationNormalSince: Date?
@@ -187,6 +189,13 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // alignment against.
         expectedRestoredPOICount = 0
         let config = makeWorldTrackingConfiguration()
+        // The capture frame's yaw origin. A map recorded under one alignment
+        // and relocalized under another is the first thing to rule out when
+        // left/right cues mirror, so both ends are on the record.
+        NavigationTrace.shared.log("ar.mappingStarted", [
+            "worldAlignment": config.worldAlignment == .gravity ? "gravity" : "gravityAndHeading"
+        ])
+        lastTracedVetoReason = nil
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
         lastUpdateTime = 0
         isMapping = true
@@ -402,7 +411,16 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
 
                     self.didUpgradeSessionFidelity = false
                     self.expectedRestoredPOICount = loadedPOIs.count
+                    self.lastTracedVetoReason = nil
                     let config = self.makeWorldTrackingConfiguration(initialWorldMap: map, lightweight: true)
+                    NavigationTrace.shared.log("ar.mapLoaded", [
+                        "mapID": metadata.id,
+                        "mapName": metadata.name,
+                        "poiCount": loadedPOIs.count,
+                        "poiNames": loadedPOIs.map(\.name),
+                        "featurePoints": featureSnapshot.totalCount,
+                        "worldAlignment": config.worldAlignment == .gravity ? "gravity" : "gravityAndHeading"
+                    ])
                     self.session.run(config, options: [.resetTracking, .removeExistingAnchors])
                 }
             } catch {
@@ -813,9 +831,70 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 self.currentPositionText = ""
                 self.poiMatchStatusText = nil
             }
+
+            self.traceARFrame(
+                position: cameraPosition,
+                heading: arHeading,
+                mappingStatus: mappingStatus,
+                hasRestoredMapAnchors: hasRestoredMapAnchors,
+                visuallyRecognizedPlace: visuallyRecognizedPlace
+            )
         }
     }
-    
+
+    /// The raw AR frame the route layer is fed, at ~4 Hz. Whether the pose is
+    /// in the saved map's frame or the session's own is exactly what the trace
+    /// has to be able to settle, so this records the alignment evidence
+    /// (restored anchors, mapping status) beside the pose itself.
+    private func traceARFrame(
+        position: simd_float3,
+        heading: Double?,
+        mappingStatus: ARFrame.WorldMappingStatus,
+        hasRestoredMapAnchors: Bool,
+        visuallyRecognizedPlace: String?
+    ) {
+        let now = Date()
+        guard lastTracedFrameAt.map({ now.timeIntervalSince($0) >= 0.25 }) ?? true else { return }
+        lastTracedFrameAt = now
+        NavigationTrace.shared.tick("ar.frame", [
+            "x": Double(position.x),
+            "z": Double(position.z),
+            "routeY": -Double(position.z),
+            "headingDeg": heading ?? NSNull(),
+            "mappingStatus": Self.describe(mappingStatus),
+            "isLocalized": isLocalized,
+            "isRelocalizing": isRelocalizing,
+            "isMapping": isMapping,
+            "hasRestoredMapAnchors": hasRestoredMapAnchors,
+            "expectedRestoredPOIs": expectedRestoredPOICount,
+            "closestPOI": closestPOI ?? NSNull(),
+            "visuallyRecognized": visuallyRecognizedPlace ?? NSNull(),
+            "activeMapID": activeMapID ?? NSNull()
+        ])
+    }
+
+    /// Why a `.normal` frame was not promoted to "localized". Logged once per
+    /// distinct reason so a 30-second search does not bury the rest of the
+    /// trace, but re-logged whenever the reason changes.
+    private func traceRelocalizationVeto(_ reason: String, detail: [String: Any]) {
+        guard lastTracedVetoReason != reason else { return }
+        lastTracedVetoReason = reason
+        var fields = detail
+        fields["reason"] = reason
+        fields["activeMapID"] = activeMapID ?? NSNull()
+        NavigationTrace.shared.log("ar.relocalizeVeto", fields)
+    }
+
+    private static func describe(_ status: ARFrame.WorldMappingStatus) -> String {
+        switch status {
+        case .notAvailable: return "notAvailable"
+        case .limited: return "limited"
+        case .extending: return "extending"
+        case .mapped: return "mapped"
+        @unknown default: return "unknown"
+        }
+    }
+
     func session(_ session: ARSession, cameraDidChangeTrackingState camera: ARCamera) {
         DispatchQueue.main.async {
             if self.isRelocalizing {
@@ -880,13 +959,28 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             relocalizationNormalSince = Date()
             let waiting = "Matching the saved map. Keep the camera up and turn slowly."
             if statusMessage != waiting { statusMessage = waiting }
+            traceRelocalizationVeto("no_restored_map_anchors", detail: [
+                "expectedRestoredPOIs": expectedRestoredPOICount
+            ])
             return
+        }
+        if expectedRestoredPOICount == 0 {
+            // No named anchors in the saved map means the anchor proof above
+            // cannot run, so `.normal` tracking alone is allowed to promote a
+            // pose that may still be in ARKit's own session frame. Worth
+            // knowing before blaming the route graph for mirrored cues.
+            traceRelocalizationVeto("anchor_proof_unavailable", detail: [
+                "expectedRestoredPOIs": 0
+            ])
         }
 
         if let previous = preLocalizationPosition,
            simd_distance(previous, cameraPosition) > postLocalizationJumpMeters {
             relocalizationNormalSince = Date()
             preLocalizationPosition = cameraPosition
+            traceRelocalizationVeto("pose_still_jumping", detail: [
+                "jumpM": Double(simd_distance(previous, cameraPosition))
+            ])
             return
         }
         preLocalizationPosition = cameraPosition
@@ -906,6 +1000,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             if statusMessage != contradiction {
                 statusMessage = contradiction
             }
+            traceRelocalizationVeto("visual_evidence_contradiction", detail: [
+                "message": contradiction
+            ])
             return
         }
 
@@ -926,6 +1023,20 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         didReportLocalizationJump = false
         isLocalized = true
         statusMessage = "Localized against saved map."
+        lastTracedVetoReason = nil
+        NavigationTrace.shared.log("ar.localized", [
+            "heldSeconds": heldSeconds,
+            "mappingStatus": Self.describe(mappingStatus),
+            "statusConfirms": statusConfirms,
+            "hadAnchorProof": expectedRestoredPOICount > 0 && hasRestoredMapAnchors,
+            "expectedRestoredPOIs": expectedRestoredPOICount,
+            "x": Double(cameraPosition.x),
+            "z": Double(cameraPosition.z),
+            "routeY": -Double(cameraPosition.z),
+            "headingDeg": arHeading ?? NSNull(),
+            "activeMapID": activeMapID ?? NSNull(),
+            "activeMapName": activeMapName ?? NSNull()
+        ])
         // Relocalization is done, so the mapping features that were held back to
         // keep the match fast can come back on now.
         upgradeSessionToFullFidelity()
@@ -950,6 +1061,15 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         didReportLocalizationJump = true
         localizationRevision += 1
         statusMessage = "Map alignment corrected."
+        NavigationTrace.shared.log("ar.poseJump", [
+            "jumpM": Double(simd_distance(previous, cameraPosition)),
+            "sinceLocalizedS": Date().timeIntervalSince(localizedAt),
+            "fromX": Double(previous.x),
+            "fromRouteY": -Double(previous.z),
+            "toX": Double(cameraPosition.x),
+            "toRouteY": -Double(cameraPosition.z),
+            "revision": localizationRevision
+        ])
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
