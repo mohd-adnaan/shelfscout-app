@@ -1,5 +1,7 @@
 // src/screens/SettingsScreen.tsx
 
+import { SvgXml } from 'react-native-svg';
+
 import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View,
@@ -54,6 +56,25 @@ const C = {
   sliderThumb: '#FFFFFF',
   divider: '#1E1E2E',
 };
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flag SVGs – rendered via SvgXml so they look crisp at any size
+// ─────────────────────────────────────────────────────────────────────────────
+
+const FLAG_SVG_EN = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480">
+  <path fill="#012169" d="M0 0h640v480H0z"/>
+  <path fill="#FFF" d="m75 0 244 181L562 0h78v62L400 241l240 178v61h-80L320 301 81 480H0v-60l239-178L0 64V0z"/>
+  <path fill="#C8102E" d="m424 281 216 159v40L369 281zm-184 20 6 35L54 480H0zM640 0v3L391 191l2-44L590 0zM0 0l239 176h-60L0 42z"/>
+  <path fill="#FFF" d="M241 0v480h160V0zM0 160v160h640V160z"/>
+  <path fill="#C8102E" d="M0 193v96h640v-96zM273 0v480h96V0z"/>
+</svg>`;
+
+const FLAG_SVG_FR = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 480">
+  <path fill="#fff" d="M150.1 0h339.7v480H150z"/>
+  <path fill="#d52b1e" d="M-19.7 0h169.8v480H-19.7zm509.5 0h169.8v480H489.9zM201 232l-13.3 4.4 61.4 54c4.7 13.7-1.6 17.8-5.6 25l66.6-8.4-1.6 67 13.9-.3-3.1-66.6 66.7 8c-4.1-8.7-7.8-13.3-4-27.2l61.3-51-10.7-4c-8.8-6.8 3.8-32.6 5.6-48.9 0 0-35.7 12.3-38 5.8l-9.2-17.5-32.6 35.8c-3.5.9-5-.5-5.9-3.5l15-74.8-23.8 13.4q-3.2 1.3-5.2-2.2l-23-46-23.6 47.8q-2.8 2.5-5 .7L264 130.8l13.7 74.1c-1.1 3-3.7 3.8-6.7 2.2l-31.2-35.3c-4 6.5-6.8 17.1-12.2 19.5s-23.5-4.5-35.6-7c4.2 14.8 17 39.6 9 47.7"/>
+</svg>`;
+
+const FLAG_SIZE = 32;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
@@ -606,9 +627,13 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                     accessibilityHint={t.settings.languageOptionAccessibilityHint}
                     onPress={() => handleLanguageChange(code)}
                   >
-                    <Text style={styles.pipelineOptionIcon}>
-                      {code === 'fr' ? '🇨🇦' : '🇬🇧'}
-                    </Text>
+                    <View style={styles.flagContainer}>
+                      <SvgXml
+                        xml={code === 'fr' ? FLAG_SVG_FR : FLAG_SVG_EN}
+                        width={FLAG_SIZE}
+                        height={FLAG_SIZE * 0.75}
+                      />
+                    </View>
                     <Text style={styles.pipelineOptionName}>{label}</Text>
                     <Text style={styles.pipelineOptionDesc}>
                       {LANGUAGE_LOCALES[code].bcp47}
@@ -1543,6 +1568,13 @@ const styles = StyleSheet.create({
     fontSize: 20,
     marginBottom: 4,
     color: C.text,
+  },
+  flagContainer: {
+    width: FLAG_SIZE,
+    height: FLAG_SIZE * 0.75,
+    borderRadius: 4,
+    overflow: 'hidden',
+    marginBottom: 6,
   },
   pipelineOptionName: {
     color: C.text,
