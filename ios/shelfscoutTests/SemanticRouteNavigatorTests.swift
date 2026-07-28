@@ -957,6 +957,173 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         ))
     }
 
+    // MARK: - Heading-settle gate
+
+    func testOpeningCueSkipsTurnCommandWhileHeadingStillSweeping() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+
+        // The relocalization pan: three headings sweeping 160° within the
+        // settle window, right before guidance starts.
+        for heading in [40.0, 120.0, 200.0] {
+            navigator.update(
+                imuState: Self.imu(bearing: heading),
+                arPosition: nil,
+                arHeading: heading,
+                arLocalized: false
+            )
+        }
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 180),
+            speakLandmarks: false,
+            arHeading: 180
+        ))
+        // The 180 reading is one instant of the sweep, not a facing: the
+        // opening announcement must not command a turn from it.
+        XCTAssertFalse(navigator.currentInstruction.contains("Turn around"))
+        XCTAssertNotNil(navigator.currentInstruction.range(of: "walk", options: .caseInsensitive))
+
+        // Once the user settles still facing the wrong way, the cue is owed —
+        // and now it is computed from a heading they actually hold.
+        navigator.settleHeadingForTesting()
+        navigator.update(
+            imuState: Self.imu(bearing: 180),
+            arPosition: nil,
+            arHeading: 180,
+            arLocalized: false
+        )
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn around to face the route."))
+    }
+
+    // MARK: - Dropped leading stub facing
+
+    func testReverseStartFacingTheDroppedStubHearsNoTurnCommand() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.reverseStubMap()])
+
+        // Standing at Onions, already turned around to face Left turn 1 —
+        // the direction the return walk physically starts in (318°).
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Spices",
+            arPosition: nil,
+            imuState: Self.imu(x: 0.736, y: -0.817, bearing: 318),
+            speakLandmarks: false,
+            arHeading: 318
+        ))
+
+        // The stub was dropped and the first leg bears 23° — 65° off. That
+        // turn happens AT the stub's far end; commanding it now told a
+        // correctly-facing user to turn into the shelf.
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Starting at Onions."))
+        XCTAssertFalse(navigator.currentInstruction.contains("face the route"))
+
+        navigator.update(
+            imuState: Self.imu(x: 0.736, y: -0.817, bearing: 318),
+            arPosition: nil,
+            arHeading: 318,
+            arLocalized: false
+        )
+        XCTAssertFalse(navigator.currentInstruction.contains("face the route"))
+    }
+
+    // MARK: - Re-capture node reuse
+
+    func testReturnCaptureReusesExistingNodesInsteadOfDuplicating() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()], activeMapID: "iga")
+        XCTAssertTrue(navigator.beginRouteCaptureAppending(toMapID: "iga"))
+        let nodesBefore = navigator.activeMap?.nodes.count ?? 0
+        let edgesBefore = navigator.activeMap?.edges.count ?? 0
+
+        // The return walk starts by re-marking the destination shelf…
+        XCTAssertTrue(navigator.captureStart(
+            named: "Onions",
+            arPosition: nil,
+            arHeading: 138,
+            imuState: Self.imu(x: -0.90, y: -16.60, bearing: 138)
+        ))
+        // …and re-marks the aisle turn a step away from mapped "Left turn 4".
+        XCTAssertTrue(navigator.captureTurn(
+            .right,
+            arPosition: nil,
+            arHeading: 23,
+            imuState: Self.imu(x: -1.70, y: -16.20, bearing: 23)
+        ))
+
+        // Same places, same graph: no duplicate chain, no parallel edges.
+        XCTAssertEqual(navigator.activeMap?.nodes.count, nodesBefore)
+        XCTAssertEqual(navigator.activeMap?.edges.count, edgesBefore)
+        XCTAssertTrue(navigator.activeMap?.nodes.contains(where: { $0.name == "Left turn 4" }) ?? false)
+    }
+
+    // MARK: - Endpoint anchoring persistence
+
+    func testAnchoredEndpointIsNotRepromptedInLaterCaptureSession() {
+        var saved = Self.igaMap(coordinateSpace: "ar_world_xz")
+        saved.anchoredNodeIds = ["onions"]
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([saved], activeMapID: "iga")
+        XCTAssertTrue(navigator.beginRouteCaptureAppending(toMapID: "iga"))
+
+        // Standing at Onions, whose 360° sweep a previous session banked.
+        navigator.update(
+            imuState: Self.imu(x: -0.93, y: -16.63, bearing: 90),
+            arPosition: simd_float3(-0.93, 0, 16.63),
+            arHeading: 90,
+            arLocalized: true
+        )
+        XCTAssertFalse(navigator.currentInstruction.contains("full circle"))
+
+        // Control: an endpoint never anchored still asks for its sweep.
+        navigator.update(
+            imuState: Self.imu(bearing: 90),
+            arPosition: simd_float3(0, 0, 0),
+            arHeading: 90,
+            arLocalized: true
+        )
+        XCTAssertTrue(navigator.currentInstruction.contains("full circle"))
+    }
+
+    // MARK: - Route overlay polyline
+
+    func testRemainingRoutePolylineEndsAtDestination() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        let polyline = navigator.remainingRoutePolyline()
+        XCTAssertGreaterThanOrEqual(polyline.count, 3)
+        XCTAssertEqual(polyline.last?.x ?? -1, 4, accuracy: 0.01)
+        XCTAssertEqual(polyline.last?.y ?? -1, 4, accuracy: 0.01)
+    }
+
+    /// The reverse of a narrow-aisle capture: Spices ──7 m at 23°── Left turn 1
+    /// ──1.1 m at 138°── Onions. Walked back from Onions the 1.1 m hop is a
+    /// leading stub bearing 318°, and the leg it drops onto bears 23° — the
+    /// 65° disagreement that made guidance command a turn at a user already
+    /// facing the way.
+    private static func reverseStubMap() -> SemanticRouteMap {
+        let spices = node(id: "spices", name: "Spices", point: SemanticRoutePoint(x: 2.735, y: 6.444), kind: .entrance)
+        let turn = node(
+            id: "turn1",
+            name: "Left turn 1",
+            point: SemanticRoutePoint(x: 0, y: 0),
+            kind: .intersection,
+            turnHint: .left
+        )
+        let onions = node(id: "onions", name: "Onions", point: SemanticRoutePoint(x: 0.736, y: -0.817), kind: .destination)
+        return map(id: "reverse-stub", coordinateSpace: "pdr_xy", nodes: [spices, turn, onions])
+    }
+
     /// The July 25 evening re-capture of the same aisle, where the straight
     /// point landed 1.6 m from the shelf instead of 1.4 m.
     private static func narrowAisleStartMap() -> SemanticRouteMap {
@@ -1139,6 +1306,166 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             visualFingerprintIds: nil
         )
         return map(id: "l-turn-landmark", coordinateSpace: "pdr_xy", nodes: [start, turn, target], landmarks: [fridge])
+    }
+
+    // MARK: - Office field map (2026-07-27)
+
+    /// Forward guidance over the real Office capture. The two "Straight point"
+    /// nodes bend by 5° and 8°, so shaping must fold them away and leave four
+    /// walked legs — not six, and not a first cue of "walk one metre".
+    func testOfficeMapForwardShapesToFourLegsWithCorrectTurns() {
+        let navigator = SemanticRouteNavigator()
+        let map = Self.officeMap()
+        navigator.replaceMapsForTesting([map])
+        let desk = map.nodes.first { $0.id == "desk" }!
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Door",
+            arPosition: Self.arPosition(desk.point),
+            imuState: Self.imu(bearing: 47),
+            speakLandmarks: false,
+            arHeading: 47
+        ))
+
+        let legs = navigator.routeSteps
+        XCTAssertEqual(legs.map(\.from.name), ["Adnaan Desk", "Right turn 2", "Left turn 3", "Right turn 4"])
+        XCTAssertEqual(legs.map(\.to.name), ["Right turn 2", "Left turn 3", "Right turn 4", "Door"])
+        XCTAssertEqual(legs.reduce(0) { $0 + $1.edge.distanceMeters }, 16.2, accuracy: 0.15)
+
+        // Walking out, each labelled turn must match the label the mapper gave
+        // it: right at "Right turn 2", left at "Left turn 3", right at 4.
+        let turns = Self.signedTurns(between: legs)
+        XCTAssertGreaterThan(turns[0], 25, "Right turn 2 should turn right walking out")
+        XCTAssertLessThan(turns[1], -25, "Left turn 3 should turn left walking out")
+        XCTAssertGreaterThan(turns[2], 25, "Right turn 4 should turn right walking out")
+    }
+
+    /// The return journey over the same capture. Every labelled turn reverses:
+    /// "Right turn 4" is a LEFT on the way back. A route that walks the graph
+    /// backwards but keeps the recorded handedness is the bidirectional bug.
+    func testOfficeMapReverseMirrorsEveryTurn() {
+        let navigator = SemanticRouteNavigator()
+        let map = Self.officeMap()
+        navigator.replaceMapsForTesting([map])
+        let door = map.nodes.first { $0.id == "door" }!
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Adnaan Desk",
+            arPosition: Self.arPosition(door.point),
+            imuState: Self.imu(bearing: 320),
+            speakLandmarks: false,
+            arHeading: 320
+        ))
+
+        let legs = navigator.routeSteps
+        XCTAssertEqual(legs.map(\.from.name), ["Door", "Right turn 4", "Left turn 3", "Right turn 2"])
+        XCTAssertEqual(legs.map(\.to.name), ["Right turn 4", "Left turn 3", "Right turn 2", "Adnaan Desk"])
+        XCTAssertEqual(legs.reduce(0) { $0 + $1.edge.distanceMeters }, 16.2, accuracy: 0.15)
+
+        let turns = Self.signedTurns(between: legs)
+        XCTAssertLessThan(turns[0], -25, "Right turn 4 must become a LEFT on the way back")
+        XCTAssertGreaterThan(turns[1], 25, "Left turn 3 must become a RIGHT on the way back")
+        XCTAssertLessThan(turns[2], -25, "Right turn 2 must become a LEFT on the way back")
+    }
+
+    /// The AR arrow overlay has to have something to draw the moment guidance
+    /// starts, and it has to end on the destination.
+    func testOfficeMapPublishesRouteOverlayPolyline() {
+        let navigator = SemanticRouteNavigator()
+        let map = Self.officeMap()
+        navigator.replaceMapsForTesting([map])
+        let desk = map.nodes.first { $0.id == "desk" }!
+        let door = map.nodes.first { $0.id == "door" }!
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Door",
+            arPosition: Self.arPosition(desk.point),
+            imuState: Self.imu(bearing: 47),
+            speakLandmarks: false,
+            arHeading: 47
+        ))
+
+        let polyline = navigator.remainingRoutePolyline()
+        XCTAssertEqual(polyline.count, 5, "believed position plus the four leg ends")
+        XCTAssertEqual(polyline.first!.distance(to: desk.point), 0, accuracy: 0.2)
+        XCTAssertEqual(polyline.last!.distance(to: door.point), 0, accuracy: 0.01)
+    }
+
+    /// The on-screen needle must agree with the leg being guided: facing along
+    /// the first leg reads as aligned, facing the other way reads as a
+    /// half-turn. This is the number every spoken turn is derived from.
+    func testHeadingErrorToActiveLegTracksTheGuidedLeg() {
+        let navigator = SemanticRouteNavigator()
+        let map = Self.officeMap()
+        navigator.replaceMapsForTesting([map])
+        let desk = map.nodes.first { $0.id == "desk" }!
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Door",
+            arPosition: Self.arPosition(desk.point),
+            imuState: Self.imu(bearing: 47),
+            speakLandmarks: false,
+            arHeading: 47
+        ))
+
+        let aligned = navigator.headingErrorToActiveLeg(liveHeading: 50)
+        XCTAssertNotNil(aligned)
+        XCTAssertEqual(abs(aligned ?? 99), 0, accuracy: 12)
+
+        let reversed = navigator.headingErrorToActiveLeg(liveHeading: 230)
+        XCTAssertEqual(abs(reversed ?? 0), 180, accuracy: 12)
+    }
+
+    private static func arPosition(_ point: SemanticRoutePoint) -> simd_float3 {
+        // Route y is the negation of ARKit z; the navigator converts back.
+        simd_float3(Float(point.x), 0, Float(-point.y))
+    }
+
+    private static func signedTurns(between legs: [SemanticRouteStep]) -> [Double] {
+        guard legs.count >= 2 else { return [] }
+        return (0..<(legs.count - 1)).map { index in
+            var diff = legs[index + 1].edge.bearingDegrees - legs[index].edge.bearingDegrees
+            while diff > 180 { diff -= 360 }
+            while diff < -180 { diff += 360 }
+            return diff
+        }
+    }
+
+    /// The "Office" map exactly as captured in the field on 2026-07-27, rebuilt
+    /// from its route report: 7 nodes, 16.2 m, segment bearings 47°, 52°, 126°,
+    /// 61°, 132°, 140°. Node positions are derived from those bearings and
+    /// distances, so this is the real graph rather than a tidied stand-in — the
+    /// point is to assert on geometry that actually failed in a building.
+    private static func officeMap() -> SemanticRouteMap {
+        func advance(_ from: SemanticRoutePoint, bearing: Double, meters: Double) -> SemanticRoutePoint {
+            let radians = bearing * .pi / 180
+            return SemanticRoutePoint(
+                x: from.x + meters * sin(radians),
+                y: from.y + meters * cos(radians)
+            )
+        }
+
+        let deskPoint = SemanticRoutePoint(x: 0, y: 0)
+        let straight1Point = advance(deskPoint, bearing: 47, meters: 1.2)
+        let right2Point = advance(straight1Point, bearing: 52, meters: 2.6)
+        let left3Point = advance(right2Point, bearing: 126, meters: 2.1)
+        let right4Point = advance(left3Point, bearing: 61, meters: 3.5)
+        let straight5Point = advance(right4Point, bearing: 132, meters: 2.2)
+        let doorPoint = advance(straight5Point, bearing: 140, meters: 4.6)
+
+        return map(
+            id: "office",
+            coordinateSpace: "ar_world_xz",
+            nodes: [
+                node(id: "desk", name: "Adnaan Desk", point: deskPoint, kind: .entrance),
+                node(id: "s1", name: "Straight point 1", point: straight1Point, kind: .intersection, turnHint: .straight),
+                node(id: "r2", name: "Right turn 2", point: right2Point, kind: .intersection, turnHint: .right),
+                node(id: "l3", name: "Left turn 3", point: left3Point, kind: .intersection, turnHint: .left),
+                node(id: "r4", name: "Right turn 4", point: right4Point, kind: .intersection, turnHint: .right),
+                node(id: "s5", name: "Straight point 5", point: straight5Point, kind: .intersection, turnHint: .straight),
+                node(id: "door", name: "Door", point: doorPoint, kind: .destination)
+            ]
+        )
     }
 
     private static func map(id: String, coordinateSpace: String, nodes: [SemanticRouteNode], landmarks: [SemanticRouteLandmark] = []) -> SemanticRouteMap {

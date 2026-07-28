@@ -7,6 +7,14 @@ struct ARViewContainer: UIViewRepresentable {
     var session: ARSession
     var isSessionActive: Bool
     var showsCoaching: Bool
+    /// AR-world positions of the remaining route polyline. Non-empty while
+    /// guidance runs on an AR-frame map: the container draws gamified chevrons
+    /// along it so a sighted developer can verify, against the real store,
+    /// that the route the guidance believes in is the route being spoken.
+    var routeOverlayPoints: [SIMD3<Float>] = []
+    /// Why the polyline is what it is ("route", or the guard that emptied it).
+    /// Traced on change so a field report of "no arrows" pinpoints the guard.
+    var routeOverlayContext: String = ""
 
     func makeUIView(context: Context) -> ARSCNView {
         let arView = ARSCNView(frame: .zero)
@@ -19,13 +27,23 @@ struct ARViewContainer: UIViewRepresentable {
         arView.automaticallyUpdatesLighting = false
         arView.backgroundColor = .black
         context.coordinator.attachCoachingOverlay(to: arView, session: session)
+        context.coordinator.attachRouteOverlay(to: arView)
         context.coordinator.update(showsCoaching: showsCoaching && isSessionActive)
+        applyRouteOverlay(via: context.coordinator)
         return arView
     }
 
     func updateUIView(_ uiView: ARSCNView, context: Context) {
         uiView.debugOptions = []
         context.coordinator.update(showsCoaching: showsCoaching && isSessionActive)
+        applyRouteOverlay(via: context.coordinator)
+    }
+
+    private func applyRouteOverlay(via coordinator: Coordinator) {
+        coordinator.updateRouteOverlay(
+            points: isSessionActive ? routeOverlayPoints : [],
+            context: isSessionActive ? routeOverlayContext : "session_idle"
+        )
     }
 
     func makeCoordinator() -> Coordinator {
@@ -35,6 +53,8 @@ struct ARViewContainer: UIViewRepresentable {
     @MainActor
     final class Coordinator {
         private let coachingOverlay = ARCoachingOverlayView()
+        private let routeOverlayRoot = SCNNode()
+        private var lastOverlaySignature = ""
 
         func attachCoachingOverlay(to arView: ARSCNView, session: ARSession) {
             coachingOverlay.session = session
@@ -58,6 +78,202 @@ struct ARViewContainer: UIViewRepresentable {
             if !showsCoaching {
                 coachingOverlay.setActive(false, animated: true)
             }
+        }
+
+        func attachRouteOverlay(to arView: ARSCNView) {
+            routeOverlayRoot.name = "routeArrowOverlay"
+            if routeOverlayRoot.parent == nil {
+                arView.scene.rootNode.addChildNode(routeOverlayRoot)
+            }
+        }
+
+        /// Where the active leg's floor trail starts, in metres ahead of the
+        /// user. The first stretch of a leg is under their feet: at a 1.35 m
+        /// camera height a marker 0.35 m ahead sits 75° below the horizon and
+        /// one at 1.85 m sits 36° below, while the AR view only sees about 30°
+        /// below centre — and the bottom of the screen is behind the guidance
+        /// panel besides. A trail that starts at the toes is a trail nobody
+        /// ever sees, which is exactly how this overlay first shipped.
+        private static let activeLegTrailStartMeters: Float = 1.6
+
+        /// Rebuilds the chevron trail when the route meaningfully changes.
+        /// The signature quantizes to half-metre buckets so per-tick progress
+        /// noise and camera-height bobbing do not thrash the scene graph.
+        func updateRouteOverlay(points: [SIMD3<Float>], context: String) {
+            let signature = points
+                .map { String(format: "%.0f,%.0f,%.0f", $0.x * 2, $0.y * 2, $0.z * 2) }
+                .joined(separator: ";")
+            guard signature != lastOverlaySignature else { return }
+            lastOverlaySignature = signature
+
+            routeOverlayRoot.childNodes.forEach { $0.removeFromParentNode() }
+            guard points.count >= 2 else {
+                // "No arrows appeared" has to be answerable from the log rather
+                // than from guessing which guard emptied the polyline.
+                NavigationTrace.shared.log("ar.routeOverlay", [
+                    "context": context,
+                    "points": points.count,
+                    "markers": 0
+                ])
+                return
+            }
+
+            let floorY = points[0].y
+            var markerCount = 0
+            let chevronSpacing: Float = 0.9
+
+            for index in 0..<(points.count - 1) {
+                let from = points[index]
+                let to = points[index + 1]
+                let delta = to - from
+                let length = simd_length(delta)
+                guard length > 0.05 else { continue }
+                let direction = delta / length
+
+                var offset: Float = index == 0
+                    ? Self.activeLegTrailStartMeters
+                    : chevronSpacing * 0.5
+                while offset < length - 0.15 {
+                    routeOverlayRoot.addChildNode(Self.chevronNode(
+                        at: from + direction * offset,
+                        direction: direction,
+                        isActiveLeg: index == 0
+                    ))
+                    markerCount += 1
+                    offset += chevronSpacing
+                }
+
+                // One ring standing at eye height on the active leg. The floor
+                // trail can fall out of frame in a narrow aisle or when the
+                // phone is held level; a gate at 1.5 m sits dead centre of the
+                // view, so there is always one element that proves which way
+                // guidance believes the route runs.
+                if index == 0, length > 0.6 {
+                    let gateOffset = min(max(length * 0.6, 1.2), min(length, 2.8))
+                    var gatePosition = from + direction * gateOffset
+                    gatePosition.y = floorY + 1.5
+                    routeOverlayRoot.addChildNode(Self.routeGateNode(
+                        at: gatePosition,
+                        direction: direction
+                    ))
+                    markerCount += 1
+                }
+
+                if index < points.count - 2 {
+                    routeOverlayRoot.addChildNode(Self.turnMarkerNode(at: to, floorY: floorY))
+                    markerCount += 1
+                }
+            }
+            if let destination = points.last {
+                routeOverlayRoot.addChildNode(Self.destinationBeaconNode(at: destination))
+                markerCount += 1
+            }
+
+            NavigationTrace.shared.log("ar.routeOverlay", [
+                "context": context,
+                "points": points.count,
+                "markers": markerCount,
+                "firstX": points[0].x,
+                "firstZ": points[0].z,
+                "floorY": floorY,
+                "lastX": points[points.count - 1].x,
+                "lastZ": points[points.count - 1].z
+            ])
+        }
+
+        /// A flat arrowhead on the floor pointing along the walking direction.
+        /// The active leg is bright green; upcoming legs are dimmer teal so
+        /// the next action reads at a glance.
+        private static func chevronNode(
+            at position: SIMD3<Float>,
+            direction: SIMD3<Float>,
+            isActiveLeg: Bool
+        ) -> SCNNode {
+            let pyramid = SCNPyramid(width: 0.28, height: 0.38, length: 0.05)
+            let color = isActiveLeg ? UIColor.systemGreen : UIColor.systemTeal
+            let material = SCNMaterial()
+            material.diffuse.contents = color.withAlphaComponent(isActiveLeg ? 0.95 : 0.55)
+            material.emission.contents = color
+            material.lightingModel = .constant
+            material.isDoubleSided = true
+            material.writesToDepthBuffer = false
+            pyramid.materials = [material]
+            let node = SCNNode(geometry: pyramid)
+            node.simdPosition = position
+            node.renderingOrder = 100
+            // A pyramid's apex points along +y; steer +y onto the (horizontal)
+            // travel direction so the arrow lies flat, pointing where to walk.
+            node.simdOrientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: simd_normalize(direction))
+            return node
+        }
+
+        /// A checkpoint ring standing across the active leg at eye height.
+        private static func routeGateNode(
+            at position: SIMD3<Float>,
+            direction: SIMD3<Float>
+        ) -> SCNNode {
+            let torus = SCNTorus(ringRadius: 0.40, pipeRadius: 0.045)
+            let material = SCNMaterial()
+            material.diffuse.contents = UIColor.systemGreen.withAlphaComponent(0.85)
+            material.emission.contents = UIColor.systemGreen
+            material.lightingModel = .constant
+            material.writesToDepthBuffer = false
+            torus.materials = [material]
+            let node = SCNNode(geometry: torus)
+            node.simdPosition = position
+            node.renderingOrder = 100
+            // A torus's axis is +y and its ring lies in the xz plane; steering
+            // +y onto the travel direction stands the ring up across the leg,
+            // so the user walks through it.
+            node.simdOrientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: simd_normalize(direction))
+            return node
+        }
+
+        /// A pillar, not a marble: a turn eight metres away has to read from
+        /// standing height, and anything lying on the floor at that distance is
+        /// a couple of pixels tall.
+        private static func turnMarkerNode(at position: SIMD3<Float>, floorY: Float) -> SCNNode {
+            let cylinder = SCNCylinder(radius: 0.05, height: 1.6)
+            let material = SCNMaterial()
+            material.diffuse.contents = UIColor.systemOrange.withAlphaComponent(0.75)
+            material.emission.contents = UIColor.systemOrange
+            material.lightingModel = .constant
+            material.writesToDepthBuffer = false
+            cylinder.materials = [material]
+            let node = SCNNode(geometry: cylinder)
+            node.simdPosition = SIMD3<Float>(position.x, floorY + 0.8, position.z)
+            node.renderingOrder = 100
+            return node
+        }
+
+        private static func destinationBeaconNode(at position: SIMD3<Float>) -> SCNNode {
+            let beacon = SCNNode()
+            beacon.simdPosition = position
+            beacon.renderingOrder = 100
+
+            let cylinder = SCNCylinder(radius: 0.04, height: 2.0)
+            let cylinderMaterial = SCNMaterial()
+            cylinderMaterial.diffuse.contents = UIColor.systemRed.withAlphaComponent(0.55)
+            cylinderMaterial.emission.contents = UIColor.systemRed
+            cylinderMaterial.lightingModel = .constant
+            cylinderMaterial.writesToDepthBuffer = false
+            cylinder.materials = [cylinderMaterial]
+            let pole = SCNNode(geometry: cylinder)
+            pole.simdPosition = SIMD3<Float>(0, 1.0, 0)
+            beacon.addChildNode(pole)
+
+            let sphere = SCNSphere(radius: 0.14)
+            let sphereMaterial = SCNMaterial()
+            sphereMaterial.diffuse.contents = UIColor.systemRed
+            sphereMaterial.emission.contents = UIColor.systemRed
+            sphereMaterial.lightingModel = .constant
+            sphereMaterial.writesToDepthBuffer = false
+            sphere.materials = [sphereMaterial]
+            let cap = SCNNode(geometry: sphere)
+            cap.simdPosition = SIMD3<Float>(0, 2.0, 0)
+            beacon.addChildNode(cap)
+
+            return beacon
         }
     }
 }
@@ -204,13 +420,25 @@ struct ARMappingView: View {
                 ARViewContainer(
                     session: mappingManager.session,
                     isSessionActive: mappingManager.sessionMode != .idle,
-                    showsCoaching: mappingManager.isMapping || (mappingManager.isRelocalizing && !mappingManager.isLocalized)
+                    showsCoaching: mappingManager.isMapping || (mappingManager.isRelocalizing && !mappingManager.isLocalized),
+                    routeOverlayPoints: routeOverlayWorldPoints,
+                    routeOverlayContext: routeOverlayContext
                 )
                 .ignoresSafeArea()
 
                 if mappingManager.sessionMode == .idle {
                     Color.black.opacity(0.82)
                         .ignoresSafeArea()
+                }
+
+                if let headingError = activeLegHeadingErrorDegrees {
+                    VStack {
+                        Spacer(minLength: 0)
+                        routeDirectionHUD(headingErrorDegrees: headingError)
+                            .padding(.bottom, 6)
+                        Spacer(minLength: 0)
+                    }
+                    .allowsHitTesting(false)
                 }
 
                 if !isAutomatedNavigation && showsMapInspector && hasInspectionContent {
@@ -228,6 +456,74 @@ struct ARMappingView: View {
                 }
             }
         )
+    }
+
+    /// Route-frame polyline mapped into the live AR session's world frame for
+    /// the chevron overlay. Route x is AR x; route y is -AR z; the floor sits
+    /// a torso below the camera. Only meaningful while localized on an
+    /// AR-frame map — `remainingRoutePolyline` is empty otherwise.
+    private var routeOverlayWorldPoints: [SIMD3<Float>] {
+        // Same pose-trust rule the navigator itself uses: a relocalized map
+        // frame, or the live capture session whose frame IS the map frame.
+        guard mappingManager.isLocalized || mappingManager.isMapping,
+              let cameraPosition = mappingManager.cameraMapPosition else {
+            return []
+        }
+        let floorY = cameraPosition.y - 1.35
+        return semanticNavigator.remainingRoutePolyline().map {
+            SIMD3<Float>(Float($0.x), floorY, Float(-$0.y))
+        }
+    }
+
+    /// Why the overlay is showing what it is. Logged with the rebuild so a
+    /// field report of "no arrows" names the guard that emptied it instead of
+    /// leaving the cause to be guessed at afterwards.
+    private var routeOverlayContext: String {
+        if !(mappingManager.isLocalized || mappingManager.isMapping) { return "not_localized" }
+        if mappingManager.cameraMapPosition == nil { return "no_camera_pose" }
+        let phase = semanticNavigator.phase
+        if phase != .navigating && phase != .recovering { return "phase_\(phase.rawValue)" }
+        if semanticNavigator.activeMap?.coordinateSpace != "ar_world_xz" { return "not_ar_frame_map" }
+        if semanticNavigator.routeSteps.isEmpty { return "no_route_steps" }
+        return "route"
+    }
+
+    /// Signed turn from where the camera points to where the active leg runs:
+    /// positive means the route is to the user's right. This is the number
+    /// every spoken turn is derived from, so putting it on screen makes a wrong
+    /// instruction visible instead of merely audible.
+    private var activeLegHeadingErrorDegrees: Double? {
+        guard let heading = mappingManager.arHeadingDegrees else { return nil }
+        return semanticNavigator.headingErrorToActiveLeg(liveHeading: heading)
+    }
+
+    /// Screen-space direction indicator, pinned to the middle of the view.
+    ///
+    /// The floor chevrons answer "where does the route run" but only while the
+    /// floor is in frame; this answers it unconditionally. The needle points
+    /// where guidance wants the user to walk, relative to where the camera
+    /// currently points — straight up means aligned — so a spoken turn that
+    /// contradicts the geometry is visible the moment it is said.
+    private func routeDirectionHUD(headingErrorDegrees: Double) -> some View {
+        let magnitude = abs(headingErrorDegrees)
+        let tint: Color = magnitude <= 20 ? .green : (magnitude <= 60 ? .yellow : .orange)
+        return VStack(spacing: 6) {
+            Image(systemName: "arrow.up")
+                .font(.system(size: 54, weight: .heavy))
+                .foregroundColor(tint)
+                .rotationEffect(.degrees(headingErrorDegrees))
+                .shadow(color: .black.opacity(0.6), radius: 6)
+                .animation(.easeOut(duration: 0.18), value: headingErrorDegrees)
+
+            Text("\(headingErrorDegrees >= 0 ? "R" : "L") \(Int(magnitude.rounded()))°")
+                .font(.system(.subheadline, design: .monospaced).weight(.bold))
+                .foregroundColor(.white)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(Color.black.opacity(0.55))
+                .clipShape(Capsule())
+        }
+        .accessibilityHidden(true)
     }
 
     private func handleAppear() {
@@ -955,80 +1251,60 @@ struct ARMappingView: View {
         }
     }
 
+    /// Deliberately compact. This panel sits over the bottom third of the
+    /// screen, which is precisely where the floor two to five metres ahead is
+    /// rendered — the stretch of route the AR overlay draws. A tall panel hides
+    /// the guidance it is describing, so everything here earns its height: the
+    /// live instruction, one status line, and the log export the field workflow
+    /// depends on. The destination and screen title live in the nav bar.
     private var automatedNavigationPanel: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Capsule()
-                .fill(Color.white.opacity(0.34))
-                .frame(width: 38, height: 5)
-                .frame(maxWidth: .infinity)
-
-            HStack(spacing: 10) {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
                 Image(systemName: "location.north.line.fill")
-                    .font(.headline.weight(.semibold))
+                    .font(.subheadline.weight(.semibold))
                     .foregroundColor(automatedAccent)
-                    .frame(width: 30, height: 30)
-                    .background(automatedAccent.opacity(0.16))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("ARKit Navigation")
-                        .font(.title3.weight(.bold))
-                        .foregroundColor(.white)
-                    Text(automatedTargetName.map { "Destination: \($0)" } ?? "Destination selected")
-                        .font(.subheadline.weight(.medium))
-                        .foregroundColor(.white.opacity(0.72))
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.8)
-                }
+                Text(automatedTargetName ?? "Destination")
+                    .font(.subheadline.weight(.bold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.8)
 
                 Spacer(minLength: 0)
-            }
 
-            VStack(alignment: .leading, spacing: 8) {
-                Text(semanticNavigator.currentInstruction)
-                    .font(.headline.weight(.semibold))
-                    .foregroundColor(.white)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                HStack(spacing: 8) {
-                    Label(routeAwareStatusText, systemImage: routeAwareStatusIcon)
-                        .foregroundColor(routeAwareStatusTint)
-
-                    if let activeMapName = mappingManager.activeMapName ?? semanticNavigator.activeMap?.name {
-                        Text(activeMapName)
-                            .foregroundColor(.white.opacity(0.58))
-                            .lineLimit(1)
-                            .minimumScaleFactor(0.78)
-                    }
+                Button {
+                    exportSessionTrace()
+                } label: {
+                    Image(systemName: "doc.text.magnifyingglass")
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundColor(.white)
+                        .padding(6)
+                        .background(Color.white.opacity(0.14))
+                        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
                 }
-                .font(.subheadline.weight(.semibold))
+                .accessibilityLabel("Export session log")
+                .accessibilityHint("Shares a log of this guidance run and the mapping walk behind it.")
             }
-            .padding(12)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.white.opacity(0.10))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8, style: .continuous)
-                    .stroke(automatedAccent.opacity(0.34), lineWidth: 1)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
 
-            // The automated flow is the one that goes wrong in a store, and it
-            // never shows the full route panel — without this the log can only
-            // be fetched from a screen the failing session never reaches.
-            Button {
-                exportSessionTrace()
-            } label: {
-                Label("Export Session Log", systemImage: "doc.text.magnifyingglass")
-                    .font(.subheadline.weight(.semibold))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 9)
-                    .foregroundColor(.white)
-                    .background(Color.white.opacity(0.12))
-                    .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            Text(semanticNavigator.currentInstruction)
+                .font(.headline.weight(.semibold))
+                .foregroundColor(.white)
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 8) {
+                Label(routeAwareStatusText, systemImage: routeAwareStatusIcon)
+                    .foregroundColor(routeAwareStatusTint)
+
+                if let activeMapName = mappingManager.activeMapName ?? semanticNavigator.activeMap?.name {
+                    Text(activeMapName)
+                        .foregroundColor(.white.opacity(0.58))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.78)
+                }
             }
-            .accessibilityHint("Shares a log of this guidance run and the mapping walk behind it.")
+            .font(.caption.weight(.semibold))
         }
-        .padding(16)
+        .padding(12)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
             LinearGradient(

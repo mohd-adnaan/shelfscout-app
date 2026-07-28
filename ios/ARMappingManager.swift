@@ -118,6 +118,14 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// How far a candidate pose may sit from a POI the camera is confidently
     /// recognizing before the pose is treated as being in the wrong frame.
     private let visualPoseContradictionDistance: Float = 12.0
+    /// How far off-axis a visually recognized POI may sit before the believed
+    /// frame is judged rotated. Visual matching already requires the POI to be
+    /// within the camera's cone, so anything beyond a generous margin means the
+    /// pose's yaw disagrees with what the lens is actually looking at.
+    private let visualBearingContradictionDegrees: Double = 55.0
+    /// Below this range the bearing to a POI swings wildly for a small position
+    /// error, so the angular test says nothing useful.
+    private let visualBearingMinimumDistanceMeters: Float = 1.5
     private let imuMotionMinimumSteps = 2
     private let imuMotionMinimumDistance: Float = 0.8
     private let imuMotionDirectionMinimumDistance: Float = 1.15
@@ -143,6 +151,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// load, before the session runs, and read on the session queue; zero means
     /// the map carries no anchors and cannot supply relocalization proof.
     private var expectedRestoredPOICount = 0
+    /// Identifiers of named anchors THIS session added (POI pins). They are
+    /// indistinguishable from map-restored anchors by name alone, so the
+    /// relocalization proof has to exclude them explicitly.
+    private var locallyCreatedAnchorIDs: Set<UUID> = []
     private var lastTracedFrameAt: Date?
     private var lastTracedVetoReason: String?
     private var fidelityUpgradeAt: Date?
@@ -188,6 +200,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // A fresh capture defines its own frame; there is no map to prove
         // alignment against.
         expectedRestoredPOICount = 0
+        locallyCreatedAnchorIDs.removeAll()
         let config = makeWorldTrackingConfiguration()
         // The capture frame's yaw origin. A map recorded under one alignment
         // and relocalized under another is the first thing to rule out when
@@ -411,6 +424,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
 
                     self.didUpgradeSessionFidelity = false
                     self.expectedRestoredPOICount = loadedPOIs.count
+                    // Reloading resets the session, so nothing we pinned before
+                    // survives; every named anchor from here is the map's.
+                    self.locallyCreatedAnchorIDs.removeAll()
                     self.lastTracedVetoReason = nil
                     let config = self.makeWorldTrackingConfiguration(initialWorldMap: map, lightweight: true)
                     NavigationTrace.shared.log("ar.mapLoaded", [
@@ -500,6 +516,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         let placed = surfacePOITransform(from: currentFrame)
         let anchor = ARAnchor(name: trimmedName, transform: placed.transform)
         session.add(anchor: anchor)
+        // Ours, not the map's — must never count as relocalization proof.
+        locallyCreatedAnchorIDs.insert(anchor.identifier)
 
         let anchorPos = simd_make_float3(placed.transform.columns.3.x, placed.transform.columns.3.y, placed.transform.columns.3.z)
 
@@ -757,12 +775,21 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // while the world-map pose is still garbage.
         let visuallyRecognizedPlace = lastVisualMatchResult?.match?.name
 
-        // Hard proof of map alignment. ARKit only restores a saved map's named
-        // ARAnchors once relocalization actually matches; while it is still
-        // searching, the session carries none of them. Plane/mesh anchors are
-        // unnamed, so a named anchor during relocalization can only have come
-        // from the loaded map.
-        let hasRestoredMapAnchors = frame.anchors.contains { ($0.name?.isEmpty == false) }
+        // Proof that a named anchor in this frame came from the LOADED MAP
+        // rather than from us.
+        //
+        // ⚠️ "any named anchor" is not that proof, which is how this check came
+        // to pass while gating nothing: `addPOIAnchor` puts named anchors into
+        // the very same session, so the flag flipped true the instant the user
+        // pinned their first POI — during a fresh capture, with no map loaded at
+        // all (see the 2026-07-27 trace: node pinned at t=12.7, flag true at
+        // t=13.2). A pose still in ARKit's own session frame then read as
+        // map-aligned, and under `.gravity` that frame's yaw is arbitrary —
+        // the "Localized, route locked, now turn 100° into a desk" failure.
+        // Only anchors this session did not create can testify.
+        let hasRestoredMapAnchors = frame.anchors.contains { anchor in
+            anchor.name?.isEmpty == false && !locallyCreatedAnchorIDs.contains(anchor.identifier)
+        }
 
 
         let x = transform.columns.3.x
@@ -995,7 +1022,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // The visual fingerprint match is pose-INDEPENDENT, so it can veto a pose
         // that lands far from the place the camera is actually looking at. Keep
         // searching instead of starting guidance from a frame known to be wrong.
-        if let contradiction = visualEvidenceContradiction(for: cameraPosition) {
+        if let contradiction = visualEvidenceContradiction(
+            for: cameraPosition,
+            cameraForward: cameraForward
+        ) {
             relocalizationNormalSince = Date()
             if statusMessage != contradiction {
                 statusMessage = contradiction
@@ -1446,17 +1476,54 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// metres kind that come from tracking in the session frame instead of the
     /// map frame — never ordinary pose noise near the right place.
     private func visualEvidenceContradiction(for cameraPosition: simd_float3) -> String? {
+        visualEvidenceContradiction(for: cameraPosition, cameraForward: nil)
+    }
+
+    /// Rejects a candidate pose that disagrees with what the camera can see.
+    ///
+    /// Two independent disagreements, because the frame can be wrong in two
+    /// ways. POSITION: the camera confidently recognizes a place the believed
+    /// pose sits far away from. BEARING: the camera recognizes a place but the
+    /// believed frame says that place is off to one side, when recognizing it
+    /// at all means the camera is pointed at it. The bearing test is the one
+    /// that catches a pure yaw error — position right, heading 100° out — which
+    /// is invisible to a distance check and is precisely the failure that
+    /// reaches the user as "Localized" followed by a turn into a desk.
+    private func visualEvidenceContradiction(
+        for cameraPosition: simd_float3,
+        cameraForward: simd_float3?
+    ) -> String? {
         guard let seen = lastVisualMatchResult?.match,
               seen.confidence >= visualPoseRequiredConfidence,
               let record = currentPOIRecords().first(where: { $0.name == seen.name }) else {
             return nil
         }
         let distance = simd_distance(cameraPosition, record.position)
-        guard distance > visualPoseContradictionDistance else { return nil }
+        if distance > visualPoseContradictionDistance {
+            return String(
+                format: "Camera sees %@ but the map pose is %.0fm away — still matching.",
+                seen.name,
+                distance
+            )
+        }
+
+        // Close enough to compare directions. Recognizing the place visually
+        // means it is in front of the lens, so the believed frame must agree.
+        guard let cameraForward,
+              distance >= visualBearingMinimumDistanceMeters else {
+            return nil
+        }
+        let toPOI = record.position - cameraPosition
+        let toPOIFlat = simd_float3(toPOI.x, 0, toPOI.z)
+        let forwardFlat = simd_float3(cameraForward.x, 0, cameraForward.z)
+        guard simd_length(toPOIFlat) > 0.001, simd_length(forwardFlat) > 0.001 else { return nil }
+        let cosine = simd_dot(simd_normalize(toPOIFlat), simd_normalize(forwardFlat))
+        let offAxisDegrees = Double(acos(max(-1, min(1, cosine))) * 180 / .pi)
+        guard offAxisDegrees > visualBearingContradictionDegrees else { return nil }
         return String(
-            format: "Camera sees %@ but the map pose is %.0fm away — still matching.",
+            format: "Camera sees %@ but the map frame puts it %.0f° off to the side — still matching.",
             seen.name,
-            distance
+            offAxisDegrees
         )
     }
 

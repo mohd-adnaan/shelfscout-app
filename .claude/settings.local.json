@@ -79,7 +79,13 @@
       "Bash(python3 belief_sim.py)",
       "Bash(python3 belief_fix_sim.py)",
       "Bash(xcrun swiftc *)",
-      "Bash(perl -0pi -e 's/speechCue = SemanticSpeechCue\\\\\\(text: \\([^\\\\n]*?\\), priority: \\(\\\\.\\\\w+\\)\\\\\\)/emitCue\\($1, priority: $2\\)/g' ios/SemanticRouteNavigator.swift)"
+      "Bash(perl -0pi -e 's/speechCue = SemanticSpeechCue\\\\\\(text: \\([^\\\\n]*?\\), priority: \\(\\\\.\\\\w+\\)\\\\\\)/emitCue\\($1, priority: $2\\)/g' ios/SemanticRouteNavigator.swift)",
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout log --oneline -25)",
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout status --short)",
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout show 69e552d --stat)",
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout show 69e552d -- ios/ARMappingManager.swift)",
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout diff ios/SemanticRouteNavigator.swift)",
+      "Bash(git -C /Users/mohammadadnaan/Projects/shelfscout diff ios/ARMappingView.swift)"
     ],
     "additionalDirectories": [
       "/Users/mohammadadnaan/Projects/ic4u/src/utils",

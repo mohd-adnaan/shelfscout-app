@@ -211,6 +211,11 @@ struct SemanticRouteMap: Identifiable, Codable, Equatable {
     var arWorldMapId: String?
     var startNodeId: String?
     var destinationNodeIds: [String]?
+    /// Endpoints whose 360° anchoring sweep completed in SOME session. The
+    /// sweep banks ARKit features into the linked ARWorldMap, which persists —
+    /// so "anchored" must persist too, or every later capture/enrichment visit
+    /// re-prompts a spin the map has already banked.
+    var anchoredNodeIds: [String]? = nil
     var nodes: [SemanticRouteNode]
     var edges: [SemanticRouteEdge]
     var landmarks: [SemanticRouteLandmark]
@@ -521,6 +526,19 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastEnrichmentSampledPoint: SemanticRoutePoint?
     private var lastEnrichmentSampledHeading: Double?
     private var lastEnrichmentSampledAt: Date?
+    /// Recent AR headings with timestamps. Guidance starts the moment
+    /// relocalization confirms — which is usually mid-way through the "turn in
+    /// a full circle" sweep the user was just asked to do. A turn command
+    /// computed from one instantaneous sample of that sweep is stale before
+    /// TTS finishes speaking it; these samples let alignment cues wait until
+    /// the heading has actually settled.
+    private var recentHeadingSamples: [(at: Date, degrees: Double)] = []
+    /// Geometry of a dropped leading stub: the short first leg the user still
+    /// physically walks even though it no longer exists as a route step. A
+    /// user facing along it is facing the route, and must not be told to turn
+    /// toward the (post-stub) first leg they have not reached yet.
+    private var leadingStubBearingDegrees: Double?
+    private var leadingStubMeters: Double = 0
 
     private let arrivalThresholdMeters = 0.55
     private let destinationProximityMeters = 0.75
@@ -604,6 +622,19 @@ final class SemanticRouteNavigator: ObservableObject {
     /// Heading error must close by at least this much to count as "already
     /// turning" — smaller than that is head sway, not a turn.
     private let routeAlignmentImprovementDegrees = 15.0
+    /// Window and spread for calling the live heading "settled". Samples inside
+    /// the window spanning more than the spread mean the user is still turning
+    /// (a relocalization sweep, or acting on an earlier cue) — an alignment cue
+    /// computed from any single instant of that motion commands a turn against
+    /// a facing the user no longer has.
+    private let headingSettleWindowSeconds: TimeInterval = 0.9
+    private let headingSettleMaxSpreadDegrees = 22.0
+    /// How closely the live heading must match a dropped leading stub's bearing
+    /// to count as "already facing the route". Wider than the start-alignment
+    /// threshold because the stub is short and coarse — a user roughly facing
+    /// the hop is doing the right thing and must not be commanded to pre-turn
+    /// onto the leg that only starts after it.
+    private let leadingStubFacingToleranceDegrees = 40.0
     /// A turn that stops part-way gets one repeat after this long.
     private let routeAlignmentStalledCueSeconds: TimeInterval = 6.0
     private let maxPDRDeltaPerUpdateMeters = 1.20
@@ -649,6 +680,17 @@ final class SemanticRouteNavigator: ObservableObject {
     /// Appended captures must begin near the existing network so the new
     /// branch connects instead of forming an unroutable island.
     private let appendConnectRadiusMeters = 4.0
+    /// Re-marking a spot within this range of an existing turn/waypoint reuses
+    /// that node instead of minting a duplicate. Matches the junction snap
+    /// radius: anything close enough to stitch is the same physical place, and
+    /// duplicating it builds the parallel-chain multigraph that made return
+    /// captures unroutable (two antiparallel edges 0.4–0.9 m apart turn start
+    /// resolution into a coin flip).
+    private let nodeReuseRadiusMeters = 0.9
+    /// Re-marking a POI by NAME tolerates much more pose drift: "Mocktail"
+    /// marked on a later visit is the same shelf even when relocalization
+    /// error puts the new pose meters from the stored node.
+    private let namedNodeReuseRadiusMeters = 4.0
     /// New nodes landing this close to an already-mapped node get a
     /// connector edge — crossings become routable junctions.
     private let junctionSnapRadiusMeters = 0.9
@@ -1011,6 +1053,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastAutoSampledAt = nil
         currentSegmentDraftMeters = 0
         resetEndpointAnchoring()
+        seedAnchoredEndpoints(from: existing)
         refreshCaptureMetrics(for: existing)
         phase = .mapping
         mappingQualityText = "Extending \(existing.name)"
@@ -1034,6 +1077,7 @@ final class SemanticRouteNavigator: ObservableObject {
         activeMapDraft = existing
         enrichmentKeyframesAdded = 0
         resetEndpointAnchoring()
+        seedAnchoredEndpoints(from: existing)
         lastEnrichmentSampledPoint = nil
         lastEnrichmentSampledHeading = nil
         lastEnrichmentSampledAt = nil
@@ -1289,6 +1333,73 @@ final class SemanticRouteNavigator: ObservableObject {
             return true
         }
 
+        // ── Re-marking an already-mapped place ──────────────────────────────
+        // A return capture walks straight back over the forward trail. Without
+        // reuse, every re-marked turn and POI minted a NEW node beside the old
+        // one (0.4–0.9 m away), growing a parallel chain whose antiparallel
+        // edges made start resolution a coin flip — and every duplicated
+        // endpoint re-prompted a 360° sweep the map had already banked.
+        if let reused = reusableExistingNode(named: name, kind: kind, near: pose, in: workingMap) {
+            if let previousID = lastCapturedNodeID,
+               let previous = workingMap.nodes.first(where: { $0.id == previousID }),
+               previous.id != reused.id,
+               !edgeExists(between: previous.id, and: reused.id, in: workingMap) {
+                var edge = Self.makeEdge(
+                    from: previous,
+                    to: reused,
+                    leftContext: nil,
+                    rightContext: nil,
+                    spokenContext: "toward \(reused.name)",
+                    confidence: arPosition == nil ? 0.72 : 0.9
+                )
+                Self.attachPendingEvidence(to: &edge, in: &workingMap, fromNodeID: previous.id)
+                workingMap.edges.append(edge)
+            }
+            if kind == .entrance {
+                workingMap.startNodeId = reused.id
+            } else if kind == .destination {
+                workingMap.destinationNodeIds = Array(Set((workingMap.destinationNodeIds ?? []) + [reused.id]))
+                if let index = workingMap.nodes.firstIndex(where: { $0.id == reused.id }),
+                   workingMap.nodes[index].kind != .entrance {
+                    workingMap.nodes[index].kind = .destination
+                    workingMap.nodes[index].poiAnchorId = workingMap.nodes[index].poiAnchorId ?? name
+                }
+            }
+            // The revisit is fresh visual evidence for the spot — usually from
+            // the opposite walking direction, exactly the coverage return
+            // journeys were missing.
+            appendVisualKeyframe(
+                to: &workingMap,
+                pose: reused.point,
+                heading: heading,
+                distanceFromSegmentStart: 0,
+                segmentID: nil,
+                capturedImage: capturedImage,
+                capturedAt: Date()
+            )
+            workingMap.updatedAt = Date()
+            NavigationTrace.shared.log("map.nodeReused", [
+                "requestedName": name,
+                "requestedKind": kind.rawValue,
+                "reusedNode": reused.name,
+                "reusedKind": reused.kind.rawValue,
+                "distM": reused.point.distance(to: pose),
+                "hadPrevious": lastCapturedNodeID != nil
+            ])
+            activeMapDraft = workingMap
+            activeMap = workingMap
+            lastCapturedNodeID = reused.id
+            lastAutoSampledPoint = reused.point
+            lastAutoSampledHeading = heading
+            lastAutoSampledAt = Date()
+            currentSegmentDraftMeters = 0
+            refreshCaptureMetrics(for: workingMap)
+            currentInstruction = "\(reused.name) is already mapped here — reusing it. Continue walking."
+            emitCue(currentInstruction, priority: .regular)
+            rebuildRAGContext()
+            return true
+        }
+
         let node = SemanticRouteNode(
             id: UUID().uuidString,
             name: name,
@@ -1405,6 +1516,41 @@ final class SemanticRouteNavigator: ObservableObject {
         emitCue(currentInstruction, priority: .regular)
         rebuildRAGContext()
         return true
+    }
+
+    /// The already-mapped node a new mark should reuse, if any. Named POIs
+    /// (entrance/destination) match by spoken name with a generous radius —
+    /// relocalization drift moves the pose, not the shelf. Structural marks
+    /// (turns, waypoints) match by proximity alone, inside the same radius the
+    /// junction stitcher already treats as "the same physical spot".
+    private func reusableExistingNode(
+        named name: String,
+        kind: SemanticRouteNodeKind,
+        near pose: SemanticRoutePoint,
+        in map: SemanticRouteMap
+    ) -> SemanticRouteNode? {
+        let candidates = map.nodes.filter { $0.id != lastCapturedNodeID }
+        if kind == .entrance || kind == .destination {
+            return candidates
+                .filter {
+                    Self.matches(name, $0.name) &&
+                    $0.point.distance(to: pose) <= namedNodeReuseRadiusMeters
+                }
+                .min(by: { $0.point.distance(to: pose) < $1.point.distance(to: pose) })
+        }
+        let structuralKinds: Set<SemanticRouteNodeKind> = [.intersection, .waypoint, .aisle]
+        return candidates
+            .filter {
+                structuralKinds.contains($0.kind) &&
+                $0.point.distance(to: pose) <= nodeReuseRadiusMeters
+            }
+            .min(by: { $0.point.distance(to: pose) < $1.point.distance(to: pose) })
+    }
+
+    private func edgeExists(between a: String, and b: String, in map: SemanticRouteMap) -> Bool {
+        map.edges.contains {
+            ($0.fromNodeID == a && $0.toNodeID == b) || ($0.fromNodeID == b && $0.toNodeID == a)
+        }
     }
 
     /// When a newly captured point lands on an already-mapped spot (a trail
@@ -1759,6 +1905,8 @@ final class SemanticRouteNavigator: ObservableObject {
         routeSteps = steps
         arrivalFacing = shaped.arrivalFacing
         currentStepIndex = 0
+        leadingStubBearingDegrees = shaped.droppedLeadingStubBearingDegrees
+        leadingStubMeters = shaped.droppedLeadingStubMeters
         segmentProgressMeters = shaped.droppedLeadingStub
             ? 0
             : min(max(start.initialProgressMeters, 0), steps.first?.edge.distanceMeters ?? 0)
@@ -1802,7 +1950,21 @@ final class SemanticRouteNavigator: ObservableObject {
         )
         let startHeading = arHeading ?? imuState.bearing
         var firstInstruction = currentInstruction
-        if let headingCue = initialHeadingAlignmentInstruction(
+        // Two reasons the opening announcement must NOT command a turn:
+        //  • the heading is still sweeping — guidance starts the moment
+        //    relocalization confirms, which is usually mid-way through the
+        //    "turn a full circle" pan, so this instant's heading is not the
+        //    user's facing;
+        //  • the user already faces a dropped leading stub — that is the
+        //    correct facing for the walk they start with, and the turn the cue
+        //    would command only exists at the stub's far end.
+        // In both cases the per-tick alignment logic re-judges against the
+        // live, settled heading and still speaks a cue if one is truly owed.
+        let startHeadingIsSettled = isLiveHeadingSettled()
+        let startFacingDroppedStub = isFacingDroppedLeadingStub(liveHeading: startHeading)
+        if startHeadingIsSettled,
+           !startFacingDroppedStub,
+           let headingCue = initialHeadingAlignmentInstruction(
             on: steps[0],
             liveHeading: startHeading
         ) {
@@ -1840,6 +2002,10 @@ final class SemanticRouteNavigator: ObservableObject {
             "arPoseY": Self.routePoint(from: arPosition)?.y ?? NSNull(),
             "nodePath": path,
             "droppedLeadingStub": shaped.droppedLeadingStub,
+            "droppedStubBearingDeg": shaped.droppedLeadingStubBearingDegrees ?? NSNull(),
+            "droppedStubMeters": shaped.droppedLeadingStubMeters,
+            "startHeadingSettled": startHeadingIsSettled,
+            "startFacingDroppedStub": startFacingDroppedStub,
             "initialProgressM": segmentProgressMeters,
             "arrivalFacing": shaped.arrivalFacing.map { "\($0.side.rawValue) \($0.meters)m" } ?? NSNull(),
             "legs": traceLegs(),
@@ -1886,6 +2052,8 @@ final class SemanticRouteNavigator: ObservableObject {
         stillnessStartedAt = nil
         lastStillnessRepromptAt = nil
         pendingAlignmentResumeCue = false
+        leadingStubBearingDegrees = nil
+        leadingStubMeters = 0
         resetRouteCorrectionGuards()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = nil
@@ -1911,6 +2079,9 @@ final class SemanticRouteNavigator: ObservableObject {
         arLocalized: Bool,
         capturedImage: CVPixelBuffer? = nil
     ) {
+        // Sampled in every phase: the sweep to expose is the relocalization
+        // pan that happens BEFORE guidance starts.
+        recordHeadingSample(arHeading)
         if phase == .mapping {
             updatePassiveObservation(imuState: imuState, arPosition: arPosition, arHeading: arHeading, arLocalized: arLocalized)
             autoSampleWalkthrough(
@@ -2407,7 +2578,10 @@ final class SemanticRouteNavigator: ObservableObject {
         // Coach the endpoint anchor whenever the user is standing at a start or
         // destination during capture — the last 0.6 m into a destination banks
         // too few features on its own to cold-relocalize from later.
-        updateEndpointAnchoring(at: pose, heading: arHeading, in: workingMap)
+        if updateEndpointAnchoring(at: pose, heading: arHeading, in: &workingMap) {
+            activeMapDraft = workingMap
+            activeMap = workingMap
+        }
 
         if workingMap.nodes.isEmpty {
             mappingQualityText = "Ready for Point A"
@@ -2487,7 +2661,10 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let now = Date()
         let heading = arHeading ?? lastEnrichmentSampledHeading
-        updateEndpointAnchoring(at: pose, heading: arHeading, in: workingMap)
+        if updateEndpointAnchoring(at: pose, heading: arHeading, in: &workingMap) {
+            activeMapDraft = workingMap
+            activeMap = workingMap
+        }
 
         let movedMeters = lastEnrichmentSampledPoint.map { pose.distance(to: $0) } ?? .greatestFiniteMagnitude
         let turnedDegrees: Double = {
@@ -2536,14 +2713,18 @@ final class SemanticRouteNavigator: ObservableObject {
     /// spot. Tracks which heading buckets have been covered, prompts once on
     /// arrival, and announces completion. Runs during both initial capture and
     /// the enrichment walk; only the endpoint kinds get anchored, never turns.
-    private func updateEndpointAnchoring(at pose: SemanticRoutePoint, heading: Double?, in map: SemanticRouteMap) {
+    /// Returns true when an endpoint newly completed its sweep this call, so
+    /// the caller must write `map` (now carrying the persisted anchor) back to
+    /// the active map even if no keyframe sampled this tick.
+    @discardableResult
+    private func updateEndpointAnchoring(at pose: SemanticRoutePoint, heading: Double?, in map: inout SemanticRouteMap) -> Bool {
         let anchorKinds: Set<SemanticRouteNodeKind> = [.destination, .entrance]
         guard let node = map.nodes
             .filter({ anchorKinds.contains($0.kind) })
             .min(by: { $0.point.distance(to: pose) < $1.point.distance(to: pose) }),
               node.point.distance(to: pose) <= anchoringPromptRadiusMeters,
               !anchoredNodeIDs.contains(node.id) else {
-            return
+            return false
         }
 
         // Prompt the sweep the first time we stand at this endpoint.
@@ -2553,7 +2734,7 @@ final class SemanticRouteNavigator: ObservableObject {
             emitCue(currentInstruction, priority: .critical)
         }
 
-        guard let heading else { return }
+        guard let heading else { return false }
         let normalizedHeading = (heading.truncatingRemainder(dividingBy: 360) + 360)
             .truncatingRemainder(dividingBy: 360)
         let bucket = Int(normalizedHeading / anchoringBucketDegrees)
@@ -2563,14 +2744,44 @@ final class SemanticRouteNavigator: ObservableObject {
 
         if buckets.count >= anchoringRequiredBuckets {
             anchoredNodeIDs.insert(node.id)
+            // Persist: the sweep's features live in the saved ARWorldMap, so
+            // "anchored" outlives this session. Without this, every later
+            // capture or enrichment visit re-prompted a spin at the same shelf.
+            map.anchoredNodeIds = Array(Set((map.anchoredNodeIds ?? []) + [node.id]))
+            map.updatedAt = Date()
             currentInstruction = NavLoc.anchorEndpointComplete(node.name)
             emitCue(currentInstruction, priority: .priority)
+            return true
         } else if addedBucket {
             mappingQualityText = NavLoc.anchorEndpointProgress(
                 node.name,
                 covered: buckets.count,
                 required: anchoringRequiredBuckets
             )
+        }
+        return false
+    }
+
+    /// Marks endpoints whose sweep completed in an earlier session as already
+    /// anchored, from the persisted flag plus the map's own keyframe coverage
+    /// (an enrichment dwell banks direction-spread keyframes at the spot even
+    /// when the flag predates this field).
+    private func seedAnchoredEndpoints(from map: SemanticRouteMap) {
+        for persisted in map.anchoredNodeIds ?? [] {
+            anchoredNodeIDs.insert(persisted)
+            anchoringPromptedNodeIDs.insert(persisted)
+        }
+        let anchorKinds: Set<SemanticRouteNodeKind> = [.destination, .entrance]
+        for node in map.nodes where anchorKinds.contains(node.kind) && !anchoredNodeIDs.contains(node.id) {
+            var buckets: Set<Int> = []
+            for keyframe in map.keyframes ?? [] where keyframe.pose.distance(to: node.point) <= anchoringPromptRadiusMeters {
+                guard let heading = keyframe.headingDegrees else { continue }
+                buckets.insert(Int(SemanticRouteMath.normalizedDegrees(heading) / anchoringBucketDegrees))
+            }
+            if buckets.count >= anchoringRequiredBuckets {
+                anchoredNodeIDs.insert(node.id)
+                anchoringPromptedNodeIDs.insert(node.id)
+            }
         }
     }
 
@@ -2611,6 +2822,37 @@ final class SemanticRouteNavigator: ObservableObject {
             map.nodes[lastIndex].poiAnchorId = name
             map.destinationNodeIds = Array(Set((map.destinationNodeIds ?? []) + [map.nodes[lastIndex].id]))
             return map.nodes[lastIndex]
+        }
+
+        // A destination this map already knows by name is the same shelf, not
+        // a second one: adopt it instead of minting a duplicate beside it.
+        if let existingIndex = map.nodes.firstIndex(where: {
+            $0.id != lastCapturedNodeID &&
+            Self.matches(name, $0.name) &&
+            $0.point.distance(to: pose) <= namedNodeReuseRadiusMeters
+        }) {
+            if map.nodes[existingIndex].kind != .entrance {
+                map.nodes[existingIndex].kind = .destination
+            }
+            map.nodes[existingIndex].poiAnchorId = map.nodes[existingIndex].poiAnchorId ?? name
+            map.destinationNodeIds = Array(Set((map.destinationNodeIds ?? []) + [map.nodes[existingIndex].id]))
+            if let previousID = lastCapturedNodeID,
+               let previous = map.nodes.first(where: { $0.id == previousID }),
+               previous.id != map.nodes[existingIndex].id,
+               !edgeExists(between: previous.id, and: map.nodes[existingIndex].id, in: map) {
+                var edge = Self.makeEdge(
+                    from: previous,
+                    to: map.nodes[existingIndex],
+                    leftContext: nil,
+                    rightContext: nil,
+                    spokenContext: "toward \(name)",
+                    confidence: arPositionWasAvailable ? 0.9 : 0.7
+                )
+                Self.attachPendingEvidence(to: &edge, in: &map, fromNodeID: previous.id)
+                map.edges.append(edge)
+            }
+            map.updatedAt = Date()
+            return map.nodes[existingIndex]
         }
 
         let target = SemanticRouteNode(
@@ -3124,6 +3366,8 @@ final class SemanticRouteNavigator: ObservableObject {
         routeSteps = steps
         arrivalFacing = shaped.arrivalFacing
         currentStepIndex = 0
+        leadingStubBearingDegrees = shaped.droppedLeadingStubBearingDegrees
+        leadingStubMeters = shaped.droppedLeadingStubMeters
         segmentProgressMeters = shaped.droppedLeadingStub
             ? 0
             : min(max(start.initialProgressMeters, 0), firstStep.edge.distanceMeters)
@@ -3212,6 +3456,8 @@ final class SemanticRouteNavigator: ObservableObject {
         routeSteps = [SemanticRouteStep(edge: rejoinEdge, from: hereNode, to: best.node)] + shapedTail.steps
         arrivalFacing = shapedTail.arrivalFacing
         currentStepIndex = 0
+        leadingStubBearingDegrees = nil
+        leadingStubMeters = 0
         segmentProgressMeters = 0
         segmentRemainingMeters = rejoinEdge.distanceMeters
         lastAnnouncedRemainingMeter = nil
@@ -3307,6 +3553,46 @@ final class SemanticRouteNavigator: ObservableObject {
         return boundedDelta
     }
 
+    private func recordHeadingSample(_ arHeading: Double?) {
+        guard let arHeading else { return }
+        let now = Date()
+        recentHeadingSamples.append((at: now, degrees: arHeading))
+        let cutoff = now.addingTimeInterval(-2.0)
+        recentHeadingSamples.removeAll { $0.at < cutoff }
+    }
+
+    /// True when the live heading has held one direction long enough to be a
+    /// facing rather than one instant of a turn still in progress. No history
+    /// (cold start) counts as settled — the caller's single reading is all the
+    /// evidence there is.
+    private func isLiveHeadingSettled(now: Date = Date()) -> Bool {
+        let windowStart = now.addingTimeInterval(-headingSettleWindowSeconds)
+        let window = recentHeadingSamples.filter { $0.at >= windowStart }
+        guard window.count >= 2, let reference = window.first?.degrees else { return true }
+        var minOffset = 0.0
+        var maxOffset = 0.0
+        for sample in window.dropFirst() {
+            let offset = SemanticRouteMath.signedAngleDifference(sample.degrees, reference)
+            minOffset = min(minOffset, offset)
+            maxOffset = max(maxOffset, offset)
+        }
+        return maxOffset - minOffset <= headingSettleMaxSpreadDegrees
+    }
+
+    /// True while the user stands before a dropped leading stub facing roughly
+    /// along it. That IS facing the route — the turn onto the first real leg
+    /// only exists at the stub's far end, and commanding it early points the
+    /// user into the shelf they are standing beside.
+    private func isFacingDroppedLeadingStub(liveHeading: Double) -> Bool {
+        guard currentStepIndex == 0,
+              let stubBearing = leadingStubBearingDegrees,
+              segmentProgressMeters <= leadingStubMeters + 0.6 else {
+            return false
+        }
+        let error = abs(SemanticRouteMath.signedAngleDifference(liveHeading, stubBearing))
+        return error <= leadingStubFacingToleranceDegrees
+    }
+
     private func initialHeadingAlignmentInstruction(
         on step: SemanticRouteStep,
         liveHeading: Double
@@ -3327,6 +3613,22 @@ final class SemanticRouteNavigator: ObservableObject {
         guard shouldEnableErrorRecovery else { return false }
         guard phase == .navigating else { return false }
         guard headingError >= routeTurnAlignmentThresholdDegrees else { return false }
+        // Facing along a dropped leading stub is facing the route: the heading
+        // error against the post-stub leg is the turn that comes LATER, at the
+        // stub's far end. Nagging it now told users who had already turned the
+        // right way to turn again.
+        if isFacingDroppedLeadingStub(liveHeading: liveHeading) { return false }
+        // A sweeping heading (relocalization pan, or a turn already underway)
+        // is not a facing. Judge alignment once it settles; a cue computed
+        // mid-sweep commands a turn against a direction already abandoned.
+        guard isLiveHeadingSettled() else {
+            NavigationTrace.shared.tick("nav.alignmentCue.deferred", [
+                "reason": "heading_sweeping",
+                "liveHeading": liveHeading,
+                "targetBearing": step.edge.bearingDegrees
+            ])
+            return false
+        }
 
         let recentlyAdvanced = lastRouteAdvanceAt.map {
             Date().timeIntervalSince($0) <= visualRouteAdvanceCooldownSeconds
@@ -3818,6 +4120,14 @@ final class SemanticRouteNavigator: ObservableObject {
 
         if phase != .recovering,
            now.timeIntervalSince(recoveryStartedAt ?? now) < recoveryHoldSeconds {
+            return
+        }
+
+        // Heading-only badness while the heading is still sweeping is a turn
+        // in progress, not a lost user. Cue once it settles — a turn command
+        // computed mid-sweep is stale before it is spoken. Any positional
+        // badness still cues immediately; position does not sweep.
+        if headingBad, !crossTrackBad, !backwardBad, !localizationBad, !isLiveHeadingSettled() {
             return
         }
 
@@ -4663,6 +4973,42 @@ final class SemanticRouteNavigator: ObservableObject {
         return left.distance(to: right) <= visualSameRoutePlaceMeters
     }
 
+    /// The remaining route as a route-frame polyline, for the sighted-developer
+    /// AR arrow overlay: from the believed position on the active leg through
+    /// every remaining node to the destination. Empty unless guiding on an
+    /// AR-frame map — the overlay draws in the AR session's world, so a PDR
+    /// route has nowhere meaningful to draw.
+    func remainingRoutePolyline() -> [SemanticRoutePoint] {
+        guard phase == .navigating || phase == .recovering,
+              activeMap?.coordinateSpace == "ar_world_xz",
+              routeSteps.indices.contains(currentStepIndex) else {
+            return []
+        }
+        var points: [SemanticRoutePoint] = []
+        if let believed = routeWorldPoint(stepIndex: currentStepIndex, progressMeters: segmentProgressMeters) {
+            points.append(believed)
+        }
+        for index in currentStepIndex..<routeSteps.count {
+            points.append(routeSteps[index].to.point)
+        }
+        return points
+    }
+
+    /// Signed turn from `liveHeading` to the leg guidance is steering along:
+    /// positive means the route runs to the user's right. Exposed so the AR
+    /// screen can show the very number every spoken turn is derived from,
+    /// rather than a second opinion computed somewhere else.
+    func headingErrorToActiveLeg(liveHeading: Double) -> Double? {
+        guard phase == .navigating || phase == .recovering,
+              routeSteps.indices.contains(currentStepIndex) else {
+            return nil
+        }
+        return SemanticRouteMath.signedAngleDifference(
+            routeSteps[currentStepIndex].edge.bearingDegrees,
+            liveHeading
+        )
+    }
+
     /// Where a point at `progressMeters` along a step sits in the route frame.
     private func routeWorldPoint(stepIndex: Int, progressMeters: Double) -> SemanticRoutePoint? {
         guard routeSteps.indices.contains(stepIndex) else { return nil }
@@ -5317,6 +5663,11 @@ final class SemanticRouteNavigator: ObservableObject {
         /// True when a stub first leg was removed, so the caller must not carry
         /// the along-track progress it had measured on that leg.
         var droppedLeadingStub: Bool
+        /// The dropped stub's direction and length. The user still physically
+        /// walks it, so alignment cues must accept this bearing as "facing the
+        /// route" until the stub is behind them.
+        var droppedLeadingStubBearingDegrees: Double?
+        var droppedLeadingStubMeters: Double
     }
 
     /// Turns the raw captured graph path into legs a person can actually walk.
@@ -5366,6 +5717,8 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         var droppedLeadingStub = false
+        var droppedStubBearingDegrees: Double?
+        var droppedStubMeters = 0.0
         var startNodeName: String?
         if allowLeadingStubDrop,
            shaped.count >= 2,
@@ -5384,6 +5737,8 @@ final class SemanticRouteNavigator: ObservableObject {
                 // They are still standing at the shelf, whatever the route now
                 // starts from: "Starting at Onions", not "at Left turn 4".
                 startNodeName = first.from.name
+                droppedStubBearingDegrees = first.edge.bearingDegrees
+                droppedStubMeters = first.edge.distanceMeters
                 shaped.removeFirst()
                 droppedLeadingStub = true
             }
@@ -5393,7 +5748,9 @@ final class SemanticRouteNavigator: ObservableObject {
             steps: shaped,
             arrivalFacing: arrivalFacing,
             startNodeName: startNodeName,
-            droppedLeadingStub: droppedLeadingStub
+            droppedLeadingStub: droppedLeadingStub,
+            droppedLeadingStubBearingDegrees: droppedStubBearingDegrees,
+            droppedLeadingStubMeters: droppedStubMeters
         )
     }
 
@@ -6497,6 +6854,12 @@ extension SemanticRouteNavigator {
         }
         resetRouteCorrectionGuards()
         rebuildRAGContext()
+    }
+
+    /// Discards heading history so the next settle check passes — the test
+    /// equivalent of the user finishing a sweep and holding still.
+    func settleHeadingForTesting() {
+        recentHeadingSamples.removeAll()
     }
 
     func expireRecoveryHoldForTesting() {

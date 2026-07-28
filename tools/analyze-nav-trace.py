@@ -305,6 +305,40 @@ def report_belief_timeline(events):
             )
 
 
+def split_sessions(events):
+    """The export concatenates whole app runs, each with its own t=0 clock.
+    Sorting the union by t interleaves capture and guidance runs into one
+    scrambled timeline, so every analysis must stay inside one session."""
+    sessions = []
+    current = []
+    for event in events:
+        is_boundary = event["e"] == "session.open" or (
+            current and event.get("t", 0) + 5.0 < current[-1].get("t", 0)
+        )
+        if is_boundary and current:
+            sessions.append(current)
+            current = []
+        current.append(event)
+    if current:
+        sessions.append(current)
+    return sessions
+
+
+def session_title(number, events):
+    opener = next((e for e in events if e["e"] == "session.open"), None)
+    started = opener.get("startedAt", "?") if opener else "?"
+    device = opener.get("device", "?") if opener else "?"
+    kinds = []
+    if any(e["e"] == "map.node" for e in events):
+        kinds.append("capture")
+    if any(e["e"] == "nav.start" for e in events):
+        kinds.append("guidance")
+    if any(e["e"] == "ar.mapLoaded" for e in events) and "guidance" not in kinds:
+        kinds.append("relocalize-only")
+    label = "+".join(kinds) or "no activity"
+    return f"SESSION {number}  [{label}]  {device}  {started}  ({len(events)} events)"
+
+
 def main():
     args = sys.argv[1:]
     if not args:
@@ -320,26 +354,45 @@ def main():
         raw_filter = set(args[index + 1].split(","))
         del args[index:index + 2]
 
+    # --session N (1-based, negatives count from the end: -1 = latest run).
+    session_pick = None
+    if "--session" in args:
+        index = args.index("--session")
+        session_pick = int(args[index + 1])
+        del args[index:index + 2]
+
     events = []
     for path in args:
         events.extend(load(path))
-    events.sort(key=lambda e: e.get("t", 0))
+
+    sessions = split_sessions(events)
+    if session_pick is not None:
+        picked = session_pick - 1 if session_pick > 0 else session_pick
+        try:
+            sessions = [sessions[picked]]
+        except IndexError:
+            print(f"no session {session_pick}; the file has {len(sessions)}")
+            return 1
 
     if raw_filter is not None:
-        for event in events:
-            if event["e"] in raw_filter:
-                print(json.dumps(event, sort_keys=True))
+        for number, session in enumerate(sessions, 1):
+            print(f"### {session_title(number, session)}")
+            for event in session:
+                if event["e"] in raw_filter:
+                    print(json.dumps(event, sort_keys=True))
         return 0
 
-    print(f"{len(events)} events  ({Counter(e['e'] for e in events).most_common()})")
-
-    report_capture(events)
-    report_localization(events)
-    report_route(events)
-    report_turns(events)
-    report_overrides(events)
-    report_cues(events)
-    report_belief_timeline(events)
+    print(f"{len(events)} events in {len(sessions)} session(s)")
+    for number, session in enumerate(sessions, 1):
+        print(f"\n\n{'#' * 78}\n# {session_title(number, session)}\n{'#' * 78}")
+        print(f"  ({Counter(e['e'] for e in session).most_common()})")
+        report_capture(session)
+        report_localization(session)
+        report_route(session)
+        report_turns(session)
+        report_overrides(session)
+        report_cues(session)
+        report_belief_timeline(session)
     return 0
 
 
