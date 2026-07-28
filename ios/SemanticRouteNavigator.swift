@@ -450,6 +450,21 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastRecoveryCueAt: Date?
     private var lastRecoveryCueKey: String?
     private var beliefIssueStartedAt: Date?
+    /// When the belief last turned healthy while recovery was active; exit
+    /// waits `beliefExitHysteresisSeconds` from here.
+    private var beliefHealthySince: Date?
+    /// Throttle for the nav.beliefHold trace event, which otherwise fires per
+    /// IMU tick (~50 Hz) and floods the export past readability.
+    private var lastBeliefHoldTraceAt: Date?
+    private var lastBeliefHoldTraceKey: String?
+    /// Throttle for the per-tick `nav.evidence` sensor-availability trace.
+    private var lastEvidenceTraceAt: Date?
+    private var lastRecoveryTraceAt: Date?
+    private var lastRecoveryTraceKey: String?
+    /// Best raw fingerprint similarity seen on the last visual match attempt,
+    /// and how many keyframes were even eligible after the heading gate.
+    private var lastVisualBestSimilarity: Double?
+    private var lastVisualCandidateCount = 0
     private var lastTrackingLimitedPrefixAt: Date?
     private var guidanceIntroProtectedUntil: Date?
     private var lastVisualRouteMatchAt: TimeInterval = 0
@@ -549,6 +564,19 @@ final class SemanticRouteNavigator: ObservableObject {
     private let turnAnnouncementThresholdMeters = 0.75
     private let crossTrackRecoveryThreshold = 1.35
     private let recoverySnapThreshold = 1.15
+    /// A snap whose heading disagrees more than this is a position guess, not a
+    /// realignment — announcing "realigned, continue" walks the user off at the
+    /// wrong angle and the belief collapses again seconds later (CIMS trace:
+    /// snap at 99° err → "Guidance realigned" → lost 1.3 s on). The position
+    /// still snaps; the announcement becomes the alignment cue instead.
+    private let recoverySnapTrustedHeadingErrorDegrees = 55.0
+    /// A healthy belief must persist this long before recovery exits and
+    /// announces "Back on route": single-tick flickers exited and re-entered
+    /// six times in 100 s, each round trip spoken aloud.
+    private let beliefExitHysteresisSeconds: TimeInterval = 2.0
+    /// After a snap or exit, a fresh "Route lost" announcement stays quiet for
+    /// this long — the banner updates, speech does not repeat the episode.
+    private let beliefHoldReentryQuietSeconds: TimeInterval = 10.0
     private let headingRecoveryThreshold = 95.0
     private let recoveryHoldSeconds: TimeInterval = 0.6
     private let recoveryCueCooldownSeconds: TimeInterval = 5.0
@@ -586,6 +614,12 @@ final class SemanticRouteNavigator: ObservableObject {
     /// leg's geometry inside the cross-track gates that keyframe matching,
     /// progress projection and recovery all measure against.
     private let mergeMaxChordOffsetMeters = 0.6
+    /// Longest leg two steps may merge into. Beyond this the folded-away node
+    /// is worth more as a mid-corridor re-anchor than the merge is as tidier
+    /// phrasing — see `canMerge`. Sized so the shelf-stub and straight-point
+    /// artefacts merging was written for still fold, while the long runs
+    /// between real waypoints keep their nodes.
+    private let mergedLegMaxMeters = 9.0
     /// Below this the geometry has no handedness worth arguing with, so a
     /// recorded turn hint is never overridden.
     private static let hintContradictionMinimumDegrees = 25.0
@@ -1922,6 +1956,9 @@ final class SemanticRouteNavigator: ObservableObject {
         lastRecoveredAt = nil
         lastRecoveryCueAt = nil
         beliefIssueStartedAt = nil
+        beliefHealthySince = nil
+        lastBeliefHoldTraceAt = nil
+        lastBeliefHoldTraceKey = nil
         lastTrackingLimitedPrefixAt = nil
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
@@ -2037,6 +2074,9 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryStartedAt = nil
         lastRecoveryCueAt = nil
         beliefIssueStartedAt = nil
+        beliefHealthySince = nil
+        lastBeliefHoldTraceAt = nil
+        lastBeliefHoldTraceKey = nil
         lastTrackingLimitedPrefixAt = nil
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
@@ -2212,6 +2252,39 @@ final class SemanticRouteNavigator: ObservableObject {
                 summary: visualMatch.landmarkName.map { visualMatch.isAliased ? "Aliased visual \($0)" : "Visual \($0)" }
                     ?? (visualMatch.isAliased ? "Aliased visual" : "Visual")
             )
+        }
+
+        // Which sensors actually reached the belief this tick.
+        //
+        // The CIMS trace showed every belief candidate carrying only
+        // `pdr_prediction` for a whole journey — no AR projection, no visual
+        // match — i.e. guidance was dead-reckoning while the UI said
+        // "Localized". Nothing in the log said WHY, so this records the three
+        // preconditions directly: whether the AR pose was trusted, whether a
+        // camera frame arrived to fingerprint, and what the map offers to match
+        // against. Throttled to 1 Hz; this is a per-tick path.
+        let evidenceTraceAge = lastEvidenceTraceAt.map { Date().timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        if evidenceTraceAge >= 1.0 {
+            lastEvidenceTraceAt = Date()
+            NavigationTrace.shared.tick("nav.evidence", [
+                "arLocalized": arLocalized,
+                "hasARPoint": arPoint != nil,
+                "coordinateSpace": activeMap?.coordinateSpace ?? "none",
+                "headingSource": arHeading == nil ? "imu_bearing" : "ar",
+                "liveHeadingDeg": liveHeading,
+                "imuBearingDeg": imuState.bearing,
+                "hasCapturedImage": capturedImage != nil,
+                "mapFingerprints": activeMap?.visualFingerprints?.count ?? 0,
+                "mapKeyframes": activeMap?.keyframes?.count ?? 0,
+                "visualMatchConf": visualMatch?.confidence ?? NSNull(),
+                "visualMatchStep": visualMatch?.stepIndex ?? NSNull(),
+                // Why a match failed: how close the best keyframe came, how
+                // many survived the heading gate, and the bar it had to clear.
+                "visualBestSimilarity": lastVisualBestSimilarity ?? NSNull(),
+                "visualCandidates": lastVisualCandidateCount,
+                "visualRequiredSimilarity": 0.62 + visualRouteMinimumConfidence * 0.26,
+                "crossTrackM": crossTrackError ?? NSNull()
+            ])
         }
 
         if let visualMatch,
@@ -3216,15 +3289,29 @@ final class SemanticRouteNavigator: ObservableObject {
             return false
         }
 
+        let now = Date()
         guard routeLocalizationStatus == .ambiguous || routeLocalizationStatus == .lost else {
             beliefIssueStartedAt = nil
             if phase == .recovering, routeBeliefState.isInstructionSafe {
-                exitRecovery(announce: true)
+                // A single healthy tick is a flicker, not a recovery — exiting
+                // on it produced "Back on route" / "Route lost" round trips
+                // seconds apart, spoken in full each time. Hold the phase until
+                // the belief stays healthy, silently.
+                if beliefHealthySince == nil {
+                    beliefHealthySince = now
+                }
+                if now.timeIntervalSince(beliefHealthySince ?? now) >= beliefExitHysteresisSeconds {
+                    beliefHealthySince = nil
+                    exitRecovery(announce: true)
+                    return false
+                }
+                return true
             }
+            beliefHealthySince = nil
             return false
         }
 
-        let now = Date()
+        beliefHealthySince = nil
         if beliefIssueStartedAt == nil {
             beliefIssueStartedAt = now
         }
@@ -3275,19 +3362,27 @@ final class SemanticRouteNavigator: ObservableObject {
 
         phase = .recovering
         recoveryReason = routeBeliefState.evidenceSummary
-        NavigationTrace.shared.log("nav.beliefHold", traceState(extra: [
-            "holdSeconds": holdDuration,
-            "candidates": routeBeliefState.candidates.prefix(4).map { candidate in
-                [
-                    "step": candidate.stepIndex,
-                    "progressM": candidate.progressMeters,
-                    "conf": candidate.confidence,
-                    "uncM": candidate.uncertaintyMeters,
-                    "support": candidate.supportCount,
-                    "sources": candidate.sources.sorted()
-                ] as [String: Any]
-            }
-        ]))
+        // On hold start, status change, or every 2 s — NOT per tick. Per-tick
+        // logging wrote ~50 identical lines a second, which both burned the
+        // trace budget and made the exported analysis unreadable.
+        let traceAge = lastBeliefHoldTraceAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        if key != lastBeliefHoldTraceKey || traceAge >= 2.0 {
+            lastBeliefHoldTraceAt = now
+            lastBeliefHoldTraceKey = key
+            NavigationTrace.shared.log("nav.beliefHold", traceState(extra: [
+                "holdSeconds": holdDuration,
+                "candidates": routeBeliefState.candidates.prefix(4).map { candidate in
+                    [
+                        "step": candidate.stepIndex,
+                        "progressM": candidate.progressMeters,
+                        "conf": candidate.confidence,
+                        "uncM": candidate.uncertaintyMeters,
+                        "support": candidate.supportCount,
+                        "sources": candidate.sources.sorted()
+                    ] as [String: Any]
+                }
+            ]))
+        }
         var instruction = routeLocalizationStatus == .lost
             ? "Route lost. Stop and slowly look around."
             : "Hold on. Pan the phone slowly."
@@ -3298,7 +3393,10 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         currentInstruction = instruction
 
-        if cueChanged || cueAge >= beliefHoldRepeatSeconds {
+        // A re-entry moments after a snap or exit is the same episode, not
+        // news; speech stays quiet inside the re-entry window while the banner
+        // still shows the state.
+        if (cueChanged && cueAge >= beliefHoldReentryQuietSeconds) || cueAge >= beliefHoldRepeatSeconds {
             emitCue(currentInstruction, priority: .critical)
             lastRecoveryCueAt = now
             lastRecoveryCueKey = key
@@ -3504,17 +3602,32 @@ final class SemanticRouteNavigator: ObservableObject {
         recoveryReason = nil
         recoveryStartedAt = nil
         beliefIssueStartedAt = nil
+        beliefHealthySince = nil
         lastRecoveryCueKey = nil
         lastRecoveredAt = Date()
         // Re-sync progress from the trusted AR projection before speaking the
         // next instruction: dead reckoning drifted during the hold, and
         // resuming from its stale progress produces wrong guidance.
+        //
+        // Through the SAME guard every other correction uses. Assigning
+        // directly let one exit teleport the user 1.3 m → 4.5 m along a 5.45 m
+        // leg in 0.67 s — nobody walks 3.2 m in two thirds of a second — which
+        // landed them on the turn node and fired "Turn left" while they were
+        // still mid-corridor. That is where a "false turn" with no mapped node
+        // behind it comes from: not the graph, a pose jump wearing guidance's
+        // voice. A correction this large means the belief is still wrong, so
+        // stay where dead reckoning says and let evidence re-converge.
         if let arRemaining = lastTrustedARRemainingMeters, let step = activeStep {
-            segmentProgressMeters = min(
-                max(step.edge.distanceMeters - arRemaining, 0),
-                step.edge.distanceMeters
-            )
-            segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
+            let observed = min(max(step.edge.distanceMeters - arRemaining, 0), step.edge.distanceMeters)
+            if let guarded = guardedSegmentProgressCorrection(
+                toward: observed,
+                on: step,
+                source: "recovery_exit",
+                maxImmediateForwardMeters: maxImmediateARProgressCorrectionMeters
+            ) {
+                segmentProgressMeters = guarded
+                segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
+            }
         }
         updateInstruction(forceSpeech: false)
         if announce, hadSpokenCue {
@@ -4149,20 +4262,27 @@ final class SemanticRouteNavigator: ObservableObject {
 
         phase = .recovering
         recoveryReason = cue.reason
-        NavigationTrace.shared.log("nav.recovery", traceState(extra: [
-            "instruction": cue.instruction,
-            "key": cue.key,
-            "reason": cue.reason,
-            "crossTrackBad": crossTrackBad,
-            "backwardBad": backwardBad,
-            "headingBad": headingBad,
-            "lowConfidenceBad": lowConfidenceBad,
-            "localizationBad": localizationBad,
-            "observedCrossTrackM": observedCrossTrack,
-            "crossTrackLimitM": crossTrackLimit,
-            "backwardDriftM": backwardDriftMeters,
-            "targetBearing": step.edge.bearingDegrees
-        ]))
+        // Same per-tick flood the belief hold had: 159 identical lines inside
+        // 0.8 s in the field trace. Log on reason change or every 2 s.
+        let recoveryTraceAge = lastRecoveryTraceAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        if cue.key != lastRecoveryTraceKey || recoveryTraceAge >= 2.0 {
+            lastRecoveryTraceAt = now
+            lastRecoveryTraceKey = cue.key
+            NavigationTrace.shared.log("nav.recovery", traceState(extra: [
+                "instruction": cue.instruction,
+                "key": cue.key,
+                "reason": cue.reason,
+                "crossTrackBad": crossTrackBad,
+                "backwardBad": backwardBad,
+                "headingBad": headingBad,
+                "lowConfidenceBad": lowConfidenceBad,
+                "localizationBad": localizationBad,
+                "observedCrossTrackM": observedCrossTrack,
+                "crossTrackLimitM": crossTrackLimit,
+                "backwardDriftM": backwardDriftMeters,
+                "targetBearing": step.edge.bearingDegrees
+            ]))
+        }
 
         // Escalation past orientation nudges: still off the corridor after
         // several seconds of cues means the user walked off the mapped path
@@ -4405,8 +4525,17 @@ final class SemanticRouteNavigator: ObservableObject {
         // window so the very next update doesn't re-enter the hold loop.
         resetRouteBelief(status: .locked)
         phase = .navigating
+        beliefHealthySince = nil
         updateInstruction(forceSpeech: false)
-        if announce {
+        // "Realigned, continue" is a promise the pose AND facing are right. A
+        // snap that only fixed the position while the heading still disagrees
+        // by ~90° (a real trace value) must not tell the user to continue —
+        // walking off at that angle is what re-derails the belief seconds
+        // later. Stay quiet; the per-tick alignment cue speaks the actual turn
+        // from the live heading on the next update.
+        let orientationTrusted = candidate.headingError <= recoverySnapTrustedHeadingErrorDegrees ||
+            (candidate.visualConfidence ?? 0) >= visualRouteSnapConfidence
+        if announce, orientationTrusted {
             currentInstruction = NavLoc.guidanceRealigned()
             emitCue(currentInstruction, priority: .priority)
         }
@@ -4905,7 +5034,21 @@ final class SemanticRouteNavigator: ObservableObject {
             return nil
         }
 
-        let matches = visualRouteCandidates(in: map, fingerprints: fingerprints, liveHeading: liveHeading)
+        let eligible = visualRouteCandidates(in: map, fingerprints: fingerprints, liveHeading: liveHeading)
+        // How close the best candidate came, whether or not it passed. With a
+        // 0.68 confidence bar the raw similarity has to clear ~0.80, and a
+        // field run matched NOTHING across a whole journey with 41 keyframes
+        // loaded — leaving the threshold and the matcher indistinguishable as
+        // causes. Recording the near-miss makes the bar calibratable against
+        // real corridors instead of guessed at.
+        var bestSimilarity: Float = 0
+        for candidate in eligible {
+            bestSimilarity = max(bestSimilarity, frameFingerprinter.similarity(liveFingerprint, candidate.fingerprint))
+        }
+        lastVisualBestSimilarity = Double(bestSimilarity)
+        lastVisualCandidateCount = eligible.count
+
+        let matches = eligible
             .compactMap { candidate -> VisualRouteMatch? in
                 let similarity = frameFingerprinter.similarity(liveFingerprint, candidate.fingerprint)
                 let isAliased = isVisualFingerprintAliased(candidate.fingerprintID, in: map)
@@ -5775,6 +5918,19 @@ final class SemanticRouteNavigator: ObservableObject {
             first.edge.bearingDegrees
         ))
         guard turn <= mergeMaxTurnDegrees else { return false }
+        // A merged leg must still be short enough to stay trustworthy.
+        //
+        // Merging exists to delete sub-metre capture artefacts, not to erase
+        // the waypoints of a long corridor. Every node is a re-anchor: progress
+        // resets there, and the belief gets a fresh geometric fix. Folding two
+        // straight points away turned a real 4-leg walk into ONE 21 m leg, so
+        // dead-reckoning drift accumulated across the whole corridor with
+        // nothing to correct against — and that is the leg where the field
+        // trace teleported the user 3.2 m onto the turn node. Past this length
+        // the intermediate node is worth more than the tidier phrasing.
+        guard first.edge.distanceMeters + second.edge.distanceMeters <= mergedLegMaxMeters else {
+            return false
+        }
         // Merging replaces the bend with its chord, and every projection gate
         // downstream measures cross-track against that line. Keep the folded
         // node close enough to it that a keyframe captured at the bend still

@@ -226,6 +226,54 @@ def report_turns(events):
             print("        ^^ hint says right, geometry says left")
 
 
+def report_evidence(events):
+    """Which sensors actually reached the belief. If this says AR and visual
+    never contributed, guidance was dead-reckoning and every downstream
+    symptom (drifting heading, 'route lost', wrong turns) follows from that —
+    look no further down the stack."""
+    ticks = [e for e in events if e["e"] == "nav.evidence"]
+    if not ticks:
+        return
+    section("SENSOR EVIDENCE REACHING THE BELIEF")
+    total = len(ticks)
+    localized = sum(1 for t in ticks if t.get("arLocalized"))
+    with_point = sum(1 for t in ticks if t.get("hasARPoint"))
+    with_image = sum(1 for t in ticks if t.get("hasCapturedImage"))
+    ar_heading = sum(1 for t in ticks if t.get("headingSource") == "ar")
+    matched = sum(1 for t in ticks if isinstance(t.get("visualMatchConf"), (int, float)))
+    print(f"  samples            {total}")
+    print(f"  arLocalized        {localized:5d}  {localized / total * 100:5.1f}%")
+    print(f"  AR pose present    {with_point:5d}  {with_point / total * 100:5.1f}%")
+    print(f"  heading from ARKit {ar_heading:5d}  {ar_heading / total * 100:5.1f}%"
+          + ("   <-- rest fall back to drifting IMU bearing" if ar_heading < total else ""))
+    print(f"  camera frame given {with_image:5d}  {with_image / total * 100:5.1f}%")
+    print(f"  visual match found {matched:5d}  {matched / total * 100:5.1f}%")
+    sims = [t["visualBestSimilarity"] for t in ticks
+            if isinstance(t.get("visualBestSimilarity"), (int, float))]
+    if sims:
+        need = next((t["visualRequiredSimilarity"] for t in ticks
+                     if isinstance(t.get("visualRequiredSimilarity"), (int, float))), None)
+        cands = [t.get("visualCandidates", 0) for t in ticks]
+        print(f"  best similarity    min {min(sims):.3f}  mean {sum(sims) / len(sims):.3f}"
+              f"  max {max(sims):.3f}"
+              + (f"   (needs >= {need:.3f})" if need else ""))
+        print(f"  keyframes eligible min {min(cands)}  max {max(cands)}  (after heading gate)")
+        if need and max(sims) < need:
+            gap = need - max(sims)
+            print(f"  !! never reached the bar — short by {gap:.3f} even at best."
+                  " The threshold, not the matcher, is what blocks visual evidence")
+        if max(cands) == 0:
+            print("  !! heading gate left ZERO keyframes eligible — nothing could match")
+    first = ticks[0]
+    print(f"  map offers         {first.get('mapKeyframes')} keyframes,"
+          f" {first.get('mapFingerprints')} fingerprints,"
+          f" space={first.get('coordinateSpace')}")
+    if with_image == 0:
+        print("  !! no camera frame ever reached the matcher — visual matching cannot run")
+    if localized == 0:
+        print("  !! arLocalized never true — no AR projection evidence, PDR only")
+
+
 def report_overrides(events):
     overrides = [
         e for e in events
@@ -233,6 +281,21 @@ def report_overrides(events):
     ]
     if not overrides:
         return
+    # Older traces logged beliefHold every tick (~50 Hz). Collapse runs of the
+    # same status so one episode reads as one line instead of nine hundred.
+    collapsed = []
+    for event in overrides:
+        previous = collapsed[-1] if collapsed else None
+        if (previous
+                and previous["e"] == "nav.beliefHold" == event["e"]
+                and previous.get("beliefStatus") == event.get("beliefStatus")
+                and event.get("t", 0) - previous.get("t", 0) < 2.0):
+            previous["_repeats"] = previous.get("_repeats", 1) + 1
+            previous["_lastT"] = event.get("t")
+            continue
+        collapsed.append(dict(event))
+    overrides = collapsed
+
     section("OVERRIDES — where something outranked the mapped route")
     for event in overrides:
         kind = event["e"]
@@ -272,6 +335,10 @@ def report_overrides(events):
                     f" {leg['distM']:.2f}m bearing {leg['bearing']:.1f}°"
                     f" speaks {leg['spokenTurnAtEnd']!r}"
                 )
+
+        if event.get("_repeats"):
+            print(f"        … same state {event['_repeats']}x"
+                  f" through t={event.get('_lastT', 0):.2f}")
 
 
 def report_belief_timeline(events):
@@ -390,6 +457,7 @@ def main():
         report_localization(session)
         report_route(session)
         report_turns(session)
+        report_evidence(session)
         report_overrides(session)
         report_cues(session)
         report_belief_timeline(session)

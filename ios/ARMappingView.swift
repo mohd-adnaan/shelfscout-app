@@ -432,10 +432,12 @@ struct ARMappingView: View {
                 }
 
                 if let headingError = activeLegHeadingErrorDegrees {
+                    // Upper third, not centre: the manual Guide sheet reaches
+                    // past mid-screen, and an indicator the panel covers is an
+                    // indicator that does not exist in the field.
                     VStack {
-                        Spacer(minLength: 0)
                         routeDirectionHUD(headingErrorDegrees: headingError)
-                            .padding(.bottom, 6)
+                            .padding(.top, 84)
                         Spacer(minLength: 0)
                     }
                     .allowsHitTesting(false)
@@ -956,25 +958,79 @@ struct ARMappingView: View {
         // target lives in a different saved map, switch to that map instead
         // of failing the session (pilot: querying cereal with the produce
         // map selected ended guidance).
-        if let launchRouteMapId,
-           let byId = maps.first(where: { $0.id == launchRouteMapId }),
-           routeContainsTarget(byId, normalizedTarget: normalizedTarget) {
-            return byId
+        let pinned: [SemanticRouteMap] = [
+            launchRouteMapId.flatMap { id in maps.first { $0.id == id } },
+            launchRouteMapName.flatMap { name in
+                maps.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }
+            }
+        ].compactMap { $0 }
+        let ordered = pinned + maps.filter { candidate in
+            !pinned.contains { $0.id == candidate.id }
         }
 
-        if let launchRouteMapName,
-           let byName = maps.first(where: { $0.name.caseInsensitiveCompare(launchRouteMapName) == .orderedSame }),
-           routeContainsTarget(byName, normalizedTarget: normalizedTarget) {
-            return byName
+        // A map where the target is a DESTINATION was captured walking toward
+        // it — its keyframes face the walking direction and its start is where
+        // the user is coming from. A map that merely CONTAINS the target as its
+        // start node would relocalize at the far end and guide a zero-length
+        // route. With directional map pairs (A→B saved separately from B→A)
+        // every target exists in both maps, so this preference is what picks
+        // the map that can actually guide there; `maps.first` was a coin flip.
+        if let toward = ordered.first(where: { routeGuidesToward($0, normalizedTarget: normalizedTarget) }) {
+            return toward
         }
 
-        if let exact = maps.first(where: { routeContainsTarget($0, normalizedTarget: normalizedTarget) }) {
-            return exact
+        if let contains = ordered.first(where: { routeContainsTarget($0, normalizedTarget: normalizedTarget) }) {
+            return contains
         }
 
         // Fuzzy fallback for ASR noise: "serial" must still find the map
-        // holding "cereal".
-        return maps.first(where: { routeContainsTargetFuzzily($0, target: target) })
+        // holding "cereal" — and the same toward-preference applies.
+        if let towardFuzzy = ordered.first(where: {
+            routeGuidesTowardFuzzily($0, target: target)
+        }) {
+            return towardFuzzy
+        }
+        return ordered.first(where: { routeContainsTargetFuzzily($0, target: target) })
+    }
+
+    /// True when the target is one of this route's DESTINATIONS — a place the
+    /// capture walk ended at, which is the direction the map can guide.
+    private func routeGuidesToward(_ route: SemanticRouteMap, normalizedTarget: String) -> Bool {
+        let destinationIDs = destinationNodeIDs(of: route)
+        return route.nodes.contains { node in
+            destinationIDs.contains(node.id) && (
+                normalizedRouteLookupKey(node.name) == normalizedTarget ||
+                node.aliases.contains { normalizedRouteLookupKey($0) == normalizedTarget }
+            )
+        } || route.landmarks.contains { landmark in
+            destinationIDs.contains(landmark.nodeID) && (
+                normalizedRouteLookupKey(landmark.name) == normalizedTarget ||
+                landmark.aliases.contains { normalizedRouteLookupKey($0) == normalizedTarget }
+            )
+        }
+    }
+
+    private func routeGuidesTowardFuzzily(_ route: SemanticRouteMap, target: String) -> Bool {
+        let destinationIDs = destinationNodeIDs(of: route)
+        return route.nodes.contains { node in
+            destinationIDs.contains(node.id) && (
+                SemanticRouteNavigator.fuzzyMatchesSpokenTarget(node.name, target) ||
+                node.aliases.contains { SemanticRouteNavigator.fuzzyMatchesSpokenTarget($0, target) }
+            )
+        } || route.landmarks.contains { landmark in
+            destinationIDs.contains(landmark.nodeID) && (
+                SemanticRouteNavigator.fuzzyMatchesSpokenTarget(landmark.name, target) ||
+                landmark.aliases.contains { SemanticRouteNavigator.fuzzyMatchesSpokenTarget($0, target) }
+            )
+        }
+    }
+
+    private func destinationNodeIDs(of route: SemanticRouteMap) -> Set<String> {
+        var ids = Set(route.nodes.filter { $0.kind == .destination }.map(\.id))
+        for id in route.destinationNodeIds ?? [] {
+            ids.insert(id)
+        }
+        return ids
     }
 
     private func routeContainsTargetFuzzily(_ route: SemanticRouteMap, target: String) -> Bool {

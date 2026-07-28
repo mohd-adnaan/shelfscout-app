@@ -126,6 +126,12 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// Below this range the bearing to a POI swings wildly for a small position
     /// error, so the angular test says nothing useful.
     private let visualBearingMinimumDistanceMeters: Float = 1.5
+    /// How far the relocalized AR heading may sit from the device compass
+    /// before the frame is judged unaligned. Generous, because indoor compass
+    /// readings are noisy — this is meant to catch the tens-of-degrees frame
+    /// error a `.gravity` session carries, not to police a few degrees of
+    /// magnetometer drift. The field failure was 63°.
+    private let compassCorroborationDegrees: Double = 40.0
     private let imuMotionMinimumSteps = 2
     private let imuMotionMinimumDistance: Float = 0.8
     private let imuMotionDirectionMinimumDistance: Float = 1.15
@@ -982,6 +988,39 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // heading 180° out. Restored named anchors only exist once ARKit has
         // genuinely matched the map, so they are the proof that the frame — and
         // therefore every bearing derived from it — is real.
+        // ── Compass corroboration ───────────────────────────────────────────
+        // The decisive check, because the anchor proof below cannot be trusted:
+        // ARKit adds a loaded map's named anchors at `run()` time, BEFORE
+        // relocalization lands, so their presence proves nothing (field trace:
+        // "LOCALIZED after 0.9s [ANCHOR-PROVEN]" on a 7332-feature map, with the
+        // frame 63° out).
+        //
+        // Maps are captured under `.gravityAndHeading`, so their bearings are
+        // compass-referenced. Relocalization must reproduce that frame — so a
+        // genuinely aligned AR heading agrees with the device compass. When it
+        // does not, ARKit is still tracking in its own `.gravity` frame whose
+        // yaw is arbitrary, and every bearing derived from it is wrong. The
+        // field trace is unambiguous: compass 303.0° vs route 298.1° (agree),
+        // ARKit 1.2° (63° out) — and guidance turned the user 63° off a
+        // corridor they were already facing correctly.
+        if let arHeading, let compassBearing = latestIMUMotion?.bearing {
+            var delta = (arHeading - compassBearing).truncatingRemainder(dividingBy: 360)
+            if delta > 180 { delta -= 360 }
+            if delta < -180 { delta += 360 }
+            let disagreement = abs(delta)
+            if disagreement > compassCorroborationDegrees {
+                relocalizationNormalSince = Date()
+                let waiting = "Matching the saved map. Keep the camera up and turn slowly."
+                if statusMessage != waiting { statusMessage = waiting }
+                traceRelocalizationVeto("compass_disagrees", detail: [
+                    "arHeadingDeg": arHeading,
+                    "compassBearingDeg": compassBearing,
+                    "disagreementDeg": disagreement
+                ])
+                return
+            }
+        }
+
         if expectedRestoredPOICount > 0, !hasRestoredMapAnchors {
             relocalizationNormalSince = Date()
             let waiting = "Matching the saved map. Keep the camera up and turn slowly."
