@@ -14,5 +14,7 @@ export const GROQ_API_KEYS: string[] = [
 export const GROQ_INTENT_MODEL = 'llama-3.3-70b-versatile';
 
 // Multimodal model for on-device scene/object/general vision queries.
-// Matches the backend workflow's vision_model.
-export const GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+// Groq retires models without notice and a retired id 404s at request time,
+// which reaches a blind user as "I could not analyze the image" — check this
+// id against GET /openai/v1/models when vision starts failing.
+export const GROQ_VISION_MODEL = 'qwen/qwen3.6-27b';

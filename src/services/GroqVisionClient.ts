@@ -3,9 +3,9 @@
 // On-device vision orchestration via Groq — the frontend equivalent of the
 // backend Scene / Object / Chat vision nodes, now with EXACT two-pass parity:
 //
-//   Pass 1 (vision):     llama-4-scout returns structured JSON, using the same
-//                        system/user prompts as the backend Config nodes plus
-//                        the user's profile traits.
+//   Pass 1 (vision):     the multimodal model returns structured JSON, using
+//                        the same system/user prompts as the backend Config
+//                        nodes plus the user's profile traits.
 //   Pass 2 (synthesize): a fast text model turns that JSON into a short spoken
 //                        answer, styled by trait_comm_style — mirroring the
 //                        backend "Synthesize result" node.
@@ -21,7 +21,7 @@ import { NativeModules, Platform } from 'react-native';
 import RNFS from 'react-native-fs';
 
 let GROQ_API_KEYS: string[] = [];
-let GROQ_VISION_MODEL = 'meta-llama/llama-4-scout-17b-16e-instruct';
+let GROQ_VISION_MODEL = 'qwen/qwen3.6-27b';
 let GROQ_TEXT_MODEL = 'llama-3.3-70b-versatile';
 try {
   // eslint-disable-next-line @typescript-eslint/no-var-requires
@@ -36,6 +36,11 @@ try {
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const VISION_TIMEOUT_MS = 20000;
 const SYNTH_TIMEOUT_MS = 8000;
+
+// Groq reserves max_tokens against the per-minute token budget, and the vision
+// model's free-tier ceiling is 8k TPM — so this is sized to the ~450 tokens a
+// scene JSON actually costs plus headroom, not set as high as it could go.
+const VISION_MAX_TOKENS = 800;
 
 // Downscale target for the vision upload. 768px is plenty for scene/object
 // description and cuts a ~1152x2048 (~600KB) frame to well under ~150KB.
@@ -196,7 +201,7 @@ class GroqVisionClient {
           ],
         },
       ],
-      { jsonMode: true, timeout: VISION_TIMEOUT_MS, maxTokens: 400 },
+      { jsonMode: true, timeout: VISION_TIMEOUT_MS, maxTokens: VISION_MAX_TOKENS, noReasoning: true },
     );
     if (!vision.ok || !vision.text) {
       return { ok: false, provider: 'none', fallbackReason: vision.fallbackReason || 'vision_failed' };
@@ -243,8 +248,15 @@ class GroqVisionClient {
   private async post(
     model: string,
     messages: unknown[],
-    opts: { jsonMode: boolean; timeout: number; maxTokens: number },
+    opts: { jsonMode: boolean; timeout: number; maxTokens: number; noReasoning?: boolean },
   ): Promise<{ ok: boolean; text?: string; fallbackReason?: string }> {
+    // The vision model is a reasoning model: left to itself it spends the whole
+    // completion budget thinking and returns empty content, which json_object
+    // rejects as json_validate_failed. `reasoning_effort: 'none'` is what makes
+    // it answer directly — but plain models (the pass-2 synthesizer) 400 on the
+    // parameter, and a future vision model may too, so it is requested only
+    // where it is needed and dropped if the API objects.
+    let sendNoReasoning = opts.noReasoning === true;
     for (let attempt = 0; attempt < Math.min(2, GROQ_API_KEYS.length + 1); attempt += 1) {
       const key = nextKey();
       if (!key) return { ok: false, fallbackReason: 'groq_no_key' };
@@ -259,6 +271,7 @@ class GroqVisionClient {
             model,
             temperature: 0.2,
             max_tokens: opts.maxTokens,
+            ...(sendNoReasoning ? { reasoning_effort: 'none' } : {}),
             ...(opts.jsonMode ? { response_format: { type: 'json_object' } } : {}),
             messages,
           }),
@@ -266,11 +279,34 @@ class GroqVisionClient {
         });
         clearTimeout(timer);
         if (res.status === 429) continue;
-        if (!res.ok) return { ok: false, fallbackReason: `groq_http_${res.status}` };
+        if (!res.ok) {
+          // A retired model id, a revoked key and a malformed frame all arrive
+          // here and all reach the user as the same "I could not analyze the
+          // image". Logging the status is what separates them: a decommissioned
+          // vision model went undiagnosed through a whole session because this
+          // reason only ever went into a trace nobody printed.
+          const body = await res.text().catch(() => '');
+          if (sendNoReasoning && body.includes('reasoning_effort')) {
+            // Model doesn't take the parameter — drop it and spend one retry
+            // rather than failing the request over a capability flag.
+            sendNoReasoning = false;
+            console.warn(`[GroqVision] ${model} rejected reasoning_effort; retrying without it`);
+            continue;
+          }
+          console.warn(`[GroqVision] ${model} HTTP ${res.status}: ${body.slice(0, 200)}`);
+          return { ok: false, fallbackReason: `groq_http_${res.status}` };
+        }
         const data = await res.json();
         const content: string | undefined = data?.choices?.[0]?.message?.content;
         const text = typeof content === 'string' ? content.trim() : '';
-        if (!text) return { ok: false, fallbackReason: 'groq_empty_content' };
+        if (!text) {
+          // Usually a reasoning model that spent the whole completion budget
+          // thinking, so the finish reason is the diagnostic worth keeping.
+          console.warn(
+            `[GroqVision] ${model} returned empty content (finish_reason=${data?.choices?.[0]?.finish_reason})`,
+          );
+          return { ok: false, fallbackReason: 'groq_empty_content' };
+        }
         return { ok: true, text };
       } catch (error: any) {
         clearTimeout(timer);

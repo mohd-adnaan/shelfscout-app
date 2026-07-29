@@ -414,6 +414,13 @@ class MobileOrchestrator {
       diagnostics: { intent },
     });
 
+    if (!result.ok) {
+      // The trace alone is not enough: the user hears a generic apology and the
+      // session log shows nothing, so a broken vision path looks identical to a
+      // bad camera frame. Say why in the console.
+      console.warn(`[Orchestrator] Vision failed (intent=${intent}): ${result.fallbackReason}`);
+    }
+
     return result.ok ? result.text || null : null;
   }
 
