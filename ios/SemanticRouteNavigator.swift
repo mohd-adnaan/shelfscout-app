@@ -461,6 +461,9 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastEvidenceTraceAt: Date?
     private var lastRecoveryTraceAt: Date?
     private var lastRecoveryTraceKey: String?
+    private var lastSnapAt: Date?
+    /// Minimum spacing between recovery snaps — see `applyRecoverySnap`.
+    private let recoverySnapCooldownSeconds: TimeInterval = 2.5
     /// Best raw fingerprint similarity seen on the last visual match attempt,
     /// and how many keyframes were even eligible after the heading gate.
     private var lastVisualBestSimilarity: Double?
@@ -624,8 +627,16 @@ final class SemanticRouteNavigator: ObservableObject {
     /// recorded turn hint is never overridden.
     private static let hintContradictionMinimumDegrees = 25.0
     private let visualRouteMatchInterval: TimeInterval = 0.45
-    private let visualRouteMinimumConfidence = 0.68
-    private let visualRouteSnapConfidence = 0.88
+    /// Similarity that maps to zero confidence (noise floor between unrelated
+    /// corridor frames) and the span to full confidence. Field distribution:
+    /// min 0.21, mean 0.39-0.49, max 0.45-0.61 across four traces.
+    private let visualSimilarityFloor = 0.30
+    private let visualSimilaritySpan = 0.35
+    /// With the mapping above: 0.40 confidence ≈ 0.44 similarity (contributes
+    /// evidence), 0.72 ≈ 0.55 similarity (trusted enough to snap position).
+    /// Both were 0.68/0.88 against a mapping that could only ever return 0.
+    private let visualRouteMinimumConfidence = 0.40
+    private let visualRouteSnapConfidence = 0.72
     private let visualRouteArrivalConfidence = 0.76
     private let visualRouteAmbiguousGap = 0.20
     /// How far apart two near-tied visual matches may sit and still describe
@@ -4499,6 +4510,14 @@ final class SemanticRouteNavigator: ObservableObject {
 
     private func applyRecoverySnap(_ candidate: RecoverySnapCandidate, announce: Bool) {
         guard candidate.stepIndex >= 0, candidate.stepIndex < routeSteps.count else { return }
+        // One snap per settling period. Unthrottled, this fired 34 times in
+        // 0.7 s in the field — each one re-running `updateInstruction`, so the
+        // user heard "7 meters" thirty times in under a second while the pose
+        // twitched. A snap is a decision, not a per-frame correction.
+        if let lastSnapAt, Date().timeIntervalSince(lastSnapAt) < recoverySnapCooldownSeconds {
+            return
+        }
+        lastSnapAt = Date()
         NavigationTrace.shared.log("nav.snap", traceState(extra: [
             "toStep": candidate.stepIndex,
             "toProgressM": candidate.progressMeters,
@@ -5318,8 +5337,21 @@ final class SemanticRouteNavigator: ObservableObject {
         return order.compactMap { best[$0] }
     }
 
+    /// Maps raw fingerprint similarity onto 0…1 confidence.
+    ///
+    /// ⚠️ Calibrated from field measurements, not from intuition. The previous
+    /// mapping subtracted 0.62 before scaling — but every similarity ever
+    /// recorded in a real corridor fell between 0.21 and 0.61, so the numerator
+    /// was always negative and this function returned **exactly zero, always**.
+    /// The visual layer could not contribute evidence under any threshold; that
+    /// is why guidance had nothing but dead reckoning to correct ARKit's yaw
+    /// with, and why a reloaded map could not fix its own frame.
+    ///
+    /// The band below is the observed distribution: ~0.30 is the noise floor
+    /// between unrelated corridor frames, ~0.65 is a confident same-place match
+    /// a step or two from where the keyframe was taken.
     private func visualConfidence(from similarity: Float) -> Double {
-        let confidence = (Double(similarity) - 0.62) / 0.26
+        let confidence = (Double(similarity) - visualSimilarityFloor) / visualSimilaritySpan
         return min(max(confidence, 0), 1)
     }
 

@@ -131,7 +131,6 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// readings are noisy — this is meant to catch the tens-of-degrees frame
     /// error a `.gravity` session carries, not to police a few degrees of
     /// magnetometer drift. The field failure was 63°.
-    private let compassCorroborationDegrees: Double = 40.0
     private let imuMotionMinimumSteps = 2
     private let imuMotionMinimumDistance: Float = 0.8
     private let imuMotionDirectionMinimumDistance: Float = 1.15
@@ -1003,23 +1002,13 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // field trace is unambiguous: compass 303.0° vs route 298.1° (agree),
         // ARKit 1.2° (63° out) — and guidance turned the user 63° off a
         // corridor they were already facing correctly.
-        if let arHeading, let compassBearing = latestIMUMotion?.bearing {
-            var delta = (arHeading - compassBearing).truncatingRemainder(dividingBy: 360)
-            if delta > 180 { delta -= 360 }
-            if delta < -180 { delta += 360 }
-            let disagreement = abs(delta)
-            if disagreement > compassCorroborationDegrees {
-                relocalizationNormalSince = Date()
-                let waiting = "Matching the saved map. Keep the camera up and turn slowly."
-                if statusMessage != waiting { statusMessage = waiting }
-                traceRelocalizationVeto("compass_disagrees", detail: [
-                    "arHeadingDeg": arHeading,
-                    "compassBearingDeg": compassBearing,
-                    "disagreementDeg": disagreement
-                ])
-                return
-            }
-        }
+        // ⚠️ REMOVED: a "compass corroboration" veto that compared `arHeading`
+        // against `latestIMUMotion.bearing`. That premise was false —
+        // `IMUSensorManager` has no magnetometer at all; its bearing is a
+        // gyro-integrated value SEEDED from this very AR heading
+        // (`seedIMUBearingIfNeeded` → `setInitialBearing`). It compared ARKit
+        // against a drifted copy of ARKit, so it could never validate the map
+        // frame. Kept as a note so the idea is not re-invented.
 
         if expectedRestoredPOICount > 0, !hasRestoredMapAnchors {
             relocalizationNormalSince = Date()
