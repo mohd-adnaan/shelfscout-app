@@ -442,7 +442,14 @@ final class SemanticRouteNavigator: ObservableObject {
     private var lastAutoSampledAt: Date?
     private var lastIMUStepCount: Int?
     private var lastIMUPosition: Position?
-    private var lastAnnouncedRemainingMeter: Int?
+    /// Smallest approach gate already spoken on this leg. Gates only ever come
+    /// closer, so one value is the whole schedule: everything larger is behind
+    /// the user and spent.
+    private var lastSpokenApproachGateMeters: Double?
+    /// When routine walking speech last went out — the pacing floor that keeps
+    /// approach, landmark and reassurance cues from stacking on each other.
+    private var lastRoutineCueAt: Date?
+    private var spokenDestinationApproachCue = false
     private var lastAnnouncedLandmarkID: String?
     private var announcedLandmarkIDs: Set<String> = []
     private var recoveryStartedAt: Date?
@@ -565,6 +572,24 @@ final class SemanticRouteNavigator: ObservableObject {
     private let destinationStillnessRadiusMeters = 0.9
     private let destinationStillnessArrivalSeconds: TimeInterval = 2.0
     private let turnAnnouncementThresholdMeters = 0.75
+    /// Remaining-distance gates at which a leg's upcoming maneuver is spoken.
+    /// Turn-by-turn apps pace guidance by maneuver, not by meter: the leg is
+    /// announced when it starts, once or twice as the maneuver approaches, and
+    /// once at the maneuver itself. The meter-by-meter countdown this replaced
+    /// spoke eight times on a single 8 m leg, which drowns the cues that carry
+    /// a decision. Descending; only the nearest un-spoken gate ever fires.
+    private let approachCueGatesMeters: [Double] = [10.0, 4.0]
+    /// A gate only fires on legs this much longer than the gate itself, so an
+    /// approach cue can never land on top of the leg-start instruction that
+    /// just spoke the same distance.
+    private let approachGateHeadroomMeters = 3.0
+    /// Floor between two routine spoken cues. Maneuver, arrival and recovery
+    /// speech ignores it — those are decisions, not pacing.
+    private let routineCueMinimumSpacingSeconds: TimeInterval = 6.0
+    /// Longest the walk goes unspoken before the current instruction is
+    /// repeated. Sparse guidance is calmer; silent guidance reads as a system
+    /// that has stopped tracking, which is the failure mode this bounds.
+    private let routineCueQuietMaxSeconds: TimeInterval = 20.0
     private let crossTrackRecoveryThreshold = 1.35
     private let recoverySnapThreshold = 1.15
     /// A snap whose heading disagrees more than this is a position guess, not a
@@ -1958,7 +1983,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastIMUStepCount = imuState.stepCount
         lastIMUPosition = imuState.position
         cumulativeTravelMeters = 0
-        lastAnnouncedRemainingMeter = nil
+        resetLegCueSchedule()
         lastAnnouncedLandmarkID = nil
         announcedLandmarkIDs.removeAll()
         shouldSpeakLandmarks = speakLandmarks
@@ -2079,7 +2104,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastIMUPosition = nil
         cumulativeTravelMeters = 0
         lastPDRDeltaWasCapped = false
-        lastAnnouncedRemainingMeter = nil
+        resetLegCueSchedule()
         lastAnnouncedLandmarkID = nil
         announcedLandmarkIDs.removeAll()
         recoveryStartedAt = nil
@@ -2455,9 +2480,6 @@ final class SemanticRouteNavigator: ObservableObject {
             updateInstruction(forceSpeech: false)
             currentInstruction = NavLoc.goodPrefix() + currentInstruction
             emitCue(currentInstruction, priority: .priority)
-            // Claim this meter bucket so the routine countdown can't clobber
-            // the resume cue later in the same tick.
-            lastAnnouncedRemainingMeter = Int(ceil(segmentRemainingMeters))
             stillnessStartedAt = nil
             lastStillnessRepromptAt = nil
         }
@@ -3481,7 +3503,7 @@ final class SemanticRouteNavigator: ObservableObject {
             ? 0
             : min(max(start.initialProgressMeters, 0), firstStep.edge.distanceMeters)
         segmentRemainingMeters = max(0, firstStep.edge.distanceMeters - segmentProgressMeters)
-        lastAnnouncedRemainingMeter = nil
+        resetLegCueSchedule()
         lastAnnouncedLandmarkID = nil
         recoveryStartedAt = nil
         recoveryReason = nil
@@ -3569,7 +3591,7 @@ final class SemanticRouteNavigator: ObservableObject {
         leadingStubMeters = 0
         segmentProgressMeters = 0
         segmentRemainingMeters = rejoinEdge.distanceMeters
-        lastAnnouncedRemainingMeter = nil
+        resetLegCueSchedule()
         lastAnnouncedLandmarkID = nil
         recoveryStartedAt = nil
         recoveryReason = nil
@@ -4531,7 +4553,7 @@ final class SemanticRouteNavigator: ObservableObject {
         currentStepIndex = candidate.stepIndex
         segmentProgressMeters = min(max(candidate.progressMeters, 0), step.edge.distanceMeters)
         segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
-        lastAnnouncedRemainingMeter = nil
+        resetLegCueSchedule()
         recoveryStartedAt = nil
         recoveryReason = nil
         lastRecoveryCueKey = nil
@@ -4611,7 +4633,7 @@ final class SemanticRouteNavigator: ObservableObject {
         resetRouteBelief(status: .initializing)
         segmentProgressMeters = 0
         segmentRemainingMeters = next.edge.distanceMeters
-        lastAnnouncedRemainingMeter = nil
+        resetLegCueSchedule()
         lastAnnouncedLandmarkID = nil
         recoveryStartedAt = nil
         recoveryReason = nil
@@ -4674,6 +4696,12 @@ final class SemanticRouteNavigator: ObservableObject {
         line: Int = #line
     ) {
         speechCue = SemanticSpeechCue(text: text, priority: priority)
+        // Every spoken cue — turn, recovery, alignment, arrival — starts the
+        // routine pacing window. An approach or reassurance cue landing right
+        // behind a maneuver cue is exactly the stacking the pacing floor
+        // exists to prevent, so the window is kept here rather than at each
+        // routine call site.
+        lastRoutineCueAt = Date()
         NavigationTrace.shared.log("cue", traceState(extra: [
             "text": text,
             "priority": String(describing: priority),
@@ -4871,7 +4899,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let pastIntroProtection = guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
         if confidence < 0.45, pastIntroProtection {
-            // Say it once per stretch of weak tracking, not on every meter cue.
+            // Say it once per stretch of weak tracking, not on every cue.
             let now = Date()
             let prefixAge = lastTrackingLimitedPrefixAt.map { now.timeIntervalSince($0) }
                 ?? .greatestFiniteMagnitude
@@ -4881,32 +4909,110 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
 
-        let bucket = Int(ceil(cueRemainingMeters))
         let routineSpeechAllowed = forceSpeech || guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
         guard routineSpeechAllowed else { return }
 
         if forceSpeech {
             emitCue(currentInstruction, priority: .priority)
-            lastAnnouncedRemainingMeter = bucket
-        } else if shouldSpeakLandmarks,
-                  let landmarkCue = nearbyLandmarkCue(on: step, after: segmentProgressMeters),
-                  !announcedLandmarkIDs.contains(landmarkCue.id) {
+            return
+        }
+
+        if shouldSpeakLandmarks,
+           let landmarkCue = nearbyLandmarkCue(on: step, after: segmentProgressMeters),
+           !announcedLandmarkIDs.contains(landmarkCue.id) {
             lastAnnouncedLandmarkID = landmarkCue.id
             announcedLandmarkIDs.insert(landmarkCue.id)
             emitCue(landmarkCue.phrase, priority: .priority)
-        } else if bucket != lastAnnouncedRemainingMeter && bucket <= 8 && bucket >= 1 {
-            lastAnnouncedRemainingMeter = bucket
-            let cue: String
-            if bucket == 1, currentStepIndex < routeSteps.count - 1 {
-                let next = routeSteps[currentStepIndex + 1]
-                cue = "One meter. \(turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees))."
-            } else if bucket == 1 {
-                cue = "One meter to \(targetName)."
-            } else {
-                cue = "\(bucket) meters."
-            }
-            emitCue(cue, priority: .priority)
+            return
         }
+
+        if speakDestinationApproachIfDue(remainingMeters: cueRemainingMeters) { return }
+        if speakApproachCueIfDue(on: step, remainingMeters: cueRemainingMeters) { return }
+        speakQuietPeriodReassuranceIfDue()
+    }
+
+    /// The last thing spoken before arrival is what tells a blind user to slow
+    /// down and get ready to reach. The old meter countdown carried it by
+    /// accident at "one meter"; with the countdown gone it is explicit, fires
+    /// once per route, and ignores the pacing floor — arrival is a decision,
+    /// not chatter.
+    private func speakDestinationApproachIfDue(remainingMeters: Double) -> Bool {
+        guard phase == .navigating,
+              currentStepIndex >= routeSteps.count - 1,
+              !spokenDestinationApproachCue,
+              (lastARNodeDistanceMeters ?? remainingMeters) <= destinationJustAheadMeters else {
+            return false
+        }
+        spokenDestinationApproachCue = true
+        emitCue(currentInstruction, priority: .priority)
+        return true
+    }
+
+    /// Speaks the leg's upcoming maneuver once per approach gate — "in 4
+    /// meters, turn right" — instead of counting the distance down meter by
+    /// meter. The gate decides *when* to speak; the phrase always carries the
+    /// live distance, so a cue delayed by the pacing floor still states the
+    /// distance the user actually has left.
+    private func speakApproachCueIfDue(on step: SemanticRouteStep, remainingMeters: Double) -> Bool {
+        guard phase == .navigating else { return false }
+        let eligible = approachCueGatesMeters.filter { gate in
+            gate < (lastSpokenApproachGateMeters ?? .greatestFiniteMagnitude)
+                && remainingMeters <= gate
+                && step.edge.distanceMeters >= gate + approachGateHeadroomMeters
+        }
+        // Nearest gate the user has crossed. Taking the largest instead would
+        // announce "in 10 meters" to someone standing 4 m out whenever two
+        // gates fall inside one pacing window.
+        guard let gate = eligible.min() else { return false }
+
+        let now = Date()
+        if let last = lastRoutineCueAt,
+           now.timeIntervalSince(last) < routineCueMinimumSpacingSeconds {
+            return false
+        }
+        // Every larger gate is now behind the user, so mark this one spoken and
+        // let the guard above retire the rest.
+        lastSpokenApproachGateMeters = gate
+        emitCue(approachCuePhrase(on: step, remainingMeters: remainingMeters), priority: .priority)
+        return true
+    }
+
+    /// Backstop for long legs: a 25 m straight has no gate between its start
+    /// and 10 m to go, and a blind walker has nothing but the cues to confirm
+    /// the system still has them. Repeats the current instruction — with its
+    /// live distance — rather than adding a new kind of cue.
+    private func speakQuietPeriodReassuranceIfDue() {
+        guard phase == .navigating else { return }
+        let now = Date()
+        guard let last = lastRoutineCueAt else {
+            lastRoutineCueAt = now
+            return
+        }
+        guard now.timeIntervalSince(last) >= routineCueQuietMaxSeconds else { return }
+        emitCue(currentInstruction, priority: .regular)
+    }
+
+    /// What the approach gate says: the maneuver waiting at the end of this
+    /// leg, or the destination on the final one. Anchoring the cue to the
+    /// maneuver is the difference between "4 meters" — 4 meters of what? — and
+    /// an instruction the user can act on without waiting for the next cue.
+    private func approachCuePhrase(on step: SemanticRouteStep, remainingMeters: Double) -> String {
+        let distance = Self.formatMeters(remainingMeters)
+        guard currentStepIndex < routeSteps.count - 1 else {
+            let destination = Self.sanitizedSpokenLabel(targetName, fallback: NavLoc.defaultDestinationLabel())
+            return NavLoc.destinationInDistance(destination, distance: distance)
+        }
+        let next = routeSteps[currentStepIndex + 1]
+        let turn = turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees)
+        return NavLoc.inDistanceTurn(distance: distance, turn: turn)
+    }
+
+    /// Clears the per-leg speech schedule so a new or re-anchored leg announces
+    /// its own gates from the top.
+    private func resetLegCueSchedule() {
+        lastSpokenApproachGateMeters = nil
+        spokenDestinationApproachCue = false
+        lastRoutineCueAt = Date()
     }
 
     private func rebuildRAGContext() {

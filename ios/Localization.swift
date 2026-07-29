@@ -449,6 +449,16 @@ enum NavLoc {
         }
     }
 
+    /// Final-leg approach cue, the destination's counterpart to
+    /// `inDistanceTurn` — spoken once as the destination comes up, not
+    /// repeated every meter.
+    static func destinationInDistance(_ destination: String, distance: String) -> String {
+        switch lang {
+        case .en: return "\(destination) in \(distance)."
+        case .fr: return "\(destination) dans \(distance)."
+        }
+    }
+
     static func defaultDestinationLabel() -> String {
         switch lang {
         case .en: return "The destination"
