@@ -475,6 +475,10 @@ final class SemanticRouteNavigator: ObservableObject {
     /// and how many keyframes were even eligible after the heading gate.
     private var lastVisualBestSimilarity: Double?
     private var lastVisualCandidateCount = 0
+    /// False until one visual match has landed in this run. While false the
+    /// keyframe heading gate is suspended, because it would otherwise assume the
+    /// live heading it exists to help check. See `currentVisualRouteMatch`.
+    private var didCorroborateHeadingVisually = false
     private var lastTrackingLimitedPrefixAt: Date?
     private var guidanceIntroProtectedUntil: Date?
     private var lastVisualRouteMatchAt: TimeInterval = 0
@@ -1998,6 +2002,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastTrackingLimitedPrefixAt = nil
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
+        didCorroborateHeadingVisually = false
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
         lastPDRDeltaWasCapped = false
@@ -2116,6 +2121,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastTrackingLimitedPrefixAt = nil
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
+        didCorroborateHeadingVisually = false
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
         lastHeadingAlignmentCueAt = nil
@@ -2318,7 +2324,17 @@ final class SemanticRouteNavigator: ObservableObject {
                 // many survived the heading gate, and the bar it had to clear.
                 "visualBestSimilarity": lastVisualBestSimilarity ?? NSNull(),
                 "visualCandidates": lastVisualCandidateCount,
-                "visualRequiredSimilarity": 0.62 + visualRouteMinimumConfidence * 0.26,
+                // ⚠️ Must stay the exact inverse of `visualConfidence(from:)`.
+                // This was hard-coded to the PRE-FIX mapping (0.62 + conf*0.26),
+                // so it reported a bar of 0.724 when the real one is 0.44. The
+                // trace analyzer then printed "never reached the bar — the
+                // threshold, not the matcher, is what blocks visual evidence"
+                // for the 2026-07-29 IGA session, whose best similarity of
+                // 0.460 was in fact ABOVE the real bar. Two rounds of guidance
+                // fixes were aimed at that phantom threshold. Derive it, never
+                // restate it.
+                "visualRequiredSimilarity": visualSimilarityFloor
+                    + visualRouteMinimumConfidence * visualSimilaritySpan,
                 "crossTrackM": crossTrackError ?? NSNull()
             ])
         }
@@ -5159,7 +5175,19 @@ final class SemanticRouteNavigator: ObservableObject {
             return nil
         }
 
-        let eligible = visualRouteCandidates(in: map, fingerprints: fingerprints, liveHeading: liveHeading)
+        // ⚠️ The heading gate is only legitimate once the live heading has been
+        // corroborated at least once. Applying it from the first frame is
+        // circular: it discards every keyframe that disagrees with the live
+        // heading, so when the AR frame's yaw is the thing that is wrong, the
+        // correct keyframes are exactly the ones thrown away — and the one
+        // pose-independent mechanism that could expose the bad yaw is disabled
+        // by the bad yaw. The 2026-07-29 IGA session shows it: 121 fingerprints
+        // in the map, 29–37 eligible after the ±100° gate, one weak match, and a
+        // frame ~140° out for the whole run. Match ungated until something lands;
+        // once one has, the gate is earned and worth having for its real purpose
+        // (rejecting the opposite-direction capture of the same aisle).
+        let gateHeading = didCorroborateHeadingVisually ? liveHeading : nil
+        let eligible = visualRouteCandidates(in: map, fingerprints: fingerprints, liveHeading: gateHeading)
         // How close the best candidate came, whether or not it passed. With a
         // 0.68 confidence bar the raw similarity has to clear ~0.80, and a
         // field run matched NOTHING across a whole journey with 41 keyframes
@@ -5211,6 +5239,32 @@ final class SemanticRouteNavigator: ObservableObject {
             }
         }
 
+        // A match that survived the ambiguity check is independent evidence
+        // about where the camera is looking, which is what earns the heading
+        // gate for every later frame. Measure the offset between the keyframe's
+        // saved map-frame heading and the live one while we have both: a large,
+        // consistent offset means the AR frame's yaw is rotated relative to the
+        // map, and it is the only absolute yaw evidence available on-device
+        // (there is no magnetometer anywhere in this app).
+        if let liveHeading,
+           let keyframeID = best.keyframeID,
+           let keyframeHeading = (map.keyframes ?? [])
+               .first(where: { $0.id == keyframeID })?.headingDegrees {
+            let offset = SemanticRouteMath.signedAngleDifference(keyframeHeading, liveHeading)
+            // `log`, not `tick`: this fires only on an accepted match (rare), and
+            // it is the only absolute yaw evidence the device can produce. Losing
+            // it to the tick soft-limit on a long journey would lose the one
+            // measurement that says whether the map frame is rotated.
+            NavigationTrace.shared.log("nav.visualYaw", [
+                "keyframeID": keyframeID,
+                "keyframeHeadingDeg": keyframeHeading,
+                "liveHeadingDeg": liveHeading,
+                "offsetDeg": offset,
+                "confidence": best.confidence,
+                "gateWasApplied": didCorroborateHeadingVisually
+            ])
+        }
+        didCorroborateHeadingVisually = true
         lastVisualRouteMatch = best
         return best
     }

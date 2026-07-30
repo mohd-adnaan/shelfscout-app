@@ -80,6 +80,19 @@ struct IMUState {
     var stepStability: Double
     var headingReliability: Double
     var pdrUncertaintyMeters: Double
+    /// Gravity-referenced device yaw straight from `CMDeviceMotion.attitude`
+    /// under `.xArbitraryZVertical`, in degrees.
+    ///
+    /// NOT a compass bearing — its origin is arbitrary and fixed for the life
+    /// of the motion session. That is exactly what makes it useful: it measures
+    /// how much the DEVICE turned, independently of ARKit. Differencing it
+    /// against the ARKit world yaw isolates rotation of the world FRAME, which
+    /// is the signature of a relocalization realignment and is invisible to
+    /// every position-based check. Unlike `bearing` it is not seeded from the
+    /// AR heading, is drift-corrected by the accelerometer, and — because Z is
+    /// pinned to gravity — stays valid when the phone pitches, where
+    /// integrating raw `rotationRate.z` does not.
+    var deviceYawDegrees: Double?
 
     init(
         position: Position = Position(),
@@ -96,7 +109,8 @@ struct IMUState {
         bearing: Double = 0,
         stepStability: Double = 0.35,
         headingReliability: Double = 0.35,
-        pdrUncertaintyMeters: Double = 0.85
+        pdrUncertaintyMeters: Double = 0.85,
+        deviceYawDegrees: Double? = nil
     ) {
         self.position = position
         self.stepCount = stepCount
@@ -113,6 +127,7 @@ struct IMUState {
         self.stepStability = stepStability
         self.headingReliability = headingReliability
         self.pdrUncertaintyMeters = pdrUncertaintyMeters
+        self.deviceYawDegrees = deviceYawDegrees
     }
 }
 

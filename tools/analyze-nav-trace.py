@@ -86,7 +86,7 @@ def report_localization(events):
     interesting = [
         e for e in events
         if e["e"] in {"ar.mappingStarted", "ar.mapLoaded", "ar.localized",
-                      "ar.relocalizeVeto", "ar.poseJump"}
+                      "ar.relocalizeVeto", "ar.poseJump", "ar.frameYawShift"}
     ]
     if not interesting:
         return
@@ -103,15 +103,25 @@ def report_localization(events):
                 f"  worldAlignment={event.get('worldAlignment')}"
             )
         elif kind == "ar.localized":
-            proof = "ANCHOR-PROVEN" if event.get("hadAnchorProof") else "NO ANCHOR PROOF"
+            # ⚠️ Deliberately NOT labelled a proof. This printed "[ANCHOR-PROVEN]"
+            # for months on the strength of `hadAnchorProof`, which only says the
+            # loaded map's named anchors were present — and ARKit inserts those at
+            # run() time, BEFORE relocalization. The badge asserted the one thing
+            # the trace could not establish, and reading it as proof is why the
+            # premature-promotion bug survived several rounds of fixes.
+            restored = event.get("restoredAnchorsPresent", event.get("hadAnchorProof"))
             print(
                 f"  {clock(event)}  LOCALIZED after {event.get('heldSeconds', 0):.1f}s"
-                f"  [{proof}]  status={event.get('mappingStatus')}"
+                f"  status={event.get('mappingStatus')}"
                 f"  at ({event.get('x', 0):.2f},{event.get('routeY', 0):.2f})"
                 f" heading {event.get('headingDeg')}"
+                f"  deviceYaw {event.get('deviceYawDeg')}"
             )
-            if not event.get("hadAnchorProof"):
-                print("        ^^ pose may still be in ARKit's own session frame, not the map's")
+            print(f"        map anchors restored: {restored}"
+                  "  (NOT proof of alignment — ARKit adds them at run() time)")
+            if event.get("deviceYawDeg") is None:
+                print("        !! no device yaw at promotion — the frame-rotation"
+                      " watch starts blind; check CMDeviceMotion is running")
         elif kind == "ar.relocalizeVeto":
             print(f"  {clock(event)}  veto: {event.get('reason')}  {event.get('message', '')}")
         elif kind == "ar.poseJump":
@@ -119,8 +129,94 @@ def report_localization(events):
                 f"  {clock(event)}  POSE JUMP {event.get('jumpM', 0):.2f}m"
                 f" ({event.get('fromX', 0):.2f},{event.get('fromRouteY', 0):.2f})"
                 f" → ({event.get('toX', 0):.2f},{event.get('toRouteY', 0):.2f})"
-                f"  {event.get('sinceLocalizedS', 0):.1f}s after localizing"
+                f"  {_num(event.get('sinceLocalizedS'), 1)}s after localizing"
+                f"  → revision {event.get('revision')}"
             )
+        elif kind == "ar.frameYawShift":
+            print(
+                f"  {clock(event)}  WORLD FRAME ROTATED {event.get('frameRotationDeg', 0):+.1f}°"
+                f"  (AR yaw moved {event.get('arDeltaDeg', 0):+.1f}°,"
+                f" device only {event.get('deviceDeltaDeg', 0):+.1f}°)"
+                f"  {_num(event.get('sinceLocalizedS'), 1)}s after localizing"
+                f"  → revision {event.get('revision')}"
+            )
+            print("        ^^ ARKit re-aligned the map frame; the route was resolved"
+                  " in the old one and is being re-resolved")
+
+
+def report_frame_yaw(events):
+    """Did the AR world FRAME rotate, or did the user turn?
+
+    This section exists because no earlier one could answer that. The trace
+    carried the AR heading alone, so a frame quietly rotating under a
+    stationary user looked identical to a user turning — and the 2026-07-29 IGA
+    session (AR heading 220.7° → ~360° → 237° across ticks that all reported
+    'still') was read three times without the cause being pinned.
+
+    `deviceYawDeg` is `CMDeviceMotion.attitude` yaw: gravity-referenced,
+    pitch-immune, and never seeded from ARKit. Whatever the user does with the
+    phone moves BOTH columns, so it cancels in the difference. What is left is
+    the frame.
+    """
+    frames = [e for e in events if e["e"] == "ar.frame"]
+    if not frames:
+        return
+    section("WORLD-FRAME YAW — AR heading vs the ARKit-independent device yaw")
+
+    have_device = [f for f in frames if isinstance(f.get("deviceYawDeg"), (int, float))]
+    if not have_device:
+        print("  !! no deviceYawDeg in this trace — either an old build, or"
+              " CMDeviceMotion never reached ARMappingManager.")
+        print("     Without it a rotating map frame cannot be told apart from a"
+              " user turning; that ambiguity is what this column removes.")
+        return
+
+    print(f"  {'time':>6}  {'arYaw':>7} {'devYaw':>7} {'Δframe':>7}  {'x':>6} {'routeY':>6}"
+          f"  {'tilt':>4} {'state':<12} note")
+    previous = None
+    for frame in frames:
+        ar = frame.get("headingDeg")
+        dev = frame.get("deviceYawDeg")
+        drift = frame.get("frameYawDriftDeg")
+        state = ("localized" if frame.get("isLocalized")
+                 else "relocalizing" if frame.get("isRelocalizing")
+                 else "mapping" if frame.get("isMapping") else "idle")
+        note = ""
+        # A step in the AR yaw that the device yaw does not corroborate is the
+        # frame moving. Flag it inline so it cannot be scrolled past.
+        if previous and all(isinstance(v, (int, float)) for v in
+                            (ar, dev, previous.get("headingDeg"), previous.get("deviceYawDeg"))):
+            ar_step = _signed(ar - previous["headingDeg"])
+            dev_step = _signed(dev - previous["deviceYawDeg"])
+            uncorroborated = _signed(ar_step - dev_step)
+            if abs(uncorroborated) >= 10:
+                note = f"<-- AR yaw moved {ar_step:+.0f}° but device only {dev_step:+.0f}°"
+        print(f"  {frame.get('t', 0):6.2f}  {_num(ar, 1):>7.7s} {_num(dev, 1):>7.7s}"
+              f" {_num(drift, 1):>7.7s}  {_num(frame.get('x'), 2):>6.6s}"
+              f" {_num(frame.get('routeY'), 2):>6.6s}"
+              f"  {'yes' if frame.get('headingTiltFallback') else '-':>4}"
+              f" {state:<12} {note}")
+        previous = frame
+
+    drifts = [abs(f["frameYawDriftDeg"]) for f in frames
+              if isinstance(f.get("frameYawDriftDeg"), (int, float))]
+    if drifts:
+        print(f"\n  peak |frame yaw drift| since the accepted baseline: {max(drifts):.1f}°")
+        if max(drifts) >= 25:
+            print("  !! the map frame guidance is steering in is rotated this far"
+                  " from the one the route was resolved in")
+
+    tilted = sum(1 for f in frames if f.get("headingTiltFallback"))
+    if tilted:
+        print(f"  heading came from the camera UP vector (steep pitch) on"
+              f" {tilted}/{len(frames)} frames")
+
+
+def _signed(degrees):
+    delta = degrees % 360
+    if delta > 180:
+        delta -= 360
+    return delta
 
 
 def report_route(events):
@@ -248,6 +344,7 @@ def report_evidence(events):
           + ("   <-- rest fall back to drifting IMU bearing" if ar_heading < total else ""))
     print(f"  camera frame given {with_image:5d}  {with_image / total * 100:5.1f}%")
     print(f"  visual match found {matched:5d}  {matched / total * 100:5.1f}%")
+    first = ticks[0]
     sims = [t["visualBestSimilarity"] for t in ticks
             if isinstance(t.get("visualBestSimilarity"), (int, float))]
     if sims:
@@ -262,9 +359,31 @@ def report_evidence(events):
             gap = need - max(sims)
             print(f"  !! never reached the bar — short by {gap:.3f} even at best."
                   " The threshold, not the matcher, is what blocks visual evidence")
+        # ⚠️ `need` is only meaningful if the app derived it from the live
+        # confidence mapping. Builds before 2026-07-30 hard-coded a stale inverse
+        # (0.62 + conf*0.26 = 0.724) while the real bar was 0.44, so this section
+        # reported "never reached the bar" for a session whose best similarity of
+        # 0.460 had actually cleared it — and sent two rounds of fixes at a
+        # threshold that was never the problem. Flag the suspect value rather
+        # than quietly drawing conclusions from it.
+        if need and abs(need - 0.724) < 1e-6:
+            print("  !! that 0.724 bar is the KNOWN-STALE formula from an old build."
+                  " The real bar is visualSimilarityFloor + conf*span = 0.44.")
+            print("     Re-read the line above against 0.44 before concluding"
+                  " anything about the threshold.")
+        mapped_conf = [t["visualMatchConf"] for t in ticks
+                       if isinstance(t.get("visualMatchConf"), (int, float))]
+        if matched and need and max(sims) < need:
+            print(f"  .. and yet {matched} match(es) were accepted"
+                  f" (confidences {mapped_conf}) — so the reported bar is wrong,"
+                  " not the matcher")
         if max(cands) == 0:
             print("  !! heading gate left ZERO keyframes eligible — nothing could match")
-    first = ticks[0]
+        elif first.get("mapFingerprints") and max(cands) < first["mapFingerprints"] * 0.5:
+            print(f"  .. heading gate discarded most of the map"
+                  f" ({max(cands)} of {first['mapFingerprints']} eligible)."
+                  " If the AR yaw is wrong, the RIGHT keyframes are the discarded"
+                  " ones — the gate is only trustworthy once a match has landed")
     print(f"  map offers         {first.get('mapKeyframes')} keyframes,"
           f" {first.get('mapFingerprints')} fingerprints,"
           f" space={first.get('coordinateSpace')}")
@@ -272,6 +391,20 @@ def report_evidence(events):
         print("  !! no camera frame ever reached the matcher — visual matching cannot run")
     if localized == 0:
         print("  !! arLocalized never true — no AR projection evidence, PDR only")
+
+    # The keyframe's saved map-frame heading against the live one: the only
+    # absolute yaw evidence on-device (this app has no magnetometer anywhere).
+    yaw_events = [e for e in events if e["e"] == "nav.visualYaw"]
+    if yaw_events:
+        offsets = [e["offsetDeg"] for e in yaw_events
+                   if isinstance(e.get("offsetDeg"), (int, float))]
+        if offsets:
+            worst = max(offsets, key=abs)
+            print(f"  visual yaw offset   {len(offsets)} measurement(s),"
+                  f" worst {worst:+.1f}° (keyframe heading − live heading)")
+            if abs(worst) > 30:
+                print("  !! the map says the camera should be facing something"
+                      " that far off — the AR frame's yaw does not match the map's")
 
 
 def report_overrides(events):
@@ -455,6 +588,7 @@ def main():
         print(f"  ({Counter(e['e'] for e in session).most_common()})")
         report_capture(session)
         report_localization(session)
+        report_frame_yaw(session)
         report_route(session)
         report_turns(session)
         report_evidence(session)

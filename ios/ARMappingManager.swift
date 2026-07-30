@@ -40,14 +40,21 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// finishing its real world-map alignment after a premature `.normal`.
     /// Observers must re-resolve anything derived from the earlier pose.
     ///
-    /// At most ONCE per relocalization. ARKit refines its alignment several
-    /// times over the first seconds, and every bump used to re-resolve the
-    /// whole route from a different pose — which changed the resolved start
-    /// edge, and therefore the spoken turn, several times in a row right as
-    /// the user was being oriented. Ongoing drift after the first correction
-    /// belongs to the navigator's own recovery path, not to a route rebuild.
+    /// Rate-limited by `localizationCorrectionCooldownSeconds` rather than
+    /// capped at one bump. ARKit refines its alignment several times over the
+    /// first seconds, and bumping on every refinement re-resolved the route —
+    /// and so the spoken turn — several times in a row while the user was being
+    /// oriented. But the old once-per-relocalization cap was worse: it meant a
+    /// realignment arriving after the first one was silently ignored, and the
+    /// route stayed locked to a frame ARKit had already abandoned.
+    ///
+    /// ⚠️ Both position AND yaw feed this. A yaw-only realignment is the case
+    /// that matters most and the one a distance check cannot see at all: when
+    /// the journey begins at the route's first node, the un-relocalized session
+    /// origin sits on top of that node, so the correction is a pure rotation
+    /// with a ~0 m position delta. See `detectWorldFrameYawShift`.
     @Published private(set) var localizationRevision = 0
-    private var didReportLocalizationJump = false
+    private var lastLocalizationCorrectionAt: Date?
     /// Per-POI count of saved feature points within `poiRelocalizationRadiusMeters`,
     /// measured at the last save. These POIs (route start + destinations) are the
     /// spots a journey begins from; a low count predicts the cold-start "pan
@@ -146,7 +153,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// window promotes without it rather than blocking forever.
     private let relocalizationStatusFallbackSeconds: TimeInterval = 2.7
     private let postLocalizationJumpMeters: Float = 1.5
-    private let postLocalizationJumpWindowSeconds: TimeInterval = 30
+    /// Minimum gap between two published corrections, so ARKit's burst of
+    /// refinements in the first seconds cannot re-resolve the route repeatedly
+    /// while the user is being oriented.
+    private let localizationCorrectionCooldownSeconds: TimeInterval = 6.0
     /// True once the lean relocalization config has been swapped back to the
     /// full mapping config for this session.
     private var didUpgradeSessionFidelity = false
@@ -168,6 +178,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private var preLocalizationPosition: simd_float3?
     private var previousPublishedPosition: simd_float3?
     private var localizedAt: Date?
+    /// Hysteresis state for the pitch threshold in `headingReading`.
+    private var usingTiltFallbackHeading = false
+    private var worldFrameYawWatch = WorldFrameYawWatch()
     
     override init() {
         super.init()
@@ -188,7 +201,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             bearing: imuState.position.bearing,
             stepCount: imuState.stepCount,
             isMoving: imuState.isMoving,
-            updatedAt: Date()
+            updatedAt: Date(),
+            deviceYawDegrees: imuState.deviceYawDegrees
         )
 
         imuMotionQueue.async(flags: .barrier) {
@@ -223,6 +237,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         preLocalizationPosition = nil
         previousPublishedPosition = nil
         localizedAt = nil
+        resetWorldFrameYawWatch()
         sessionMode = .mapping
         mappingStatus = .notAvailable
         activeMapMetadata = nil
@@ -261,6 +276,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         preLocalizationPosition = nil
         previousPublishedPosition = nil
         localizedAt = nil
+        resetWorldFrameYawWatch()
         sessionMode = .idle
         mappingStatus = .notAvailable
         currentPositionText = ""
@@ -410,6 +426,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     self.preLocalizationPosition = nil
                     self.previousPublishedPosition = nil
                     self.localizedAt = nil
+                    self.resetWorldFrameYawWatch()
                     self.sessionMode = .relocalizing
                     self.mappingStatus = .notAvailable
                     self.currentPositionText = ""
@@ -767,7 +784,12 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         let yaw = frame.camera.eulerAngles.y * 180 / .pi
         let cameraPosition = simd_make_float3(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z)
         let cameraForward = simd_make_float3(-transform.columns.2.x, -transform.columns.2.y, -transform.columns.2.z)
-        let arHeading = headingDegrees(for: cameraForward)
+        // Up vector too: it is the heading reference whenever the phone is
+        // pitched far enough that forward goes near-vertical.
+        let cameraUp = simd_make_float3(transform.columns.1.x, transform.columns.1.y, transform.columns.1.z)
+        let headingReading = self.headingReading(for: cameraForward, cameraUp: cameraUp)
+        let arHeading = headingReading?.degrees
+        let headingUsedTiltFallback = headingReading?.usedTiltFallback ?? false
         let displayHeading = arHeading ?? Double(yaw)
         let liveFeatureSnapshot = isMapping ? sampledFeaturePoints(from: frame.rawFeaturePoints) : nil
         let poiMatchResult = bestPOIMatch(
@@ -809,6 +831,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 hasRestoredMapAnchors: hasRestoredMapAnchors
             )
             self.detectPostLocalizationJump(cameraPosition: cameraPosition)
+            self.detectWorldFrameYawShift(
+                arHeading: arHeading,
+                usedTiltFallback: headingUsedTiltFallback
+            )
             self.mappingStatus = mappingStatus
             self.cameraMapPosition = cameraPosition
             self.cameraMapForward = cameraForward
@@ -867,6 +893,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             self.traceARFrame(
                 position: cameraPosition,
                 heading: arHeading,
+                usedTiltFallback: headingUsedTiltFallback,
                 mappingStatus: mappingStatus,
                 hasRestoredMapAnchors: hasRestoredMapAnchors,
                 visuallyRecognizedPlace: visuallyRecognizedPlace
@@ -881,6 +908,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private func traceARFrame(
         position: simd_float3,
         heading: Double?,
+        usedTiltFallback: Bool,
         mappingStatus: ARFrame.WorldMappingStatus,
         hasRestoredMapAnchors: Bool,
         visuallyRecognizedPlace: String?
@@ -888,11 +916,26 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         let now = Date()
         guard lastTracedFrameAt.map({ now.timeIntervalSince($0) >= 0.25 }) ?? true else { return }
         lastTracedFrameAt = now
+        // The AR yaw beside the ARKit-independent device yaw, every sample. A
+        // frame that rotates under a stationary user is only visible as the
+        // divergence between these two columns, and reading the AR heading alone
+        // (all the trace used to carry) cannot tell that apart from a user
+        // turning — which is why three sessions of traces did not settle it.
+        let deviceYaw = currentIMUMotion()?.deviceYawDegrees
         NavigationTrace.shared.tick("ar.frame", [
             "x": Double(position.x),
             "z": Double(position.z),
             "routeY": -Double(position.z),
             "headingDeg": heading ?? NSNull(),
+            "deviceYawDeg": deviceYaw ?? NSNull(),
+            "headingTiltFallback": usedTiltFallback,
+            "frameYawDriftDeg": {
+                guard let heading, let deviceYaw else { return NSNull() as Any }
+                return worldFrameYawWatch.frameYawDrift(
+                    arHeading: heading,
+                    deviceYaw: deviceYaw
+                ) ?? NSNull()
+            }(),
             "mappingStatus": Self.describe(mappingStatus),
             "isLocalized": isLocalized,
             "isRelocalizing": isRelocalizing,
@@ -945,6 +988,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 default:
                     self.relocalizationNormalSince = nil
                     self.preLocalizationPosition = nil
+                    // Tracking dropped: any yaw baseline belongs to a frame that
+                    // may not survive the recovery, so it must not be carried
+                    // across and reported as a shift afterwards.
+                    self.worldFrameYawWatch.acceptAlignment(arHeading: nil, deviceYaw: nil)
                     // Re-running the session to restore plane/mesh fidelity can
                     // blip tracking for a frame or two. That is a configuration
                     // change, not a lost map, so it must not tear down a
@@ -1078,7 +1125,16 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         arHeadingDegrees = arHeading
         previousPublishedPosition = cameraPosition
         localizedAt = Date()
-        didReportLocalizationJump = false
+        lastLocalizationCorrectionAt = nil
+        // Baseline the frame-rotation watch from the yaw we are about to hand
+        // guidance. Everything after this is measured against it, so if this
+        // promotion turns out to be premature the realignment shows up as a
+        // divergence instead of vanishing into a route locked at the wrong angle.
+        let deviceYawAtPromotion = currentIMUMotion()?.deviceYawDegrees
+        worldFrameYawWatch.acceptAlignment(
+            arHeading: arHeading,
+            deviceYaw: deviceYawAtPromotion
+        )
         isLocalized = true
         statusMessage = "Localized against saved map."
         lastTracedVetoReason = nil
@@ -1086,8 +1142,14 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             "heldSeconds": heldSeconds,
             "mappingStatus": Self.describe(mappingStatus),
             "statusConfirms": statusConfirms,
-            "hadAnchorProof": expectedRestoredPOICount > 0 && hasRestoredMapAnchors,
+            // ⚠️ NOT proof of anything. ARKit inserts a loaded map's named
+            // anchors at `run()` time, before relocalization, so this is true
+            // from the first frame. Named to stop the trace reader (and the
+            // analyzer, which printed "[ANCHOR-PROVEN]") from treating a
+            // restored-anchor count as evidence the frame is aligned.
+            "restoredAnchorsPresent": expectedRestoredPOICount > 0 && hasRestoredMapAnchors,
             "expectedRestoredPOIs": expectedRestoredPOICount,
+            "deviceYawDeg": deviceYawAtPromotion ?? NSNull(),
             "x": Double(cameraPosition.x),
             "z": Double(cameraPosition.z),
             "routeY": -Double(cameraPosition.z),
@@ -1109,25 +1171,114 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             return
         }
         defer { previousPublishedPosition = cameraPosition }
-        guard !didReportLocalizationJump,
-              let localizedAt,
-              Date().timeIntervalSince(localizedAt) <= postLocalizationJumpWindowSeconds,
-              let previous = previousPublishedPosition,
+        guard let previous = previousPublishedPosition,
               simd_distance(previous, cameraPosition) > postLocalizationJumpMeters else {
             return
         }
-        didReportLocalizationJump = true
-        localizationRevision += 1
-        statusMessage = "Map alignment corrected."
+        let jump = Double(simd_distance(previous, cameraPosition))
+        guard publishLocalizationCorrection(reason: "pose_jump") else { return }
         NavigationTrace.shared.log("ar.poseJump", [
-            "jumpM": Double(simd_distance(previous, cameraPosition)),
-            "sinceLocalizedS": Date().timeIntervalSince(localizedAt),
+            "jumpM": jump,
+            "sinceLocalizedS": localizedAt.map { Date().timeIntervalSince($0) } ?? NSNull(),
             "fromX": Double(previous.x),
             "fromRouteY": -Double(previous.z),
             "toX": Double(cameraPosition.x),
             "toRouteY": -Double(cameraPosition.z),
             "revision": localizationRevision
         ])
+    }
+
+    /// Detects ARKit re-orienting the world frame under a pose we already
+    /// published — the failure mode no position check can see.
+    ///
+    /// ## Why this is needed at all
+    ///
+    /// A journey usually starts at the route's first node, which is also where
+    /// the mapping walk started, which is where the saved map's ORIGIN is. Until
+    /// relocalization lands, ARKit tracks in its own `.gravity` frame whose
+    /// origin is where this session started — the same spot. So the pose reads
+    /// as sitting exactly on the first node (the 2026-07-29 IGA trace snapped it
+    /// to the right edge at 0.25 m cross-track) while the yaw is arbitrary. When
+    /// ARKit then aligns for real, the correction is a pure ROTATION about a
+    /// point the user is standing on: position barely moves, so
+    /// `detectPostLocalizationJump` sees nothing, `localizationRevision` never
+    /// bumps, and the route stays locked to a bearing ARKit has abandoned. That
+    /// is what reaches the user as the route running off behind them.
+    ///
+    /// ## How it separates "the user turned" from "the frame turned"
+    ///
+    /// `IMUState.deviceYawDegrees` comes from `CMDeviceMotion.attitude` under
+    /// `.xArbitraryZVertical`: gravity-referenced, pitch-immune, and — decisively
+    /// — never seeded from ARKit. So over any short window
+    ///
+    ///     Δ(AR yaw) − Δ(device yaw) ≈ rotation of the AR world FRAME
+    ///
+    /// because whatever the user did with the phone appears in both terms and
+    /// cancels. A user spinning 180° moves both by 180° and reads as zero; a
+    /// stationary user whose AR heading walks 140° reads as 140°.
+    ///
+    /// ⚠️ This is the mechanism commit c718e3f deleted. That commit was right
+    /// that comparing `arHeading` against `IMUState.bearing` cannot do
+    /// COMPASS corroboration (there is no magnetometer, and `bearing` is seeded
+    /// from the AR heading), and right to remove it from the promotion gate. But
+    /// the differential signal it was accidentally computing was real, and
+    /// deleting it left nothing at all watching the frame. This restores the
+    /// signal on a reference that is genuinely independent, and uses it for what
+    /// it can actually prove: rotation, not absolute direction.
+    /// Delegates the decision to `WorldFrameYawWatch` (pure, unit-tested) and
+    /// keeps only the I/O here: reading the sensors, rate-limiting, tracing.
+    private func detectWorldFrameYawShift(arHeading: Double?, usedTiltFallback: Bool) {
+        guard isRelocalizing, isLocalized, let arHeading,
+              let deviceYaw = currentIMUMotion()?.deviceYawDegrees else {
+            worldFrameYawWatch.clearWindow()
+            return
+        }
+        let previousConvention = worldFrameYawWatch.signConvention
+        let detection = worldFrameYawWatch.ingest(
+            at: Date(),
+            arHeading: arHeading,
+            deviceYaw: deviceYaw,
+            usedTiltFallback: usedTiltFallback
+        )
+        if worldFrameYawWatch.signConvention != previousConvention {
+            NavigationTrace.shared.log("ar.yawSignCalibrated", [
+                "convention": worldFrameYawWatch.signConvention == .subtract ? "subtract" : "add",
+                "votes": worldFrameYawWatch.signVotes,
+                "cumulativeDetectorEnabled": worldFrameYawWatch.signConvention == .subtract
+            ])
+        }
+        guard let detection else { return }
+        guard publishLocalizationCorrection(reason: "frame_yaw_shift") else { return }
+        NavigationTrace.shared.log("ar.frameYawShift", [
+            "detector": detection.detector.rawValue,
+            "frameRotationDeg": detection.rotationDegrees,
+            "arDeltaDeg": detection.arDeltaDegrees,
+            "deviceDeltaDeg": detection.deviceDeltaDegrees,
+            "arHeadingDeg": arHeading,
+            "deviceYawDeg": deviceYaw,
+            "heldSeconds": detection.heldSeconds,
+            "sinceLocalizedS": localizedAt.map { Date().timeIntervalSince($0) } ?? NSNull(),
+            "revision": localizationRevision
+        ])
+    }
+
+    /// Publishes one alignment correction, rate-limited. Returns false when the
+    /// cooldown swallowed it, so callers can skip their trace too.
+    private func publishLocalizationCorrection(reason: String) -> Bool {
+        let now = Date()
+        if let last = lastLocalizationCorrectionAt,
+           now.timeIntervalSince(last) < localizationCorrectionCooldownSeconds {
+            return false
+        }
+        lastLocalizationCorrectionAt = now
+        localizationRevision += 1
+        statusMessage = "Map alignment corrected."
+        return true
+    }
+
+    private func resetWorldFrameYawWatch() {
+        worldFrameYawWatch.reset()
+        lastLocalizationCorrectionAt = nil
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
@@ -1148,6 +1299,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             self.isLocalized = false
             self.relocalizationNormalSince = nil
             self.preLocalizationPosition = nil
+            self.resetWorldFrameYawWatch()
             self.closestPOI = nil
             self.poiMatchStatusText = nil
         }
@@ -1289,6 +1441,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         let stepCount: Int
         let isMoving: Bool
         let updatedAt: Date
+        /// ARKit-independent device yaw; see `detectWorldFrameYawShift`. Not to
+        /// be confused with `bearing`, which is seeded from the AR heading and
+        /// therefore cannot testify about the AR frame.
+        let deviceYawDegrees: Double?
     }
 
     private struct ARIMUMotionReference {
@@ -2315,14 +2471,66 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         return horizontal / length
     }
 
-    private func headingDegrees(for cameraForward: simd_float3) -> Double? {
+    /// A heading reading plus how it was derived. The provenance matters because
+    /// the two derivations do not agree to the degree when the phone is rolled,
+    /// so a switch between them looks like a real turn — and the world-frame
+    /// yaw-shift detector must not read that as ARKit realigning the map.
+    private struct ARHeadingReading {
+        let degrees: Double
+        /// True when the pitch was steep enough that the camera's UP vector,
+        /// not its forward vector, supplied the horizontal reference.
+        let usedTiltFallback: Bool
+    }
+
+    private func headingReading(
+        for cameraForward: simd_float3,
+        cameraUp: simd_float3? = nil
+    ) -> ARHeadingReading? {
         // Must match SemanticRouteNavigator's route frame (y = -z): 0° is the
         // session's initial facing (-Z) and heading increases on physical
         // RIGHT turns. Using raw +z flips the handedness and mirrors every
         // geometric left/right cue.
-        let horizontal = SIMD2<Double>(Double(cameraForward.x), -Double(cameraForward.z))
-        guard simd_length(horizontal) > 0.001 else { return nil }
-        return normalizedDegrees(atan2(horizontal.x, horizontal.y) * 180 / Double.pi)
+        //
+        // ⚠️ Tilt robustness. Taking the heading from the forward vector alone
+        // fails as the phone pitches: looking down at the screen (or up) drives
+        // the forward vector toward vertical, its horizontal component collapses
+        // to noise, and `atan2` of that noise swings tens of degrees. The old
+        // `> 0.001` guard let all of it through — a field trace recorded the
+        // heading moving 46° → 39° → 357° → 3° while the user stood still with
+        // `progress` pinned at 0.00 m, which reads to the user as the route
+        // "drifting off to the left or right" seconds after it appeared
+        // correctly. Past ~70° of pitch the camera's UP vector is the reliable
+        // horizontal reference: looking down it points the way you face,
+        // looking up it points behind you.
+        // ⚠️ Hysteresis, not a single threshold. A bare `< 0.34` cutoff flaps
+        // between the two references whenever the pitch hovers near it, and
+        // because forward-derived and up-derived headings only coincide at zero
+        // roll, each flap injects a step change into the heading. That is
+        // indistinguishable from the world frame rotating, so it would both
+        // mislead the user and trip the yaw-shift detector. Enter the fallback
+        // below 0.30 (≈73° pitch), leave it only above 0.40 (≈66°).
+        var horizontal = SIMD2<Double>(Double(cameraForward.x), -Double(cameraForward.z))
+        let forwardHorizontalLength = simd_length(horizontal)
+        let fallbackEnterLength = 0.30
+        let fallbackExitLength = 0.40
+        let wantsFallback = usingTiltFallbackHeading
+            ? forwardHorizontalLength < fallbackExitLength
+            : forwardHorizontalLength < fallbackEnterLength
+        var usedTiltFallback = false
+        if wantsFallback, let cameraUp {
+            let upHorizontal = SIMD2<Double>(Double(cameraUp.x), -Double(cameraUp.z))
+            if simd_length(upHorizontal) > 0.34 {
+                horizontal = cameraForward.y < 0 ? upHorizontal : -upHorizontal
+                usedTiltFallback = true
+            }
+        }
+        usingTiltFallbackHeading = usedTiltFallback
+        // Still degenerate (phone flat on a table): no trustworthy heading.
+        guard simd_length(horizontal) > 0.2 else { return nil }
+        return ARHeadingReading(
+            degrees: normalizedDegrees(atan2(horizontal.x, horizontal.y) * 180 / Double.pi),
+            usedTiltFallback: usedTiltFallback
+        )
     }
 
     private func normalizedDegrees(_ degrees: Double) -> Double {
@@ -2913,6 +3121,262 @@ final class ARFrameFingerprinter {
         guard lhs.count == rhs.count, !lhs.isEmpty else { return 0 }
         let averageDelta = zip(lhs, rhs).map { abs($0 - $1) }.reduce(0, +) / Float(lhs.count)
         return max(0, 1 - averageDelta * 1.8)
+    }
+}
+
+/// Decides whether ARKit has re-oriented the world frame under a pose already
+/// handed to guidance — the failure no position check can see.
+///
+/// ## The failure this exists for
+///
+/// A journey usually starts at the route's first node, which is where the mapping
+/// walk started, which is where the saved map's ORIGIN is. Until relocalization
+/// lands, ARKit tracks in its own `.gravity` frame whose origin is where THIS
+/// session started — the same spot. So the pose reads as sitting exactly on the
+/// first node (the 2026-07-29 IGA trace snapped it to the right edge at 0.25 m
+/// cross-track) while the yaw is arbitrary. When ARKit then aligns for real, the
+/// correction is a pure ROTATION about a point the user is standing on: position
+/// barely moves, so a distance check sees nothing, `localizationRevision` never
+/// bumps, and the route stays locked to a bearing ARKit has abandoned. That is
+/// what reaches the user as the route running off behind them.
+///
+/// ## Separating "the user turned" from "the frame turned"
+///
+/// `IMUState.deviceYawDegrees` comes from `CMDeviceMotion.attitude` under
+/// `.xArbitraryZVertical`: gravity-referenced, pitch-immune, and — decisively —
+/// never seeded from ARKit. Over any window,
+///
+///     Δ(AR yaw) − Δ(device yaw) ≈ rotation of the AR world FRAME
+///
+/// because whatever the user did with the phone appears in both terms and
+/// cancels. A user spinning 180° moves both by 180° and reads as zero; a
+/// stationary user whose AR heading walks 140° reads as 140°.
+///
+/// ⚠️ This is the mechanism commit c718e3f deleted. That commit was right that
+/// comparing `arHeading` against `IMUState.bearing` cannot do COMPASS
+/// corroboration (there is no magnetometer anywhere in this app, and `bearing`
+/// is gyro-integrated from a seed taken off the AR heading), and right to remove
+/// it from the promotion gate. But the differential signal it was accidentally
+/// computing was real, and deleting it left nothing at all watching the frame.
+/// This restores the signal on a genuinely independent reference and uses it for
+/// what it can prove: rotation, not absolute direction.
+///
+/// Extracted from `ARMappingManager` as a pure value type so the scenarios that
+/// matter — the IGA failure, the same failure while the user pans, an ordinary
+/// turn, an inverted sign convention, a tilt-reference switch — are covered by
+/// tests rather than by a trip to a grocery store.
+struct WorldFrameYawWatch {
+    enum Detector: String {
+        /// The device was held still while the AR yaw stepped. Sign-independent.
+        case stillDevice = "still_device"
+        /// Cumulative divergence since the accepted alignment. Needs the sign
+        /// convention established first.
+        case cumulative
+    }
+
+    /// Whether the AR heading and the device yaw increase in the same direction.
+    /// Measured, never assumed — see `voteOnSignConvention`.
+    enum SignConvention { case unknown, subtract, add }
+
+    struct Detection {
+        let detector: Detector
+        let rotationDegrees: Double
+        let arDeltaDegrees: Double
+        let deviceDeltaDegrees: Double
+        let heldSeconds: TimeInterval
+    }
+
+    // ── Tunables ────────────────────────────────────────────────────────────
+    /// How far the AR yaw must move, against a still device, to count.
+    /// Comfortably above what `CMDeviceMotion.attitude` drifts over the hold
+    /// window and far below the errors seen in the field (IGA: ~140°).
+    var shiftDegrees = 12.0
+    /// How much the DEVICE may have turned across the window and still count as
+    /// held still. Above this the window proves nothing either way and is simply
+    /// not acted on; the next quiet moment catches the same shift.
+    var stillnessDegrees = 8.0
+    /// A shift must persist this long. One frame of disagreement is noise.
+    var holdSeconds: TimeInterval = 0.6
+    /// Span of the rolling history — long enough to bracket a step change
+    /// against a pre-jump reading, short enough that a deliberate turn cannot
+    /// fit inside it under the stillness cap.
+    var windowSeconds: TimeInterval = 1.6
+    /// Bar for the cumulative detector, higher than the still-device one because
+    /// it accumulates over the whole journey and so must clear the yaw drift
+    /// `CMDeviceMotion.attitude` picks up over minutes without a magnetometer.
+    var cumulativeDegrees = 25.0
+    /// A turn must be at least this big to vote on the sign convention.
+    var signVoteDegrees = 20.0
+    var signVotesRequired = 3
+
+    // ── State ───────────────────────────────────────────────────────────────
+    private var samples: [(at: Date, arHeading: Double, deviceYaw: Double, usedTiltFallback: Bool)] = []
+    private var reference: (arHeading: Double, deviceYaw: Double)?
+    private(set) var signConvention: SignConvention = .unknown
+    private(set) var signVotes = 0
+
+    /// Wipes everything, including the measured sign convention. For a new AR
+    /// session: the convention is really a property of the OS and device, but
+    /// re-measuring costs nothing and stops one bad session poisoning the next.
+    mutating func reset() {
+        samples.removeAll()
+        reference = nil
+        signConvention = .unknown
+        signVotes = 0
+    }
+
+    /// Drops the rolling window but keeps the alignment baseline and the
+    /// measured convention. For a gap in readings, where consecutive samples
+    /// would otherwise be differenced across the gap.
+    mutating func clearWindow() {
+        samples.removeAll()
+    }
+
+    /// Anchors the cumulative detector: everything after this is measured
+    /// against the frame guidance was actually built on.
+    mutating func acceptAlignment(arHeading: Double?, deviceYaw: Double?) {
+        samples.removeAll()
+        if let arHeading, let deviceYaw {
+            reference = (arHeading: arHeading, deviceYaw: deviceYaw)
+        } else {
+            reference = nil
+        }
+    }
+
+    /// How far the frame has rotated since the accepted alignment. Diagnostic
+    /// only — nothing acts on it, so a wrong sign convention here is visible in
+    /// the trace rather than harmful.
+    func frameYawDrift(arHeading: Double, deviceYaw: Double) -> Double? {
+        guard let reference else { return nil }
+        let arDrift = Self.signedDegrees(arHeading - reference.arHeading)
+        let deviceDrift = Self.signedDegrees(deviceYaw - reference.deviceYaw)
+        return Self.signedDegrees(arDrift - deviceDrift)
+    }
+
+    mutating func ingest(
+        at now: Date,
+        arHeading: Double,
+        deviceYaw: Double,
+        usedTiltFallback: Bool
+    ) -> Detection? {
+        // The forward-vector and up-vector heading derivations do not agree
+        // under roll, so a switch between them is a step change that is NOT the
+        // frame moving. Drop the history rather than read the switch as one.
+        if let last = samples.last, last.usedTiltFallback != usedTiltFallback {
+            samples.removeAll()
+        }
+        samples.append((at: now, arHeading: arHeading, deviceYaw: deviceYaw, usedTiltFallback: usedTiltFallback))
+        samples.removeAll { $0.at < now.addingTimeInterval(-windowSeconds) }
+        if reference == nil {
+            reference = (arHeading: arHeading, deviceYaw: deviceYaw)
+        }
+
+        guard let oldest = samples.first,
+              now.timeIntervalSince(oldest.at) >= holdSeconds else {
+            return nil
+        }
+        let arStep = Self.signedDegrees(arHeading - oldest.arHeading)
+        let deviceStep = Self.signedDegrees(deviceYaw - oldest.deviceYaw)
+        let heldSeconds = now.timeIntervalSince(oldest.at)
+        voteOnSignConvention(arStep: arStep, deviceStep: deviceStep)
+
+        // ── Detector 1: still device, moving AR yaw ─────────────────────────
+        // The device term enters only as a magnitude, so this cannot be broken
+        // by getting the rotational sense backwards. It is also the exact
+        // signature of the observed failure.
+        if abs(deviceStep) <= stillnessDegrees, abs(arStep) > shiftDegrees {
+            return accept(
+                detector: .stillDevice,
+                rotation: Self.signedDegrees(arStep - deviceStep),
+                arDelta: arStep,
+                deviceDelta: deviceStep,
+                heldSeconds: heldSeconds,
+                arHeading: arHeading,
+                deviceYaw: deviceYaw
+            )
+        }
+
+        // ── Detector 2: cumulative, since the accepted alignment ────────────
+        // Detector 1 only fires if a quiet window happens to bracket the jump,
+        // and often none does: the moment the frame rotates, guidance starts
+        // telling the user to turn, they pan, and every window from then on has
+        // both readings already past the step. The IGA session did exactly this
+        // — "Turn sharp left" at t=4.21, then 81 cues deferred as
+        // `heading_sweeping`. The cumulative difference does not care when the
+        // rotation happened, so it closes that gap.
+        guard signConvention == .subtract,
+              let cumulative = frameYawDrift(arHeading: arHeading, deviceYaw: deviceYaw),
+              abs(cumulative) > cumulativeDegrees,
+              let reference else {
+            return nil
+        }
+        return accept(
+            detector: .cumulative,
+            rotation: cumulative,
+            arDelta: Self.signedDegrees(arHeading - reference.arHeading),
+            deviceDelta: Self.signedDegrees(deviceYaw - reference.deviceYaw),
+            heldSeconds: heldSeconds,
+            arHeading: arHeading,
+            deviceYaw: deviceYaw
+        )
+    }
+
+    /// Re-baselines onto the corrected frame before returning, so one rotation
+    /// is never reported twice.
+    private mutating func accept(
+        detector: Detector,
+        rotation: Double,
+        arDelta: Double,
+        deviceDelta: Double,
+        heldSeconds: TimeInterval,
+        arHeading: Double,
+        deviceYaw: Double
+    ) -> Detection {
+        samples.removeAll()
+        reference = (arHeading: arHeading, deviceYaw: deviceYaw)
+        return Detection(
+            detector: detector,
+            rotationDegrees: rotation,
+            arDeltaDegrees: arDelta,
+            deviceDeltaDegrees: deviceDelta,
+            heldSeconds: heldSeconds
+        )
+    }
+
+    /// Establishes from measurement whether the AR heading and the device yaw
+    /// increase in the same direction, so the cumulative detector can subtract
+    /// them without depending on a hand-reasoned sign.
+    ///
+    /// While the frame is stable, a window in which the user genuinely turned
+    /// has `arStep ≈ deviceStep` if the conventions agree and `arStep ≈ −deviceStep`
+    /// if they are opposed. Which pairing cancels is therefore a direct read of
+    /// the convention.
+    ///
+    /// If the votes come back `.add`, the negation in
+    /// `IMUSensorManager.processAttitude` is wrong for this OS/device: the
+    /// cumulative detector stays disabled and the trace says so — rather than
+    /// the subtraction silently becoming an addition, doubling every turn the
+    /// user makes and re-resolving the route on each one. A silent sign error
+    /// producing constant false corrections would be a worse failure than the
+    /// one being fixed, which is why this is measured and not reasoned.
+    private mutating func voteOnSignConvention(arStep: Double, deviceStep: Double) {
+        guard signConvention == .unknown, abs(deviceStep) >= signVoteDegrees else { return }
+        let subtracted = abs(Self.signedDegrees(arStep - deviceStep))
+        let added = abs(Self.signedDegrees(arStep + deviceStep))
+        // A window where neither pairing cancels is one where the frame was
+        // itself moving; it says nothing about the convention.
+        guard min(subtracted, added) <= stillnessDegrees else { return }
+        signVotes += subtracted < added ? 1 : -1
+        guard abs(signVotes) >= signVotesRequired else { return }
+        signConvention = signVotes > 0 ? .subtract : .add
+    }
+
+    /// Wraps a degree difference into (-180, 180].
+    static func signedDegrees(_ degrees: Double) -> Double {
+        var delta = degrees.truncatingRemainder(dividingBy: 360)
+        if delta > 180 { delta -= 360 }
+        if delta < -180 { delta += 360 }
+        return delta
     }
 }
 

@@ -35,6 +35,12 @@ class IMUSensorManager: ObservableObject {
     private var gyroIntegrationBearing: Double = 0
     private var initialBearingSet: Bool = false
     private var lastTimestamp: TimeInterval = 0
+
+    /// Gravity-referenced device yaw from `CMDeviceMotion.attitude`, in degrees.
+    /// Published untouched — no seeding, no correction, no path snapping — so it
+    /// stays an ARKit-independent witness to how far the device has turned. See
+    /// `IMUState.deviceYawDegrees` for why that independence matters.
+    private var attitudeYawDegrees: Double?
     
     // Step detection - MATCHING ANDROID
     private var filteredAcceleration: [Double] = []
@@ -354,9 +360,22 @@ class IMUSensorManager: ObservableObject {
     
     private func processMotionUpdate(_ motion: CMDeviceMotion) {
         let timestamp = motion.timestamp
+        processAttitude(motion.attitude)
         processAccelerometer(motion, timestamp: timestamp)
         processGyroscope(motion.rotationRate, timestamp: timestamp)
         updateIMUState()
+    }
+
+    /// Under `.xArbitraryZVertical` the attitude's Z axis is pinned to gravity,
+    /// so `yaw` is a true horizontal rotation about the vertical — unaffected by
+    /// how the phone is pitched or rolled. Sign is flipped to match the app's
+    /// convention throughout (heading increases on a physical RIGHT turn);
+    /// CoreMotion's yaw increases counter-clockwise.
+    private func processAttitude(_ attitude: CMAttitude) {
+        var degrees = -attitude.yaw * 180.0 / .pi
+        degrees = degrees.truncatingRemainder(dividingBy: 360)
+        if degrees < 0 { degrees += 360 }
+        attitudeYawDegrees = degrees
     }
     
     private func processAccelerometer(_ motion: CMDeviceMotion, timestamp: TimeInterval) {
@@ -748,7 +767,8 @@ class IMUSensorManager: ObservableObject {
             bearing: currentBearing,
             stepStability: stepStability,
             headingReliability: headingReliability,
-            pdrUncertaintyMeters: pdrUncertaintyMeters
+            pdrUncertaintyMeters: pdrUncertaintyMeters,
+            deviceYawDegrees: attitudeYawDegrees
         )
         
         // FIX: Always dispatch @Published write to main thread.
