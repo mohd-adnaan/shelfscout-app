@@ -153,6 +153,24 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// window promotes without it rather than blocking forever.
     private let relocalizationStatusFallbackSeconds: TimeInterval = 2.7
     private let postLocalizationJumpMeters: Float = 1.5
+    /// How much the AR↔device yaw offset may move across the settle window and
+    /// still count as a frame ARKit has finished aligning.
+    ///
+    /// Sized above the noise floor, not at it: the AR heading and the device
+    /// yaw are sampled by different subsystems at different instants, so a fast
+    /// relocalization pan injects apparent offset spread from timing skew alone
+    /// (90°/s against a 30 ms skew is ~3°). Held frames in the cims trace sat
+    /// under 3.5° per second; the swing that should have been caught was 10–13°
+    /// and the post-promotion shift was 38°.
+    private let relocalizationYawSettleDegrees: Double = 8.0
+    /// Escape hatch. A user standing still because the frame will not settle is
+    /// worse than a frame that may be rotated — the visual keyframe headings
+    /// correct that in flight now (`SemanticRouteNavigator`'s map-frame yaw
+    /// bias), and there is no recovery at all from never starting.
+    private let relocalizationYawSettleMaxWaitSeconds: TimeInterval = 12.0
+    /// The offset has to be observed over at least this long before it can be
+    /// called settled. Must stay under `WorldFrameYawWatch.windowSeconds`.
+    private let relocalizationYawSettleWindowSeconds: TimeInterval = 1.0
     /// Minimum gap between two published corrections, so ARKit's burst of
     /// refinements in the first seconds cannot re-resolve the route repeatedly
     /// while the user is being oriented.
@@ -175,9 +193,20 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private var fidelityUpgradeAt: Date?
     private let fidelityUpgradeSettleSeconds: TimeInterval = 2.0
     private var relocalizationNormalSince: Date?
+    /// When the yaw-settling veto first blocked a promotion, so the escape
+    /// hatch can measure how long the user has been held up by it.
+    private var yawSettleVetoSince: Date?
+    /// True once that escape hatch has fired for this relocalization attempt.
+    private var yawSettleVetoExpired = false
     private var preLocalizationPosition: simd_float3?
     private var previousPublishedPosition: simd_float3?
     private var localizedAt: Date?
+    /// Frame rotation that was detected but whose correction the publish
+    /// cooldown swallowed. Held rather than dropped: `WorldFrameYawWatch` has
+    /// already re-baselined onto the corrected frame by the time the cooldown
+    /// is consulted, so a dropped detection is a rotation nothing will ever
+    /// report again — the route simply stays locked to the abandoned bearing.
+    private var pendingFrameYawRotationDegrees: Double = 0
     /// Hysteresis state for the pitch threshold in `headingReading`.
     private var usingTiltFallbackHeading = false
     private var worldFrameYawWatch = WorldFrameYawWatch()
@@ -229,6 +258,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         ])
         lastTracedVetoReason = nil
         session.run(config, options: [.resetTracking, .removeExistingAnchors])
+        // A fresh capture already runs the full config, so the on-demand
+        // upgrade in `addPOIAnchor` has nothing to do — and must not re-run the
+        // session mid-capture to discover that.
+        didUpgradeSessionFidelity = true
         lastUpdateTime = 0
         isMapping = true
         isRelocalizing = false
@@ -423,6 +456,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     self.isMapping = false
                     self.isLocalized = false
                     self.relocalizationNormalSince = nil
+                    self.yawSettleVetoSince = nil
+                    self.yawSettleVetoExpired = false
                     self.preLocalizationPosition = nil
                     self.previousPublishedPosition = nil
                     self.localizedAt = nil
@@ -525,6 +560,15 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             statusMessage = "Camera pose is not ready yet."
             return false
         }
+        // Pinning is the one thing that needs LiDAR depth and plane raycasts,
+        // and a relocalized session runs the lightweight config that has
+        // neither. Ask for them here — the authoring flow, where the user is
+        // looking at the result and the map is about to be re-saved — and
+        // never automatically after relocalizing, where the same call reverts
+        // the map alignment under a blind user's route. THIS pin still uses
+        // the fallback cascade in `surfacePOITransform`; the next one gets
+        // depth. See `upgradeSessionToFullFidelity`.
+        upgradeSessionToFullFidelity()
         let visualFingerprint = frameFingerprinter.makeFingerprint(from: currentFrame.capturedImage)
 
         if let existingAnchor = poiAnchorsByName[trimmedName] {
@@ -823,6 +867,14 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         let z = transform.columns.3.z
 
         DispatchQueue.main.async {
+            // Before the promotion gate, not after: the gate's yaw-settling
+            // veto reads the window this call feeds, and judging the frame on
+            // evidence that stops one frame short of the decision is how a
+            // still-swinging frame got promoted.
+            self.detectWorldFrameYawShift(
+                arHeading: arHeading,
+                usedTiltFallback: headingUsedTiltFallback
+            )
             self.confirmRelocalizationIfStable(
                 cameraPosition: cameraPosition,
                 cameraForward: cameraForward,
@@ -831,10 +883,6 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 hasRestoredMapAnchors: hasRestoredMapAnchors
             )
             self.detectPostLocalizationJump(cameraPosition: cameraPosition)
-            self.detectWorldFrameYawShift(
-                arHeading: arHeading,
-                usedTiltFallback: headingUsedTiltFallback
-            )
             self.mappingStatus = mappingStatus
             self.cameraMapPosition = cameraPosition
             self.cameraMapForward = cameraForward
@@ -987,11 +1035,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     }
                 default:
                     self.relocalizationNormalSince = nil
+                    self.yawSettleVetoSince = nil
+                    self.yawSettleVetoExpired = false
                     self.preLocalizationPosition = nil
-                    // Tracking dropped: any yaw baseline belongs to a frame that
-                    // may not survive the recovery, so it must not be carried
-                    // across and reported as a shift afterwards.
-                    self.worldFrameYawWatch.acceptAlignment(arHeading: nil, deviceYaw: nil)
                     // Re-running the session to restore plane/mesh fidelity can
                     // blip tracking for a frame or two. That is a configuration
                     // change, not a lost map, so it must not tear down a
@@ -999,6 +1045,25 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     let isFidelitySettling = self.fidelityUpgradeAt.map {
                         Date().timeIntervalSince($0) < self.fidelityUpgradeSettleSeconds
                     } ?? false
+                    // Tracking genuinely dropped: the yaw baseline belongs to a
+                    // frame that may not survive the recovery, so it must not be
+                    // carried across and reported as a shift afterwards. The
+                    // next promotion sets a new one.
+                    //
+                    // ⚠️ Not on a fidelity blip. The same `isFidelitySettling`
+                    // window already protects `isLocalized` here — but the
+                    // baseline was being wiped unconditionally, so the one event
+                    // most likely to move the frame (our own `session.run()`)
+                    // was also the event that blinded the watch to it. That is
+                    // the cims trace: 38° of rotation, `frameYawDriftDeg`
+                    // reporting 2.9°, and a route left pointing into a wall.
+                    if !isFidelitySettling {
+                        self.worldFrameYawWatch.acceptAlignment(arHeading: nil, deviceYaw: nil)
+                        NavigationTrace.shared.log("ar.yawBaselineDropped", [
+                            "trackingState": "\(camera.trackingState)",
+                            "wasLocalized": self.isLocalized
+                        ])
+                    }
                     if self.isLocalized, !isFidelitySettling {
                         self.isLocalized = false
                         self.closestPOI = nil
@@ -1087,6 +1152,57 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         }
         preLocalizationPosition = cameraPosition
 
+        // ── Yaw-settling veto ───────────────────────────────────────────────
+        // The position check above cannot see the failure that actually
+        // happens. ARKit's relocalization refines over several seconds, and a
+        // refinement is largely a ROTATION about a point the user is standing
+        // on: position moves by centimetres while the world yaw — the quantity
+        // every bearing, every turn word and the whole overlay derive from —
+        // swings by tens of degrees.
+        //
+        // The 2026-07-30 cims trace: the AR↔device yaw offset moved through
+        // −21° … −34° over the three seconds before promotion and the pose
+        // read as rock steady the whole time. It was promoted mid-swing, the
+        // route was locked to that instant's frame, and 0.34 s later the frame
+        // moved another 38°. Requiring the offset to hold still is the only
+        // way to promote a frame ARKit has actually finished with.
+        let yawSpread = worldFrameYawWatch.offsetSpreadDegrees(
+            minimumSeconds: relocalizationYawSettleWindowSeconds
+        )
+        if let yawSpread, yawSpread <= relocalizationYawSettleDegrees {
+            // Settled: forget how long the last unsettled spell ran, so a
+            // second one later gets its own full patience rather than
+            // inheriting a clock that has already run out.
+            yawSettleVetoSince = nil
+        } else if let yawSpread, !yawSettleVetoExpired {
+            let vetoSince = yawSettleVetoSince ?? Date()
+            yawSettleVetoSince = vetoSince
+            let waitedSeconds = Date().timeIntervalSince(vetoSince)
+            if waitedSeconds < relocalizationYawSettleMaxWaitSeconds {
+                relocalizationNormalSince = Date()
+                let waiting = "Matching the saved map. Hold the camera steady."
+                if statusMessage != waiting { statusMessage = waiting }
+                traceRelocalizationVeto("frame_yaw_still_settling", detail: [
+                    "offsetSpreadDeg": yawSpread,
+                    "allowedDeg": relocalizationYawSettleDegrees,
+                    "waitedSeconds": waitedSeconds
+                ])
+                return
+            }
+            // Latched, not re-armed. The veto resets `relocalizationNormalSince`
+            // on every frame it blocks, so a timeout that merely stopped
+            // vetoing for one frame would be undone by the next: the hold clock
+            // would never reach the confirmation window and the user would wait
+            // forever. Giving up has to stay given up until something resets
+            // the relocalization.
+            yawSettleVetoExpired = true
+            NavigationTrace.shared.log("ar.yawSettleTimeout", [
+                "offsetSpreadDeg": yawSpread,
+                "allowedDeg": relocalizationYawSettleDegrees,
+                "waitedSeconds": waitedSeconds
+            ])
+        }
+
         // ── Wrong-frame veto ────────────────────────────────────────────────
         // `.normal` tracking does NOT prove ARKit matched the saved map: while
         // relocalization has not landed, ARKit keeps tracking in its OWN session
@@ -1119,6 +1235,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         guard promoted else { return }
 
         relocalizationNormalSince = nil
+        yawSettleVetoSince = nil
+        yawSettleVetoExpired = false
         preLocalizationPosition = nil
         cameraMapPosition = cameraPosition
         cameraMapForward = cameraForward
@@ -1149,6 +1267,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             // restored-anchor count as evidence the frame is aligned.
             "restoredAnchorsPresent": expectedRestoredPOICount > 0 && hasRestoredMapAnchors,
             "expectedRestoredPOIs": expectedRestoredPOICount,
+            // What the frame was doing when it was accepted. A promotion with a
+            // null spread means the watch had no window to judge with, not that
+            // the frame was steady.
+            "yawOffsetSpreadDeg": yawSpread ?? NSNull(),
             "deviceYawDeg": deviceYawAtPromotion ?? NSNull(),
             "x": Double(cameraPosition.x),
             "z": Double(cameraPosition.z),
@@ -1157,9 +1279,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             "activeMapID": activeMapID ?? NSNull(),
             "activeMapName": activeMapName ?? NSNull()
         ])
-        // Relocalization is done, so the mapping features that were held back to
-        // keep the match fast can come back on now.
-        upgradeSessionToFullFidelity()
+        // ⚠️ NOTHING re-runs the session here. See
+        // `upgradeSessionToFullFidelity` for why relocalizing no longer
+        // triggers a fidelity upgrade at all.
     }
 
     /// A large pose jump shortly after localization is ARKit correcting a
@@ -1228,17 +1350,24 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// Delegates the decision to `WorldFrameYawWatch` (pure, unit-tested) and
     /// keeps only the I/O here: reading the sensors, rate-limiting, tracing.
     private func detectWorldFrameYawShift(arHeading: Double?, usedTiltFallback: Bool) {
-        guard isRelocalizing, isLocalized, let arHeading,
+        guard isRelocalizing, let arHeading,
               let deviceYaw = currentIMUMotion()?.deviceYawDegrees else {
             worldFrameYawWatch.clearWindow()
             return
         }
         let previousConvention = worldFrameYawWatch.signConvention
+        // Observed from the first relocalizing frame, acted on only once there
+        // is an accepted alignment to correct. Two things need the pre-promotion
+        // samples: the yaw-settling veto in `confirmRelocalizationIfStable`, and
+        // the sign convention — whose votes need a real turn, which is exactly
+        // what the user is doing during the relocalization pan and almost never
+        // does afterwards.
         let detection = worldFrameYawWatch.ingest(
             at: Date(),
             arHeading: arHeading,
             deviceYaw: deviceYaw,
-            usedTiltFallback: usedTiltFallback
+            usedTiltFallback: usedTiltFallback,
+            acting: isLocalized
         )
         if worldFrameYawWatch.signConvention != previousConvention {
             NavigationTrace.shared.log("ar.yawSignCalibrated", [
@@ -1247,8 +1376,35 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 "cumulativeDetectorEnabled": worldFrameYawWatch.signConvention == .subtract
             ])
         }
+        // A rotation the cooldown swallowed earlier still has to reach the route
+        // layer; retry it as soon as the cooldown allows.
+        if detection == nil,
+           pendingFrameYawRotationDegrees != 0,
+           publishLocalizationCorrection(reason: "frame_yaw_shift_deferred") {
+            NavigationTrace.shared.log("ar.frameYawShift", [
+                "detector": "deferred",
+                "frameRotationDeg": pendingFrameYawRotationDegrees,
+                "arHeadingDeg": arHeading,
+                "deviceYawDeg": deviceYaw,
+                "published": true,
+                "sinceLocalizedS": localizedAt.map { Date().timeIntervalSince($0) } ?? NSNull(),
+                "revision": localizationRevision
+            ])
+            pendingFrameYawRotationDegrees = 0
+        }
         guard let detection else { return }
-        guard publishLocalizationCorrection(reason: "frame_yaw_shift") else { return }
+        // ⚠️ Log BEFORE consulting the cooldown, and bank the rotation when the
+        // cooldown refuses. `ingest` has already re-baselined onto the corrected
+        // frame, so a detection dropped here is gone for good: it will never be
+        // re-detected, nothing is logged, and the route stays locked to a
+        // bearing ARKit abandoned. The old `guard publish… else { return }` did
+        // exactly that.
+        let published = publishLocalizationCorrection(reason: "frame_yaw_shift")
+        if !published {
+            pendingFrameYawRotationDegrees = WorldFrameYawWatch.signedDegrees(
+                pendingFrameYawRotationDegrees + detection.rotationDegrees
+            )
+        }
         NavigationTrace.shared.log("ar.frameYawShift", [
             "detector": detection.detector.rawValue,
             "frameRotationDeg": detection.rotationDegrees,
@@ -1257,6 +1413,8 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             "arHeadingDeg": arHeading,
             "deviceYawDeg": deviceYaw,
             "heldSeconds": detection.heldSeconds,
+            "published": published,
+            "pendingRotationDeg": pendingFrameYawRotationDegrees,
             "sinceLocalizedS": localizedAt.map { Date().timeIntervalSince($0) } ?? NSNull(),
             "revision": localizationRevision
         ])
@@ -1279,6 +1437,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     private func resetWorldFrameYawWatch() {
         worldFrameYawWatch.reset()
         lastLocalizationCorrectionAt = nil
+        pendingFrameYawRotationDegrees = 0
     }
 
     func session(_ session: ARSession, didFailWithError error: Error) {
@@ -1322,8 +1481,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// saved feature cloud: scene mesh reconstruction, plane detection and scene
     /// depth all run per frame and compete with relocalization for the same CPU/
     /// GPU budget, which is why a large store map could sit on "pan around" for
-    /// tens of seconds. Relocalize lean, then `upgradeSessionToFullFidelity()`
-    /// turns the mapping features back on once tracking is established.
+    /// tens of seconds. A relocalizing session therefore stays lean for its
+    /// whole life; only pinning a POI asks for the mapping features back, via
+    /// `upgradeSessionToFullFidelity()`, because that re-run costs the map
+    /// alignment.
     private func makeWorldTrackingConfiguration(
         initialWorldMap: ARWorldMap? = nil,
         lightweight: Bool = false
@@ -1359,15 +1520,47 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         return config
     }
 
-    /// Re-enables plane detection, scene depth and mesh once relocalization has
-    /// succeeded. Runs WITHOUT reset options so ARKit keeps the tracking state
-    /// and restored map anchors it just worked to establish; `worldAlignment` is
-    /// pinned to the relocalized session's `.gravity` because changing alignment
-    /// mid-session would move the world origin out from under the route frame.
+    /// Re-enables plane detection, scene depth and mesh on an already
+    /// relocalized session, so a POI pinned from here lands on the object the
+    /// camera is aimed at (LiDAR depth / plane raycast) instead of on the
+    /// user's own standing pose.
+    ///
+    /// ## ⚠️ Never call this during guidance
+    ///
+    /// It re-runs the session, and re-running the session destroys the
+    /// relocalized map alignment. Two field traces say so with the same
+    /// signature — the world yaw snaps back to ARKit's own session frame within
+    /// ~0.2 s of the `run()`, position untouched, so it is a pure rotation that
+    /// no position check can see:
+    ///
+    ///   2026-07-30 cims   run() at promotion (t=18.51) → frame reverted +38° at 18.85
+    ///   2026-07-30 ECSE   run() deferred to t≈7.4      → frame reverted +29° at  7.54
+    ///
+    /// In both the route was locked to the pre-`run()` frame and the overlay
+    /// swung off through a wall — which is exactly what the user sees. The
+    /// second trace also lost tracking outright (`notAvailable`, isLocalized
+    /// false) 3.5 s later, with mesh and depth newly running on a loaded map.
+    ///
+    /// `run(config)` without reset options is documented to keep tracking
+    /// state, so this is inference from timing rather than from Apple's
+    /// contract — but two traces, one signature, and no other event at those
+    /// instants. The upgrade buys depth-accurate pinning, which only the
+    /// authoring flow needs; guidance never pins anything, so the trade is not
+    /// close. Now requested explicitly by `addPOIAnchor`, never automatically
+    /// after relocalizing.
+    ///
+    /// Runs WITHOUT reset options and pins `worldAlignment` to the relocalized
+    /// session's `.gravity`, because changing alignment mid-session would move
+    /// the world origin out from under the route frame.
     private func upgradeSessionToFullFidelity() {
         guard !didUpgradeSessionFidelity else { return }
         didUpgradeSessionFidelity = true
         fidelityUpgradeAt = Date()
+        NavigationTrace.shared.log("ar.fidelityUpgrade", [
+            "isLocalized": isLocalized,
+            "isMapping": isMapping,
+            "sinceLocalizedS": localizedAt.map { Date().timeIntervalSince($0) } ?? NSNull()
+        ])
         let config = makeWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         session.run(config)
@@ -3211,7 +3404,16 @@ struct WorldFrameYawWatch {
 
     // ── State ───────────────────────────────────────────────────────────────
     private var samples: [(at: Date, arHeading: Double, deviceYaw: Double, usedTiltFallback: Bool)] = []
-    private var reference: (arHeading: Double, deviceYaw: Double)?
+    /// The AR↔device yaw offset at the alignment guidance was actually built
+    /// on. Set ONLY by `acceptAlignment`.
+    ///
+    /// ⚠️ It used to be auto-seeded by `ingest` whenever it was nil, and that
+    /// single line is why the 2026-07-30 cims trace reported "peak drift 4.4°"
+    /// for a 38° rotation: a tracking blip cleared the baseline, the next
+    /// sample — taken AFTER the frame had already turned — became the new one,
+    /// and every drift reading from then on was measured from the wrong frame.
+    /// A missing baseline must read as "unknown", never as "no drift".
+    private var acceptedReference: (arHeading: Double, deviceYaw: Double)?
     private(set) var signConvention: SignConvention = .unknown
     private(set) var signVotes = 0
 
@@ -3220,7 +3422,7 @@ struct WorldFrameYawWatch {
     /// re-measuring costs nothing and stops one bad session poisoning the next.
     mutating func reset() {
         samples.removeAll()
-        reference = nil
+        acceptedReference = nil
         signConvention = .unknown
         signVotes = 0
     }
@@ -3234,30 +3436,75 @@ struct WorldFrameYawWatch {
 
     /// Anchors the cumulative detector: everything after this is measured
     /// against the frame guidance was actually built on.
+    ///
+    /// ⚠️ Deliberately does NOT drop the rolling window. Clearing it here made
+    /// the first 0.6 s after promotion — the likeliest moment for ARKit to
+    /// finish realigning, and the moment guidance has just locked the route —
+    /// the one interval the still-device detector structurally could not see:
+    /// its hold needs a sample older than the jump, and that sample had just
+    /// been deleted. The cims trace's 38° shift landed 0.34 s after promotion
+    /// and went unreported for exactly that reason. Pre-promotion samples are
+    /// honest observations of the same frame; keeping them is what lets the
+    /// detector bracket a jump that straddles the promotion.
     mutating func acceptAlignment(arHeading: Double?, deviceYaw: Double?) {
-        samples.removeAll()
         if let arHeading, let deviceYaw {
-            reference = (arHeading: arHeading, deviceYaw: deviceYaw)
+            acceptedReference = (arHeading: arHeading, deviceYaw: deviceYaw)
         } else {
-            reference = nil
+            acceptedReference = nil
         }
     }
 
     /// How far the frame has rotated since the accepted alignment. Diagnostic
     /// only — nothing acts on it, so a wrong sign convention here is visible in
-    /// the trace rather than harmful.
+    /// the trace rather than harmful. Nil until an alignment has been accepted.
     func frameYawDrift(arHeading: Double, deviceYaw: Double) -> Double? {
-        guard let reference else { return nil }
-        let arDrift = Self.signedDegrees(arHeading - reference.arHeading)
-        let deviceDrift = Self.signedDegrees(deviceYaw - reference.deviceYaw)
+        guard let acceptedReference else { return nil }
+        let arDrift = Self.signedDegrees(arHeading - acceptedReference.arHeading)
+        let deviceDrift = Self.signedDegrees(deviceYaw - acceptedReference.deviceYaw)
         return Self.signedDegrees(arDrift - deviceDrift)
     }
 
+    /// Peak-to-peak movement of the AR↔device yaw offset across the rolling
+    /// window — i.e. how much the world FRAME has been turning under the user,
+    /// with everything the user did with the phone cancelled out. Nil until the
+    /// window spans `minimumSeconds`, so "not enough evidence" is distinct from
+    /// "settled".
+    ///
+    /// This is what the relocalization promotion gate was missing. A frame
+    /// rotating about a standing user moves the position by ~0 m, so the
+    /// position-jump veto reports a perfectly settled pose while the only
+    /// quantity every bearing depends on is still swinging.
+    func offsetSpreadDegrees(minimumSeconds: TimeInterval) -> Double? {
+        guard let oldest = samples.first,
+              let newest = samples.last,
+              newest.at.timeIntervalSince(oldest.at) >= minimumSeconds else {
+            return nil
+        }
+        // Measured as signed deltas from the first offset rather than on the
+        // raw values, so a window straddling 0°/360° does not read as a 360°
+        // swing.
+        let datum = Self.signedDegrees(oldest.arHeading - oldest.deviceYaw)
+        let deltas = samples.map {
+            Self.signedDegrees(Self.signedDegrees($0.arHeading - $0.deviceYaw) - datum)
+        }
+        guard let low = deltas.min(), let high = deltas.max() else { return nil }
+        return high - low
+    }
+
+    /// - Parameter acting: when false the sample is recorded and the sign
+    ///   convention still votes on it, but no detection is returned. Used while
+    ///   relocalization is still in progress: there is no accepted alignment to
+    ///   correct yet, but the pan the user is doing right then is the best
+    ///   sign-convention material in the whole session — and gating ingestion
+    ///   on `isLocalized` is why `signConvention` never left `.unknown` in the
+    ///   field, which left the cumulative detector permanently disabled.
+    @discardableResult
     mutating func ingest(
         at now: Date,
         arHeading: Double,
         deviceYaw: Double,
-        usedTiltFallback: Bool
+        usedTiltFallback: Bool,
+        acting: Bool = true
     ) -> Detection? {
         // The forward-vector and up-vector heading derivations do not agree
         // under roll, so a switch between them is a step change that is NOT the
@@ -3267,9 +3514,6 @@ struct WorldFrameYawWatch {
         }
         samples.append((at: now, arHeading: arHeading, deviceYaw: deviceYaw, usedTiltFallback: usedTiltFallback))
         samples.removeAll { $0.at < now.addingTimeInterval(-windowSeconds) }
-        if reference == nil {
-            reference = (arHeading: arHeading, deviceYaw: deviceYaw)
-        }
 
         guard let oldest = samples.first,
               now.timeIntervalSince(oldest.at) >= holdSeconds else {
@@ -3279,6 +3523,7 @@ struct WorldFrameYawWatch {
         let deviceStep = Self.signedDegrees(deviceYaw - oldest.deviceYaw)
         let heldSeconds = now.timeIntervalSince(oldest.at)
         voteOnSignConvention(arStep: arStep, deviceStep: deviceStep)
+        guard acting else { return nil }
 
         // ── Detector 1: still device, moving AR yaw ─────────────────────────
         // The device term enters only as a magnitude, so this cannot be broken
@@ -3307,14 +3552,14 @@ struct WorldFrameYawWatch {
         guard signConvention == .subtract,
               let cumulative = frameYawDrift(arHeading: arHeading, deviceYaw: deviceYaw),
               abs(cumulative) > cumulativeDegrees,
-              let reference else {
+              let acceptedReference else {
             return nil
         }
         return accept(
             detector: .cumulative,
             rotation: cumulative,
-            arDelta: Self.signedDegrees(arHeading - reference.arHeading),
-            deviceDelta: Self.signedDegrees(deviceYaw - reference.deviceYaw),
+            arDelta: Self.signedDegrees(arHeading - acceptedReference.arHeading),
+            deviceDelta: Self.signedDegrees(deviceYaw - acceptedReference.deviceYaw),
             heldSeconds: heldSeconds,
             arHeading: arHeading,
             deviceYaw: deviceYaw
@@ -3333,7 +3578,7 @@ struct WorldFrameYawWatch {
         deviceYaw: Double
     ) -> Detection {
         samples.removeAll()
-        reference = (arHeading: arHeading, deviceYaw: deviceYaw)
+        acceptedReference = (arHeading: arHeading, deviceYaw: deviceYaw)
         return Detection(
             detector: detector,
             rotationDegrees: rotation,

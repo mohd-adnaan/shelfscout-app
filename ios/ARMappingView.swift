@@ -379,10 +379,16 @@ struct ARMappingView: View {
                 || semanticNavigator.phase == .recovering else {
             return
         }
+        // ARKit has moved the world frame, so anything measured about how that
+        // frame sat relative to the map describes a frame that no longer
+        // exists. Drop it and let the keyframes re-measure against the new one
+        // — carrying a stale bias forward would apply a correction for an error
+        // that has already been corrected, and double it.
+        semanticNavigator.noteARFrameRealigned()
         semanticNavigator.realignRouteToCorrectedPose(
             arPosition: mappingManager.cameraMapPosition,
             imuState: sensorManager.imuState,
-            heading: mappingManager.arHeadingDegrees
+            heading: semanticNavigator.mapFrameHeading(mappingManager.arHeadingDegrees)
         )
     }
 
@@ -464,6 +470,12 @@ struct ARMappingView: View {
     /// the chevron overlay. Route x is AR x; route y is -AR z; the floor sits
     /// a torso below the camera. Only meaningful while localized on an
     /// AR-frame map — `remainingRoutePolyline` is empty otherwise.
+    ///
+    /// The two frames are only interchangeable while ARKit's world yaw agrees
+    /// with the map's; when it does not, writing route coordinates straight
+    /// into world coordinates draws a correct route at a wrong angle — arrows
+    /// heading into a wall while the corridor runs straight ahead. Hence
+    /// `arFrameRoutePolyline`, which applies the measured rotation.
     private var routeOverlayWorldPoints: [SIMD3<Float>] {
         // Same pose-trust rule the navigator itself uses: a relocalized map
         // frame, or the live capture session whose frame IS the map frame.
@@ -472,7 +484,7 @@ struct ARMappingView: View {
             return []
         }
         let floorY = cameraPosition.y - 1.35
-        return semanticNavigator.remainingRoutePolyline().map {
+        return semanticNavigator.arFrameRoutePolyline(userARPosition: cameraPosition).map {
             SIMD3<Float>(Float($0.x), floorY, Float(-$0.y))
         }
     }
@@ -495,7 +507,12 @@ struct ARMappingView: View {
     /// every spoken turn is derived from, so putting it on screen makes a wrong
     /// instruction visible instead of merely audible.
     private var activeLegHeadingErrorDegrees: Double? {
-        guard let heading = mappingManager.arHeadingDegrees else { return nil }
+        // Map frame, not AR frame: the leg bearings this is compared against
+        // are the map's, and mixing the two puts the on-screen turn readout at
+        // odds with the spoken one by exactly the frame rotation.
+        guard let heading = semanticNavigator.mapFrameHeading(mappingManager.arHeadingDegrees) else {
+            return nil
+        }
         return semanticNavigator.headingErrorToActiveLeg(liveHeading: heading)
     }
 

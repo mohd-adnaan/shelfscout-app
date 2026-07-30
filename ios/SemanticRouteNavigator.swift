@@ -479,6 +479,42 @@ final class SemanticRouteNavigator: ObservableObject {
     /// keyframe heading gate is suspended, because it would otherwise assume the
     /// live heading it exists to help check. See `currentVisualRouteMatch`.
     private var didCorroborateHeadingVisually = false
+    /// Measured rotation of the live ARKit world frame relative to the saved
+    /// map's frame, in degrees, added to every AR heading before guidance uses
+    /// it: `mapHeading = arHeading + bias`.
+    ///
+    /// ## Why this exists
+    ///
+    /// Relocalization can land on a frame that is rotated relative to the map
+    /// and then hold it perfectly steady — the 2026-07-30 cims session ran a
+    /// whole journey 26° out, stable the entire time. Nothing on the device can
+    /// tell a stable-and-right frame from a stable-and-wrong one by watching
+    /// ARKit alone: `deviceYawDegrees` measures rotation, not direction, and
+    /// there is no magnetometer anywhere in this app.
+    ///
+    /// The saved keyframes can. Each carries the heading the camera held when
+    /// it was captured, in the map's frame. When the live camera matches one,
+    /// `keyframeHeading − liveHeading` is a direct reading of how far the live
+    /// frame is rotated from the map's. That session measured it 18 times,
+    /// worst −26.8°, against a guidance heading error of 25–26° — the same
+    /// number, logged to `nav.visualYaw` and thrown away. This consumes it.
+    ///
+    /// Yaw only. A rotated frame also displaces position, but the size of that
+    /// displacement depends on where the rotation was centred, which a heading
+    /// measurement cannot say; position already has its own correction path in
+    /// `applyRecoverySnap`.
+    private var mapFrameYawBiasDegrees: Double = 0
+    /// Keyframe-vs-live heading offsets from accepted matches. Residuals, not
+    /// absolutes: `liveHeading` here is already bias-corrected, so each reading
+    /// says how much the bias is still wrong by, and applying their median
+    /// converges instead of oscillating.
+    private var visualYawResiduals: [(at: Date, degrees: Double)] = []
+    private var lastYawBiasCorrectionAt: Date?
+    /// Set when a correction lands, consumed on the next update tick. The route
+    /// must be rebuilt from the corrected heading — it was resolved from one now
+    /// known to be wrong — but not from inside the visual matcher, which runs
+    /// with `activeStep` already bound for the rest of the tick.
+    private var pendingFrameYawRealignment = false
     private var lastTrackingLimitedPrefixAt: Date?
     private var guidanceIntroProtectedUntil: Date?
     private var lastVisualRouteMatchAt: TimeInterval = 0
@@ -673,6 +709,35 @@ final class SemanticRouteNavigator: ObservableObject {
     /// several always land inside it.
     private let visualSameRoutePlaceMeters = 1.5
     private let visualRouteAdvanceCooldownSeconds: TimeInterval = 1.4
+    // ── Map-frame yaw bias ──────────────────────────────────────────────────
+    // How many accepted visual matches must agree before the AR frame is
+    // declared rotated. Three, because one match can be a lucky lookalike and
+    // two can both be the same wrong place; and because the correction rebuilds
+    // the route, which the user hears.
+    private let visualYawSamplesRequired = 3
+    /// How many of the most recent measurements are weighed. Recency matters
+    /// because the frame error is a STEP, not a drift: when ARKit re-orients,
+    /// every older reading describes a frame that no longer exists, and mixing
+    /// the two populations makes any spread test fail forever. Judging the tail
+    /// means the estimate follows the frame instead of averaging across a
+    /// change in it.
+    private let visualYawRecentSamples = 5
+    /// Measurements older than this stop counting at all.
+    private let visualYawWindowSeconds: TimeInterval = 45
+    /// How far a measurement may sit from the median and still be counted as
+    /// agreeing with it. A keyframe matches from a slightly different standpoint
+    /// than it was captured from, so individual readings scatter; a real frame
+    /// rotation is a common bias underneath that scatter.
+    private let visualYawAgreementDegrees: Double = 11
+    /// Below this the correction is not worth rebuilding the route for — it is
+    /// inside the scatter of the measurement itself.
+    private let visualYawActionableDegrees: Double = 12
+    /// Above this a "rotation" is far more likely to be three matches from the
+    /// wrong corridor than a real frame error, so it is logged and refused
+    /// rather than applied. Relocalization, not arithmetic, is the answer to a
+    /// frame that far out.
+    private let visualYawMaxCorrectionDegrees: Double = 60
+    private let visualYawCorrectionCooldownSeconds: TimeInterval = 10
     /// Kept short: at the finish line a long visual-confirmation hold reads
     /// as "the app is lost" and delays the reaching handoff.
     private let visualArrivalMaxHoldSeconds: TimeInterval = 2.5
@@ -2003,6 +2068,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
         didCorroborateHeadingVisually = false
+        resetMapFrameYawBias()
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
         lastPDRDeltaWasCapped = false
@@ -2122,6 +2188,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
         didCorroborateHeadingVisually = false
+        resetMapFrameYawBias()
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
         lastHeadingAlignmentCueAt = nil
@@ -2157,10 +2224,23 @@ final class SemanticRouteNavigator: ObservableObject {
     func update(
         imuState: IMUState,
         arPosition: simd_float3?,
-        arHeading: Double?,
+        arHeading rawARHeading: Double?,
         arLocalized: Bool,
         capturedImage: CVPixelBuffer? = nil
     ) {
+        // Everything below this line works in the MAP's frame. The ARKit world
+        // frame can be rotated relative to it — see `mapFrameYawBiasDegrees` —
+        // and correcting once at the ingress is what keeps guidance, the
+        // overlay and the spoken turns from each holding a different opinion
+        // about which way the user faces. The bias is 0 until the keyframes
+        // prove otherwise, so this is a no-op on a correctly aligned session.
+        //
+        // Guidance phases only. A capture or enrichment walk WRITES keyframe
+        // headings into the map, and those must be recorded in the frame they
+        // were observed in; correcting them against a bias measured from an
+        // earlier journey would bake the correction into the map itself.
+        let isGuiding = phase == .navigating || phase == .recovering
+        let arHeading = isGuiding ? mapFrameHeading(rawARHeading) : rawARHeading
         // Sampled in every phase: the sweep to expose is the relocalization
         // pan that happens BEFORE guidance starts.
         recordHeadingSample(arHeading)
@@ -2199,6 +2279,17 @@ final class SemanticRouteNavigator: ObservableObject {
             timestamp: Date().timeIntervalSinceReferenceDate,
             liveHeading: arHeading ?? imuState.bearing
         )
+        // The match above can have proved the frame is rotated, which makes the
+        // route resolved from the old heading — and `step`, bound just above —
+        // stale. Rebuild and yield the tick; the next one runs on the corrected
+        // frame.
+        if consumePendingFrameYawRealignment(
+            arPosition: arPosition,
+            imuState: imuState,
+            heading: mapFrameHeading(rawARHeading)
+        ) {
+            return
+        }
         let pdrDelta = pdrDistanceDelta(from: imuState)
         lastRouteUpdatePDRDelta = pdrDelta
         let expectedHeading = step.edge.bearingDegrees
@@ -4792,6 +4883,10 @@ final class SemanticRouteNavigator: ObservableObject {
             fields["legTurnHint"] = step.to.turnHint?.rawValue ?? "none"
         }
         if let heading = traceLiveHeading { fields["heading"] = heading }
+        // `heading` above is MAP-frame; `ar.frame`'s `headingDeg` is raw ARKit.
+        // Without this field the two columns differ by an unexplained constant
+        // and the next trace reader has to guess which one lies.
+        if mapFrameYawBiasDegrees != 0 { fields["mapFrameYawBiasDeg"] = mapFrameYawBiasDegrees }
         if let headingError = traceHeadingError { fields["headingErrDeg"] = headingError }
         if let crossTrack = traceCrossTrack { fields["crossM"] = crossTrack }
         if let alongTrack = traceAlongTrack { fields["alongM"] = alongTrack }
@@ -5261,12 +5356,221 @@ final class SemanticRouteNavigator: ObservableObject {
                 "liveHeadingDeg": liveHeading,
                 "offsetDeg": offset,
                 "confidence": best.confidence,
-                "gateWasApplied": didCorroborateHeadingVisually
+                "gateWasApplied": didCorroborateHeadingVisually,
+                "biasDeg": mapFrameYawBiasDegrees
             ])
+            ingestVisualYawResidual(offset, match: best)
         }
         didCorroborateHeadingVisually = true
         lastVisualRouteMatch = best
         return best
+    }
+
+    // MARK: - Map-frame yaw bias
+
+    /// The live AR heading expressed in the saved map's frame. Every consumer
+    /// of a heading — guidance, the overlay, the on-screen error readout — must
+    /// go through this, or they disagree about which way the user is facing.
+    func mapFrameHeading(_ arHeading: Double?) -> Double? {
+        guard let arHeading else { return nil }
+        guard mapFrameYawBiasDegrees != 0 else { return arHeading }
+        return SemanticRouteMath.normalizedDegrees(arHeading + mapFrameYawBiasDegrees)
+    }
+
+    /// Route polyline rotated out of the map's frame and into the live ARKit
+    /// world frame, for the floor overlay.
+    ///
+    /// The overlay used to write route coordinates straight into AR world
+    /// coordinates, which is only correct while the two frames agree. When they
+    /// do not, the arrows are drawn rotated — the "route drifts off through the
+    /// wall" screenshot — even though the route data is perfect. The rotation is
+    /// centred on the user rather than on the map origin: their AR position is
+    /// the one place the two frames are known to coincide, so the path always
+    /// starts at their feet and only its direction is corrected.
+    func arFrameRoutePolyline(userARPosition: SIMD3<Float>) -> [SemanticRoutePoint] {
+        let polyline = remainingRoutePolyline()
+        guard mapFrameYawBiasDegrees != 0, !polyline.isEmpty else { return polyline }
+        let user = SemanticRoutePoint(x: Double(userARPosition.x), y: -Double(userARPosition.z))
+        let radians = mapFrameYawBiasDegrees * .pi / 180.0
+        let cosBias = cos(radians)
+        let sinBias = sin(radians)
+        return polyline.map { point in
+            // Headings here are compass-style: measured clockwise from +y, so a
+            // point at bearing B sits at (sin B, cos B). Re-expressing a
+            // map-frame bearing B in the AR frame means B − bias, which on the
+            // components is this rotation.
+            let dx = point.x - user.x
+            let dy = point.y - user.y
+            return SemanticRoutePoint(
+                x: user.x + dx * cosBias - dy * sinBias,
+                y: user.y + dx * sinBias + dy * cosBias
+            )
+        }
+    }
+
+    /// One keyframe-vs-live heading reading, measured against the already
+    /// corrected heading, so it is what the bias is still wrong by.
+    private func ingestVisualYawResidual(_ residualDegrees: Double, match: VisualRouteMatch) {
+        guard phase == .navigating || phase == .recovering else { return }
+        // An aliased keyframe is one whose view repeats elsewhere on the route,
+        // so its saved heading may belong to a different place entirely. Good
+        // enough to contribute position evidence, where the ambiguity is
+        // between two points on the same route; not good enough to rotate the
+        // world by, where it is between two directions.
+        guard !match.isAliased else { return }
+        // The evidence bar, and nothing above it.
+        //
+        // ⚠️ This carried its own higher bar (0.50) for one build and that made
+        // the whole correction inert: the 2026-07-30 ECSE map's best matches
+        // ran 0.433–0.466 similarity, i.e. every single one landed under it,
+        // and five measurements agreeing on −29.2° produced no correction at
+        // all. Real corridors match weakly. Agreement across independent
+        // matches is the filter here, not per-match strength — three
+        // lookalikes that all lie by the same angle is a far less likely
+        // accident than one weak match being right.
+        guard match.confidence >= visualRouteMinimumConfidence else { return }
+        let now = Date()
+        visualYawResiduals.append((at: now, degrees: residualDegrees))
+        visualYawResiduals.removeAll { now.timeIntervalSince($0.at) > visualYawWindowSeconds }
+        applyFrameYawCorrectionIfWarranted()
+    }
+
+    /// Turns a run of agreeing measurements into one correction to the bias.
+    ///
+    /// Median-and-agreement rather than a peak-to-peak spread test over
+    /// everything in the window. A plain spread test deadlocks the moment the
+    /// frame changes mid-journey: the window then holds readings from two
+    /// different frames, they can never agree, and the correction that would
+    /// fix the newer one is refused forever. Taking the median of the recent
+    /// tail and keeping only what agrees with it lets the minority population
+    /// — the stale frame — simply be outvoted.
+    private func applyFrameYawCorrectionIfWarranted() {
+        guard visualYawResiduals.count >= visualYawSamplesRequired else { return }
+        let now = Date()
+        if let last = lastYawBiasCorrectionAt,
+           now.timeIntervalSince(last) < visualYawCorrectionCooldownSeconds {
+            return
+        }
+        // Not `map(\.degrees)`: Swift key paths do not address tuple members.
+        let recent = visualYawResiduals.suffix(visualYawRecentSamples).map { $0.degrees }
+        let sorted = recent.sorted()
+        let median = sorted[sorted.count / 2]
+        let agreeing = sorted.filter {
+            abs(SemanticRouteMath.signedAngleDifference($0, median)) <= visualYawAgreementDegrees
+        }
+        let spread = (sorted.last ?? 0) - (sorted.first ?? 0)
+        guard agreeing.count >= visualYawSamplesRequired else {
+            NavigationTrace.shared.log("nav.frameYawCorrection", [
+                "applied": false,
+                "reason": "measurements_disagree",
+                "samples": recent.count,
+                "agreeing": agreeing.count,
+                "spreadDeg": spread,
+                "medianDeg": median,
+                "biasDeg": mapFrameYawBiasDegrees
+            ])
+            return
+        }
+        // The median of what agreed, not of everything: outliers must not drag
+        // the correction they were excluded from.
+        let correction = agreeing[agreeing.count / 2]
+        guard abs(correction) >= visualYawActionableDegrees else { return }
+        guard abs(correction) <= visualYawMaxCorrectionDegrees else {
+            // Deliberately not applied. A frame this far out is a relocalization
+            // failure, and rotating the route by 100° on three fingerprint
+            // matches would be a far worse outcome than the wrong route the user
+            // already has.
+            NavigationTrace.shared.log("nav.frameYawCorrection", [
+                "applied": false,
+                "reason": "implausible_rotation",
+                "samples": recent.count,
+                "agreeing": agreeing.count,
+                "spreadDeg": spread,
+                "correctionDeg": correction,
+                "biasDeg": mapFrameYawBiasDegrees
+            ])
+            visualYawResiduals.removeAll()
+            return
+        }
+
+        let previousBias = mapFrameYawBiasDegrees
+        mapFrameYawBiasDegrees = SemanticRouteMath.signedAngleDifference(
+            mapFrameYawBiasDegrees + correction,
+            0
+        )
+        lastYawBiasCorrectionAt = now
+        visualYawResiduals.removeAll()
+        // The heading history now straddles two frames, so "has the user held
+        // one direction" is unanswerable from it — every sample before this
+        // instant is offset from every sample after it by the correction, which
+        // would read as a turn the user never made. Start the window again.
+        recentHeadingSamples.removeAll()
+        pendingFrameYawRealignment = true
+        NavigationTrace.shared.log("nav.frameYawCorrection", [
+            "applied": true,
+            "samples": recent.count,
+            "agreeing": agreeing.count,
+            "spreadDeg": spread,
+            "correctionDeg": correction,
+            "medianDeg": median,
+            "previousBiasDeg": previousBias,
+            "biasDeg": mapFrameYawBiasDegrees
+        ])
+    }
+
+    /// Rebuilds the route from the corrected heading, at a tick boundary.
+    /// Returns true when the caller must abandon the rest of this tick, whose
+    /// `activeStep` no longer describes the route.
+    private func consumePendingFrameYawRealignment(
+        arPosition: simd_float3?,
+        imuState: IMUState,
+        heading: Double?
+    ) -> Bool {
+        guard pendingFrameYawRealignment else { return false }
+        // Cleared before the rebuild, not after: `rebuildRouteFromCurrentPose`
+        // speaks a cue and refreshes state, and clearing afterwards would let
+        // any flag raised during that work be swallowed.
+        pendingFrameYawRealignment = false
+        guard realignRouteToCorrectedPose(
+            arPosition: arPosition,
+            imuState: imuState,
+            heading: heading
+        ) else {
+            // The rebuild retry window swallowed it; re-arm and try on a later
+            // tick rather than losing the correction.
+            pendingFrameYawRealignment = true
+            return false
+        }
+        return true
+    }
+
+    /// Clears everything measured about the AR frame's rotation.
+    ///
+    /// Journey-scoped on purpose. The bias is a property of the AR session, not
+    /// of the leg being walked, so carrying it across a warm retarget would be
+    /// defensible — but a bias carried into a session that has since
+    /// re-relocalized is silently applied to a frame it was never measured
+    /// against, and there is no evidence on hand to notice that. Re-measuring
+    /// costs a few visual matches at the start of the next leg.
+    private func resetMapFrameYawBias() {
+        mapFrameYawBiasDegrees = 0
+        visualYawResiduals.removeAll()
+        lastYawBiasCorrectionAt = nil
+        pendingFrameYawRealignment = false
+    }
+
+    /// ARKit itself moved the world frame. Everything measured about the old
+    /// frame's rotation is void — the error may have been corrected, made
+    /// worse, or replaced — so the bias goes back to zero and the keyframes
+    /// re-measure against whatever frame is now live.
+    func noteARFrameRealigned() {
+        guard mapFrameYawBiasDegrees != 0 || !visualYawResiduals.isEmpty else { return }
+        NavigationTrace.shared.log("nav.frameYawBiasCleared", [
+            "reason": "ar_frame_realigned",
+            "discardedBiasDeg": mapFrameYawBiasDegrees,
+            "discardedSamples": visualYawResiduals.count
+        ])
+        resetMapFrameYawBias()
     }
 
     /// Two near-tied matches describe one place, not a real ambiguity.

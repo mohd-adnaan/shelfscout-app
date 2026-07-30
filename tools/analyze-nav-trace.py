@@ -86,7 +86,10 @@ def report_localization(events):
     interesting = [
         e for e in events
         if e["e"] in {"ar.mappingStarted", "ar.mapLoaded", "ar.localized",
-                      "ar.relocalizeVeto", "ar.poseJump", "ar.frameYawShift"}
+                      "ar.relocalizeVeto", "ar.poseJump", "ar.frameYawShift",
+                      "ar.yawSettleTimeout", "ar.yawBaselineDropped",
+                      "ar.yawSignCalibrated", "ar.fidelityUpgrade",
+                      "nav.frameYawCorrection", "nav.frameYawBiasCleared"}
     ]
     if not interesting:
         return
@@ -133,6 +136,7 @@ def report_localization(events):
                 f"  → revision {event.get('revision')}"
             )
         elif kind == "ar.frameYawShift":
+            published = event.get("published", True)
             print(
                 f"  {clock(event)}  WORLD FRAME ROTATED {event.get('frameRotationDeg', 0):+.1f}°"
                 f"  (AR yaw moved {event.get('arDeltaDeg', 0):+.1f}°,"
@@ -140,8 +144,70 @@ def report_localization(events):
                 f"  {_num(event.get('sinceLocalizedS'), 1)}s after localizing"
                 f"  → revision {event.get('revision')}"
             )
-            print("        ^^ ARKit re-aligned the map frame; the route was resolved"
-                  " in the old one and is being re-resolved")
+            if published:
+                print("        ^^ ARKit re-aligned the map frame; the route was resolved"
+                      " in the old one and is being re-resolved")
+            else:
+                print(f"        ^^ correction HELD BACK by the cooldown"
+                      f" (pending {event.get('pendingRotationDeg', 0):+.1f}°) —"
+                      " the route is still on the old frame until it publishes")
+        elif kind == "ar.yawSettleTimeout":
+            print(
+                f"  {clock(event)}  yaw never settled: promoted anyway after"
+                f" {event.get('waitedSeconds', 0):.1f}s"
+                f"  (spread {event.get('offsetSpreadDeg', 0):.1f}°"
+                f" vs {event.get('allowedDeg', 0):.1f}° allowed)"
+            )
+            print("        ^^ the frame was still moving when the route was locked;"
+                  " the visual yaw bias is the only thing that can fix it now")
+        elif kind == "ar.fidelityUpgrade":
+            print(
+                f"  {clock(event)}  SESSION RE-RUN (fidelity upgrade)"
+                f"  isLocalized={event.get('isLocalized')}"
+                f"  {_num(event.get('sinceLocalizedS'), 1)}s after localizing"
+            )
+            if event.get("isLocalized"):
+                print("        !! this re-runs ARKit on a relocalized session and has"
+                      " reverted the map alignment within ~0.2s in two field traces —"
+                      " expect a frame rotation right after this line")
+        elif kind == "ar.yawBaselineDropped":
+            print(
+                f"  {clock(event)}  yaw baseline dropped (tracking"
+                f" {event.get('trackingState')}, wasLocalized={event.get('wasLocalized')})"
+                "  — frame drift is unmeasurable until the next promotion"
+            )
+        elif kind == "ar.yawSignCalibrated":
+            enabled = event.get("cumulativeDetectorEnabled")
+            print(
+                f"  {clock(event)}  yaw sign convention = {event.get('convention')}"
+                f" ({event.get('votes')} votes) → cumulative detector"
+                f" {'ENABLED' if enabled else 'DISABLED'}"
+            )
+        elif kind == "nav.frameYawCorrection":
+            if event.get("applied"):
+                print(
+                    f"  {clock(event)}  MAP-FRAME YAW BIAS"
+                    f" {event.get('previousBiasDeg', 0):+.1f}° →"
+                    f" {event.get('biasDeg', 0):+.1f}°"
+                    f"  from {event.get('samples')} keyframe measurements"
+                    f" (median {event.get('medianDeg', 0):+.1f}°,"
+                    f" spread {event.get('spreadDeg', 0):.1f}°)"
+                )
+                print("        ^^ the keyframes say the AR frame is rotated this far"
+                      " from the map; the route is being rebuilt on the corrected one")
+            else:
+                print(
+                    f"  {clock(event)}  yaw bias NOT applied: {event.get('reason')}"
+                    f"  ({event.get('samples')} measurements,"
+                    f" median {event.get('medianDeg', 0):+.1f}°,"
+                    f" spread {event.get('spreadDeg', 0):.1f}°)"
+                )
+        elif kind == "nav.frameYawBiasCleared":
+            print(
+                f"  {clock(event)}  yaw bias cleared ({event.get('reason')}):"
+                f" discarded {event.get('discardedBiasDeg', 0):+.1f}°"
+                f" and {event.get('discardedSamples')} measurement(s)"
+            )
 
 
 def report_frame_yaw(events):
@@ -200,11 +266,23 @@ def report_frame_yaw(events):
 
     drifts = [abs(f["frameYawDriftDeg"]) for f in frames
               if isinstance(f.get("frameYawDriftDeg"), (int, float))]
+    localized_frames = [f for f in frames if f.get("isLocalized")]
+    blind = [f for f in localized_frames if f.get("frameYawDriftDeg") is None]
     if drifts:
         print(f"\n  peak |frame yaw drift| since the accepted baseline: {max(drifts):.1f}°")
         if max(drifts) >= 25:
             print("  !! the map frame guidance is steering in is rotated this far"
                   " from the one the route was resolved in")
+    # ⚠️ A null drift on a LOCALIZED frame is not "no drift" — it is no
+    # baseline, so the column is measuring nothing. Reporting a reassuring peak
+    # over the frames that did have one, while saying nothing about the frames
+    # that did not, is how the 2026-07-30 trace announced "peak drift 4.4°" for
+    # a 38° rotation and sent the investigation after a 4° problem.
+    if blind:
+        print(f"  !! {len(blind)}/{len(localized_frames)} localized frames carried NO"
+              " yaw baseline — drift was unmeasurable across them, not zero")
+        print("     (look for ar.yawBaselineDropped; the peak above covers only"
+              " the frames that had one)")
 
     tilted = sum(1 for f in frames if f.get("headingTiltFallback"))
     if tilted:
@@ -400,11 +478,23 @@ def report_evidence(events):
                    if isinstance(e.get("offsetDeg"), (int, float))]
         if offsets:
             worst = max(offsets, key=abs)
+            ordered = sorted(offsets)
+            median = ordered[len(ordered) // 2]
             print(f"  visual yaw offset   {len(offsets)} measurement(s),"
-                  f" worst {worst:+.1f}° (keyframe heading − live heading)")
-            if abs(worst) > 30:
-                print("  !! the map says the camera should be facing something"
-                      " that far off — the AR frame's yaw does not match the map's")
+                  f" median {median:+.1f}°  worst {worst:+.1f}°"
+                  f"  range {ordered[0]:+.1f}…{ordered[-1]:+.1f}"
+                  "  (keyframe heading − live heading)")
+            # The MEDIAN is the number that matters, not the worst: a common
+            # bias under the scatter is the frame being rotated, and it is what
+            # the navigator's map-frame yaw bias acts on. A large worst reading
+            # with a median near zero is one bad match, not a bad frame.
+            if abs(median) > 12:
+                print("  !! a consistent bias this size means the AR frame's yaw"
+                      " does not match the map's — expect a nav.frameYawCorrection")
+            biases = [e.get("biasDeg") for e in yaw_events
+                      if isinstance(e.get("biasDeg"), (int, float))]
+            if biases and any(b != 0 for b in biases):
+                print(f"  bias in force when measured: {biases[0]:+.1f}° → {biases[-1]:+.1f}°")
 
 
 def report_overrides(events):
