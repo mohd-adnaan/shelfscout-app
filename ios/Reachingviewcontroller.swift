@@ -125,6 +125,22 @@ class ReachingViewController: UIViewController {
 
   let detectionUrl: String?
   let initialWorldMap: ARWorldMap?
+  /// The navigation session, still running and already relocalized to the
+  /// map this target lives in. When present, reaching ATTACHES to it instead
+  /// of running its own — see `attachInheritedSession` in +ar.swift for why a
+  /// cold session at the destination is the thing that used to time out.
+  let inheritedSession: ARSession?
+  /// True once we are driving the inherited session (set at attach).
+  var inheritedSessionActive = false
+  /// True once the inherited session has delivered a normally-tracked frame,
+  /// i.e. the inheritance is confirmed good and the cold fallback is off.
+  var inheritedSessionProven = false
+  /// Fires if an attached session never proves itself — the transition can
+  /// outlive the session (screen torn down, tracking lost), and a silent dead
+  /// session would be a worse failure than the cold start it replaced.
+  var inheritedSessionWatchdog: DispatchWorkItem?
+  /// How long an attached session gets to deliver a normally-tracked frame.
+  let inheritedSessionProofTimeoutSec: TimeInterval = 3.0
   let spatialTargetWorldPosition: simd_float3?
   let spatialTargetMapName: String?
   /// true = POI was pinned on the object surface (LiDAR/raycast at mapping
@@ -190,7 +206,14 @@ class ReachingViewController: UIViewController {
   var spatialTargetRelocalizationCueLastAt: TimeInterval = 0
   var spatialTargetRelocalizationCueCount = 0
   let spatialTargetRelocalizationCueIntervalSec: TimeInterval = 7.0
-  let spatialTargetPlacementTimeoutSec: TimeInterval = 18.0
+  /// Budget for a COLD relocalization against the saved map. Inheriting the
+  /// navigation session skips this entirely; when there is nothing to inherit
+  /// the user is standing at a shelf asking ARKit to feature-match a whole
+  /// store map, and 18 s was not a relocalization budget — it was a stopwatch
+  /// on a failure. Navigation's own gate allows 12 s for yaw settling alone
+  /// (ARMappingManager.relocalizationYawSettleMaxWaitSeconds) on top of the
+  /// match itself.
+  let spatialTargetPlacementTimeoutSec: TimeInterval = 45.0
   /// Close-range correction of the map-pin anchor onto live geometry
   /// (see refineSpatialAnchorOnApproach). Locks after the first snap.
   var spatialAnchorSnapHits: [simd_float3] = []
@@ -281,9 +304,6 @@ class ReachingViewController: UIViewController {
   var arFrameCount = 0
   let anchorWaitFrames = 15
   var meshReconstructionEnabled = false
-  /// Set when the AR session started lean to speed up relocalization against a
-  /// saved map; cleared once the mapping features are switched back on.
-  var pendingFidelityUpgrade = false
   var lastFrameProcessedAt: TimeInterval = 0
   let frameProcessInterval: TimeInterval = 0.05
   /// Prevents ARFrame retention: skip new frames while visionQ is still processing
@@ -516,6 +536,7 @@ class ReachingViewController: UIViewController {
        acquisitionUrl: String? = nil,
       sessionId: String? = nil,
        initialWorldMap: ARWorldMap? = nil,
+       inheritedSession: ARSession? = nil,
        spatialTargetWorldPosition: simd_float3? = nil,
        spatialTargetMapName: String? = nil,
        spatialTargetIsSurfacePlacement: Bool = true,
@@ -533,6 +554,7 @@ class ReachingViewController: UIViewController {
     self.imageHeight  = imageHeight
     self.detectionUrl = detectionUrl
     self.initialWorldMap = initialWorldMap
+    self.inheritedSession = inheritedSession
     self.spatialTargetWorldPosition = spatialTargetWorldPosition
     self.spatialTargetMapName = spatialTargetMapName
     self.spatialTargetIsSurfacePlacement = spatialTargetIsSurfacePlacement
@@ -828,6 +850,7 @@ class ReachingViewController: UIViewController {
   func cleanup() {
     running = false; beepTimer?.cancel(); beepTimer = nil
     redetectTimer?.invalidate(); redetectTimer = nil
+    inheritedSessionWatchdog?.cancel(); inheritedSessionWatchdog = nil
     lastARFrame = nil  // release to avoid ARFrame retention warning
     playerNode?.stop(); audioEngine?.stop(); audioEngine = nil
     hapticEngine?.stop(); hapticEngine = nil

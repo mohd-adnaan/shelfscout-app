@@ -159,10 +159,12 @@ extension ReachingViewController {
 
     let elapsed = now - spatialTargetPlacementStartedAt
     if elapsed > spatialTargetPlacementTimeoutSec {
-      NSLog("◎ [SpatialTarget] ❌ Relocalization timed out after %.1fs for %@ on map %@",
-            elapsed, objectName, spatialTargetMapName ?? "unknown")
+      NSLog("◎ [SpatialTarget] ❌ Placement timed out after %.1fs for %@ on map %@ (session=%@, tracking=%@)",
+            elapsed, objectName, spatialTargetMapName ?? "unknown",
+            inheritedSessionActive ? "inherited" : "cold",
+            "\(frame.camera.trackingState)")
       if guidanceAudioEnabled {
-        say("I could not relocalize to the saved map. Try scanning this area again, then retry.")
+        say("I could not line up with the saved map here. Try scanning this area again, then retry.")
       }
       finishWith(success: false, reason: "spatial_relocalization_timeout")
       return
@@ -170,9 +172,11 @@ extension ReachingViewController {
 
     switch frame.camera.trackingState {
     case .normal:
-      // Relocalization landed; restore the mapping features that were held back
-      // to get here quickly (surface snap and extent refinement need them).
-      upgradeToFullFidelityAfterRelocalization()
+      // Nothing to switch on: the session configuration is never re-run after
+      // this point. Re-running it reverts the world-frame yaw, which would
+      // move the map coordinate we are about to place from — see
+      // attachInheritedSession and ARMappingManager.upgradeSessionToFullFidelity.
+      break
     default:
       speakSpatialTargetRelocalizationCueIfNeeded()
       if arFrameCount % 30 == 0 {
@@ -333,11 +337,17 @@ extension ReachingViewController {
     }
     spatialTargetRelocalizationCueLastAt = now
     spatialTargetRelocalizationCueCount += 1
+    // ARKit matches the saved map from PARALLAX, not from a still frame: a
+    // phone held steady at one spot gives it nothing new to match, which is
+    // how a user following "point at the shelf" literally could stand there
+    // until the deadline. Every cue past the first asks for movement.
     switch spatialTargetRelocalizationCueCount {
     case 1:
       say("Finding the saved map. Move the phone slowly and point toward the mapped shelf.")
+    case 2:
+      say("Still matching. Take a small step and sweep the phone slowly across the shelf and what is beside it.")
     default:
-      say("Still matching the map. Keep panning slowly across the shelf in front of you.")
+      say("Still matching. Keep moving slowly — turn a little and look further along the aisle.")
     }
   }
 

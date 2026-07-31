@@ -213,6 +213,11 @@ class ReachingModule: NSObject {
     routeMapId: String? = nil,
     routeMapName: String? = nil,
     targetWorldPosition: simd_float3? = nil,
+    // A live, already-relocalized navigation session to inherit instead of
+    // cold-starting one. Passed directly by the native arrival handoff;
+    // automated arrivals park theirs in `ARLiveSessionHandoff` instead, and
+    // this call picks it up below.
+    liveSession: ARSession? = nil,
     targetRegion: [CGFloat] = [0.42, 0.38, 0.58, 0.62],
     // Defaults resolve per call, so a native caller with nothing to say about
     // guidance style (the route-manager arrival handoff) still runs whatever
@@ -231,6 +236,13 @@ class ReachingModule: NSObject {
       onFailure("BAD_TARGET", "targetName is required for spatial target reaching", nil)
       return
     }
+
+    // Inherit the navigation session when one is on offer: it is already
+    // relocalized to this map, so reaching skips the second relocalization
+    // that was stalling at the shelf. The saved world map is still loaded
+    // below — it is the fallback if the inherited session turns out to be
+    // dead or untracked by the time reaching attaches to it.
+    let inheritedSession = liveSession ?? ARLiveSessionHandoff.shared.claim(mapID: routeMapId)
 
     var resolvedWorldMap: ARWorldMap?
     var resolvedTargetPosition: simd_float3? = targetWorldPosition
@@ -260,14 +272,20 @@ class ReachingModule: NSObject {
         resolvedPOIName = mapContext.poiName
       }
     } catch {
-      if routeMapId?.isEmpty == false || (routeMapName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false) {
+      let namedMapRequested = routeMapId?.isEmpty == false
+        || (routeMapName?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false)
+      // An inherited session already IS the map frame, so a caller-supplied
+      // target position is enough to reach for — a map file that failed to
+      // load only costs us the cold-start fallback and the stored POI record.
+      if namedMapRequested, inheritedSession == nil || resolvedTargetPosition == nil {
+        releaseInheritedSession(inheritedSession)
         onFailure("TARGET_NOT_IN_MAP", error.localizedDescription, error)
         return
       }
       NSLog("◎ [ReachingModule] Spatial target map lookup skipped/fallback: %@", error.localizedDescription)
     }
 
-    if resolvedTargetPosition != nil && resolvedWorldMap == nil {
+    if resolvedTargetPosition != nil && resolvedWorldMap == nil && inheritedSession == nil {
       onFailure(
         "MAP_NOT_FOUND",
         "Spatial Target has a saved target position but no ARWorldMap to relocalize against.",
@@ -277,13 +295,14 @@ class ReachingModule: NSObject {
     }
 
     NSLog(
-      "◎ [ReachingModule] Spatial target=%@ map=%@ world=%@ placement=%@ region=[%.2f,%.2f,%.2f,%.2f] mode=%@",
+      "◎ [ReachingModule] Spatial target=%@ map=%@ world=%@ placement=%@ region=[%.2f,%.2f,%.2f,%.2f] mode=%@ session=%@",
       targetName,
       resolvedMapName ?? "current",
       resolvedTargetPosition.map { String(format: "(%.2f,%.2f,%.2f)", $0.x, $0.y, $0.z) } ?? "nil",
       resolvedIsSurfacePlacement ? "surface" : "camera_pose(legacy)",
       targetRegion[0], targetRegion[1], targetRegion[2], targetRegion[3],
-      mode.rawValue
+      mode.rawValue,
+      inheritedSession == nil ? "cold(relocalize)" : "inherited(navigation)"
     )
 
     let status = AVCaptureDevice.authorizationStatus(for: .video)
@@ -298,6 +317,7 @@ class ReachingModule: NSObject {
         acquisitionUrl: nil,
         sessionId: sessionId,
         initialWorldMap: resolvedWorldMap,
+        inheritedSession: inheritedSession,
         spatialTargetWorldPosition: resolvedTargetPosition,
         spatialTargetMapName: resolvedMapName,
         spatialTargetIsSurfacePlacement: resolvedIsSurfacePlacement,
@@ -308,15 +328,32 @@ class ReachingModule: NSObject {
         ttsRate: ttsRate,
         distanceUnit: distanceUnit,
         resolver: { result in onDone(result as? [String: Any] ?? [:]) },
-        rejecter: { code, message, error in onFailure(code ?? "ERROR", message ?? "Reaching failed.", error) }
+        rejecter: { code, message, error in
+          releaseInheritedSession(inheritedSession)
+          onFailure(code ?? "ERROR", message ?? "Reaching failed.", error)
+        }
       )
     }
     if status == .authorized { launch() }
     else if status == .notDetermined {
       AVCaptureDevice.requestAccess(for: .video) { ok in
-        if ok { launch() } else { onFailure("CAM", "Camera denied", nil) }
+        if ok { launch() } else {
+          releaseInheritedSession(inheritedSession)
+          onFailure("CAM", "Camera denied", nil)
+        }
       }
-    } else { onFailure("CAM", "Camera not authorized", nil) }
+    } else {
+      releaseInheritedSession(inheritedSession)
+      onFailure("CAM", "Camera not authorized", nil)
+    }
+  }
+
+  /// A session we took ownership of but never handed to a reaching screen has
+  /// nobody left to stop it, so the camera would stay live. Release it.
+  private static func releaseInheritedSession(_ session: ARSession?) {
+    guard let session else { return }
+    NSLog("◎ [ReachingModule] Releasing the inherited navigation session — reaching never started")
+    DispatchQueue.main.async { session.pause() }
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -817,6 +854,7 @@ class ReachingModule: NSObject {
     acquisitionUrl: String?,
     sessionId: String?,
     initialWorldMap: ARWorldMap? = nil,
+    inheritedSession: ARSession? = nil,
     spatialTargetWorldPosition: simd_float3? = nil,
     spatialTargetMapName: String? = nil,
     spatialTargetIsSurfacePlacement: Bool = true,
@@ -854,6 +892,7 @@ class ReachingModule: NSObject {
                             acquisitionUrl: acquisitionUrl,
                             sessionId: sessionId,
                             initialWorldMap: initialWorldMap,
+                            inheritedSession: inheritedSession,
                             spatialTargetWorldPosition: spatialTargetWorldPosition,
                             spatialTargetMapName: spatialTargetMapName,
                             spatialTargetIsSurfacePlacement: spatialTargetIsSurfacePlacement,
@@ -886,6 +925,7 @@ class ReachingModule: NSObject {
                                    acquisitionUrl: acquisitionUrl,
                                    sessionId: sessionId,
                                    initialWorldMap: initialWorldMap,
+                                   inheritedSession: inheritedSession,
                                    spatialTargetWorldPosition: spatialTargetWorldPosition,
                                    spatialTargetMapName: spatialTargetMapName,
                                    spatialTargetIsSurfacePlacement: spatialTargetIsSurfacePlacement,
@@ -907,6 +947,7 @@ class ReachingModule: NSObject {
         acquisitionUrl: acquisitionUrl,
         sessionId: sessionId,
         initialWorldMap: initialWorldMap,
+        inheritedSession: inheritedSession,
         spatialTargetWorldPosition: spatialTargetWorldPosition,
         spatialTargetMapName: spatialTargetMapName,
         spatialTargetIsSurfacePlacement: spatialTargetIsSurfacePlacement,

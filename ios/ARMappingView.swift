@@ -625,14 +625,24 @@ struct ARMappingView: View {
         let mapName = manager.activeMapName
         let objectPosition = reachingObjectWorldPosition(for: objectName)
 
-        // Reaching runs its own AR session; release the camera first.
-        manager.stopMapping()
+        // Reaching INHERITS this session instead of starting its own. A cold
+        // reaching session has to relocalize the whole world map a second
+        // time, standing still at the shelf — which is where it stalled and
+        // timed out without ever placing the box. The live session is already
+        // relocalized, so `objectPosition` (a map-frame coordinate) is valid in
+        // it immediately. Only when there is nothing to inherit do we release
+        // the camera and let reaching cold-start.
+        let liveSession = manager.detachLiveSessionForHandoff(reason: "manual_arrival_reaching")
+        if liveSession == nil {
+            manager.stopMapping()
+        }
 
         ReachingModule.launchSpatialTargetReaching(
             targetName: objectName,
             routeMapId: mapId,
             routeMapName: mapName,
             targetWorldPosition: objectPosition,
+            liveSession: liveSession,
             voiceOverEnabled: launchVoiceOverEnabled,
             onFailure: { _, message, _ in
                 DispatchQueue.main.async {
@@ -1137,6 +1147,18 @@ struct ARMappingView: View {
             message: message
         )
         result.sessionAlive = keepSessionAlive
+
+        // Automated arrival with a reaching object: this screen is about to be
+        // torn down, JS speaks the switch-over line, and only then calls back
+        // through the bridge to start reaching. Park the live, relocalized
+        // session in the handoff holder so reaching inherits it across that
+        // gap instead of cold-relocalizing the map at the shelf (which is what
+        // stalled and timed out). Unclaimed offers pause themselves.
+        if reachingObjectName != nil,
+           let live = mappingManager.detachLiveSessionForHandoff(reason: "automated_arrival_reaching") {
+            ARLiveSessionHandoff.shared.offer(session: live, mapID: mappingManager.activeMapID)
+        }
+
         onAutomationComplete?(result)
     }
 

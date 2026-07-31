@@ -25,6 +25,141 @@ extension ReachingViewController {
   }
 
   func startAR() {
+    // Inheriting the live navigation session is the fast path: it is already
+    // relocalized, so there is nothing to wait for. Only cold-start when there
+    // is nothing to inherit.
+    if attachInheritedSession() { return }
+    startColdARSession()
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Inherited (handed-off) session
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  /// Attaches to the navigation session handed over at arrival.
+  ///
+  /// ## Why this exists
+  ///
+  /// Reaching used to run its own session with `initialWorldMap` +
+  /// `.resetTracking`, which meant the user had to relocalize the entire world
+  /// map a SECOND time — standing at the shelf, barely moving, with the target
+  /// filling the frame. That is the worst case for ARKit's feature matching,
+  /// and it is where the session sat repeating "point toward the mapped shelf"
+  /// until the placement deadline killed it. The box never appeared because
+  /// tracking never reached `.normal`.
+  ///
+  /// The navigation session next to it was already localized in that exact
+  /// map. Inheriting it means the POI coordinate is valid on the first frame.
+  ///
+  /// ## What is deliberately NOT done here
+  ///
+  /// The configuration is left exactly as navigation was running it. Re-running
+  /// a relocalized session (even without reset options, even to only add plane
+  /// detection) has twice been caught reverting the world-frame yaw by ~30°
+  /// within 0.2 s — see `ARMappingManager.upgradeSessionToFullFidelity`. A
+  /// rotated world frame moves a map-frame POI sideways by r·θ, which is the
+  /// "box glued a metre off the object" failure. Refinement quality is worth
+  /// far less than the frame the anchor is expressed in, so we take the
+  /// session as it is: raycasting still works (`.estimatedPlane` does not need
+  /// plane detection, and on LiDAR devices ARKit raycasts against its internal
+  /// depth regardless), and extent refinement is Vision-only anyway.
+  private func attachInheritedSession() -> Bool {
+    guard let session = inheritedSession else { return false }
+    guard let config = session.configuration else {
+      // Never ran, so there is no tracking to inherit. Release it rather than
+      // leaving an ownerless session holding the camera next to our own.
+      NSLog("📷 [ReachingVC] Handed-off session never ran a configuration — cold start instead")
+      session.pause()
+      return false
+    }
+
+    sceneView.session = session
+    // Navigation drives its delegate on a background queue; every reaching
+    // callback assumes the main queue (nil == main).
+    session.delegateQueue = nil
+    session.delegate = self
+    inheritedSessionActive = true
+    inheritedSessionProven = false
+
+    // Report what the running session actually delivers, not what the device
+    // could do: navigation's relocalization config carries no scene depth, so
+    // `frame.sceneDepth` will be nil no matter how Pro the phone is.
+    let deviceHasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
+    hasLiDAR = deviceHasLiDAR && config.frameSemantics.contains(.sceneDepth)
+    meshReconstructionEnabled = (config as? ARWorldTrackingConfiguration)?.sceneReconstruction == .mesh
+
+    startBeepLoop()
+    startRedetectionLoop()
+    armInheritedSessionWatchdog()
+
+    NSLog("📷 [ReachingVC] 🤝 Attached to the live navigation session — map=%@ alignment=%@ sceneDepth=%@ planes=%@",
+          spatialTargetMapName ?? "unknown",
+          config.worldAlignment == .gravity ? "gravity" : "gravityAndHeading",
+          hasLiDAR ? "YES" : "NO",
+          (config as? ARWorldTrackingConfiguration).map { $0.planeDetection.isEmpty ? "NO" : "YES" } ?? "?")
+    return true
+  }
+
+  /// An attached session that never delivers a normally-tracked frame is a
+  /// dead handoff (torn down during the transition, or tracking lost on the
+  /// way over). Rather than hang silently, drop it and do what reaching always
+  /// did: cold-start against the saved map.
+  private func armInheritedSessionWatchdog() {
+    inheritedSessionWatchdog?.cancel()
+    let work = DispatchWorkItem { [weak self] in
+      guard let self = self else { return }
+      guard self.inheritedSessionActive, !self.inheritedSessionProven,
+            !self.hasCompleted, !self.anchorPlaced else { return }
+      NSLog("📷 [ReachingVC] ⚠️ Handed-off session never tracked in %.1fs — falling back to a cold relocalization",
+            self.inheritedSessionProofTimeoutSec)
+      self.startColdARSession()
+    }
+    inheritedSessionWatchdog = work
+    DispatchQueue.main.asyncAfter(deadline: .now() + inheritedSessionProofTimeoutSec, execute: work)
+  }
+
+  /// Called from the frame handler the first time the inherited session tracks
+  /// normally: the handoff is good, so the watchdog stands down.
+  func confirmInheritedSessionTracking() {
+    guard inheritedSessionActive, !inheritedSessionProven else { return }
+    inheritedSessionProven = true
+    inheritedSessionWatchdog?.cancel()
+    inheritedSessionWatchdog = nil
+    NSLog("📷 [ReachingVC] ✅ Inherited session is tracking normally — no relocalization needed")
+  }
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // MARK: - Cold session
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  private func startColdARSession() {
+    inheritedSessionWatchdog?.cancel()
+    inheritedSessionWatchdog = nil
+    if inheritedSessionActive {
+      // The handoff failed. Let go of that session completely — a fresh one
+      // keeps the fallback identical to a normal launch.
+      inheritedSessionActive = false
+      inheritedSessionProven = false
+      let stale = sceneView.session
+      stale.delegate = nil
+      stale.pause()
+      sceneView.session = ARSession()
+      sceneView.session.delegate = self
+      // The loops below are started again at the end of this method; the beep
+      // timer has to be cancelled first or the dropped one keeps firing.
+      beepTimer?.cancel()
+      beepTimer = nil
+      // Placement gates count frames and elapsed time from session start, and
+      // the narration starts over from the first cue.
+      arFrameCount = 0
+      spatialTargetPlacementStartedAt = 0
+      spatialTargetFirstNormalAt = 0
+      spatialPOIAnchorUUID = nil
+      spatialPOIAnchorLastPosition = nil
+      spatialTargetRelocalizationCueCount = 0
+      spatialTargetRelocalizationCueLastAt = 0
+    }
+
     let config = ARWorldTrackingConfiguration()
     config.initialWorldMap = initialWorldMap
     if initialWorldMap != nil {
@@ -39,28 +174,36 @@ extension ReachingViewController {
     } else {
       config.worldAlignment = .gravityAndHeading
     }
-    hasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
-    if hasLiDAR {
-      NSLog("📷 [ReachingVC] ✅ LiDAR DETECTED (Pro device) — using LiDAR metric depth for anchor seeding")
-      NSLog("📷 [ReachingVC] 🔬 Depth source: LiDAR sceneDepth (metric, no calibration needed)")
-    } else {
-      NSLog("📷 [ReachingVC] ❌ No LiDAR (non-Pro device) — using Qwen backend depth + ARKit raycast refinement")
-      NSLog("📷 [ReachingVC] 🔬 Depth source: Qwen/backend relative depth → ARKit estimatedPlane refinement")
-    }
+    let deviceHasLiDAR = ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth)
 
     // Relocalizing against a saved map is the slow, blocking step here: the
     // target box cannot be placed until tracking reaches .normal. Plane
     // detection, scene depth and mesh reconstruction all run per frame and
-    // compete with ARKit's feature matching for the same budget, so hold them
-    // back until relocalization lands (upgradeToFullFidelityAfterRelocalization)
-    // rather than making the user wait on "pan around" with no box.
+    // compete with ARKit's feature matching for the same budget, so the map
+    // path runs lean.
+    //
+    // The lean config then stays for the whole session. It used to be swapped
+    // back to the full one the moment relocalization landed, but re-running a
+    // relocalized session has twice been caught reverting the world-frame yaw
+    // by ~30° right afterwards (see ARMappingManager.upgradeSessionToFullFidelity),
+    // and a rotated frame drags every map-frame coordinate sideways with it —
+    // the exact "box a metre off the pinned object" report. Raycast refinement
+    // survives without it: `.estimatedPlane` needs no plane anchors, and on
+    // LiDAR devices ARKit raycasts against its internal depth either way.
     if initialWorldMap != nil {
       config.planeDetection = []
-      pendingFidelityUpgrade = true
+      hasLiDAR = false
+      NSLog("📷 [ReachingVC] Map-relocalization session — lean config (no planes/depth/mesh), kept for the whole session")
     } else {
       config.planeDetection = [.horizontal, .vertical]
+      hasLiDAR = deviceHasLiDAR
       if hasLiDAR {
         config.frameSemantics.insert(.sceneDepth)
+        NSLog("📷 [ReachingVC] ✅ LiDAR DETECTED (Pro device) — using LiDAR metric depth for anchor seeding")
+        NSLog("📷 [ReachingVC] 🔬 Depth source: LiDAR sceneDepth (metric, no calibration needed)")
+      } else {
+        NSLog("📷 [ReachingVC] ❌ No LiDAR (non-Pro device) — using Qwen backend depth + ARKit raycast refinement")
+        NSLog("📷 [ReachingVC] 🔬 Depth source: Qwen/backend relative depth → ARKit estimatedPlane refinement")
       }
       if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
         config.sceneReconstruction = .mesh
@@ -83,28 +226,6 @@ extension ReachingViewController {
     }
   }
 
-  /// Switches the lean relocalization session back to the full mapping feature
-  /// set once tracking is established. Runs WITHOUT reset options so the hard-won
-  /// relocalized tracking state and the restored POI anchors survive; the
-  /// `.gravity` alignment is preserved because changing it mid-session would
-  /// move the world origin the placed anchor is expressed in.
-  func upgradeToFullFidelityAfterRelocalization() {
-    guard pendingFidelityUpgrade else { return }
-    pendingFidelityUpgrade = false
-
-    let config = ARWorldTrackingConfiguration()
-    config.worldAlignment = .gravity
-    config.planeDetection = [.horizontal, .vertical]
-    if hasLiDAR {
-      config.frameSemantics.insert(.sceneDepth)
-    }
-    if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
-      config.sceneReconstruction = .mesh
-      meshReconstructionEnabled = true
-    }
-    sceneView.session.run(config)
-    NSLog("📷 [ReachingVC] Relocalized — plane detection, depth and mesh re-enabled")
-  }
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Place World Anchor
@@ -1070,6 +1191,12 @@ extension ReachingViewController {
 extension ReachingViewController: ARSessionDelegate {
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
     guard running, !hasCompleted else { return }
+    // Ahead of the frame throttle so the handoff proof can never be starved by
+    // a busy vision queue — this is the signal the watchdog is waiting for.
+    if inheritedSessionActive, !inheritedSessionProven,
+       case .normal = frame.camera.trackingState {
+      confirmInheritedSessionTracking()
+    }
     let now = ProcessInfo.processInfo.systemUptime
     guard now - lastFrameProcessedAt >= frameProcessInterval else { return }
     // Skip if visionQ is still processing a previous frame (prevents ARFrame retention buildup)

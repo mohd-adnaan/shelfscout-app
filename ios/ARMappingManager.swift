@@ -72,6 +72,10 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     @Published private(set) var recognizedPlaceName: String?
 
     let session = ARSession()
+    /// True while another owner (the reaching session) is driving this session.
+    /// Teardown must not pause it then — the point of the handoff is that
+    /// reaching inherits tracking that is *already* relocalized.
+    private(set) var isSessionHandedOff = false
     private let sessionDelegateQueue = DispatchQueue(label: "placefinder.arkit.mapping.session", qos: .userInitiated)
     private let poiRecordsQueue = DispatchQueue(label: "placefinder.arkit.mapping.poi-records", attributes: .concurrent)
     private let imuMotionQueue = DispatchQueue(label: "placefinder.arkit.mapping.imu-motion", attributes: .concurrent)
@@ -249,6 +253,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         // alignment against.
         expectedRestoredPOICount = 0
         locallyCreatedAnchorIDs.removeAll()
+        reclaimSessionAfterHandoff()
         let config = makeWorldTrackingConfiguration()
         // The capture frame's yaw origin. A map recorded under one alignment
         // and relocalized under another is the first thing to rule out when
@@ -300,7 +305,15 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     }
     
     func stopMapping() {
-        session.pause()
+        // A handed-off session belongs to reaching now. Pausing it here would
+        // undo the whole handoff: the JS arrival path tears this screen down
+        // (handleDisappear → stopMapping) in the seconds between the offer and
+        // reaching claiming it, and a paused session delivers no frames.
+        if isSessionHandedOff {
+            NSLog("🗺️ [ARMapping] stopMapping while session is handed off — leaving the session running for reaching")
+        } else {
+            session.pause()
+        }
         isMapping = false
         isRelocalizing = false
         isLocalized = false
@@ -326,7 +339,99 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         resetStableMatch()
         resetMotionReference()
     }
-    
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // MARK: - Live session handoff (navigation → reaching)
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Hands the live, already-relocalized session to the reaching flow.
+    ///
+    /// Reaching used to start a COLD session (`initialWorldMap` +
+    /// `.resetTracking`) at arrival, which asked the user to relocalize the
+    /// whole world map a SECOND time — standing at a shelf, barely moving,
+    /// with an 18 s budget. Relocalization at journey start only succeeds
+    /// because the user deliberately turns a full circle there; at the
+    /// destination it stalls, so the box never got placed and reaching timed
+    /// out with "point toward the mapped shelf" on repeat.
+    ///
+    /// Inheriting the session removes that second relocalization entirely: the
+    /// map frame is already established, the POI ARAnchors are already
+    /// restored, and a POI coordinate read out of `mapPOIs` is *already* valid
+    /// in the frame reaching is about to render.
+    ///
+    /// The session is NOT paused and its config is NOT re-run — see
+    /// `upgradeSessionToFullFidelity` for why re-running a relocalized session
+    /// is off the table. Returns nil when there is nothing worth inheriting,
+    /// and the caller falls back to the old cold start.
+    func detachLiveSessionForHandoff(reason: String) -> ARSession? {
+        guard session.configuration != nil, sessionMode != .idle else {
+            NSLog("🗺️ [ARMapping] No live session to hand off (%@) — mode=%@", reason, "\(sessionMode)")
+            return nil
+        }
+        // A session that never localized carries no map frame, so its poses
+        // mean nothing to a map-frame POI coordinate. A fresh capture session
+        // IS the map frame, so it qualifies too.
+        guard isLocalized || isMapping else {
+            NSLog("🗺️ [ARMapping] Live session not localized — cold reaching start (%@)", reason)
+            return nil
+        }
+
+        NavigationTrace.shared.log("ar.sessionHandoff", [
+            "reason": reason,
+            "isLocalized": isLocalized,
+            "isMapping": isMapping,
+            "mapID": activeMapID ?? NSNull()
+        ])
+        NSLog("🗺️ [ARMapping] 🤝 Handing live session to reaching (%@) — localized=%@ map=%@",
+              reason, isLocalized ? "YES" : "NO", activeMapName ?? "none")
+
+        isSessionHandedOff = true
+        // Stop consuming frames on our side; reaching installs its own
+        // delegate. Without this the manager keeps publishing pose updates
+        // into a screen that is being torn down.
+        session.delegate = nil
+
+        // Same published-state reset as stopMapping, minus the pause.
+        isMapping = false
+        isRelocalizing = false
+        isLocalized = false
+        isSavingMap = false
+        relocalizationNormalSince = nil
+        preLocalizationPosition = nil
+        previousPublishedPosition = nil
+        localizedAt = nil
+        resetWorldFrameYawWatch()
+        sessionMode = .idle
+        mappingStatus = .notAvailable
+        currentPositionText = ""
+        closestPOI = nil
+        poiMatchStatusText = nil
+        cameraMapPosition = nil
+        cameraMapForward = nil
+        arHeadingDegrees = nil
+        lastVisualMatchTime = 0
+        lastVisualMatchResult = nil
+        lastVisualMatchCandidates = nil
+        poseEvidenceWindow.removeAll()
+        localizationCandidates.removeAll()
+        resetStableMatch()
+        resetMotionReference()
+
+        return session
+    }
+
+    /// Takes the session back before a mapping/relocalization run. Both entry
+    /// points re-run it with `.resetTracking`, so whatever reaching left behind
+    /// is discarded — only the delegate has to be re-installed, because the
+    /// handoff cleared it.
+    private func reclaimSessionAfterHandoff() {
+        guard isSessionHandedOff else { return }
+        isSessionHandedOff = false
+        session.delegate = self
+        session.delegateQueue = sessionDelegateQueue
+        NSLog("🗺️ [ARMapping] Reclaimed the AR session after a reaching handoff")
+    }
+
     func saveMap(named requestedName: String? = nil) {
         isSavingMap = true
         let existingMetadata = activeMapMetadata
@@ -485,6 +590,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     // survives; every named anchor from here is the map's.
                     self.locallyCreatedAnchorIDs.removeAll()
                     self.lastTracedVetoReason = nil
+                    self.reclaimSessionAfterHandoff()
                     let config = self.makeWorldTrackingConfiguration(initialWorldMap: map, lightweight: true)
                     NavigationTrace.shared.log("ar.mapLoaded", [
                         "mapID": metadata.id,
@@ -3622,6 +3728,97 @@ struct WorldFrameYawWatch {
         if delta > 180 { delta -= 360 }
         if delta < -180 { delta += 360 }
         return delta
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// MARK: - Live session handoff holder
+// ═══════════════════════════════════════════════════════════════════════════
+
+/// Carries a live, relocalized ARSession across the gap between navigation
+/// ending and reaching starting.
+///
+/// The native (route-manager) arrival hands the session straight to
+/// `ReachingModule.launchSpatialTargetReaching`. The automated arrival cannot:
+/// it resolves to JS, JS speaks the "switching to reaching" line, and only
+/// then calls back down through the bridge — several seconds later, with the
+/// navigation screen already dismissed. This holder keeps the session alive
+/// (and, crucially, unpaused) across that gap, then hands it to whichever
+/// reaching launch shows up first.
+///
+/// If nobody claims it, the session is paused and released, so a dropped
+/// handoff can never leave the camera running behind the user's back.
+final class ARLiveSessionHandoff: @unchecked Sendable {
+    static let shared = ARLiveSessionHandoff()
+
+    private let lock = NSLock()
+    private var heldSession: ARSession?
+    private var heldMapID: String?
+    private var expiry: DispatchWorkItem?
+
+    /// Long enough for the JS round trip (arrival → announcement → bridge call
+    /// → up to 3.6 s of modal-presentation retries), short enough that a
+    /// dropped handoff releases the camera promptly.
+    private let holdSeconds: TimeInterval = 25
+
+    private init() {}
+
+    func offer(session: ARSession, mapID: String?) {
+        lock.lock()
+        expiry?.cancel()
+        heldSession = session
+        heldMapID = mapID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let work = DispatchWorkItem { [weak self] in self?.expire() }
+        expiry = work
+        lock.unlock()
+        NSLog("🤝 [SessionHandoff] Live session offered for map %@ — held for %.0fs",
+              mapID ?? "unknown", holdSeconds)
+        DispatchQueue.main.asyncAfter(deadline: .now() + holdSeconds, execute: work)
+    }
+
+    /// Takes the offered session, if one is waiting and it belongs to the map
+    /// the caller is reaching in. A map mismatch is left alone rather than
+    /// claimed: a session relocalized to a different map would place the box
+    /// from coordinates that mean nothing in its frame.
+    func claim(mapID: String?) -> ARSession? {
+        lock.lock()
+        defer { lock.unlock() }
+        guard let session = heldSession else { return nil }
+        let wanted = mapID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let held = heldMapID ?? ""
+        if !wanted.isEmpty, !held.isEmpty, wanted != held {
+            NSLog("🤝 [SessionHandoff] Offered session is for map %@, reaching wants %@ — not claiming",
+                  held, wanted)
+            return nil
+        }
+        expiry?.cancel()
+        expiry = nil
+        heldSession = nil
+        heldMapID = nil
+        NSLog("🤝 [SessionHandoff] ✅ Reaching claimed the live navigation session")
+        return session
+    }
+
+    /// Drops the offer. `pauseSession: true` releases the camera — used when
+    /// nobody is going to claim it.
+    func discard(pauseSession: Bool) {
+        lock.lock()
+        expiry?.cancel()
+        expiry = nil
+        let session = heldSession
+        heldSession = nil
+        heldMapID = nil
+        lock.unlock()
+        guard let session else { return }
+        NSLog("🤝 [SessionHandoff] Offer discarded (pause=%@)", pauseSession ? "YES" : "NO")
+        if pauseSession {
+            DispatchQueue.main.async { session.pause() }
+        }
+    }
+
+    private func expire() {
+        NSLog("🤝 [SessionHandoff] ⏳ Nobody claimed the live session — pausing it")
+        discard(pauseSession: true)
     }
 }
 
