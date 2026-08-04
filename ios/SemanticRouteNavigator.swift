@@ -364,7 +364,17 @@ struct SemanticRouteCaptureQuality: Codable, Equatable {
     var hasMinimumSpatialEvidence: Bool
     var hasMinimumVisualEvidence: Bool
     var warnings: [String]
+    /// Nodes the route passes close to while heading somewhere materially
+    /// different — a corridor walked more than once. Distinct from
+    /// `aliasedVisualSampleCount`, which only knows whether two places *look*
+    /// alike; this counts places that overlap in space. Optional so maps saved
+    /// before the check decode as "not measured" rather than failing.
+    var overlappingCorridorCount: Int?
 
+    /// Deliberately not part of the pass/fail gate. Retracing a corridor is
+    /// often forced by the building — a dead-end wing has to be walked back
+    /// out of — so refusing the save would block maps that are the best
+    /// obtainable. It is surfaced as a warning instead.
     var isSufficientForGuidance: Bool {
         hasMinimumSpatialEvidence && hasMinimumVisualEvidence && aliasedVisualSampleCount <= max(1, visualSampleCount / 3)
     }
@@ -657,6 +667,10 @@ final class SemanticRouteNavigator: ObservableObject {
     /// looping the same recovery cue.
     private let beliefRebuildAfterSeconds: TimeInterval = 12.0
     private let routeRebuildRetrySeconds: TimeInterval = 4.0
+    /// Extra walking a rebuild may add before it reads as a wrong-edge
+    /// resolution rather than a correction. Scaled against the remaining route
+    /// as well, so short final legs are not judged by an absolute metre count.
+    private let routeRebuildRegressionMarginMeters = 3.0
     private let postRecoveryAlignmentWindowSeconds: TimeInterval = 6.0
     /// AR must disagree with a dead-reckoned step completion by more than
     /// this before the advance is blocked.
@@ -670,6 +684,11 @@ final class SemanticRouteNavigator: ObservableObject {
     private let targetNodeSnapDistance = 0.35
     private let manualNodeSnapDistance = 0.28
     private let routeStartEdgeSnapThreshold = 1.6
+    /// How many of the nearest edges start resolution scores. One is not
+    /// enough on a route that doubles back through its own corridor; a
+    /// handful covers every overlap seen in captured maps without making the
+    /// resolve loop meaningfully more expensive.
+    private let routeStartEdgeCandidateLimit = 8
     /// A final leg this short was never a walk: in a narrow aisle the mapper
     /// pins a node at arm's length from the shelf so arrival can say which way
     /// to face. Guiding it as a segment sends the user walking into the shelf.
@@ -942,6 +961,14 @@ final class SemanticRouteNavigator: ObservableObject {
     private struct NavigationStart {
         var nodePath: [String]
         var initialProgressMeters: Double
+    }
+
+    /// One edge of the route graph with the pose projected onto it. Named
+    /// members rather than a tuple so a ranked list of them stays readable.
+    private struct EdgeMatch {
+        var edge: SemanticRouteEdge
+        var alongTrackMeters: Double
+        var crossTrackMeters: Double
     }
 
     private struct VisualFingerprintSample {
@@ -2067,7 +2094,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastTrackingLimitedPrefixAt = nil
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
-        didCorroborateHeadingVisually = false
+        // `didCorroborateHeadingVisually` is cleared by resetMapFrameYawBias().
         resetMapFrameYawBias()
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
@@ -2187,7 +2214,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastTrackingLimitedPrefixAt = nil
         lastVisualRouteMatchAt = 0
         lastVisualRouteMatch = nil
-        didCorroborateHeadingVisually = false
+        // `didCorroborateHeadingVisually` is cleared by resetMapFrameYawBias().
         resetMapFrameYawBias()
         arrivalVisualHoldStartedAt = nil
         lastRouteAdvanceAt = nil
@@ -3601,14 +3628,39 @@ final class SemanticRouteNavigator: ObservableObject {
         let steps = shaped.steps
         guard let firstStep = steps.first else { return false }
 
+        let proposedProgress = shaped.droppedLeadingStub
+            ? 0
+            : min(max(start.initialProgressMeters, 0), firstStep.edge.distanceMeters)
+        if let regression = routeRebuildRegression(
+            proposedSteps: steps,
+            proposedProgressMeters: proposedProgress,
+            arPosition: arPosition,
+            imuState: imuState,
+            in: map
+        ) {
+            // Walking the user backwards is worse than admitting confusion. One
+            // captured session had them 6.4 m from the destination on the final
+            // leg when a rebuild resolved onto a parallel edge 0.34 m away and
+            // handed back a 12.5 m route through a POI already passed; the next
+            // 16 s were contradictory turn cues. Refusing leaves the belief hold
+            // in charge, which stops the user instead of misrouting them, and
+            // the retry timer takes another look once evidence moves.
+            NavigationTrace.shared.log("nav.rebuildRejected", traceState(extra: [
+                "reason": "backward_regression",
+                "currentTotalRemainingM": regression.currentTotalMeters,
+                "proposedTotalRemainingM": regression.proposedTotalMeters,
+                "crossTrackToCurrentRouteM": regression.crossTrackMeters,
+                "nodePath": start.nodePath
+            ]))
+            return false
+        }
+
         routeSteps = steps
         arrivalFacing = shaped.arrivalFacing
         currentStepIndex = 0
         leadingStubBearingDegrees = shaped.droppedLeadingStubBearingDegrees
         leadingStubMeters = shaped.droppedLeadingStubMeters
-        segmentProgressMeters = shaped.droppedLeadingStub
-            ? 0
-            : min(max(start.initialProgressMeters, 0), firstStep.edge.distanceMeters)
+        segmentProgressMeters = proposedProgress
         segmentRemainingMeters = max(0, firstStep.edge.distanceMeters - segmentProgressMeters)
         resetLegCueSchedule()
         lastAnnouncedLandmarkID = nil
@@ -3624,13 +3676,19 @@ final class SemanticRouteNavigator: ObservableObject {
         resetRouteBelief(status: .initializing)
         phase = .navigating
         updateInstruction(forceSpeech: false)
+        // Banner keeps the prefix, speech drops it. A realignment is bookkeeping
+        // the user cannot act on, and it is not rare: five rebuilds fired in the
+        // 19 s after one relocalization, so the ear got "Route realigned from
+        // your position" five times and the direction that followed it four
+        // times too late to matter. The instruction alone is the actionable part.
+        let spokenInstruction = currentInstruction
         currentInstruction = NavLoc.routeRealignedPrefix() + currentInstruction
         NavigationTrace.shared.log("nav.rebuild", traceState(extra: [
             "nodePath": start.nodePath,
             "droppedLeadingStub": shaped.droppedLeadingStub,
             "legs": traceLegs()
         ]))
-        emitCue(currentInstruction, priority: .critical)
+        emitCue(spokenInstruction, priority: .critical)
         // The realignment cue carries the new direction, so it claims the turn
         // slot: an alignment nudge on the very next tick would stack a second
         // turn command onto it.
@@ -3640,6 +3698,57 @@ final class SemanticRouteNavigator: ObservableObject {
         lastHeadingAlignmentErrorDegrees = nil
         rebuildRAGContext()
         return true
+    }
+
+    /// Detects a rebuild that would send a user who is demonstrably still on
+    /// their route substantially further from the destination than they
+    /// already are — the signature of start resolution latching onto the wrong
+    /// edge in a corridor the route retraces.
+    ///
+    /// The on-route test is what keeps this from blocking honest rebuilds: a
+    /// user who really has wandered off sits far from every remaining leg, and
+    /// for them a longer route is the correct answer, not a regression.
+    /// Returns nil when the rebuild is acceptable.
+    private func routeRebuildRegression(
+        proposedSteps: [SemanticRouteStep],
+        proposedProgressMeters: Double,
+        arPosition: simd_float3?,
+        imuState: IMUState,
+        in map: SemanticRouteMap
+    ) -> (currentTotalMeters: Double, proposedTotalMeters: Double, crossTrackMeters: Double)? {
+        let livePose = map.coordinateSpace == "ar_world_xz"
+            ? Self.routePoint(from: arPosition)
+            : SemanticRoutePoint(x: imuState.position.x, y: imuState.position.y)
+        guard !proposedSteps.isEmpty,
+              currentStepIndex < routeSteps.count,
+              let pose = livePose
+        else { return nil }
+
+        // Only the legs still to be walked. Standing on an already-completed
+        // leg means the user genuinely did go backwards, and re-routing them
+        // the long way round is then the honest answer.
+        let remainingSteps = routeSteps[currentStepIndex...]
+        let crossTrack = remainingSteps
+            .map { Self.project(pose, onto: $0).crossTrackMeters }
+            .min() ?? .greatestFiniteMagnitude
+        guard crossTrack <= recoverySnapThreshold else { return nil }
+
+        let currentTotal = remainingSteps.enumerated().reduce(0.0) { partial, pair in
+            pair.offset == 0
+                ? partial + max(0, pair.element.edge.distanceMeters - segmentProgressMeters)
+                : partial + pair.element.edge.distanceMeters
+        }
+        guard currentTotal > 0 else { return nil }
+
+        let proposedTotal = proposedSteps.enumerated().reduce(0.0) { partial, pair in
+            pair.offset == 0
+                ? partial + max(0, pair.element.edge.distanceMeters - proposedProgressMeters)
+                : partial + pair.element.edge.distanceMeters
+        }
+
+        let allowance = max(routeRebuildRegressionMarginMeters, currentTotal * 0.5)
+        guard proposedTotal > currentTotal + allowance else { return nil }
+        return (currentTotal, proposedTotal, crossTrack)
     }
 
     /// Off-corridor recovery beyond orientation nudges: routes from the live
@@ -3771,8 +3880,13 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         updateInstruction(forceSpeech: false)
         if announce, hadSpokenCue {
+            // Banner keeps the prefix, speech drops it — same reasoning as the
+            // realignment cue. "Back on route" was spoken 12 times in a single
+            // 2-minute walk; re-stating the direction already tells the user
+            // guidance is live again, without spending a sentence saying so.
+            let spokenInstruction = currentInstruction
             currentInstruction = NavLoc.backOnRoutePrefix() + currentInstruction
-            emitCue(currentInstruction, priority: .priority)
+            emitCue(spokenInstruction, priority: .priority)
         }
     }
 
@@ -5552,23 +5666,40 @@ final class SemanticRouteNavigator: ObservableObject {
     /// re-relocalized is silently applied to a frame it was never measured
     /// against, and there is no evidence on hand to notice that. Re-measuring
     /// costs a few visual matches at the start of the next leg.
+    /// Clearing the bias MUST also disarm the heading gate. The gate filters
+    /// keyframes against the live heading, and it is only legitimate because a
+    /// match once confirmed that heading. Discarding the bias discards exactly
+    /// that confirmation, so leaving the gate armed points it at a heading now
+    /// known to be uncorrected — and it then throws away the keyframes that
+    /// disagree, which are the very ones that could re-measure the bias.
+    ///
+    /// That is not hypothetical. In the 2026-08-01 IGA run a bias of +13.6°
+    /// measured from 3 keyframes agreeing to within 0.3° was cleared by a frame
+    /// realignment at t=35.7 s. The gate stayed on, visual matching fell from
+    /// 37% to 8.5% (mean similarity 0.406 against a 0.440 bar), no residual
+    /// could be gathered, and the frame ran 64.6° out for the rest of the walk
+    /// with no way back. The two journey-scoped callers already paired these
+    /// two resets by hand; keeping the pairing here makes it structural.
     private func resetMapFrameYawBias() {
         mapFrameYawBiasDegrees = 0
         visualYawResiduals.removeAll()
         lastYawBiasCorrectionAt = nil
         pendingFrameYawRealignment = false
+        didCorroborateHeadingVisually = false
     }
 
     /// ARKit itself moved the world frame. Everything measured about the old
     /// frame's rotation is void — the error may have been corrected, made
     /// worse, or replaced — so the bias goes back to zero and the keyframes
-    /// re-measure against whatever frame is now live.
+    /// re-measure against whatever frame is now live, ungated until one lands.
     func noteARFrameRealigned() {
-        guard mapFrameYawBiasDegrees != 0 || !visualYawResiduals.isEmpty else { return }
+        guard mapFrameYawBiasDegrees != 0 || !visualYawResiduals.isEmpty
+            || didCorroborateHeadingVisually else { return }
         NavigationTrace.shared.log("nav.frameYawBiasCleared", [
             "reason": "ar_frame_realigned",
             "discardedBiasDeg": mapFrameYawBiasDegrees,
-            "discardedSamples": visualYawResiduals.count
+            "discardedSamples": visualYawResiduals.count,
+            "gateWasArmed": didCorroborateHeadingVisually
         ])
         resetMapFrameYawBias()
     }
@@ -6096,58 +6227,82 @@ final class SemanticRouteNavigator: ObservableObject {
             ? Self.routePoint(from: arPosition)
             : SemanticRoutePoint(x: imuState.position.x, y: imuState.position.y)
 
-        if let edgeMatch = nearestEdge(in: map, to: pose),
-           edgeMatch.crossTrackMeters <= routeStartEdgeSnapThreshold {
-            var options: [(path: [String], progress: Double, cost: Double)] = []
+        // Every edge the user could plausibly be standing on, not just the
+        // closest. Costs below are absolute metres-to-target, so they compare
+        // across edges as readily as they compare the two directions along one.
+        let candidateEdges = nearestEdges(in: map, to: pose, limit: routeStartEdgeCandidateLimit)
+            .filter { $0.crossTrackMeters <= routeStartEdgeSnapThreshold }
+        if !candidateEdges.isEmpty {
+            var options: [(path: [String], progress: Double, cost: Double, edgeID: String, crossTrack: Double)] = []
 
-            let forwardTail = shortestPath(in: map, from: edgeMatch.edge.toNodeID, to: targetNodeID)
-            // A tail that immediately doubles back through the node behind the
-            // user describes the reverse option with a pointless out-and-back
-            // leg bolted on. Their costs tie when the user stands on the node,
-            // so the heading penalty alone could pick the U-turn.
-            let forwardTailDoublesBack = forwardTail.count >= 2 && forwardTail[1] == edgeMatch.edge.fromNodeID
-            if !forwardTail.isEmpty, !forwardTailDoublesBack {
-                let path = [edgeMatch.edge.fromNodeID] + forwardTail
-                let progress = edgeMatch.alongTrackMeters
-                let headingPenalty = routeStartHeadingPenalty(
-                    liveHeading: headingDegrees,
-                    routeBearing: edgeMatch.edge.bearingDegrees
-                )
-                let cost = max(0, edgeMatch.edge.distanceMeters - edgeMatch.alongTrackMeters)
-                    + pathCost(for: forwardTail, in: map)
-                    + headingPenalty
-                options.append((path, progress, cost))
+            for edgeMatch in candidateEdges {
+                // Stepping onto a candidate edge costs the walk out to it. Without
+                // this the comparison would rate an edge 1.5 m away exactly as
+                // highly as the one under the user's feet.
+                let approachCost = edgeMatch.crossTrackMeters
+
+                let forwardTail = shortestPath(in: map, from: edgeMatch.edge.toNodeID, to: targetNodeID)
+                // A tail that immediately doubles back through the node behind the
+                // user describes the reverse option with a pointless out-and-back
+                // leg bolted on. Their costs tie when the user stands on the node,
+                // so the heading penalty alone could pick the U-turn.
+                let forwardTailDoublesBack = forwardTail.count >= 2 && forwardTail[1] == edgeMatch.edge.fromNodeID
+                if !forwardTail.isEmpty, !forwardTailDoublesBack {
+                    let path = [edgeMatch.edge.fromNodeID] + forwardTail
+                    let progress = edgeMatch.alongTrackMeters
+                    let headingPenalty = routeStartHeadingPenalty(
+                        liveHeading: headingDegrees,
+                        routeBearing: edgeMatch.edge.bearingDegrees
+                    )
+                    let cost = max(0, edgeMatch.edge.distanceMeters - edgeMatch.alongTrackMeters)
+                        + pathCost(for: forwardTail, in: map)
+                        + headingPenalty
+                        + approachCost
+                    options.append((path, progress, cost, edgeMatch.edge.id, edgeMatch.crossTrackMeters))
+                }
+
+                let reverseTail = shortestPath(in: map, from: edgeMatch.edge.fromNodeID, to: targetNodeID)
+                let reverseTailDoublesBack = reverseTail.count >= 2 && reverseTail[1] == edgeMatch.edge.toNodeID
+                if !reverseTail.isEmpty, !reverseTailDoublesBack {
+                    let path = [edgeMatch.edge.toNodeID] + reverseTail
+                    let progress = max(0, edgeMatch.edge.distanceMeters - edgeMatch.alongTrackMeters)
+                    let headingPenalty = routeStartHeadingPenalty(
+                        liveHeading: headingDegrees,
+                        routeBearing: SemanticRouteMath.normalizedDegrees(edgeMatch.edge.bearingDegrees + 180)
+                    )
+                    let cost = max(0, edgeMatch.alongTrackMeters) + pathCost(for: reverseTail, in: map)
+                        + headingPenalty
+                        + approachCost
+                    options.append((path, progress, cost, edgeMatch.edge.id, edgeMatch.crossTrackMeters))
+                }
             }
 
-            let reverseTail = shortestPath(in: map, from: edgeMatch.edge.fromNodeID, to: targetNodeID)
-            let reverseTailDoublesBack = reverseTail.count >= 2 && reverseTail[1] == edgeMatch.edge.toNodeID
-            if !reverseTail.isEmpty, !reverseTailDoublesBack {
-                let path = [edgeMatch.edge.toNodeID] + reverseTail
-                let progress = max(0, edgeMatch.edge.distanceMeters - edgeMatch.alongTrackMeters)
-                let headingPenalty = routeStartHeadingPenalty(
-                    liveHeading: headingDegrees,
-                    routeBearing: SemanticRouteMath.normalizedDegrees(edgeMatch.edge.bearingDegrees + 180)
-                )
-                let cost = max(0, edgeMatch.alongTrackMeters) + pathCost(for: reverseTail, in: map)
-                    + headingPenalty
-                options.append((path, progress, cost))
-            }
-
+            let nearestMatch = candidateEdges[0]
             NavigationTrace.shared.log("nav.start.resolve", [
                 "mode": "edge_snap",
                 "poseX": pose?.x ?? NSNull(),
                 "poseY": pose?.y ?? NSNull(),
                 "headingDeg": headingDegrees ?? NSNull(),
-                "snappedEdge": edgeMatch.edge.id,
-                "snappedEdgeBearing": edgeMatch.edge.bearingDegrees,
-                "snappedEdgeReverseBearing": edgeMatch.edge.reverseBearingDegrees,
-                "alongTrackM": edgeMatch.alongTrackMeters,
-                "crossTrackM": edgeMatch.crossTrackMeters,
+                "snappedEdge": nearestMatch.edge.id,
+                "snappedEdgeBearing": nearestMatch.edge.bearingDegrees,
+                "snappedEdgeReverseBearing": nearestMatch.edge.reverseBearingDegrees,
+                "alongTrackM": nearestMatch.alongTrackMeters,
+                "crossTrackM": nearestMatch.crossTrackMeters,
+                "candidateEdges": candidateEdges.map { candidate in
+                    [
+                        "edge": candidate.edge.id,
+                        "bearing": candidate.edge.bearingDegrees,
+                        "alongTrackM": candidate.alongTrackMeters,
+                        "crossTrackM": candidate.crossTrackMeters
+                    ] as [String: Any]
+                },
                 "options": options.map { option in
                     [
                         "path": option.path,
                         "initialProgressM": option.progress,
-                        "cost": option.cost
+                        "cost": option.cost,
+                        "edge": option.edgeID,
+                        "crossTrackM": option.crossTrack
                     ] as [String: Any]
                 },
                 "chosen": options.min(by: { $0.cost < $1.cost })?.path ?? []
@@ -6529,15 +6684,38 @@ final class SemanticRouteNavigator: ObservableObject {
         return map.nodes.min { $0.point.distance(to: pose) < $1.point.distance(to: pose) }
     }
 
-    private func nearestEdge(in map: SemanticRouteMap, to pose: SemanticRoutePoint?) -> (edge: SemanticRouteEdge, alongTrackMeters: Double, crossTrackMeters: Double)? {
-        guard let pose else { return nil }
+    private func nearestEdge(in map: SemanticRouteMap, to pose: SemanticRoutePoint?) -> EdgeMatch? {
+        nearestEdges(in: map, to: pose, limit: 1).first
+    }
+
+    /// Edges sorted by cross-track distance from `pose`, nearest first.
+    ///
+    /// Start resolution needs more than the single nearest edge. A route that
+    /// retraces its own corridor puts unrelated edges within centimetres of
+    /// each other — in one captured map "Left turn 7" sat 0.25 m off the
+    /// "Left turn 6 → 5103" edge — so the nearest edge is regularly the wrong
+    /// one, and a resolver that only ever saw that one edge had no way to
+    /// notice. Ranking a handful of candidates lets the heading penalty, which
+    /// already knows which way the user faces, discard the impostor.
+    private func nearestEdges(
+        in map: SemanticRouteMap,
+        to pose: SemanticRoutePoint?,
+        limit: Int
+    ) -> [EdgeMatch] {
+        guard let pose, limit > 0 else { return [] }
         let nodeByID = Dictionary(uniqueKeysWithValues: map.nodes.map { ($0.id, $0) })
-        return map.edges.compactMap { edge -> (edge: SemanticRouteEdge, alongTrackMeters: Double, crossTrackMeters: Double)? in
+        return map.edges.compactMap { edge -> EdgeMatch? in
             guard let from = nodeByID[edge.fromNodeID], let to = nodeByID[edge.toNodeID] else { return nil }
             let projection = Self.project(pose, from: from.point, to: to.point, distance: edge.distanceMeters)
-            return (edge, projection.alongTrackMeters, projection.crossTrackMeters)
+            return EdgeMatch(
+                edge: edge,
+                alongTrackMeters: projection.alongTrackMeters,
+                crossTrackMeters: projection.crossTrackMeters
+            )
         }
-        .min { $0.crossTrackMeters < $1.crossTrackMeters }
+        .sorted { $0.crossTrackMeters < $1.crossTrackMeters }
+        .prefix(limit)
+        .map { $0 }
     }
 
     private static func project(_ point: SemanticRoutePoint, onto step: SemanticRouteStep) -> (alongTrackMeters: Double, crossTrackMeters: Double) {
@@ -7291,6 +7469,10 @@ final class SemanticRouteNavigator: ObservableObject {
         if aliasedIDs.count > max(1, visualSampleCount / 3) {
             warnings.append("Distant parts of the route look identical; add a distinctive landmark near each.")
         }
+        let overlaps = overlappingCorridorCount(in: map)
+        if overlaps > 0 {
+            warnings.append("The route passes through \(overlaps) spot\(overlaps == 1 ? "" : "s") twice heading different ways; guidance can pick the wrong direction there.")
+        }
 
         return SemanticRouteCaptureQuality(
             keyframeCount: keyframeCount,
@@ -7300,8 +7482,52 @@ final class SemanticRouteNavigator: ObservableObject {
             averageKeyframeSpacingMeters: averageSpacing,
             hasMinimumSpatialEvidence: hasMinimumSpatialEvidence,
             hasMinimumVisualEvidence: hasMinimumVisualEvidence,
-            warnings: warnings
+            warnings: warnings,
+            overlappingCorridorCount: overlaps
         )
+    }
+
+    /// Roughly the AR pose error near a turn: closer than this and a pose that
+    /// errs toward the foreign edge will snap to it.
+    private static let overlappingCorridorProximityMeters = 1.0
+    /// Below this the two edges lead the same way, so picking the wrong one
+    /// costs the user nothing.
+    private static let overlappingCorridorBearingDegrees = 60.0
+
+    /// Counts nodes that sit within `overlappingCorridorProximityMeters` of an
+    /// edge they are not an endpoint of, where that edge heads a materially
+    /// different way than the node's own.
+    ///
+    /// Proximity alone over-reports: a corridor with a slight kink puts every
+    /// node near its neighbour's edge, and snapping to the wrong one of two
+    /// near-parallel edges leads to the same place anyway. The bearing test is
+    /// what isolates real trouble — the route crossing or doubling back
+    /// through somewhere it has already been. On the captured floor that
+    /// misrouted a walk, this flags the five genuine overlaps (including the
+    /// turn node sitting 0.25 m off an edge running 96° away, which is where
+    /// start resolution latched onto the wrong corridor) and correctly ignores
+    /// four benign kinks.
+    private static func overlappingCorridorCount(in map: SemanticRouteMap) -> Int {
+        let nodeByID = Dictionary(uniqueKeysWithValues: map.nodes.map { ($0.id, $0) })
+        var count = 0
+        for node in map.nodes {
+            // The direction the user actually travels through this node.
+            // Destinations have no outgoing edge, so fall back to arrival.
+            let ownBearing = map.edges.first(where: { $0.fromNodeID == node.id })?.bearingDegrees
+                ?? map.edges.first(where: { $0.toNodeID == node.id })?.bearingDegrees
+            guard let ownBearing else { continue }
+            for edge in map.edges {
+                guard edge.fromNodeID != node.id, edge.toNodeID != node.id,
+                      let from = nodeByID[edge.fromNodeID], let to = nodeByID[edge.toNodeID] else { continue }
+                let projection = project(node.point, from: from.point, to: to.point, distance: edge.distanceMeters)
+                guard projection.crossTrackMeters <= overlappingCorridorProximityMeters else { continue }
+                let divergence = abs(SemanticRouteMath.signedAngleDifference(ownBearing, edge.bearingDegrees))
+                if divergence > overlappingCorridorBearingDegrees {
+                    count += 1
+                }
+            }
+        }
+        return count
     }
 
     /// Route-frame axis convention where y = -(ARKit z), making bearings
@@ -7527,6 +7753,16 @@ extension SemanticRouteNavigator {
         lastStillnessRepromptAt = nil
     }
 
+    /// Whether the keyframe heading gate is armed. Armed, it filters keyframes
+    /// against the live heading; that is only sound while a visual match has
+    /// confirmed the heading.
+    var headingGateArmedForTesting: Bool { didCorroborateHeadingVisually }
+
+    /// The state after a visual match has landed, without needing camera frames.
+    func armHeadingGateForTesting() {
+        didCorroborateHeadingVisually = true
+    }
+
     /// Which step each saved image is attributed to, without needing a camera
     /// frame to score it.
     func visualCandidateAttributionForTesting() -> [(fingerprintID: String, stepIndex: Int)] {
@@ -7665,6 +7901,10 @@ extension SemanticRouteNavigator {
             html += "<span>\(quality.keyframeCount) keyframes</span>"
             html += "<span>\(quality.visualSampleCount) visual samples</span>"
             html += "<span class=\"\(quality.aliasedVisualSampleCount > 0 ? "bad" : "ok")\">\(quality.aliasedVisualSampleCount) aliased</span>"
+            // Recomputed when absent so reports on maps saved before the check
+            // still show it, rather than silently reading as clean.
+            let overlaps = quality.overlappingCorridorCount ?? overlappingCorridorCount(in: map)
+            html += "<span class=\"\(overlaps > 0 ? "bad" : "ok")\">\(overlaps) corridor overlap\(overlaps == 1 ? "" : "s")</span>"
             html += String(format: "<span>%.1fm route</span>", quality.routeDistanceMeters)
             if let spacing = quality.averageKeyframeSpacingMeters {
                 html += String(format: "<span>%.2fm keyframe spacing</span>", spacing)

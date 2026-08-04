@@ -142,6 +142,67 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertEqual(navigator.segmentRemainingMeters, 4.0, accuracy: 0.05)
     }
 
+    func testDoublingBackCorridorDoesNotRouteUserBackwards() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.doublingBackMap()])
+
+        // Just short of Junction and already facing the Elevators leg. The
+        // Corner→Printer edge runs 0.15 m away while Junction's own leg is
+        // 0.60 m away, so nearest-edge alone snapped to the spur and routed the
+        // user down to Printer and back — 11.9 m instead of 5.2 m.
+        let started = navigator.startNavigation(
+            to: "Elevators",
+            arPosition: simd_float3(0.15, 0, 6.4),
+            imuState: Self.imu(bearing: 270),
+            speakLandmarks: false,
+            arHeading: 270
+        )
+
+        XCTAssertTrue(started)
+        XCTAssertEqual(navigator.phase, .navigating)
+        XCTAssertEqual(
+            navigator.totalRemainingMeters, 5.15, accuracy: 0.4,
+            "Should walk straight to Elevators, not back down the spur"
+        )
+        XCTAssertLessThan(
+            navigator.totalRemainingMeters, 8.0,
+            "Routing back through Printer costs ~12 m and passes a POI already behind the user"
+        )
+    }
+
+    func testFrameRealignmentDisarmsHeadingGate() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        navigator.armHeadingGateForTesting()
+        XCTAssertTrue(navigator.headingGateArmedForTesting)
+
+        navigator.noteARFrameRealigned()
+
+        XCTAssertFalse(
+            navigator.headingGateArmedForTesting,
+            "Discarding the frame bias discards the match that earned the gate; left armed it filters keyframes against a heading known to be uncorrected, so the bias can never be re-measured"
+        )
+    }
+
+    func testOverlappingCorridorIsCountedInCaptureQuality() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.doublingBackMap()])
+
+        // Junction vs the Corner→Printer edge: 0.3 m apart, headings 90° apart.
+        XCTAssertEqual(navigator.activeMap?.captureQuality?.overlappingCorridorCount, 1)
+        XCTAssertTrue(
+            navigator.activeMap?.captureQuality?.warnings.contains { $0.contains("twice heading different ways") } ?? false,
+            "An overlapping corridor should warn the mapper"
+        )
+    }
+
+    func testStraightRouteReportsNoCorridorOverlap() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnMap()])
+
+        XCTAssertEqual(navigator.activeMap?.captureQuality?.overlappingCorridorCount, 0)
+    }
+
     func testSuddenPDRStepJumpDoesNotTeleportToDestination() {
         let navigator = SemanticRouteNavigator()
         navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
@@ -1270,6 +1331,23 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         let turn = node(id: "turn", name: "Corner", point: SemanticRoutePoint(x: 0, y: 4), kind: .intersection, turnHint: .right)
         let target = node(id: "checkout", name: "Checkout", point: SemanticRoutePoint(x: 4, y: 4), kind: .destination)
         return map(id: "l-turn", coordinateSpace: "pdr_xy", nodes: [start, turn, target])
+    }
+
+    /// A route that walks into a dead-end spur and back out, the shape that
+    /// misrouted a real capture. Junction sits 0.3 m off the Corner→Printer
+    /// edge while heading 90° away from it, so the nearest edge to someone
+    /// standing on Junction is one they have no business being routed onto.
+    private static func doublingBackMap() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let corner = node(id: "corner", name: "Corner", point: SemanticRoutePoint(x: 0, y: -4), kind: .intersection)
+        let spur = node(id: "printer", name: "Printer", point: SemanticRoutePoint(x: 0, y: -10), kind: .destination)
+        let junction = node(id: "junction", name: "Junction", point: SemanticRoutePoint(x: 0.3, y: -7), kind: .intersection, turnHint: .left)
+        let target = node(id: "elevators", name: "Elevators", point: SemanticRoutePoint(x: -5, y: -7), kind: .destination)
+        return map(
+            id: "doubling-back",
+            coordinateSpace: "ar_world_xz",
+            nodes: [start, corner, spur, junction, target]
+        )
     }
 
     private static func lTurnARMap() -> SemanticRouteMap {
