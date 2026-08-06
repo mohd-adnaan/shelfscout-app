@@ -139,7 +139,9 @@ enum NavLoc {
     static func followCorner() -> String {
         switch lang {
         case .en: return "follow the corner"
-        case .fr: return "suivez le coin"
+        // "suivez le coin" is not an instruction in French. "virage" is the
+        // word the rest of this catalog already uses for a turn.
+        case .fr: return "suivez le virage"
         }
     }
 
@@ -171,17 +173,19 @@ enum NavLoc {
         }
     }
 
+    // "franchement" reads as "frankly" as readily as "sharply"; "brusquement"
+    // is unambiguous about the magnitude of the turn.
     static func turnSharpLeft() -> String {
         switch lang {
         case .en: return "turn sharp left"
-        case .fr: return "tournez franchement à gauche"
+        case .fr: return "tournez brusquement à gauche"
         }
     }
 
     static func turnSharpRight() -> String {
         switch lang {
         case .en: return "turn sharp right"
-        case .fr: return "tournez franchement à droite"
+        case .fr: return "tournez brusquement à droite"
         }
     }
 
@@ -226,14 +230,14 @@ enum NavLoc {
     static func turnSharpLeftCommand() -> String {
         switch lang {
         case .en: return "Turn sharp left."
-        case .fr: return "Tournez franchement à gauche."
+        case .fr: return "Tournez brusquement à gauche."
         }
     }
 
     static func turnSharpRightCommand() -> String {
         switch lang {
         case .en: return "Turn sharp right."
-        case .fr: return "Tournez franchement à droite."
+        case .fr: return "Tournez brusquement à droite."
         }
     }
 
@@ -260,17 +264,20 @@ enum NavLoc {
         }
     }
 
+    // "se tasser" is the everyday Quebec verb for moving over a step; the
+    // European "se décaler" is understood here but is not what a Montreal
+    // speaker would say.
     static func stepLeft() -> String {
         switch lang {
         case .en: return "Step left"
-        case .fr: return "Décalez-vous à gauche"
+        case .fr: return "Tassez-vous à gauche"
         }
     }
 
     static func stepRight() -> String {
         switch lang {
         case .en: return "Step right"
-        case .fr: return "Décalez-vous à droite"
+        case .fr: return "Tassez-vous à droite"
         }
     }
 
@@ -314,7 +321,9 @@ enum NavLoc {
     static func easeToClock(hour: Int) -> String {
         switch lang {
         case .en: return "Ease to \(hour) o'clock."
-        case .fr: return "Ajustez vers \(hour) heure\(hour == 1 ? "" : "s")."
+        // "ajuster" is transitive in French — "Ajustez vers…" has no object and
+        // lands as a fragment. "Orientez-vous" carries the same soft register.
+        case .fr: return "Orientez-vous vers \(hour) heure\(hour == 1 ? "" : "s")."
         }
     }
 
@@ -407,7 +416,10 @@ enum NavLoc {
     ) -> String {
         switch lang {
         case .en: return "Starting at \(start). \(destination) is \(distance) away. \(firstInstruction)"
-        case .fr: return "Départ à \(start). \(destination) est à \(distance). \(firstInstruction)"
+        // "Départ à" is the time construction ("départ à 8 h"); a place takes
+        // "départ de", which would then need to contract with the label's
+        // article ("de le" → "du"). The colon form sidesteps both.
+        case .fr: return "Point de départ : \(start). \(destination) est à \(distance). \(firstInstruction)"
         }
     }
 
@@ -449,6 +461,31 @@ enum NavLoc {
         }
     }
 
+    // ── Landmarks passed along a leg ────────────────────────────────────────
+    //
+    // These were built inline in SemanticRouteNavigator until the French pilot
+    // prep: the name and the side phrase were already localized, but the
+    // connective words around them were not, so a French session spoke
+    // « Fromages à votre gauche in 3 mètres ». Everything a landmark cue says
+    // now goes through here.
+
+    /// "cheese counter on your left in 3 meters" — a fragment. Callers add the
+    /// sentence punctuation, because it is used both standalone and embedded.
+    static func landmarkAhead(name: String, side: String, distance: String) -> String {
+        switch lang {
+        case .en: return "\(name) \(side) in \(distance)"
+        case .fr: return "\(name) \(side) dans \(distance)"
+        }
+    }
+
+    /// "Passing the cheese counter on your left" — a fragment, as above.
+    static func passingLandmark(name: String, side: String) -> String {
+        switch lang {
+        case .en: return "Passing \(name) \(side)"
+        case .fr: return "Vous passez \(name) \(side)"
+        }
+    }
+
     static func inDistanceTurn(distance: String, turn: String) -> String {
         switch lang {
         case .en: return "In \(distance), \(turn)."
@@ -456,10 +493,14 @@ enum NavLoc {
         }
     }
 
+    /// French takes a preposition before a walked distance. "sur" is used
+    /// rather than "de" throughout this catalog because every distance string
+    /// can begin with "environ", and "de environ" would need eliding to
+    /// "d'environ" — a contraction the interpolation cannot make.
     static func walkDistance(distance: String, context: String) -> String {
         switch lang {
         case .en: return "Walk \(distance), \(context)."
-        case .fr: return "Marchez \(distance), \(context)."
+        case .fr: return "Marchez sur \(distance), \(context)."
         }
     }
 
@@ -470,7 +511,7 @@ enum NavLoc {
     ) -> String {
         switch lang {
         case .en: return "Walk \(distance), \(context). Passing \(landmark)."
-        case .fr: return "Marchez \(distance), \(context). Vous passez \(landmark)."
+        case .fr: return "Marchez sur \(distance), \(context). Vous passez \(landmark)."
         }
     }
 
@@ -482,7 +523,7 @@ enum NavLoc {
     ) -> String {
         switch lang {
         case .en: return "\(prefix)\(turn). Walk \(distance), \(context)."
-        case .fr: return "\(prefix)\(turn). Marchez \(distance), \(context)."
+        case .fr: return "\(prefix)\(turn). Marchez sur \(distance), \(context)."
         }
     }
 
@@ -501,10 +542,16 @@ enum NavLoc {
     }
 
     /// Off-route rejoin, straight ahead: "Off route. Walk 4 meters to aisle 3."
+    ///
+    /// French uses "pour rejoindre X" rather than "jusqu'à X" on purpose: the
+    /// node label is interpolated raw, and "jusqu'à" would have to contract
+    /// with a label that carries its own article. `defaultRouteLabel` is
+    /// exactly that case — "jusqu'à le trajet" is ungrammatical, while "pour
+    /// rejoindre le trajet" is correct and also reads better as a rejoin.
     static func rejoinStraight(distance: String, node: String) -> String {
         switch lang {
         case .en: return "Off route. Walk \(distance) to \(node)."
-        case .fr: return "Vous avez quitté le trajet. Marchez \(distance) jusqu’à \(node)."
+        case .fr: return "Vous avez quitté le trajet. Marchez sur \(distance) pour rejoindre \(node)."
         }
     }
 
@@ -514,7 +561,7 @@ enum NavLoc {
         case .en:
             return "Off route. \(turn) Then walk \(distance) to \(node)."
         case .fr:
-            return "Vous avez quitté le trajet. \(turn) Puis marchez \(distance) jusqu’à \(node)."
+            return "Vous avez quitté le trajet. \(turn) Puis marchez sur \(distance) pour rejoindre \(node)."
         }
     }
 
@@ -542,10 +589,14 @@ enum NavLoc {
         }
     }
 
+    /// French must not use "Vous êtes arrivé" here: the participle agrees with
+    /// the listener, so every woman in the study would hear a masculine form
+    /// (and "arrivé(e)" is unspeakable). "Arrivée à X" is the noun — the same
+    /// phrasing transit announcements use — and carries no listener gender.
     static func arrivedAt(_ target: String) -> String {
         switch lang {
         case .en: return "Arrived at \(target)."
-        case .fr: return "Vous êtes arrivé à \(target)."
+        case .fr: return "Arrivée à \(target)."
         }
     }
 
@@ -578,7 +629,9 @@ enum NavLoc {
         case .en:
             return "Near \(target). Look toward the target to confirm arrival."
         case .fr:
-            return "Vous approchez de \(target). Tournez-vous vers la cible pour confirmer l’arrivée."
+            // The label goes after "vers", never after "de": "de" would have to
+            // contract with an article the label may carry ("de le" → "du").
+            return "Vous approchez de la cible. Tournez-vous vers \(target) pour confirmer l’arrivée."
         }
     }
 
@@ -668,14 +721,14 @@ enum NavLoc {
     static func relocRecognizedPlaceCue(_ placeName: String) -> String {
         switch lang {
         case .en: return "I can see \(placeName). Keep turning slowly, lining up the map."
-        case .fr: return "Je reconnais \(placeName). Continuez à tourner lentement, alignement de la carte en cours."
+        case .fr: return "Je reconnais \(placeName). Continuez à tourner lentement, j’aligne la carte."
         }
     }
 
     static func anchorEndpointPrompt(_ nodeName: String) -> String {
         switch lang {
         case .en: return "You're at \(nodeName). Anchor it — hold the phone up and turn a slow full circle so this spot can be found again from any direction."
-        case .fr: return "Vous êtes à \(nodeName). Ancrez ce point : tenez le téléphone levé et faites lentement un tour complet pour que cet endroit soit reconnu depuis n'importe quelle direction."
+        case .fr: return "Vous êtes à \(nodeName). Ancrez ce point : tenez le téléphone levé et faites lentement un tour complet pour que cet endroit soit reconnu depuis n’importe quelle direction."
         }
     }
 
@@ -689,7 +742,9 @@ enum NavLoc {
     static func anchorEndpointComplete(_ nodeName: String) -> String {
         switch lang {
         case .en: return "\(nodeName) anchored."
-        case .fr: return "\(nodeName) ancré."
+        // "\(nodeName) ancré" would have to agree with the label's gender,
+        // which the interpolation cannot know. Fronting the noun avoids it.
+        case .fr: return "Ancrage terminé : \(nodeName)."
         }
     }
 
@@ -741,6 +796,23 @@ enum NavLoc {
         switch lang {
         case .en: return "No walkable route to \(target)."
         case .fr: return "Aucun trajet praticable vers \(target)."
+        }
+    }
+
+    /// Both of these are SPOKEN on the guidance-start path, so they have to be
+    /// localized even though the rest of the map-loading errors around them are
+    /// display-only operator text.
+    static func loadMatchingARMap() -> String {
+        switch lang {
+        case .en: return "Load the matching AR map for this route before guiding."
+        case .fr: return "Chargez la carte AR correspondant à ce trajet avant de lancer le guidage."
+        }
+    }
+
+    static func startARMapFirst() -> String {
+        switch lang {
+        case .en: return "Load or start the AR map first so I can localize on the captured route."
+        case .fr: return "Chargez ou démarrez d’abord la carte AR pour que je puisse vous situer sur le trajet enregistré."
         }
     }
 
@@ -831,6 +903,376 @@ enum NavLoc {
         switch lang {
         case .en: return "behind you"
         case .fr: return "derrière vous"
+        }
+    }
+}
+
+/// Spoken reaching-guidance strings, per language.
+///
+/// Same contract as `NavLoc`: every entry returns a COMPLETE phrase, never a
+/// fragment to be concatenated across languages.
+///
+/// Two rules this catalog exists to enforce, both of which the previous inline
+/// English violated by construction:
+///
+///  1. NOTHING here may agree with the listener's gender. The pilot has mixed-
+///     gender participants and the app has no way to know which, so
+///     "vous vous êtes éloigné" and "vous êtes prêt" are out — every phrase is
+///     written so no participle agrees with "vous".
+///  2. NOTHING here may agree with the target's gender or number either. The
+///     object name arrives from the intent LLM with its article already
+///     stripped, so "la bouteille atteinte" / "les céréales atteintes" cannot
+///     be produced. Constructions with "avoir" and with the name after a
+///     preposition are safe; a predicate adjective on the name is not.
+enum ReachLoc {
+    private static var lang: AppLanguage { AppLocale.current }
+
+    // ── Object out of view ──────────────────────────────────────────────────
+
+    static func objectBehindTurnAround() -> String {
+        switch lang {
+        case .en: return "Turn around. Object is behind you."
+        case .fr: return "Faites demi-tour. L’objet est derrière vous."
+        }
+    }
+
+    static func objectBehindTurnBack() -> String {
+        switch lang {
+        case .en: return "Object is behind you. Turn back."
+        case .fr: return "L’objet est derrière vous. Retournez-vous."
+        }
+    }
+
+    static func objectBehindTurn(toRight: Bool) -> String {
+        switch lang {
+        case .en: return "Object is behind you. Turn \(toRight ? "right" : "left")."
+        case .fr: return "L’objet est derrière vous. Tournez à \(toRight ? "droite" : "gauche")."
+        }
+    }
+
+    /// `lastSeen` comes from `lastSeenSide` below.
+    static func outOfViewTurn(lastSeen: String, toRight: Bool) -> String {
+        switch lang {
+        case .en: return "Out of view, was \(lastSeen). Turn \(toRight ? "right" : "left")."
+        case .fr: return "Hors champ. Il était \(lastSeen). Tournez à \(toRight ? "droite" : "gauche")."
+        }
+    }
+
+    static func lastSeenSide(toRight: Bool) -> String {
+        switch lang {
+        case .en: return toRight ? "to your right" : "to your left"
+        case .fr: return toRight ? "à votre droite" : "à votre gauche"
+        }
+    }
+
+    static func offTrackObjectIs(_ side: String) -> String {
+        switch lang {
+        case .en: return "Off track. Object is \(side)."
+        case .fr: return "Vous déviez. L’objet est \(side)."
+        }
+    }
+
+    static func objectIs(_ side: String) -> String {
+        switch lang {
+        case .en: return "Object is \(side)."
+        case .fr: return "L’objet est \(side)."
+        }
+    }
+
+    // ── Approach ────────────────────────────────────────────────────────────
+
+    static func straightAheadDistance(_ distance: String) -> String {
+        switch lang {
+        case .en: return "Straight ahead. \(distance)."
+        case .fr: return "Tout droit. \(distance)."
+        }
+    }
+
+    static func goingTheRightWay(_ distance: String) -> String {
+        switch lang {
+        case .en: return "\(distance). Going the right way."
+        case .fr: return "\(distance). Vous allez dans la bonne direction."
+        }
+    }
+
+    static func gettingFurther(_ distance: String) -> String {
+        switch lang {
+        case .en: return "Getting further. \(distance)."
+        case .fr: return "Vous vous éloignez. \(distance)."
+        }
+    }
+
+    static func distanceOnly(_ distance: String) -> String {
+        "\(distance)."
+    }
+
+    static func armsReachKeepGoing() -> String {
+        switch lang {
+        case .en: return "Arm's reach. Keep going."
+        case .fr: return "À portée de main. Continuez."
+        }
+    }
+
+    static func almostThere() -> String {
+        switch lang {
+        case .en: return "Almost there."
+        case .fr: return "Vous y êtes presque."
+        }
+    }
+
+    static func tiltPhoneUp() -> String {
+        switch lang {
+        case .en: return "Tilt phone up."
+        case .fr: return "Inclinez le téléphone vers le haut."
+        }
+    }
+
+    static func tiltPhoneDown() -> String {
+        switch lang {
+        case .en: return "Tilt phone down."
+        case .fr: return "Inclinez le téléphone vers le bas."
+        }
+    }
+
+    // ── Distances (reaching scale: centimetres or arm's-length steps) ────────
+
+    static func armsReachDistance() -> String {
+        switch lang {
+        case .en: return "arm's reach"
+        case .fr: return "à portée de main"
+        }
+    }
+
+    static func centimeters(_ count: Int) -> String {
+        switch lang {
+        case .en: return "\(count) centimeters"
+        case .fr: return "\(count) centimètres"
+        }
+    }
+
+    static func oneStepAway() -> String {
+        switch lang {
+        case .en: return "one step away"
+        case .fr: return "à un pas"
+        }
+    }
+
+    static func aboutStepsAway(_ count: Int) -> String {
+        switch lang {
+        case .en: return "about \(count) steps"
+        case .fr: return "à environ \(count) pas"
+        }
+    }
+
+    // ── Final reach ─────────────────────────────────────────────────────────
+
+    /// `hint` is `slightlyRightHint`/`slightlyLeftHint` or an empty string.
+    static func objectHereReachForward(object: String, hint: String) -> String {
+        switch lang {
+        case .en: return "\(object) here. Reach forward\(hint)."
+        case .fr: return "\(object), juste ici. Tendez la main vers l’avant\(hint)."
+        }
+    }
+
+    static func slightlySideHint(toRight: Bool) -> String {
+        switch lang {
+        case .en: return toRight ? ", slightly right" : ", slightly left"
+        case .fr: return toRight ? ", légèrement à droite" : ", légèrement à gauche"
+        }
+    }
+
+    static func almostThereReachFor(_ object: String) -> String {
+        switch lang {
+        case .en: return "Almost there. Reach forward for \(object)."
+        case .fr: return "Vous y êtes presque. Tendez la main vers \(object)."
+        }
+    }
+
+    static func almostThereGrab(_ object: String) -> String {
+        switch lang {
+        case .en: return "Almost there. Grab \(object)."
+        case .fr: return "Vous y êtes presque. Attrapez \(object)."
+        }
+    }
+
+    static func keepReachingRightInFront(_ object: String) -> String {
+        switch lang {
+        case .en: return "Keep reaching. \(object) is right in front of you."
+        case .fr: return "Continuez à tendre la main. \(object) est juste devant vous."
+        }
+    }
+
+    /// "Tap when you have it" cannot use a French object clitic: "quand vous
+    /// l'avez" fixes the object as singular and a plural target needs "les".
+    static func tapWhenYouHave(_ object: String) -> String {
+        switch lang {
+        case .en: return "Tap anywhere when you have \(object)."
+        case .fr: return "Touchez l’écran quand vous avez \(object)."
+        }
+    }
+
+    static func reachForwardTapWhenDone() -> String {
+        switch lang {
+        case .en: return "Reach forward. Tap anywhere when you have it."
+        case .fr: return "Tendez la main vers l’avant. Touchez l’écran quand vous avez l’article."
+        }
+    }
+
+    static func reachedObject(_ object: String) -> String {
+        switch lang {
+        case .en: return "\(object) reached!"
+        // Not "\(object) atteint" — the participle would have to agree with the
+        // object. After "avoir" with the object following, it does not.
+        case .fr: return "Vous avez atteint \(object)!"
+        }
+    }
+
+    static func done() -> String {
+        switch lang {
+        case .en: return "Done"
+        case .fr: return "Terminé"
+        }
+    }
+
+    // ── Hand tracking (withHand mode) ───────────────────────────────────────
+
+    static func closeEnoughRaiseHand(_ object: String) -> String {
+        switch lang {
+        case .en: return "Close enough. Raise your hand to reach for \(object)."
+        case .fr: return "Assez proche. Levez la main pour attraper \(object)."
+        }
+    }
+
+    static func showYourHand() -> String {
+        switch lang {
+        case .en: return "Show your hand to the camera."
+        case .fr: return "Montrez votre main à la caméra."
+        }
+    }
+
+    static func cannotSeeYourHand() -> String {
+        switch lang {
+        case .en: return "I can't see your hand. Hold it up in front of the camera."
+        case .fr: return "Je ne vois pas votre main. Tenez-la devant la caméra."
+        }
+    }
+
+    static func handAlignedReachToGrab(_ object: String) -> String {
+        switch lang {
+        case .en: return "Hand aligned. Reach forward to grab \(object)."
+        case .fr: return "Main alignée. Tendez la main pour attraper \(object)."
+        }
+    }
+
+    /// `directionRawValue` is `ReachingViewController.Direction.rawValue`, which
+    /// is an English token because it doubles as a trace/log key. It is mapped
+    /// here rather than localized at the enum so the logs stay stable.
+    static func moveHand(_ directionRawValue: String) -> String {
+        switch lang {
+        case .en: return "Move hand \(directionRawValue)"
+        case .fr: return "Déplacez la main \(handDirectionFrench(directionRawValue))"
+        }
+    }
+
+    private static func handDirectionFrench(_ raw: String) -> String {
+        switch raw {
+        case "left": return "vers la gauche"
+        case "right": return "vers la droite"
+        case "up": return "vers le haut"
+        case "down": return "vers le bas"
+        case "top left": return "vers le haut à gauche"
+        case "top right": return "vers le haut à droite"
+        case "down left": return "vers le bas à gauche"
+        case "down right": return "vers le bas à droite"
+        default: return raw
+        }
+    }
+
+    // ── Session start, handoff and AR status ────────────────────────────────
+
+    static func guidingPointPhoneThenTap(_ object: String) -> String {
+        switch lang {
+        case .en: return "Guiding to \(object). Point phone toward it. Tap anywhere when you have it."
+        case .fr: return "Je vous guide vers \(object). Pointez le téléphone vers l’objet. Touchez l’écran quand vous avez l’article."
+        }
+    }
+
+    static func guidingPointPhoneThenRaiseHand(_ object: String) -> String {
+        switch lang {
+        case .en: return "Guiding to \(object). Point phone toward it. I'll tell you when to raise your hand."
+        case .fr: return "Je vous guide vers \(object). Pointez le téléphone vers l’objet. Je vous dirai quand lever la main."
+        }
+    }
+
+    static func guidingToSavedSpot(_ object: String) -> String {
+        switch lang {
+        case .en: return "Guiding you to the saved spot near \(object). It is within arm's reach from there."
+        case .fr: return "Je vous guide vers l’endroit enregistré près de \(object). De là, ce sera à portée de main."
+        }
+    }
+
+    /// No listener agreement: "vous vous êtes éloigné" would be masculine.
+    static func movedAwayResumingNavigation() -> String {
+        switch lang {
+        case .en: return "Moved away. Resuming navigation."
+        case .fr: return "Trop loin. Reprise de la navigation."
+        }
+    }
+
+    static func targetLocked() -> String {
+        switch lang {
+        case .en: return "Target locked."
+        case .fr: return "Cible verrouillée."
+        }
+    }
+
+    static func couldNotLineUpWithMap() -> String {
+        switch lang {
+        case .en: return "I could not line up with the saved map here. Try scanning this area again, then retry."
+        case .fr: return "Je n’ai pas pu m’aligner avec la carte enregistrée ici. Balayez cette zone de nouveau, puis réessayez."
+        }
+    }
+
+    static func findingSavedMap() -> String {
+        switch lang {
+        case .en: return "Finding the saved map. Move the phone slowly and point toward the mapped shelf."
+        // "tablette", not "étagère" — the Quebec word for a store shelf.
+        case .fr: return "Je cherche la carte enregistrée. Déplacez le téléphone lentement et pointez-le vers la tablette cartographiée."
+        }
+    }
+
+    static func stillMatchingStepAndSweep() -> String {
+        switch lang {
+        case .en: return "Still matching. Take a small step and sweep the phone slowly across the shelf and what is beside it."
+        case .fr: return "Je cherche encore. Faites un petit pas et balayez lentement le téléphone sur la tablette et autour."
+        }
+    }
+
+    static func stillMatchingKeepMoving() -> String {
+        switch lang {
+        case .en: return "Still matching. Keep moving slowly — turn a little and look further along the aisle."
+        case .fr: return "Je cherche encore. Continuez à bouger lentement — tournez un peu et regardez plus loin dans l’allée."
+        }
+    }
+
+    static func trackingFailed() -> String {
+        switch lang {
+        case .en: return "Tracking failed."
+        case .fr: return "Échec du suivi."
+        }
+    }
+
+    static func trackingPaused() -> String {
+        switch lang {
+        case .en: return "Tracking paused"
+        case .fr: return "Suivi en pause"
+        }
+    }
+
+    static func trackingResumed() -> String {
+        switch lang {
+        case .en: return "Tracking resumed"
+        case .fr: return "Suivi rétabli"
         }
     }
 }

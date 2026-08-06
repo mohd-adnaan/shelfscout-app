@@ -17,6 +17,7 @@ import {
 import { AccessibilityService } from './AccessibilityService';
 import { debugLogger } from './DebugLogger';
 import { mobileOrchestrator } from './MobileOrchestrator';
+import { strings } from '../i18n';
 
 // =============================================================================
 // iOS ARKit Native Module Bridge
@@ -101,7 +102,7 @@ export const triggerIOSReaching = async (
 
       // Fallback: Announce to user
       AccessibilityService.announce(
-        `Guiding you to ${objectName}. ARKit module initializing.`
+        strings().reaching.guidingToInitializing(objectName)
       );
       return false;
     }
@@ -497,11 +498,13 @@ const sendToBackendWorkflow = async (
         );
 
       if (!isContinuousIteration && !parsedResponse.reaching_ios && !isARKitNavigationHandoff) {
-        const message = 'Server returned empty response. Please try again.';
+        const message = strings().reaching.emptyResponse;
         AccessibilityService.announceError(message, false);
         throw new Error(message);
       } else if (parsedResponse.reaching_ios) {
-        parsedResponse.text = `Guiding you to ${parsedResponse.object || 'the object'}`;
+        parsedResponse.text = strings().reaching.guidingToShort(
+          parsedResponse.object || strings().reaching.defaultObjectName,
+        );
       }
       // else: continuous-mode iteration with empty guidance → leave text
       //       empty, downstream TTS guard skips speak. NO "Continue"

@@ -43,6 +43,7 @@ import { sendToWorkflow } from '../services/WorkflowService';
 import { requestPermissions } from '../services/PermissionService';
 import { COLORS } from '../utils/constants';
 import { ReachingBridge, ReachingEvents } from '../native/ReachingModule';
+import { useStrings, useStringsGetter } from '../i18n';
 
 const MainScreen: React.FC = () => {
   // ============================================================================
@@ -63,6 +64,12 @@ const MainScreen: React.FC = () => {
   const { startRecognition, stopRecognition, cancelRecognition } = useVoiceRecognition();
   const { device, cameraRef, capturePhoto } = useCamera();
   const { speak, stop: stopTTS } = useTTS();
+
+  // `s` for anything rendered (re-renders on language change); `t()` for the
+  // announcements, several of which run inside effects that must not close
+  // over the catalog that was current when they were registered.
+  const s = useStrings();
+  const t = useStringsGetter();
 
   // ============================================================================
   // Refs for state tracking
@@ -94,7 +101,7 @@ const MainScreen: React.FC = () => {
         if (isScreenReaderOn && hasPermissions) {
           setTimeout(() => {
             AccessibilityInfo.announceForAccessibility(
-              'ShelfScout activated. Use the voice button to start recording. Double tap the button to take a photo immediately.'
+              t().status.welcome
             );
           }, 1000);
         }
@@ -176,15 +183,15 @@ const MainScreen: React.FC = () => {
       
       if (!granted) {
         // WCAG 3.3.1: Clear error identification
-        const errorMessage = 'ShelfScout needs microphone and camera access to function properly. Please grant these permissions in your device settings.';
+        const errorMessage = t().status.permissionsDeniedDetail;
         
         // Announce to screen reader
         AccessibilityInfo.announceForAccessibility(
-          `Error: ${errorMessage}`
+          t().speech.genericError(errorMessage)
         );
         
         Alert.alert(
-          'Permissions Required',
+          t().status.permissionsRequiredTitle,
           errorMessage,
           [
             { 
@@ -193,7 +200,7 @@ const MainScreen: React.FC = () => {
               onPress: () => {
                 // Focus on permission button for accessibility
                 AccessibilityInfo.announceForAccessibility(
-                  'Use the Grant Permissions button to enable access.'
+                  t().status.grantPermissionsHint
                 );
               }
             }
@@ -202,7 +209,7 @@ const MainScreen: React.FC = () => {
       } else {
         // Announce success
         AccessibilityInfo.announceForAccessibility(
-          'Permissions granted. ShelfScout is ready to use.'
+          t().status.permissionsGranted
         );
       }
     } catch (error) {
@@ -210,7 +217,7 @@ const MainScreen: React.FC = () => {
       
       // WCAG 3.3.1: Announce error
       AccessibilityInfo.announceForAccessibility(
-        'Error checking permissions. Please try again or check your device settings.'
+        t().status.permissionsCheckFailed
       );
     }
   };
@@ -221,12 +228,12 @@ const MainScreen: React.FC = () => {
   const handlePress = async () => {
     // WCAG 3.3.2: Check permissions first
     if (!hasPermissions) {
-      const message = 'Please grant microphone and camera permissions to use ShelfScout.';
+      const message = t().status.permissionsMissing;
       
-      AccessibilityInfo.announceForAccessibility(`Error: ${message}`);
+      AccessibilityInfo.announceForAccessibility(t().speech.genericError(message));
       
       Alert.alert(
-        'Permissions Required',
+        t().status.permissionsRequiredTitle,
         message,
         [{ text: 'OK', style: 'default' }]
       );
@@ -238,14 +245,14 @@ const MainScreen: React.FC = () => {
       console.log('🛑 Tap during speaking - stopping TTS');
       
       // Announce action
-      AccessibilityInfo.announceForAccessibility('Stopping speech.');
+      AccessibilityInfo.announceForAccessibility(t().status.stoppingSpeech);
       
       await stopTTS();
       setIsSpeaking(false);
       
       // Announce ready state
       AccessibilityInfo.announceForAccessibility(
-        'Speech stopped. ShelfScout is ready. Tap to speak.'
+        t().status.speechStoppedReady
       );
       return;
     }
@@ -256,7 +263,7 @@ const MainScreen: React.FC = () => {
       
       // Inform user
       AccessibilityInfo.announceForAccessibility(
-        'ShelfScout is processing. Please wait, or double tap to cancel.'
+        t().status.processingPleaseWait
       );
       return;
     }
@@ -269,7 +276,7 @@ const MainScreen: React.FC = () => {
       
       // Announce action
       AccessibilityInfo.announceForAccessibility(
-        'Stopping recording and processing your command.'
+        t().status.stoppingRecording
       );
       
       setIsRecording(false);
@@ -280,7 +287,7 @@ const MainScreen: React.FC = () => {
       } else {
         // WCAG 3.3.1: No transcript error
         AccessibilityInfo.announceForAccessibility(
-          'No voice input detected. Please try again.'
+          t().speech.noVoiceInput
         );
       }
     } else {
@@ -319,14 +326,14 @@ const MainScreen: React.FC = () => {
       console.log('🚨 EMERGENCY STOP - Stopping TTS');
       
       // Announce action
-      AccessibilityInfo.announceForAccessibility('Emergency stop. Stopping speech.');
+      AccessibilityInfo.announceForAccessibility(t().status.emergencyStop);
       
       await stopTTS();
       setIsSpeaking(false);
       
       // Announce ready
       AccessibilityInfo.announceForAccessibility(
-        'Stopped. ShelfScout is ready. Tap to speak.'
+        t().status.stoppedReady
       );
       return;
     }
@@ -337,7 +344,7 @@ const MainScreen: React.FC = () => {
       
       // Inform user
       AccessibilityInfo.announceForAccessibility(
-        'Cannot interrupt while processing. Please wait for the response.'
+        t().status.cannotInterrupt
       );
       return;
     }
@@ -347,7 +354,7 @@ const MainScreen: React.FC = () => {
       console.log('📸 Double tap while recording - capturing photo');
       
       // Announce action
-      AccessibilityInfo.announceForAccessibility('Taking photo.');
+      AccessibilityInfo.announceForAccessibility(t().status.takingPhoto);
       
       try {
         await capturePhoto();
@@ -355,7 +362,7 @@ const MainScreen: React.FC = () => {
         
         // Announce success
         AccessibilityInfo.announceForAccessibility(
-          'Photo captured. Continue speaking your command.'
+          t().status.photoCaptured
         );
       } catch (error) {
         console.error('❌ Photo capture error:', error);
@@ -366,7 +373,7 @@ const MainScreen: React.FC = () => {
           : 'Failed to capture photo';
         
         AccessibilityInfo.announceForAccessibility(
-          `Photo capture failed: ${errorMessage}. Continue with voice command.`
+          t().status.photoCaptureFailedDetail(errorMessage)
         );
       }
     }
@@ -394,11 +401,11 @@ const MainScreen: React.FC = () => {
     if (!errorMessage.includes('already started')) {
       // Announce error
       AccessibilityInfo.announceForAccessibility(
-        `Speech recognition error: ${errorMessage}. Please try again.`
+        t().status.speechRecognitionError(errorMessage)
       );
       
       Alert.alert(
-        'Speech Recognition Error', 
+        t().status.speechRecognitionErrorTitle, 
         errorMessage + '. Please try again.',
         [{ text: 'OK', style: 'default' }]
       );
@@ -422,7 +429,7 @@ const MainScreen: React.FC = () => {
       
       // WCAG 4.1.3: Announce processing state
       AccessibilityInfo.announceForAccessibility(
-        'Processing your request. Please wait.'
+        t().status.processingRequest
       );
       
       // Capture photo
@@ -463,7 +470,7 @@ const MainScreen: React.FC = () => {
 
       // WCAG 4.1.3: Announce speaking state
       AccessibilityInfo.announceForAccessibility(
-        'Response received. Speaking now.'
+        t().status.responseReceived
       );
 
       // Speak response
@@ -474,7 +481,7 @@ const MainScreen: React.FC = () => {
       
       // WCAG 4.1.3: Announce ready state
       AccessibilityInfo.announceForAccessibility(
-        'Response complete. ShelfScout is ready. Tap to speak.'
+        t().status.responseCompleteReady
       );
       
     } catch (error) {
@@ -500,7 +507,7 @@ const MainScreen: React.FC = () => {
       AccessibilityInfo.announceForAccessibility(userMessage);
       
       Alert.alert(
-        'Error',
+        t().status.errorTitle,
         userMessage,
         [{ text: 'OK', style: 'default' }]
       );
@@ -658,7 +665,7 @@ const MainScreen: React.FC = () => {
           style={styles.permissionButton}
           onPress={initializePermissions}
           accessible={true}
-          accessibilityLabel="Grant Permissions"
+          accessibilityLabel={s.status.grantPermissionsButton}
           accessibilityHint="Activates permission request for microphone and camera access"
           accessibilityRole="button"
         >
@@ -666,7 +673,7 @@ const MainScreen: React.FC = () => {
             style={styles.permissionText}
             accessible={false} // Button handles accessibility
           >
-            Grant Permissions
+            {s.status.grantPermissionsButton}
           </Text>
         </TouchableOpacity>
       )}

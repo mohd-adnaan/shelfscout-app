@@ -760,7 +760,7 @@ extension ReachingViewController {
         self?.handDot.isHidden = true; self?.handDotGlow.isHidden = true
       }
       let now = ProcessInfo.processInfo.systemUptime
-      if now - lastSpeechTime > 3 { say("Object is behind you. Turn back."); lastSpeechTime = now }
+      if now - lastSpeechTime > 3 { say(ReachLoc.objectBehindTurnBack()); lastSpeechTime = now }
       return
     }
 
@@ -1211,11 +1211,11 @@ extension ReachingViewController: ARSessionDelegate {
     }
   }
   func session(_ session: ARSession, didFailWithError error: Error) {
-    say("Tracking failed.")
+    say(ReachLoc.trackingFailed())
     DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
       self?.finishWith(success: false, reason: "ar_error")
     }
   }
-  func sessionWasInterrupted(_ session: ARSession)   { say("Tracking paused") }
-  func sessionInterruptionEnded(_ session: ARSession) { say("Tracking resumed") }
+  func sessionWasInterrupted(_ session: ARSession)   { say(ReachLoc.trackingPaused()) }
+  func sessionInterruptionEnded(_ session: ARSession) { say(ReachLoc.trackingResumed()) }
 }

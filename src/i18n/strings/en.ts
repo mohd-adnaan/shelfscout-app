@@ -25,6 +25,45 @@ export const en = {
     genericError: (detail: string) => `Error: ${detail}`,
   },
 
+  // ── App-shell status, announced through VoiceOver ────────────────────────
+  //
+  // These are announceForAccessibility calls, not TTS. They still have to be
+  // localized: a blind Quebec participant runs VoiceOver in French, and an
+  // English string handed to a French voice is read with French phonetics.
+  status: {
+    welcome:
+      'ShelfScout activated. Use the voice button to start recording. Double tap the button to take a photo immediately.',
+    permissionsRequiredTitle: 'Permissions Required',
+    grantPermissionsButton: 'Grant Permissions',
+    grantPermissionsHint: 'Use the Grant Permissions button to enable access.',
+    permissionsGranted: 'Permissions granted. ShelfScout is ready to use.',
+    permissionsDeniedDetail:
+      'ShelfScout needs microphone and camera access to function properly. Please grant these permissions in your device settings.',
+    permissionsMissing:
+      'Please grant microphone and camera permissions to use ShelfScout.',
+    permissionsCheckFailed:
+      'Error checking permissions. Please try again or check your device settings.',
+    stoppingSpeech: 'Stopping speech.',
+    speechStoppedReady: 'Speech stopped. ShelfScout is ready. Tap to speak.',
+    processingPleaseWait:
+      'ShelfScout is processing. Please wait, or double tap to cancel.',
+    stoppingRecording: 'Stopping recording and processing your command.',
+    emergencyStop: 'Emergency stop. Stopping speech.',
+    stoppedReady: 'Stopped. ShelfScout is ready. Tap to speak.',
+    cannotInterrupt: 'Cannot interrupt while processing. Please wait for the response.',
+    takingPhoto: 'Taking photo.',
+    photoCaptured: 'Photo captured. Continue speaking your command.',
+    photoCaptureFailedDetail: (detail: string) =>
+      `Photo capture failed: ${detail}. Continue with voice command.`,
+    speechRecognitionErrorTitle: 'Speech Recognition Error',
+    speechRecognitionError: (detail: string) =>
+      `Speech recognition error: ${detail}. Please try again.`,
+    processingRequest: 'Processing your request. Please wait.',
+    responseReceived: 'Response received. Speaking now.',
+    responseCompleteReady: 'Response complete. ShelfScout is ready. Tap to speak.',
+    errorTitle: 'Error',
+  },
+
   // ── Reaching guidance ────────────────────────────────────────────────────
   reaching: {
     guidingTo: (target: string) =>
@@ -44,6 +83,12 @@ export const en = {
     noPreciseCoordinates: (object: string) =>
       `I can detect the ${object} in the scene, but I could not get precise coordinates for guidance. Try pointing your camera more directly at it and ask again.`,
     defaultObjectName: 'object',
+    /** Short form used where the beeps/tap instructions are spoken separately. */
+    guidingToShort: (target: string) => `Guiding you to ${target}.`,
+    guidingToInitializing: (target: string) =>
+      `Guiding you to ${target}. ARKit module initializing.`,
+    emptyResponse: 'Server returned empty response. Please try again.',
+    navigationStopped: 'Navigation stopped. ShelfScout is ready.',
   },
 
   // ── Settings: language section ───────────────────────────────────────────

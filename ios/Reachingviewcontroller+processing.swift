@@ -69,7 +69,7 @@ extension ReachingViewController {
         NSLog("🎯 [Placement] Using %@ bbox + %@ pose",
               usingFresh ? "FRESH AR-frame" : "stale photo",
               usingSavedPose ? "SAVED detection-time" : "live")
-        placeWorldAnchor(frame: frame); say("Target locked.")
+        placeWorldAnchor(frame: frame); say(ReachLoc.targetLocked())
       }
       return
     }

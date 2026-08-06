@@ -164,7 +164,7 @@ extension ReachingViewController {
             inheritedSessionActive ? "inherited" : "cold",
             "\(frame.camera.trackingState)")
       if guidanceAudioEnabled {
-        say("I could not line up with the saved map here. Try scanning this area again, then retry.")
+        say(ReachLoc.couldNotLineUpWithMap())
       }
       finishWith(success: false, reason: "spatial_relocalization_timeout")
       return
@@ -270,7 +270,7 @@ extension ReachingViewController {
     if !spatialTargetIsSurfacePlacement && guidanceAudioEnabled {
       // Legacy pin marks where the mapper STOOD, not the object itself.
       // Tell the user so the last half-meter is on their hands, not the box.
-      say("Guiding you to the saved spot near \(objectName). It is within arm's reach from there.")
+      say(ReachLoc.guidingToSavedSpot(objectName))
     }
   }
 
@@ -343,11 +343,11 @@ extension ReachingViewController {
     // until the deadline. Every cue past the first asks for movement.
     switch spatialTargetRelocalizationCueCount {
     case 1:
-      say("Finding the saved map. Move the phone slowly and point toward the mapped shelf.")
+      say(ReachLoc.findingSavedMap())
     case 2:
-      say("Still matching. Take a small step and sweep the phone slowly across the shelf and what is beside it.")
+      say(ReachLoc.stillMatchingStepAndSweep())
     default:
-      say("Still matching. Keep moving slowly — turn a little and look further along the aisle.")
+      say(ReachLoc.stillMatchingKeepMoving())
     }
   }
 
@@ -872,7 +872,7 @@ extension ReachingViewController {
         DispatchQueue.main.async { [weak self] in
           self?.distanceLabel.text = "\(Int(depth * 100)) cm"
         }
-        say("Target locked.")
+        say(ReachLoc.targetLocked())
       }
 
   // ═══════════════════════════════════════════════════════════════════════════

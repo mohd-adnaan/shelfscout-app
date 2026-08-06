@@ -417,28 +417,57 @@ class ReachingViewController: UIViewController {
   var directionStableThreshold = 4
   /// TTS rate passed from React Native (matches user's app-wide setting)
   var ttsRate: Float = 0.5
-  /// Cached premium voice — mirrors iOSTtsClient.ts PREFERRED_VOICES exactly
-  /// Premium (Neural TTS) > Enhanced > Compact > system default
-  lazy var premiumVoice: AVSpeechSynthesisVoice? = {
-    // Ordered by quality — MUST match iOSTtsClient.ts PREFERRED_VOICES list
-    let candidates: [(id: String, label: String)] = [
-      ("com.apple.voice.premium.en-US.Zoe",              "Zoe PREMIUM"),
-      ("com.apple.voice.premium.en-US.Samantha",          "Samantha PREMIUM"),
-      ("com.apple.voice.enhanced.en-US.Samantha",         "Samantha ENHANCED"),
-      ("com.apple.voice.enhanced.en-US.Ava",              "Ava ENHANCED"),
-      ("com.apple.voice.enhanced.en-AU.Karen",            "Karen ENHANCED"),
-      ("com.apple.voice.enhanced.en-GB.Serena",           "Serena ENHANCED"),
-      ("com.apple.voice.compact.en-US.Samantha",          "Samantha COMPACT"),
-    ]
-    for c in candidates {
-      if let voice = AVSpeechSynthesisVoice(identifier: c.id) {
-        NSLog("🎤 [ReachingVC] Selected voice: %@ [%@]", c.id, c.label)
+  /// Preferred voice for the CURRENT app language — mirrors iOSTtsClient.ts
+  /// PREFERRED_VOICES. Premium (Neural TTS) > Enhanced > Compact > system
+  /// default for that language.
+  ///
+  /// Deliberately computed, not `lazy`: a `lazy var` resolves once and keeps
+  /// whatever language was active at first use, which is how this ended up
+  /// reading French cues in an en-US voice. Resolution is a lookup in the
+  /// installed-voice list and happens at most once per utterance (there is a
+  /// 1.2 s speech cooldown), so recomputing costs nothing worth caching.
+  var premiumVoice: AVSpeechSynthesisVoice? {
+    let language = AppLocale.current
+    for id in Self.preferredVoiceIdentifiers(for: language) {
+      if let voice = AVSpeechSynthesisVoice(identifier: id) {
         return voice
       }
     }
-    NSLog("⚠️ [ReachingVC] No preferred voice found — using system default en-US")
-    return AVSpeechSynthesisVoice(language: "en-US")
-  }()
+    NSLog("⚠️ [ReachingVC] No preferred %@ voice installed — using system default %@",
+          language.rawValue, language.speechLocale)
+    return AVSpeechSynthesisVoice(language: language.speechLocale)
+  }
+
+  /// Ordered by quality — MUST match iOSTtsClient.ts PREFERRED_VOICES.
+  private static func preferredVoiceIdentifiers(for language: AppLanguage) -> [String] {
+    switch language {
+    case .en:
+      return [
+        "com.apple.voice.premium.en-US.Zoe",
+        "com.apple.voice.premium.en-US.Samantha",
+        "com.apple.voice.enhanced.en-US.Samantha",
+        "com.apple.voice.enhanced.en-US.Ava",
+        "com.apple.voice.enhanced.en-AU.Karen",
+        "com.apple.voice.enhanced.en-GB.Serena",
+        "com.apple.voice.compact.en-US.Samantha",
+      ]
+    case .fr:
+      return [
+        // Quebec French first — a Montreal participant should not hear Paris
+        // French, and must never hear French read by an English voice.
+        "com.apple.voice.premium.fr-CA.Amelie",
+        "com.apple.voice.enhanced.fr-CA.Amelie",
+        "com.apple.voice.enhanced.fr-CA.Nicolas",
+        "com.apple.voice.compact.fr-CA.Amelie",
+        // European French — intelligible in Quebec, only if no fr-CA voice is
+        // installed.
+        "com.apple.voice.premium.fr-FR.Thomas",
+        "com.apple.voice.enhanced.fr-FR.Thomas",
+        "com.apple.voice.enhanced.fr-FR.Marie",
+        "com.apple.voice.compact.fr-FR.Thomas",
+      ]
+    }
+  }
 
   var hapticEngine: CHHapticEngine?
 
@@ -636,9 +665,9 @@ class ReachingViewController: UIViewController {
       self.running = true
       if self.guidanceAudioEnabled {
         if self.mode == .handFree {
-          self.say("Guiding to \(self.objectName). Point phone toward it. Tap anywhere when you have it.")
+          self.say(ReachLoc.guidingPointPhoneThenTap(self.objectName))
         } else {
-          self.say("Guiding to \(self.objectName). Point phone toward it. I'll tell you when to raise your hand.")
+          self.say(ReachLoc.guidingPointPhoneThenRaiseHand(self.objectName))
         }
       } else {
         NSLog("🔇 [ReachingVC] Silent bootstrap active — delaying AR guidance audio")
@@ -785,7 +814,7 @@ class ReachingViewController: UIViewController {
     guard !hasCompleted else { return }
     // Manual exit = user confirms they have the object (or wants to stop)
     // Always treat as success since auto-detection is unreliable
-    say("Done"); finishWith(success: true, reason: "user_confirmed")
+    say(ReachLoc.done()); finishWith(success: true, reason: "user_confirmed")
   }
 
   func handleSuccess() {
@@ -810,7 +839,7 @@ class ReachingViewController: UIViewController {
       self.view.addSubview(flash)
       UIView.animate(withDuration: 1.0) { flash.alpha = 0 } completion: { _ in flash.removeFromSuperview() }
     }
-    say("\(objectName) reached!")
+    say(ReachLoc.reachedObject(objectName))
 
     DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { [weak self] in
       guard let self = self, !self.hasDismissed else { return }

@@ -19,6 +19,7 @@
 
 import { NativeModules, Platform } from 'react-native';
 import RNFS from 'react-native-fs';
+import { AppLanguage, getAppLanguage } from '../i18n';
 
 let GROQ_API_KEYS: string[] = [];
 let GROQ_VISION_MODEL = 'qwen/qwen3.6-27b';
@@ -106,6 +107,101 @@ For other responses:
 
 const USR_SYNTHESIZE = (content: string) => `VISUAL INFORMATION:\n${content}\nNow Begin!`;
 
+// ── French (fr-CA) prompts ─────────────────────────────────────────────────
+//
+// These are what a Quebec participant actually hears: scene descriptions and
+// chat answers are free text straight from the model, so an English prompt
+// produces an English answer no matter what language they asked in.
+//
+// Same contract split as GroqIntentClient: the JSON KEY NAMES stay English
+// because parseVisionJson reads them, and only the VALUES are French. The
+// prompts say so explicitly — a fully French prompt otherwise tempts the model
+// to translate the keys too, which silently empties the parse.
+//
+// Distances are asked for in metres or steps, never feet: Quebec is metric and
+// the navigation layer already speaks "mètres" / "pas".
+
+const TRAIT_VISION_PROFILE_FR =
+  'L’utilisateur est complètement aveugle. Évite les références visuelles comme les couleurs ou l’éclairage, sauf si elles touchent à la sécurité. Mets l’accent sur les détails tactiles (texture, forme, taille) et sur les repères sonores.';
+const TRAIT_COMM_STYLE_FR =
+  'Réponds de façon directe et efficace. Garde les réponses courtes et centrées sur l’information essentielle.';
+
+const SYS_SCENE_FR = `${TRAIT_VISION_PROFILE_FR}
+
+Tu es un assistant visuel qui analyse un environnement. Concentre-toi sur l’espace où l’on peut circuler, les obstacles importants et l’aménagement des lieux.
+
+Format de sortie :
+Retourne un objet JSON avec exactement ces clés. Les NOMS DES CLÉS restent en anglais ; leurs VALEURS sont rédigées en français :
+- "layout_data" : les passages, allées ou espaces libres visibles, avec leurs dimensions approximatives si possible.
+- "hazard_data" : les dangers immédiats (boîtes au sol, personnes, poteaux) avec leur position.
+- "environment_summary" : un résumé factuel et dense de ce que contient le lieu.`;
+
+const USR_SCENE_FR =
+  'Tu aides une personne aveugle à comprendre son environnement. Ton rôle est de décrire ce qui l’entoure immédiatement, en utilisant uniquement ce qui est clairement visible sur l’image. Consignes : - Ne décris une zone ou un article que s’il est vraiment visible. - Indique la position approximative des zones et des produits que tu décris : à gauche, à droite, devant, derrière, etc. - Estime les distances en pas ou en mètres, par exemple « la tablette est à environ 3 mètres devant vous ». - Mentionne les obstacles ou les personnes à proximité. - Si tu n’es pas certain d’une partie de la scène, dis-le clairement, par exemple « je ne distingue pas ce qui se trouve à votre droite ». - Garde des explications simples, concises et utiles pour quelqu’un qui ne voit pas.';
+
+const SYS_CHAT_FR = `${TRAIT_VISION_PROFILE_FR}
+
+Tu es un assistant visuel précis. Ton objectif est de répondre à la question de l’utilisateur en te fondant strictement sur ce que montre l’image.
+
+Format de sortie :
+Retourne un objet JSON avec exactement ces clés. Les NOMS DES CLÉS restent en anglais ; leurs VALEURS sont rédigées en français :
+- "visual_reasoning" : une courte réflexion interne qui vérifie si l’image permet de répondre à la question. Sinon, explique pourquoi.
+- "pointers" : une réponse brève à la question de l’utilisateur, en t’appuyant sur l’image au besoin.
+- "visual_data" : une description objective et détaillée des éléments visuels pertinents pour la question.`;
+
+const USR_CHAT_FR = (transcript: string) =>
+  `Tu es un assistant pour une personne aveugle ou malvoyante. Tes réponses doivent toujours être claires, concises, faciles à écouter et utiles pour se déplacer ou identifier un objet en temps réel. Évite de décrire des détails sans intérêt comme l’éclairage, les couleurs ou l’agencement, sauf si c’est nécessaire pour répondre à la question.\n\nRéponds à cette question de l’utilisateur : « ${transcript} ».`;
+
+const SYS_SYNTHESIZE_FR = `${TRAIT_COMM_STYLE_FR}
+
+Tu es un assistant qui aide une personne aveugle. Ton objectif est de transformer les données techniques fournies en une réponse orale naturelle et utile.
+
+DONNÉES D’ENTRÉE :
+Tu reçois des données JSON brutes décrivant la scène, des objets ou des relations spatiales.
+
+TÂCHE :
+1. Interprète les données JSON.
+2. Formule une réponse conforme au profil de l’utilisateur : ${TRAIT_VISION_PROFILE_FR}
+3. Ajuste ton ton et ta longueur selon : ${TRAIT_COMM_STYLE_FR}
+
+RÈGLES :
+- Réponds TOUJOURS en français. C’est la langue de l’utilisateur, même si les données d’entrée sont en anglais.
+- Résume seulement ce qui est fourni, de façon claire et compréhensible. N’ajoute rien qui ne soit pas dans les données.
+- Les réponses qui situent un objet doivent reprendre EXACTEMENT la formulation reçue, sans retraitement : conserve telles quelles les positions horaires, les distances et les marqueurs de séquence.
+Pour les autres réponses :
+- Emploie un langage naturel. Aucun JSON ni jargon technique dans la sortie.
+- Garde des réponses brèves et concises.`;
+
+const USR_SYNTHESIZE_FR = (content: string) =>
+  `INFORMATION VISUELLE :\n${content}\nCommence maintenant!`;
+
+// ── Per-language prompt selection ──────────────────────────────────────────
+
+const SYS_SCENE_BY_LANGUAGE: Record<AppLanguage, string> = {
+  en: SYS_SCENE,
+  fr: SYS_SCENE_FR,
+};
+const USR_SCENE_BY_LANGUAGE: Record<AppLanguage, string> = {
+  en: USR_SCENE,
+  fr: USR_SCENE_FR,
+};
+const SYS_CHAT_BY_LANGUAGE: Record<AppLanguage, string> = {
+  en: SYS_CHAT,
+  fr: SYS_CHAT_FR,
+};
+const USR_CHAT_BY_LANGUAGE: Record<AppLanguage, (transcript: string) => string> = {
+  en: USR_CHAT,
+  fr: USR_CHAT_FR,
+};
+const SYS_SYNTHESIZE_BY_LANGUAGE: Record<AppLanguage, string> = {
+  en: SYS_SYNTHESIZE,
+  fr: SYS_SYNTHESIZE_FR,
+};
+const USR_SYNTHESIZE_BY_LANGUAGE: Record<AppLanguage, (content: string) => string> = {
+  en: USR_SYNTHESIZE,
+  fr: USR_SYNTHESIZE_FR,
+};
+
 export interface GroqVisionResult {
   ok: boolean;
   text?: string;
@@ -176,12 +272,18 @@ class GroqVisionClient {
   }
 
   async describeScene(imageUri: string, transcript?: string): Promise<GroqVisionResult> {
-    const userText = (transcript && transcript.trim()) || USR_SCENE;
-    return this.twoPass(SYS_SCENE, userText, imageUri);
+    const language = getAppLanguage();
+    const userText = (transcript && transcript.trim()) || USR_SCENE_BY_LANGUAGE[language];
+    return this.twoPass(SYS_SCENE_BY_LANGUAGE[language], userText, imageUri);
   }
 
   async answerQuestion(imageUri: string, transcript: string): Promise<GroqVisionResult> {
-    return this.twoPass(SYS_CHAT, USR_CHAT(transcript.trim()), imageUri);
+    const language = getAppLanguage();
+    return this.twoPass(
+      SYS_CHAT_BY_LANGUAGE[language],
+      USR_CHAT_BY_LANGUAGE[language](transcript.trim()),
+      imageUri,
+    );
   }
 
   // Pass 1: vision → structured JSON. Pass 2: JSON → spoken text.
@@ -218,11 +320,15 @@ class GroqVisionClient {
     const structured = extractJson(vision.text) || vision.text;
 
     // ── Pass 2: synthesize to speech ──
+    // Re-read the language here rather than passing it down from the caller:
+    // Pass 1 can take 20 s, and this is the pass whose output is spoken, so it
+    // should follow the setting as it stands when the answer is produced.
+    const synthLanguage = getAppLanguage();
     const synth = await this.post(
       GROQ_TEXT_MODEL,
       [
-        { role: 'system', content: SYS_SYNTHESIZE },
-        { role: 'user', content: USR_SYNTHESIZE(structured) },
+        { role: 'system', content: SYS_SYNTHESIZE_BY_LANGUAGE[synthLanguage] },
+        { role: 'user', content: USR_SYNTHESIZE_BY_LANGUAGE[synthLanguage](structured) },
       ],
       { jsonMode: false, timeout: SYNTH_TIMEOUT_MS, maxTokens: 200 },
     );

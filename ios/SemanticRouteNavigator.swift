@@ -2052,12 +2052,12 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         if let requiredARMapID = map.arWorldMapId,
            requiredARMapID != activeARWorldMapID {
-            currentInstruction = "Load the matching AR map for this route before guiding."
+            currentInstruction = NavLoc.loadMatchingARMap()
             emitCue(currentInstruction, priority: .priority)
             return false
         }
         if map.coordinateSpace == "ar_world_xz", arPosition == nil {
-            currentInstruction = "Load or start the AR map first so I can localize on the captured route."
+            currentInstruction = NavLoc.startARMapFirst()
             emitCue(currentInstruction, priority: .priority)
             return false
         }
@@ -5541,7 +5541,11 @@ final class SemanticRouteNavigator: ObservableObject {
             let side = Self.side(landmark.side, reversed: reversed)
             let name = Self.sanitizedSpokenLabel(landmark.name)
             guard !name.isEmpty else { return nil }
-            return (ahead, "\(name) \(Self.sidePhrase(side)) in \(Self.formatDistance(ahead))")
+            return (ahead, NavLoc.landmarkAhead(
+                name: name,
+                side: Self.sidePhrase(side),
+                distance: Self.formatDistance(ahead)
+            ))
         }
         .min { $0.ahead < $1.ahead }?
         .phrase
@@ -5561,9 +5565,15 @@ final class SemanticRouteNavigator: ObservableObject {
             let name = Self.sanitizedSpokenLabel(landmark.name)
             guard !name.isEmpty else { return nil }
             if ahead > 1.0 {
-                return (ahead, landmark.id, "\(name) \(Self.sidePhrase(side)) in \(Self.formatDistance(ahead)).")
+                let phrase = NavLoc.landmarkAhead(
+                    name: name,
+                    side: Self.sidePhrase(side),
+                    distance: Self.formatDistance(ahead)
+                )
+                return (ahead, landmark.id, "\(phrase).")
             }
-            return (abs(ahead), landmark.id, "Passing \(name) \(Self.sidePhrase(side)).")
+            let phrase = NavLoc.passingLandmark(name: name, side: Self.sidePhrase(side))
+            return (abs(ahead), landmark.id, "\(phrase).")
         }
         .min { $0.ahead < $1.ahead }
         .map { ($0.id, $0.phrase) }

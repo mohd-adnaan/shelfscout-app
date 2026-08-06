@@ -71,7 +71,7 @@ extension ReachingViewController {
     // Threshold 0.15: ignore minor sway so "behind you" can fire cleanly
     if abs(rightDot) > 0.15 {
       lastKnownHorizontalSign = rightDot > 0 ? 1.0 : -1.0
-      lastKnownDirectionLabel = rightDot > 0 ? "to your right" : "to your left"
+      lastKnownDirectionLabel = ReachLoc.lastSeenSide(toRight: rightDot > 0)
     }
 
     // ── Object behind camera ─────────────────────────────────────────────
@@ -93,13 +93,13 @@ extension ReachingViewController {
       if now - lastSpeechTime > 3.0 {
         if behindCentered {
           // Object directly behind — don't confuse with left/right, just turn around
-          say("Turn around. Object is behind you.")
+          say(ReachLoc.objectBehindTurnAround())
         } else {
-          let turnDir = rightDot > 0 ? "right" : "left"
+          let toRight = rightDot > 0
           if lastKnownDirectionLabel.isEmpty {
-            say("Object is behind you. Turn \(turnDir).")
+            say(ReachLoc.objectBehindTurn(toRight: toRight))
           } else {
-            say("Out of view, was \(lastKnownDirectionLabel). Turn \(turnDir).")
+            say(ReachLoc.outOfViewTurn(lastSeen: lastKnownDirectionLabel, toRight: toRight))
           }
         }
         lastSpeechTime = now
@@ -226,13 +226,13 @@ extension ReachingViewController {
   func distanceDescription(_ dist: Float) -> String {
     if distanceUnit == "cm" {
       let cm = Int(dist * 100)
-      if cm < 30 { return "arm's reach" }
-      return "\(cm) centimeters"
+      if cm < 30 { return ReachLoc.armsReachDistance() }
+      return ReachLoc.centimeters(cm)
     } else {
       let steps = Int(round(dist / 0.75))  // 75cm per step
-      if steps <= 0 { return "arm's reach" }
-      if steps == 1 { return "one step away" }
-      return "about \(steps) steps"
+      if steps <= 0 { return ReachLoc.armsReachDistance() }
+      if steps == 1 { return ReachLoc.oneStepAway() }
+      return ReachLoc.aboutStepsAway(steps)
     }
   }
 
@@ -249,9 +249,9 @@ extension ReachingViewController {
       if direction != lastSpokenDirection || now - lastSpeechTime > 5.0 {
         var hint = ""
         if abs(lastRightDot) > 0.10 {
-          hint = lastRightDot > 0 ? ", slightly right" : ", slightly left"
+          hint = ReachLoc.slightlySideHint(toRight: lastRightDot > 0)
         }
-        say("\(objectName) here. Reach forward\(hint).")
+        say(ReachLoc.objectHereReachForward(object: objectName, hint: hint))
         lastSpokenDirection = direction; lastSpeechTime = now
       }
       return
@@ -263,10 +263,10 @@ extension ReachingViewController {
     // announcements at 80-100cm actual distance.
     if direction == .centered && dist < 0.50 {
       if direction != lastSpokenDirection {
-        say("Arm's reach. Keep going.")
+        say(ReachLoc.armsReachKeepGoing())
         lastSpokenDirection = direction; lastSpeechTime = now
       } else if now - lastSpeechTime > 4.0 {
-        say("Almost there.")
+        say(ReachLoc.almostThere())
         lastSpeechTime = now
       }
       return
@@ -275,18 +275,18 @@ extension ReachingViewController {
     // ── Case 3: Aligned, walking toward ─────────────────────────────────
     if direction == .centered {
       if direction != lastSpokenDirection {
-        say("Straight ahead. \(distanceDescription(dist)).")
+        say(ReachLoc.straightAheadDistance(distanceDescription(dist)))
         lastSpokenDirection = direction; lastSpeechTime = now
         lastAnnouncedSteps = steps
       } else if now - lastSpeechTime > 4.0 {
         if steps < lastAnnouncedSteps && progressConfirmations < 2 {
-          say("\(distanceDescription(dist)). Going the right way.")
+          say(ReachLoc.goingTheRightWay(distanceDescription(dist)))
           progressConfirmations += 1
         } else if steps > lastAnnouncedSteps + 1 && progressConfirmations > 0 {
-          say("Getting further. \(distanceDescription(dist)).")
+          say(ReachLoc.gettingFurther(distanceDescription(dist)))
           progressConfirmations = 0
         } else {
-          say("\(distanceDescription(dist)).")
+          say(ReachLoc.distanceOnly(distanceDescription(dist)))
         }
         lastAnnouncedSteps = steps
         lastSpeechTime = now
@@ -299,10 +299,10 @@ extension ReachingViewController {
       if direction != lastSpokenDirection && (now - lastSpeechTime) >= speechCooldown {
         if direction == .top {
           // Object is above camera → user pointing at floor → tilt up
-          say("Tilt phone up.")
+          say(ReachLoc.tiltPhoneUp())
         } else {
           // Object is below camera → user pointing at ceiling → tilt down
-          say("Tilt phone down.")
+          say(ReachLoc.tiltPhoneDown())
         }
         lastSpokenDirection = direction; lastSpeechTime = now
       }
@@ -312,12 +312,12 @@ extension ReachingViewController {
     // ── Case 5: Not aligned — contextual direction ──────────────────────
     if direction == lastSpokenDirection { return }
     if directionStableFrames >= directionStableThreshold && (now - lastSpeechTime) >= speechCooldown {
-      let dirLabel = direction == .right ? "to your right" : "to your left"
+      let dirLabel = ReachLoc.lastSeenSide(toRight: direction == .right)
 
       if lastSpokenDirection == .centered && progressConfirmations > 0 {
-        say("Off track. Object is \(dirLabel).")
+        say(ReachLoc.offTrackObjectIs(dirLabel))
       } else {
-        say("Object is \(dirLabel).")
+        say(ReachLoc.objectIs(dirLabel))
       }
       lastSpokenDirection = direction; lastSpeechTime = now
       progressConfirmations = 0
@@ -363,7 +363,7 @@ extension ReachingViewController {
     if !acquisitionTriggered {
       acquisitionTriggered = true
       acquisitionPollStart = now
-      say("Almost there. Reach forward for \(objectName).")
+      say(ReachLoc.almostThereReachFor(objectName))
       triggerHaptic(0.6)
       NSLog("🔍 [Acquisition] ── ENTERED zone (%.2fm < %.2fm) ── polling starts",
             dist, acquisitionDepthThreshold)
@@ -372,7 +372,7 @@ extension ReachingViewController {
     // ── Check timeout ────────────────────────────────────────────────────
     if now - acquisitionPollStart > acquisitionTimeout {
       acquisitionTimedOut = true
-      say("Tap anywhere when you have \(objectName).")
+      say(ReachLoc.tapWhenYouHave(objectName))
       NSLog("🔍 [Acquisition] ⏱ TIMEOUT after %.0fs — manual exit only", acquisitionTimeout)
       return
     }
@@ -545,7 +545,7 @@ extension ReachingViewController {
         }
       } else if checkNum == 1 {
         // ── First failed check — encourage user (once only) ─────────────
-        self.say("Keep reaching. \(self.objectName) is right in front of you.")
+        self.say(ReachLoc.keepReachingRightInFront(self.objectName))
       }
       // Subsequent failures: silent. Parking sensor tone provides feedback.
     }.resume()

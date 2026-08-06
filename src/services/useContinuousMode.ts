@@ -37,6 +37,7 @@ import { speachesSentenceChunker } from '../services/SpeachesSentenceChunker';
 import { audioFeedback } from '../services/AudioFeedbackService';
 import { useDeviceOrientation } from '../hooks/useDeviceOrientation';
 import { cameraIntrinsicsForUploadedImage } from './CameraIntrinsics';
+import { strings } from '../i18n';
 
 // ============================================================================
 // Configuration
@@ -537,7 +538,7 @@ export const useContinuousNavigation = (options: ContinuousNavigationOptions) =>
     updateCycleState('idle');
     setStats({ ...statsRef.current });
 
-    AccessibilityInfo.announceForAccessibility('Navigation stopped. CyberSight is ready.');
+    AccessibilityInfo.announceForAccessibility(strings().reaching.navigationStopped);
     audioFeedback.playEarcon('ready');
   }, [updateCycleState, log]);
 

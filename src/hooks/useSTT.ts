@@ -13,7 +13,7 @@ import { useState, useRef, useEffect, useCallback } from 'react';
 import { Platform, Alert, AccessibilityInfo } from 'react-native';
 import Voice from '@react-native-voice/voice';
 import { AccessibilityService } from '../services/AccessibilityService';
-import { currentLocales } from '../i18n';
+import { currentLocales, strings } from '../i18n';
 import { SPEACHES_CONFIG } from '../utils/constants';
 
 interface UseSTTReturn {
@@ -84,7 +84,7 @@ export const useSTT = (options?: UseSTTOptions): UseSTTReturn => {
       silenceTimerRef.current = null;
     }
     
-    AccessibilityInfo.announceForAccessibility('Processing your request');
+    AccessibilityInfo.announceForAccessibility(strings().status.processingRequest);
     
     const callback = onAutoSubmitRef.current;
     if (callback) {
