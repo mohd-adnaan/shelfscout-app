@@ -20,6 +20,12 @@ export interface ARKitNavigationConfig {
   errorRecovery?: boolean;
   /** Speak turns as clock-face hours ("turn to 2 o'clock") instead of left/right. */
   clockFaceDirections?: boolean;
+  /**
+   * Unit spoken route distances are measured in. Steps are for users who
+   * cannot estimate metres without sight — "walk 12 steps" is countable,
+   * "walk 8 meters" is not. Defaults to meters natively when omitted.
+   */
+  distanceUnit?: 'meters' | 'steps';
   voiceOverEnabled?: boolean;
   ttsRate?: number;
   /** Language for native spoken guidance ('en' | 'fr'). */

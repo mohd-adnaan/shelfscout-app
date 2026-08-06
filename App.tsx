@@ -2358,6 +2358,7 @@ function AppInner(): React.JSX.Element {
       speakLandmarks: true,
       errorRecovery: settingsRef.current.navigationErrorRecovery,
       clockFaceDirections: settingsRef.current.navigationClockFaceDirections,
+      distanceUnit: settingsRef.current.navigationDistanceUnit,
       voiceOverEnabled: screenReaderEnabledRef.current,
       ttsRate: settingsRef.current.ttsRate,
       language: settingsRef.current.language,

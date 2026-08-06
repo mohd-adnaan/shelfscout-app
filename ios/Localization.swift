@@ -54,6 +54,52 @@ enum AppLocale {
     }
 }
 
+/// How spoken route distances are measured.
+///
+/// Mirrors `navigationDistanceUnit` in `src/context/SettingsContext.tsx`.
+/// Several pilot participants could not act on metres — a distance you have
+/// never had to estimate without sight is not a distance you can walk. Steps
+/// are a unit the user carries with them.
+enum NavigationDistanceUnit: String {
+    case meters
+    case steps
+
+    /// Tolerant parse for the bridged value. Anything unrecognised falls back
+    /// to metres rather than changing a live session's unit to a guess.
+    init(code: String?) {
+        guard let code, !code.isEmpty else {
+            self = .meters
+            return
+        }
+        self = NavigationDistanceUnit(rawValue: code.lowercased()) ?? .meters
+    }
+
+    /// Metres covered by one walking step.
+    ///
+    /// Matches `IMUSensorManager`'s own step model (0.65 m default, 0.67 m
+    /// typical calibrated value), so a spoken step count agrees with the
+    /// odometry the same guidance is built on. Deliberately shorter than the
+    /// reaching pipeline's 0.75 m: that measures an arm's-length approach,
+    /// this measures a walking gait. Erring short overstates the count a
+    /// little, which stops a user short of an obstacle rather than past it.
+    static let metersPerStep = 0.65
+}
+
+/// Process-wide distance unit for native spoken guidance.
+///
+/// A global for the same reason `AppLocale` is: the distance formatters are
+/// `static` on SemanticRouteNavigator and are reached from static phrase
+/// builders deep inside the geometry code.
+enum NavigationUnits {
+    private static let queue = DispatchQueue(label: "com.shelfscout.navunits")
+    private static var _current: NavigationDistanceUnit = .meters
+
+    static var current: NavigationDistanceUnit {
+        get { queue.sync { _current } }
+        set { queue.sync { _current = newValue } }
+    }
+}
+
 /// Spoken guidance strings, per language.
 ///
 /// Every entry returns a COMPLETE phrase. Do not build sentences by
@@ -253,6 +299,36 @@ enum NavLoc {
         switch lang {
         case .en: return "Head to \(hour) o'clock"
         case .fr: return "Dirigez-vous vers \(hour) heure\(hour == 1 ? "" : "s")"
+        }
+    }
+
+    // ── Course correction (staying centred in the aisle) ────────────────────
+    //
+    // Deliberately different wording from the recovery nudges above. These are
+    // small adjustments spoken while the user is walking a leg correctly, and
+    // must not sound like "you are off route" — a pilot participant who heard
+    // alarm-toned corrections started stopping and re-orienting each time.
+
+    /// Clock-face course correction, always one or two hours either side of
+    /// straight ahead: "Ease to 11 o'clock."
+    static func easeToClock(hour: Int) -> String {
+        switch lang {
+        case .en: return "Ease to \(hour) o'clock."
+        case .fr: return "Ajustez vers \(hour) heure\(hour == 1 ? "" : "s")."
+        }
+    }
+
+    static func bearLeftSlightly() -> String {
+        switch lang {
+        case .en: return "Bear slightly left."
+        case .fr: return "Serrez légèrement à gauche."
+        }
+    }
+
+    static func bearRightSlightly() -> String {
+        switch lang {
+        case .en: return "Bear slightly right."
+        case .fr: return "Serrez légèrement à droite."
         }
     }
 
@@ -695,6 +771,29 @@ enum NavLoc {
         switch lang {
         case .en: return "\(count) meters"
         case .fr: return "\(count) mètres"
+        }
+    }
+
+    static func oneStep() -> String {
+        switch lang {
+        case .en: return "1 step"
+        case .fr: return "1 pas"
+        }
+    }
+
+    static func steps(_ count: Int) -> String {
+        switch lang {
+        case .en: return "\(count) steps"
+        case .fr: return "\(count) pas"
+        }
+    }
+
+    /// Long counts are rounded before they are spoken: "about 30 steps" is a
+    /// number a walking user can hold on to, "32 steps" is not.
+    static func aboutSteps(_ count: Int) -> String {
+        switch lang {
+        case .en: return "about \(count) steps"
+        case .fr: return "environ \(count) pas"
         }
     }
 

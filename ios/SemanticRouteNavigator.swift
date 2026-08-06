@@ -569,6 +569,11 @@ final class SemanticRouteNavigator: ObservableObject {
     /// so two systems each cueing "reasonably often" still reach the user as
     /// one run-on contradiction. This is the floor under all of them.
     private var lastTurnCueAt: Date?
+    /// When the live course first left the corridor's tolerance, and when the
+    /// last course nudge was spoken. See the course-correction constants: the
+    /// persistence window is what separates a drift from a glance at a shelf.
+    private var courseCorrectionSince: Date?
+    private var lastCourseCueAt: Date?
     /// Straight-line AR distance to the current step's end node, set every
     /// navigation update while AR is localized. Floors spoken turn/arrival
     /// countdowns so PDR overshoot cannot announce a turn the AR pose clearly
@@ -795,6 +800,48 @@ final class SemanticRouteNavigator: ObservableObject {
     private let leadingStubFacingToleranceDegrees = 40.0
     /// A turn that stops part-way gets one repeat after this long.
     private let routeAlignmentStalledCueSeconds: TimeInterval = 6.0
+    // ── Course correction (staying centred in the aisle) ────────────────────
+    //
+    // Pilot, clock-face condition: a participant walking a straight aisle but
+    // drifting to the right heard nothing until he brushed the shelf, because
+    // the only lateral guidance there is — cross-track recovery — does not arm
+    // until the user is over a metre off the centre line, which in a 1.2 m
+    // aisle means already in the shelving. And when it does arm it aims at the
+    // NEAREST point on the route, i.e. straight sideways: a correction that
+    // crosses the centre line instead of joining it, which is what had him
+    // bouncing between the two sides.
+    //
+    // Both come out of one change: steer at a point AHEAD on the leg rather
+    // than beside it (pure pursuit). Heading error and lateral offset fold
+    // into a single small angle, and following it converges onto the centre of
+    // the aisle. In clock-face phrasing that angle lands on 11 or 1 o'clock,
+    // which is exactly the nudge that was asked for.
+    //
+    /// How far ahead on the leg the steering target sits. Larger is gentler:
+    /// this is what keeps ordinary aisle offsets inside one clock hour instead
+    /// of commanding a sidestep.
+    private let courseLookaheadMeters = 2.4
+    private let courseMinimumLookaheadMeters = 1.0
+    /// Below this the user is walking the corridor well enough to be left
+    /// alone. Sized above a walking head-sway and below the ~20° diagonal that
+    /// crosses a 1.2 m aisle within four metres.
+    private let courseCorrectionThresholdDegrees = 20.0
+    /// Above this it is a turn, not a nudge, and the wording would lie: "ease
+    /// to 3 o'clock" for an 85° error reads as an adjustment and is a
+    /// manoeuvre. Kept just under `routeTurnAlignmentThresholdDegrees` so the
+    /// two cues never hold different opinions about the same angle.
+    private let courseCorrectionMaxDegrees = 50.0
+    /// The error must persist this long before anything is spoken. One sway of
+    /// the phone toward a shelf is not a course.
+    private let courseCorrectionHoldSeconds: TimeInterval = 2.0
+    /// And a nudge is never repeated sooner than this, whatever changed. The
+    /// whole point of the cue is that it is rare enough to be worth acting on.
+    private let courseCorrectionRepeatSeconds: TimeInterval = 9.0
+    /// Nor does one land on the heels of a turn, alignment or recovery cue.
+    private let courseCorrectionQuietAfterTurnSeconds: TimeInterval = 6.0
+    /// Never fires this close to the end of a leg; the turn cue owns that space
+    /// and a nudge there would fight it.
+    private let courseCorrectionMinimumRemainingMeters = 1.5
     private let maxPDRDeltaPerUpdateMeters = 1.20
     private let offAxisProgressExtraMeters = 1.25
     private let offAxisProgressMaxMeters = 3.4
@@ -2110,6 +2157,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastStillnessRepromptAt = nil
         pendingAlignmentResumeCue = false
         resetRouteCorrectionGuards()
+        resetCourseCorrectionState()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = Date().addingTimeInterval(guidanceIntroProtectionSeconds)
         recoveryReason = nil
@@ -2157,7 +2205,7 @@ final class SemanticRouteNavigator: ObservableObject {
         currentInstruction = NavLoc.startingJourney(
             start: startName,
             destination: spokenTarget,
-            distance: Self.formatMeters(totalRemainingMeters),
+            distance: Self.formatDistance(totalRemainingMeters),
             firstInstruction: firstInstruction
         )
         NavigationTrace.shared.log("nav.start", [
@@ -2231,6 +2279,7 @@ final class SemanticRouteNavigator: ObservableObject {
         leadingStubBearingDegrees = nil
         leadingStubMeters = 0
         resetRouteCorrectionGuards()
+        resetCourseCorrectionState()
         resetRouteBelief(status: .initializing)
         guidanceIntroProtectedUntil = nil
         capturedPointCount = activeMap?.nodes.count ?? 0
@@ -2659,6 +2708,21 @@ final class SemanticRouteNavigator: ObservableObject {
                 }
                 advanceStepOrArrive()
             }
+            rebuildRAGContext()
+            return
+        }
+
+        // Runs after recovery so a genuinely lost user hears recovery's cue
+        // instead of a nudge, and before the walking instruction so the nudge
+        // it speaks is what the banner shows.
+        if issueCourseCorrectionCueIfNeeded(
+            on: step,
+            liveHeading: liveHeading,
+            pose: arPoint,
+            routeProjection: routeProjection,
+            isMoving: imuState.isMoving,
+            arLocalized: arLocalized
+        ) {
             rebuildRAGContext()
             return
         }
@@ -3825,7 +3889,7 @@ final class SemanticRouteNavigator: ObservableObject {
 
         let turn = Self.relativeTurnCommand(from: liveHeading, to: rejoinEdge.bearingDegrees, style: turnPhrasing)
         let nodeName = Self.sanitizedSpokenLabel(best.node.name, fallback: NavLoc.defaultRouteLabel())
-        let rejoinDistance = Self.formatMeters(rejoinEdge.distanceMeters)
+        let rejoinDistance = Self.formatDistance(rejoinEdge.distanceMeters)
         currentInstruction = turn.key == "straight"
             ? NavLoc.rejoinStraight(distance: rejoinDistance, node: nodeName)
             : NavLoc.rejoinWithTurn(turn: turn.text, distance: rejoinDistance, node: nodeName)
@@ -3969,6 +4033,18 @@ final class SemanticRouteNavigator: ObservableObject {
         return Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing)
     }
 
+    /// Floor between any two spoken turn instructions, whichever subsystem
+    /// raised them.
+    ///
+    /// Clock-face phrasing needs a wider one. Its twelve bands mean a user
+    /// mid-turn crosses several while acting on a single cue, and each crossing
+    /// is a candidate for a fresh sentence; at the left/right floor that
+    /// reached the pilot as a stream faster than anyone could follow. The
+    /// left/right value is left exactly where it was tuned.
+    private var sharedTurnCueMinimumGapSeconds: TimeInterval {
+        turnPhrasing == .clockFace ? 3.2 : routeAlignmentCueMinimumGapSeconds
+    }
+
     private func issueHeadingAlignmentCueIfNeeded(
         on step: SemanticRouteStep,
         liveHeading: Double,
@@ -4011,7 +4087,7 @@ final class SemanticRouteNavigator: ObservableObject {
         let instruction = Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing)
         let key = "align_\(Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing).key)_\(currentStepIndex)"
         let now = Date()
-        let cueChanged = key != lastHeadingAlignmentCueKey
+        let cueChanged = !Self.isSameSpokenCorrection(key, as: lastHeadingAlignmentCueKey)
         let cueAge = lastHeadingAlignmentCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
 
         currentInstruction = instruction
@@ -4038,7 +4114,7 @@ final class SemanticRouteNavigator: ObservableObject {
         } ?? false
         let sinceAnyTurnCue = lastTurnCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
         let shouldSpeak: Bool
-        if sinceAnyTurnCue < routeAlignmentCueMinimumGapSeconds {
+        if sinceAnyTurnCue < sharedTurnCueMinimumGapSeconds {
             shouldSpeak = false
         } else if isTurningTowardRoute {
             // They are already turning the right way; only speak again if the
@@ -4059,6 +4135,136 @@ final class SemanticRouteNavigator: ObservableObject {
             pendingAlignmentResumeCue = true
         }
         return true
+    }
+
+    /// The point on the leg the user should be steering at: a fixed distance
+    /// ahead of wherever they currently project onto it, clamped to the leg's
+    /// far end.
+    ///
+    /// Aiming here rather than at the nearest point is the whole difference
+    /// between converging on the centre of the aisle and crossing it. The
+    /// angle it produces also degrades correctly: at an offset far larger than
+    /// the lookahead it approaches the sideways aim the old cue always used.
+    private func coursePursuitPoint(on step: SemanticRouteStep, alongTrackMeters: Double) -> SemanticRoutePoint {
+        let legLength = max(step.edge.distanceMeters, 0.0001)
+        let lookahead = max(courseMinimumLookaheadMeters, min(courseLookaheadMeters, legLength))
+        let target = min(legLength, max(0, alongTrackMeters) + lookahead)
+        let t = target / legLength
+        return SemanticRoutePoint(
+            x: step.from.point.x + t * (step.to.point.x - step.from.point.x),
+            y: step.from.point.y + t * (step.to.point.y - step.from.point.y)
+        )
+    }
+
+    /// A small, rare correction that keeps the user near the middle of the
+    /// aisle instead of waiting for them to hit a shelf.
+    ///
+    /// Returns true only on the tick it actually speaks, so it never blocks
+    /// progress, arrival or the normal walking instruction. Runs after
+    /// recovery and only while `.navigating`: a user who is genuinely off
+    /// route gets recovery's cue, not a nudge.
+    private func issueCourseCorrectionCueIfNeeded(
+        on step: SemanticRouteStep,
+        liveHeading: Double,
+        pose: SemanticRoutePoint?,
+        routeProjection: RouteProjection?,
+        isMoving: Bool,
+        arLocalized: Bool
+    ) -> Bool {
+        // Corrective guidance, same as the alignment nudge: the study
+        // condition that turns error recovery off asks for turn-by-turn only.
+        guard shouldEnableErrorRecovery else { return false }
+        guard phase == .navigating, isMoving, arLocalized else {
+            courseCorrectionSince = nil
+            return false
+        }
+        // Never lands on top of the opening announcement — the user is still
+        // hearing where they are being taken.
+        guard guidanceIntroProtectedUntil.map({ Date() >= $0 }) ?? true else { return false }
+        guard let pose, let routeProjection else {
+            courseCorrectionSince = nil
+            return false
+        }
+        // Needs room ahead on the leg for a lookahead point to mean anything,
+        // and must stay out of the turn cue's space at the end of it. Floored
+        // by the live AR distance for the same reason the countdown is: a
+        // dead-reckoned belief that lags the pose would let a nudge land on a
+        // user already standing at the turn.
+        let remaining = min(segmentRemainingMeters, lastARNodeDistanceMeters ?? .greatestFiniteMagnitude)
+        guard remaining >= courseCorrectionMinimumRemainingMeters else {
+            courseCorrectionSince = nil
+            return false
+        }
+        // A sweeping heading is not a course. Same reasoning as the alignment
+        // cue: a correction computed mid-sweep argues with a facing the user
+        // has already left.
+        guard isLiveHeadingSettled() else { return false }
+
+        let targetBearing = pose.bearingDegrees(
+            to: coursePursuitPoint(on: step, alongTrackMeters: routeProjection.alongTrackMeters)
+        )
+        let courseError = SemanticRouteMath.signedAngleDifference(targetBearing, liveHeading)
+        let magnitude = abs(courseError)
+        guard magnitude >= courseCorrectionThresholdDegrees,
+              magnitude <= courseCorrectionMaxDegrees else {
+            courseCorrectionSince = nil
+            return false
+        }
+
+        let now = Date()
+        let since = courseCorrectionSince ?? now
+        courseCorrectionSince = since
+        guard now.timeIntervalSince(since) >= courseCorrectionHoldSeconds else { return false }
+
+        let sinceAnyTurnCue = lastTurnCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        guard sinceAnyTurnCue >= courseCorrectionQuietAfterTurnSeconds else { return false }
+
+        let cue = Self.courseCorrectionCue(forSignedDegrees: courseError, style: turnPhrasing)
+        let cueAge = lastCourseCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
+        // Unlike the turn cues, a changed key does NOT license an immediate
+        // repeat. Drifting a little further is not new information — the user
+        // already knows which way to ease, and hearing it again two seconds
+        // later is the flooding this whole cue is meant to replace.
+        guard cueAge >= courseCorrectionRepeatSeconds else { return false }
+
+        currentInstruction = cue.text
+        lastCourseCueAt = now
+        lastTurnCueAt = now
+        courseCorrectionSince = nil
+        NavigationTrace.shared.log("nav.courseCorrection", traceState(extra: [
+            "instruction": cue.text,
+            "key": cue.key,
+            "courseErrorDeg": courseError,
+            "crossTrackM": routeProjection.crossTrackMeters,
+            "alongTrackM": routeProjection.alongTrackMeters,
+            "targetBearing": targetBearing,
+            "legBearing": step.edge.bearingDegrees,
+            "liveHeading": liveHeading
+        ]))
+        emitCue(cue.text, priority: .priority)
+        return true
+    }
+
+    /// Phrasing for a course correction. Clock-face mode carries the magnitude
+    /// in the hour ("ease to 11 o'clock"); left/right mode says only that the
+    /// adjustment is a slight one, because "turn left" for a 25° drift is what
+    /// walked pilot users into the opposite shelf.
+    private static func courseCorrectionCue(
+        forSignedDegrees diff: Double,
+        style: SemanticTurnPhrasing
+    ) -> (text: String, key: String) {
+        if style == .clockFace {
+            let hour = clockHour(forSignedDegrees: diff)
+            return (NavLoc.easeToClock(hour: hour), "course_clock_\(hour)")
+        }
+        return diff > 0
+            ? (NavLoc.bearRightSlightly(), "course_right")
+            : (NavLoc.bearLeftSlightly(), "course_left")
+    }
+
+    private func resetCourseCorrectionState() {
+        courseCorrectionSince = nil
+        lastCourseCueAt = nil
     }
 
     private func advanceFromVisualDecisionPoint(
@@ -4511,7 +4717,7 @@ final class SemanticRouteNavigator: ObservableObject {
             routeProjection: routeProjection,
             backwardDriftMeters: backwardDriftMeters
         )
-        let cueChanged = cue.key != lastRecoveryCueKey
+        let cueChanged = !Self.isSameSpokenCorrection(cue.key, as: lastRecoveryCueKey)
         let cueAge = lastRecoveryCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
 
         phase = .recovering
@@ -4566,7 +4772,7 @@ final class SemanticRouteNavigator: ObservableObject {
         // the alignment cue, and shared with it: alternating between the two
         // subsystems was still a run-on contradiction to the person listening.
         let sinceAnyTurnCue = lastTurnCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
-        guard sinceAnyTurnCue >= routeAlignmentCueMinimumGapSeconds else { return }
+        guard sinceAnyTurnCue >= sharedTurnCueMinimumGapSeconds else { return }
         guard cueChanged || cueAge >= recoveryCueCooldownSeconds else {
             return
         }
@@ -4609,11 +4815,19 @@ final class SemanticRouteNavigator: ObservableObject {
 
         if crossTrackBad {
             if let pose, let routeProjection {
-                let routeBearing = pose.bearingDegrees(to: routeProjection.nearestPoint)
+                // Aim at a point AHEAD on the leg, not the nearest point
+                // beside it. The nearest point is a sideways dash that
+                // overshoots the centre line and needs correcting back — the
+                // zigzag a pilot participant walked. The pursuit point puts
+                // them on a converging line, and the distance spoken is the
+                // distance to it, so "head to 1 o'clock, 3 meters" is a walk
+                // the user can actually complete.
+                let pursuit = coursePursuitPoint(on: step, alongTrackMeters: routeProjection.alongTrackMeters)
+                let routeBearing = pose.bearingDegrees(to: pursuit)
                 let command = Self.relativeRecoveryCommand(from: liveHeading, to: routeBearing, style: turnPhrasing)
                 let context = recoveryContext(on: step, progressMeters: routeProjection.alongTrackMeters)
                 return RecoveryCueDecision(
-                    instruction: Self.compactRecoveryInstruction(command, meters: observedCrossTrack),
+                    instruction: Self.compactRecoveryInstruction(command, meters: pose.distance(to: pursuit)),
                     reason: "Off route \(Self.formatShortMeters(observedCrossTrack)), \(context).",
                     key: "off_route_\(command.key)"
                 )
@@ -4807,6 +5021,9 @@ final class SemanticRouteNavigator: ObservableObject {
     private func advanceStepOrArrive() {
         lastRouteAdvanceAt = Date()
         resetRouteCorrectionGuards()
+        // A new leg has its own centre line; nothing measured against the old
+        // one should throttle or shape the first nudge on this one.
+        resetCourseCorrectionState()
         guard currentStepIndex < routeSteps.count - 1 else {
             phase = .arrived
             resetRouteBelief(status: .locked)
@@ -4876,7 +5093,7 @@ final class SemanticRouteNavigator: ObservableObject {
         } else {
             landmarkPrefix = ""
         }
-        currentInstruction = NavLoc.turnThenWalk(prefix: landmarkPrefix, turn: Self.sentenceCased(turn), distance: Self.formatMeters(next.edge.distanceMeters), context: nextContext)
+        currentInstruction = NavLoc.turnThenWalk(prefix: landmarkPrefix, turn: Self.sentenceCased(turn), distance: Self.formatDistance(next.edge.distanceMeters), context: nextContext)
         emitCue(currentInstruction, priority: .critical)
         // This already told them which way to turn, so the alignment cue must
         // not repeat it a tick later while they are still turning.
@@ -5101,7 +5318,7 @@ final class SemanticRouteNavigator: ObservableObject {
                     ? "\(Self.sentenceCased(turn))."
                     : NavLoc.atTheTurn(turn)
             } else {
-                currentInstruction = NavLoc.inDistanceTurn(distance: Self.formatMeters(cueRemainingMeters), turn: turn)
+                currentInstruction = NavLoc.inDistanceTurn(distance: Self.formatDistance(cueRemainingMeters), turn: turn)
             }
         } else if currentStepIndex >= routeSteps.count - 1,
                   (lastARNodeDistanceMeters ?? cueRemainingMeters) <= destinationJustAheadMeters {
@@ -5116,9 +5333,9 @@ final class SemanticRouteNavigator: ObservableObject {
         } else {
             let landmarkContext = shouldSpeakLandmarks ? nextLandmarkPhrase(on: step, after: segmentProgressMeters) : nil
             if let landmarkContext {
-                currentInstruction = NavLoc.walkDistancePassing(distance: Self.formatMeters(cueRemainingMeters), context: context, landmark: landmarkContext)
+                currentInstruction = NavLoc.walkDistancePassing(distance: Self.formatDistance(cueRemainingMeters), context: context, landmark: landmarkContext)
             } else {
-                currentInstruction = NavLoc.walkDistance(distance: Self.formatMeters(cueRemainingMeters), context: context)
+                currentInstruction = NavLoc.walkDistance(distance: Self.formatDistance(cueRemainingMeters), context: context)
             }
         }
 
@@ -5222,7 +5439,7 @@ final class SemanticRouteNavigator: ObservableObject {
     /// maneuver is the difference between "4 meters" — 4 meters of what? — and
     /// an instruction the user can act on without waiting for the next cue.
     private func approachCuePhrase(on step: SemanticRouteStep, remainingMeters: Double) -> String {
-        let distance = Self.formatMeters(remainingMeters)
+        let distance = Self.formatDistance(remainingMeters)
         guard currentStepIndex < routeSteps.count - 1 else {
             let destination = Self.sanitizedSpokenLabel(targetName, fallback: NavLoc.defaultDestinationLabel())
             return NavLoc.destinationInDistance(destination, distance: distance)
@@ -5324,7 +5541,7 @@ final class SemanticRouteNavigator: ObservableObject {
             let side = Self.side(landmark.side, reversed: reversed)
             let name = Self.sanitizedSpokenLabel(landmark.name)
             guard !name.isEmpty else { return nil }
-            return (ahead, "\(name) \(Self.sidePhrase(side)) in \(Self.formatMeters(ahead))")
+            return (ahead, "\(name) \(Self.sidePhrase(side)) in \(Self.formatDistance(ahead))")
         }
         .min { $0.ahead < $1.ahead }?
         .phrase
@@ -5344,7 +5561,7 @@ final class SemanticRouteNavigator: ObservableObject {
             let name = Self.sanitizedSpokenLabel(landmark.name)
             guard !name.isEmpty else { return nil }
             if ahead > 1.0 {
-                return (ahead, landmark.id, "\(name) \(Self.sidePhrase(side)) in \(Self.formatMeters(ahead)).")
+                return (ahead, landmark.id, "\(name) \(Self.sidePhrase(side)) in \(Self.formatDistance(ahead)).")
             }
             return (abs(ahead), landmark.id, "Passing \(name) \(Self.sidePhrase(side)).")
         }
@@ -6913,7 +7130,7 @@ final class SemanticRouteNavigator: ObservableObject {
         guard meters >= 1.5, carriesDistance else {
             return NavLoc.nudgeWithDistance(command.text, distance: nil)
         }
-        return NavLoc.nudgeWithDistance(command.text, distance: formatShortMeters(meters))
+        return NavLoc.nudgeWithDistance(command.text, distance: formatShortDistance(meters))
     }
 
     /// Signed heading offset → clock hour: +90° is 3 o'clock, −90° is 9,
@@ -6923,6 +7140,40 @@ final class SemanticRouteNavigator: ObservableObject {
         while hour <= 0 { hour += 12 }
         while hour > 12 { hour -= 12 }
         return hour
+    }
+
+    /// Whether a freshly computed cue says the same thing as the one already
+    /// spoken.
+    ///
+    /// Left/right phrasing has five bands across 360°, so a key change really
+    /// is new information. Clock-face phrasing has twelve: an ordinary walking
+    /// sway renames the cue every couple of seconds, and the old
+    /// `key != lastKey` test spoke on each rename. That is what turned the
+    /// clock-face condition of the pilot into a stream of corrections nobody
+    /// could act on ("2 o'clock… 3 o'clock… 2 o'clock"). Neighbouring hours are
+    /// one correction; only a two-hour move is worth interrupting for.
+    static func isSameSpokenCorrection(_ candidate: String, as previous: String?) -> Bool {
+        guard let previous else { return false }
+        if candidate == previous { return true }
+        guard let lhs = clockCueParts(candidate),
+              let rhs = clockCueParts(previous),
+              lhs.prefix == rhs.prefix,
+              lhs.suffix == rhs.suffix else {
+            return false
+        }
+        let separation = abs(lhs.hour - rhs.hour)
+        return min(separation, 12 - separation) <= 1
+    }
+
+    /// Splits a cue key such as `align_clock_2_0` around its clock hour, so two
+    /// keys are only ever compared by hour when everything else about them —
+    /// which subsystem raised them, which leg they belong to — matches.
+    private static func clockCueParts(_ key: String) -> (prefix: String, hour: Int, suffix: String)? {
+        guard let marker = key.range(of: "clock_") else { return nil }
+        let tail = key[marker.upperBound...]
+        let digits = tail.prefix { $0.isNumber }
+        guard let hour = Int(digits) else { return nil }
+        return (String(key[..<marker.lowerBound]), hour, String(tail.dropFirst(digits.count)))
     }
 
     private static func relativeTurnCommand(
@@ -7010,6 +7261,42 @@ final class SemanticRouteNavigator: ObservableObject {
         case .straight, .corner: return hint
         }
     }
+
+    /// A distance as the user asked to hear it. Every SPOKEN distance goes
+    /// through here; `formatMeters` stays literal metres for the mapping
+    /// screen and the diagnostic reason strings, which are read by whoever is
+    /// debugging a route rather than by whoever is walking it.
+    private static func formatDistance(_ meters: Double) -> String {
+        switch NavigationUnits.current {
+        case .meters: return formatMeters(meters)
+        case .steps: return formatSteps(meters)
+        }
+    }
+
+    private static func formatShortDistance(_ meters: Double) -> String {
+        switch NavigationUnits.current {
+        case .meters: return formatShortMeters(meters)
+        case .steps: return formatSteps(meters)
+        }
+    }
+
+    /// Metres → walking steps. Never returns zero: "less than one step" is not
+    /// something a walking user can act on, and every call site here is
+    /// already guarded by an arrival check for the genuinely-there case.
+    private static func formatSteps(_ meters: Double) -> String {
+        let raw = max(0, meters) / NavigationDistanceUnit.metersPerStep
+        let count = max(1, Int(raw.rounded()))
+        if count == 1 { return NavLoc.oneStep() }
+        // Past this the exact count is false precision — it is well inside the
+        // spread of one person's stride — and a round number is easier to hold.
+        if count > stepCountRoundingThreshold {
+            let rounded = Int((Double(count) / 5.0).rounded()) * 5
+            return NavLoc.aboutSteps(max(5, rounded))
+        }
+        return NavLoc.steps(count)
+    }
+
+    private static let stepCountRoundingThreshold = 20
 
     private static func formatMeters(_ meters: Double) -> String {
         let clamped = max(0, meters)
@@ -7746,6 +8033,16 @@ extension SemanticRouteNavigator {
 
     func expireGuidanceIntroProtectionForTesting() {
         guidanceIntroProtectedUntil = nil
+    }
+
+    /// Backdates the course-correction persistence window, so a test can reach
+    /// the cue without holding a drift for two real seconds. Returns false when
+    /// no drift is being tracked, which is itself the assertion some tests want.
+    @discardableResult
+    func expireCourseCorrectionHoldForTesting() -> Bool {
+        guard courseCorrectionSince != nil else { return false }
+        courseCorrectionSince = Date().addingTimeInterval(-(courseCorrectionHoldSeconds + 0.1))
+        return true
     }
 
     func forceStillnessRepromptWindowForTesting() {

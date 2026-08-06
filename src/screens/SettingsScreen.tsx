@@ -259,6 +259,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     updateEnableAcquisitionAutoExit,
     updateNavigationErrorRecovery,
     updateNavigationClockFaceDirections,
+    updateNavigationDistanceUnit,
     updateLanguage,
     effectiveReachingPipeline,
   } =
@@ -416,6 +417,72 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
       );
     },
     [updateNavigationClockFaceDirections],
+  );
+
+  const handleNavigationDistanceUnit = useCallback(
+    async (unit: 'meters' | 'steps') => {
+      await updateNavigationDistanceUnit(unit);
+      await speechOutput.announce(
+        unit === 'steps'
+          ? 'Route distances will be spoken in steps.'
+          : 'Route distances will be spoken in meters.',
+      );
+    },
+    [updateNavigationDistanceUnit],
+  );
+
+  // Both navigation blocks below (In-Device Mode and the ARKit pipeline
+  // section) offer the same choice, so it lives here once rather than being
+  // copied into each.
+  const renderNavigationDistanceUnitPicker = () => (
+    <>
+      <Text style={styles.settingDescription}>
+        Choose how route distances are spoken during guidance.
+      </Text>
+      <View style={styles.comparisonRow}>
+        <TouchableOpacity
+          style={[
+            styles.pipelineOption,
+            settings.navigationDistanceUnit === 'meters' && styles.pipelineOptionActive,
+          ]}
+          accessible={true}
+          accessibilityRole="button"
+          accessibilityLabel={`Meters${
+            settings.navigationDistanceUnit === 'meters' ? ', currently selected' : ''
+          }`}
+          accessibilityHint="Double tap to select"
+          onPress={() => handleNavigationDistanceUnit('meters')}
+        >
+          <Text style={styles.pipelineOptionIcon}>📏</Text>
+          <Text style={styles.pipelineOptionName}>Meters</Text>
+          <Text style={styles.pipelineOptionDesc}>"Walk 8 meters"</Text>
+          {settings.navigationDistanceUnit === 'meters' && <View style={styles.activeDot} />}
+        </TouchableOpacity>
+
+        <View style={styles.pipelineDivider} />
+
+        <TouchableOpacity
+          style={[
+            styles.pipelineOption,
+            settings.navigationDistanceUnit === 'steps' && styles.pipelineOptionActiveAlt,
+          ]}
+          accessible={true}
+          accessibilityRole="button"
+          accessibilityLabel={`Steps${
+            settings.navigationDistanceUnit === 'steps' ? ', currently selected' : ''
+          }`}
+          accessibilityHint="Double tap to select"
+          onPress={() => handleNavigationDistanceUnit('steps')}
+        >
+          <Text style={styles.pipelineOptionIcon}>👣</Text>
+          <Text style={styles.pipelineOptionName}>Steps</Text>
+          <Text style={styles.pipelineOptionDesc}>"Walk 12 steps"</Text>
+          {settings.navigationDistanceUnit === 'steps' && (
+            <View style={[styles.activeDot, { backgroundColor: C.warning }]} />
+          )}
+        </TouchableOpacity>
+      </View>
+    </>
   );
 
   const handleWearablesMicrophoneToggle = useCallback(
@@ -740,6 +807,8 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
                 />
               </View>
 
+              {renderNavigationDistanceUnitPicker()}
+
               <Text style={styles.settingDescription}>
                 Set up and manage the saved ARKit maps used by on-device
                 navigation and Spatial Target reaching.
@@ -871,6 +940,8 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
               />
             </View>
           )}
+
+          {settings.navigationPipeline === 'arkit' && renderNavigationDistanceUnitPicker()}
 
           {Platform.OS === 'ios' && (
             <TouchableOpacity

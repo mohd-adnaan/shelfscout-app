@@ -75,6 +75,14 @@ export interface AppSettings {
    */
   navigationClockFaceDirections: boolean;
   /**
+   * Unit ARKit route guidance speaks distances in. The pilot found several
+   * participants could not act on metres — a distance you have never had to
+   * judge without sight is not one you can walk — while steps are countable
+   * against their own gait. Separate from `distanceUnit`, which is reaching's
+   * arm's-length steps-vs-centimetres choice.
+   */
+  navigationDistanceUnit: 'meters' | 'steps';
+  /**
    * Language ShelfScout speaks, listens, and renders in. Seeded from the
    * device language on first launch, then user-controlled: a Quebec user may
    * run an English iPhone but want French guidance, or the reverse. Drives
@@ -100,6 +108,7 @@ interface SettingsContextValue {
   updateEnableAcquisitionAutoExit: (value: boolean) => Promise<void>;
   updateNavigationErrorRecovery: (value: boolean) => Promise<void>;
   updateNavigationClockFaceDirections: (value: boolean) => Promise<void>;
+  updateNavigationDistanceUnit: (unit: 'meters' | 'steps') => Promise<void>;
   updateLanguage: (language: AppLanguage) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
@@ -143,6 +152,7 @@ const DEFAULT_SETTINGS: AppSettings = {
   enableAcquisitionAutoExit: false,
   navigationErrorRecovery: true,
   navigationClockFaceDirections: false,
+  navigationDistanceUnit: 'meters',
   // Seeded from the device on first launch (and on upgrade from a build that
   // predates this setting); an explicit choice in Settings overrides it.
   language: detectDeviceLanguage(),
@@ -395,6 +405,16 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateNavigationDistanceUnit = useCallback(
+    async (unit: 'meters' | 'steps') => {
+      const next = { ...settings, navigationDistanceUnit: unit };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Navigation distance unit → ${unit}`);
+    },
+    [settings, persist],
+  );
+
   const updateLanguage = useCallback(
     async (language: AppLanguage) => {
       const next = { ...settings, language };
@@ -491,6 +511,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateEnableAcquisitionAutoExit,
     updateNavigationErrorRecovery,
     updateNavigationClockFaceDirections,
+    updateNavigationDistanceUnit,
     updateLanguage,
     resolveReachingPipeline,
     resolveNavigationPipeline,

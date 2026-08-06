@@ -196,6 +196,9 @@ final class ARKitNavigationModule: NSObject {
             if let languageCode = config["language"] as? String {
                 AppLocale.current = AppLanguage(code: languageCode)
             }
+            // Same reasoning for the spoken distance unit: read it per session
+            // rather than trusting whatever a previous one left behind.
+            NavigationUnits.current = NavigationDistanceUnit(code: config["distanceUnit"] as? String)
 
             let host = ARKitRouteHostView(
                 launchTargetName: targetName,
@@ -280,6 +283,7 @@ final class ARKitNavigationModule: NSObject {
             if let languageCode = config["language"] as? String {
                 AppLocale.current = AppLanguage(code: languageCode)
             }
+            NavigationUnits.current = NavigationDistanceUnit(code: config["distanceUnit"] as? String)
 
             self.pendingResolve = resolve
             self.activeTargetName = targetName

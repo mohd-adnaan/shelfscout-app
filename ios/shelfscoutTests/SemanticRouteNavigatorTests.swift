@@ -522,6 +522,168 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertTrue(navigator.currentInstruction.contains("9 o'clock"))
     }
 
+    /// Clock-face phrasing renames the cue every 30°, so a user swaying while
+    /// walking used to be spoken to on every rename. Neighbouring hours are one
+    /// correction; two hours apart is genuinely new.
+    func testNeighbouringClockHoursAreOneCorrectionNotTwo() {
+        XCTAssertTrue(SemanticRouteNavigator.isSameSpokenCorrection("align_clock_2_0", as: "align_clock_3_0"))
+        XCTAssertTrue(SemanticRouteNavigator.isSameSpokenCorrection("off_route_clock_12", as: "off_route_clock_1"))
+        XCTAssertFalse(SemanticRouteNavigator.isSameSpokenCorrection("align_clock_2_0", as: "align_clock_4_0"))
+        // A left/right flip is never the same correction, however close the
+        // hours look numerically.
+        XCTAssertFalse(SemanticRouteNavigator.isSameSpokenCorrection("align_clock_11_0", as: "align_clock_1_0"))
+        // Same hour on a different leg, or from a different subsystem, is a
+        // different cue — the hour is only compared when everything else matches.
+        XCTAssertFalse(SemanticRouteNavigator.isSameSpokenCorrection("align_clock_2_1", as: "align_clock_2_0"))
+        XCTAssertFalse(SemanticRouteNavigator.isSameSpokenCorrection("off_route_clock_2", as: "align_clock_2"))
+        // Left/right keys keep the old exact-match behaviour.
+        XCTAssertTrue(SemanticRouteNavigator.isSameSpokenCorrection("align_left_0", as: "align_left_0"))
+        XCTAssertFalse(SemanticRouteNavigator.isSameSpokenCorrection("align_left_0", as: "align_right_0"))
+        XCTAssertFalse(SemanticRouteNavigator.isSameSpokenCorrection("align_left_0", as: nil))
+    }
+
+    // MARK: - Course correction (aisle centring)
+
+    /// The pilot bump: walking straight down the aisle but drifting toward the
+    /// right-hand shelf. Cross-track recovery does not arm this early, so
+    /// before the course cue existed the user heard nothing until contact.
+    func testDriftTowardTheShelfIsNudgedBackBeforeRecoveryArms() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            clockFaceDirections: true,
+            arHeading: 10
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+
+        // Three metres along, 0.7 m right of the centre line and angled 10°
+        // further right — Henrique's line. Well under the 1.05 m cross-track
+        // limit and the 55° alignment threshold, so nothing else speaks.
+        let pose = simd_float3(0.7, 0, -3.0)
+        let walking = Self.imu(isMoving: true, x: 0, y: 3.0, bearing: 10)
+        navigator.update(imuState: walking, arPosition: pose, arHeading: 10, arLocalized: true)
+        XCTAssertNotEqual(navigator.phase, .recovering)
+
+        // A drift has to persist before it is spoken; one tick is not a course.
+        XCTAssertTrue(navigator.expireCourseCorrectionHoldForTesting())
+        navigator.update(imuState: walking, arPosition: pose, arHeading: 10, arLocalized: true)
+
+        XCTAssertEqual(navigator.speechCue?.text, "Ease to 11 o'clock.")
+        XCTAssertEqual(navigator.phase, .navigating)
+    }
+
+    func testCentredWalkerIsLeftAlone() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            clockFaceDirections: true,
+            arHeading: 0
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+
+        // A third of a metre off centre and facing straight: inside every aisle
+        // this app maps, and nothing worth speaking about.
+        let walking = Self.imu(isMoving: true, x: 0, y: 3.0, bearing: 0)
+        navigator.update(
+            imuState: walking,
+            arPosition: simd_float3(0.35, 0, -3.0),
+            arHeading: 0,
+            arLocalized: true
+        )
+        XCTAssertFalse(navigator.expireCourseCorrectionHoldForTesting())
+    }
+
+    /// Same geometry, left/right phrasing: the correction must read as a small
+    /// adjustment, not as the "turn left" that walks someone into the far shelf.
+    func testCourseCorrectionSpeaksASlightBearWithoutClockFace() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 10
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+
+        let pose = simd_float3(0.7, 0, -3.0)
+        let walking = Self.imu(isMoving: true, x: 0, y: 3.0, bearing: 10)
+        navigator.update(imuState: walking, arPosition: pose, arHeading: 10, arLocalized: true)
+        XCTAssertTrue(navigator.expireCourseCorrectionHoldForTesting())
+        navigator.update(imuState: walking, arPosition: pose, arHeading: 10, arLocalized: true)
+
+        XCTAssertEqual(navigator.speechCue?.text, "Bear slightly left.")
+    }
+
+    /// Turn-by-turn-only is a study condition: with error recovery off the user
+    /// asked for no corrective interjections at all.
+    func testCourseCorrectionSilentWhenErrorRecoveryDisabled() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            errorRecovery: false,
+            arHeading: 0
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+
+        let walking = Self.imu(isMoving: true, x: 0, y: 3.0, bearing: 10)
+        navigator.update(
+            imuState: walking,
+            arPosition: simd_float3(0.7, 0, -3.0),
+            arHeading: 10,
+            arLocalized: true
+        )
+        XCTAssertFalse(navigator.expireCourseCorrectionHoldForTesting())
+    }
+
+    // MARK: - Distance unit
+
+    func testStepsUnitSpeaksRouteDistancesAsSteps() {
+        NavigationUnits.current = .steps
+        defer { NavigationUnits.current = .meters }
+
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        // 8 m at 0.65 m per step is 12 steps — under the rounding threshold, so
+        // it is spoken exactly.
+        XCTAssertTrue(navigator.currentInstruction.contains("12 steps"))
+        XCTAssertFalse(navigator.currentInstruction.contains("meters"))
+    }
+
+    func testMetersRemainTheDefaultUnit() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        XCTAssertTrue(navigator.currentInstruction.contains("8 meters"))
+    }
+
     // MARK: - Paused-user cues
 
     func testStillnessRepromptsFullWalkInstruction() {
