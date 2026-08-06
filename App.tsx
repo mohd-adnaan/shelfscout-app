@@ -3297,13 +3297,20 @@ function AppInner(): React.JSX.Element {
         // route — matching the reaching pipeline's audio config.
         await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
 
+        // Single 215ms tone. Users start speaking on it, and the mic is not
+        // open until this promise resolves + the settle delay below — so the
+        // cue asset must never grow back into a multi-tone earcon.
+        // See playListenSound() in utils/soundEffects.ts.
         await playListenSound();
 
         // The listening cue is finished now; switch to recording for STT.
         prepareForRecording();
       }
 
-      // Delay to let audio session reconfigure after category switch
+      // Delay to let audio session reconfigure after category switch.
+      // Was 100ms and raised to 350ms to fix category-switch failures — this
+      // is the largest remaining chunk of beep→mic latency, so retune it only
+      // with on-device verification.
       if (!screenReaderEnabled) {
         await new Promise<void>(resolve => setTimeout(() => resolve(), 350));
       }

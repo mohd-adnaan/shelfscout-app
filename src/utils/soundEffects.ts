@@ -5,6 +5,7 @@
 // App state audio cues:
 //
 //   soundshelfstudio-ui-notification-listening-start.mp3 → Interaction/listening started
+//     ⚠️ MUST stay a SINGLE tone. See playListenSound() for why.
 //   jbl_latency_sae.caf                                  → Loops while waiting for backend/RTAB
 //   jbl_success_sae.caf                                  → Right before speaking the result
 //   jbl_stopped_ios_sae.mp3                              → Error returned from backend
@@ -245,6 +246,22 @@ const _playOnce = (key: SoundKey, onFinish?: () => void): void => {
 /**
  * Play when the app enters LISTENING state.
  * Resolves when the cue finishes so recording can start after the full sound.
+ *
+ * ── The cue asset MUST be a single tone ──────────────────────────────────
+ * Pilot testers reported "it beeps, then it beeps again to start listening",
+ * and they (correctly) started speaking on the FIRST beep.
+ *
+ * There was never a duplicate call site — the shipped MP3 was itself a
+ * two-tone earcon: tone 1 at 0-237ms, tone 2 at 237-840ms, then 544ms of
+ * trailing digital silence, 1.384s total. Because startListening() awaits
+ * this promise before switching the session to PlayAndRecord, the mic only
+ * opened ~1.75s after tone 1 — so everything a user said on the first beep
+ * was spoken into a closed microphone.
+ *
+ * The asset is now trimmed to tone 1 alone (215ms, faded to zero). Anyone
+ * replacing it must keep it a single short tone: every extra millisecond
+ * here is a millisecond of the user's first word that the recogniser never
+ * hears.
  */
 export const playListenSound = (): Promise<void> => {
   _listenPlaying = true;
