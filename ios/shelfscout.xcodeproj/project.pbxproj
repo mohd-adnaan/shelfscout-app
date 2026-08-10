@@ -37,6 +37,10 @@
 		5F92E8262F784DAD0036D6A4 /* Reachingviewcontroller+withHand.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F92E8252F784DA80036D6A4 /* Reachingviewcontroller+withHand.swift */; };
 		5F9A0A012F00000200000001 /* ProximitySensorModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5F9A0A002F00000200000001 /* ProximitySensorModule.swift */; };
 		5F9A0A032F00000200000001 /* ProximitySensorModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5F9A0A022F00000200000001 /* ProximitySensorModule.m */; };
+		5FE1B0012FD0000000000001 /* DeviceAttitudeModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FE1A0012FD0000000000001 /* DeviceAttitudeModule.swift */; };
+		5FE1B0022FD0000000000002 /* DeviceAttitudeModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FE1A0022FD0000000000002 /* DeviceAttitudeModule.m */; };
+		5FE1B0032FD0000000000003 /* SpatialAudioModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FE1A0032FD0000000000003 /* SpatialAudioModule.swift */; };
+		5FE1B0042FD0000000000004 /* SpatialAudioModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FE1A0042FD0000000000004 /* SpatialAudioModule.m */; };
 		5FA100012FC0000000000001 /* ARKitNavigationModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FA200012FC0000000000001 /* ARKitNavigationModels.swift */; };
 		5FA100022FC0000000000002 /* ARKitNavigationModule.m in Sources */ = {isa = PBXBuildFile; fileRef = 5FA200022FC0000000000002 /* ARKitNavigationModule.m */; };
 		5FA100032FC0000000000003 /* ARKitNavigationModule.swift in Sources */ = {isa = PBXBuildFile; fileRef = 5FA200032FC0000000000003 /* ARKitNavigationModule.swift */; };
@@ -111,6 +115,10 @@
 		5F92E8252F784DA80036D6A4 /* Reachingviewcontroller+withHand.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "Reachingviewcontroller+withHand.swift"; sourceTree = "<group>"; };
 		5F9A0A002F00000200000001 /* ProximitySensorModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ProximitySensorModule.swift; sourceTree = "<group>"; };
 		5F9A0A022F00000200000001 /* ProximitySensorModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ProximitySensorModule.m; sourceTree = "<group>"; };
+		5FE1A0012FD0000000000001 /* DeviceAttitudeModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DeviceAttitudeModule.swift; sourceTree = "<group>"; };
+		5FE1A0022FD0000000000002 /* DeviceAttitudeModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = DeviceAttitudeModule.m; sourceTree = "<group>"; };
+		5FE1A0032FD0000000000003 /* SpatialAudioModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SpatialAudioModule.swift; sourceTree = "<group>"; };
+		5FE1A0042FD0000000000004 /* SpatialAudioModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = SpatialAudioModule.m; sourceTree = "<group>"; };
 		5FA200012FC0000000000001 /* ARKitNavigationModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARKitNavigationModels.swift; sourceTree = "<group>"; };
 		5FA200022FC0000000000002 /* ARKitNavigationModule.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = ARKitNavigationModule.m; sourceTree = "<group>"; };
 		5FA200032FC0000000000003 /* ARKitNavigationModule.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ARKitNavigationModule.swift; sourceTree = "<group>"; };
@@ -173,6 +181,10 @@
 				5F00AC122FB9899B008C5923 /* WearablesCameraModule.swift */,
 				5F9A0A002F00000200000001 /* ProximitySensorModule.swift */,
 				5F9A0A022F00000200000001 /* ProximitySensorModule.m */,
+				5FE1A0012FD0000000000001 /* DeviceAttitudeModule.swift */,
+				5FE1A0022FD0000000000002 /* DeviceAttitudeModule.m */,
+				5FE1A0032FD0000000000003 /* SpatialAudioModule.swift */,
+				5FE1A0042FD0000000000004 /* SpatialAudioModule.m */,
 				5FA200012FC0000000000001 /* ARKitNavigationModels.swift */,
 				5FA200022FC0000000000002 /* ARKitNavigationModule.m */,
 				5FA200032FC0000000000003 /* ARKitNavigationModule.swift */,
@@ -544,6 +556,10 @@
 				5FD1C1023C00000100000001 /* WearablesCameraModule.m in Sources */,
 				5F9A0A012F00000200000001 /* ProximitySensorModule.swift in Sources */,
 				5F9A0A032F00000200000001 /* ProximitySensorModule.m in Sources */,
+				5FE1B0012FD0000000000001 /* DeviceAttitudeModule.swift in Sources */,
+				5FE1B0022FD0000000000002 /* DeviceAttitudeModule.m in Sources */,
+				5FE1B0032FD0000000000003 /* SpatialAudioModule.swift in Sources */,
+				5FE1B0042FD0000000000004 /* SpatialAudioModule.m in Sources */,
 				761780ED2CA45674006654EE /* AppDelegate.swift in Sources */,
 				5FD1F2013C00000200000001 /* SceneDelegate.swift in Sources */,
 				5F2669B42FBD557C007C1473 /* Reachingviewcontroller+placeandhold.swift in Sources */,

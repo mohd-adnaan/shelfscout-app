@@ -25,7 +25,7 @@ import {
 } from 'react-native-vision-camera';
 import Video from 'react-native-video';
 import { useTTS } from './src/hooks/useTTS';
-import { strings } from './src/i18n';
+import { strings, getAppLanguage } from './src/i18n';
 import { useSTT } from './src/hooks/useSTT_Enhanced';
 import { useWakeWordSTT } from './src/hooks/useWakeWordSTT';
 import { useDeviceOrientation } from './src/hooks/useDeviceOrientation';
@@ -47,6 +47,17 @@ import {
   determineActionMode,
 } from './src/services/WorkflowService';
 import { sendToRtabGuidance } from './src/services/RtabGuidanceService';
+import {
+  startDeviceAttitude,
+  stopDeviceAttitude,
+  getDeviceAttitude,
+} from './src/native/DeviceAttitude';
+import {
+  startSpatialAudio,
+  updateSpatialAudio,
+  silenceSpatialAudio,
+  stopSpatialAudio,
+} from './src/native/SpatialAudio';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
 import {
   initSounds,
@@ -426,6 +437,13 @@ function AppInner(): React.JSX.Element {
   // Qwen detection to reacquire the target. Keeps the loop alive instead of
   // exiting on bothInactive.
   const reacquiringRef = useRef(false);
+  // Orientation sensor + HRTF renderer that back the standard tracker. Started
+  // lazily on the first smart-guidance send (starting them at loop entry would
+  // run CoreMotion and an audio engine through every navigation cycle that
+  // never reaches the tracker) and torn down in the loop's cleanup block.
+  const trackerSensorsStartedRef = useRef(false);
+  const spatialAudioReadyRef = useRef(false);
+  const spatialAudioAttemptsRef = useRef(0);
   const rtabFeedIntervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const rtabLastSentFrameRef = useRef<string>('');
   const rtabLastObjectRef = useRef<string>('');
@@ -1106,6 +1124,49 @@ function AppInner(): React.JSX.Element {
 
   const hasSubmittedRtabFrame = useCallback((photoPath: string) => {
     return !!photoPath && rtabSubmittedFrameUrisRef.current.has(photoPath);
+  }, []);
+
+  // ============================================================================
+  // Standard tracker sensors — phone orientation + HRTF spatial audio
+  // ============================================================================
+  //
+  // Both back Melody's tracker specifically: orientation rides out with each
+  // frame, and the sonification block in the response drives the spatial cue.
+  // Neither is used by the on-device ARKit reaching pipeline, which does its
+  // own sensing and its own audio in ReachingViewController.
+
+  const startTrackerSensors = useCallback(async () => {
+    if (!trackerSensorsStartedRef.current) {
+      trackerSensorsStartedRef.current = true;
+      await startDeviceAttitude({ referenceFrame: 'gravity' });
+    }
+
+    // The audio engine is retried separately from the orientation sensor. It
+    // is the one that realistically fails on a first attempt — TTS and the
+    // wake-word recognizer contend for the same audio session — and a single
+    // transient failure must not silence the cue for the rest of the session.
+    // Bounded so a genuinely unavailable engine doesn't retry every cycle.
+    if (spatialAudioReadyRef.current || spatialAudioAttemptsRef.current >= 3) return;
+
+    spatialAudioAttemptsRef.current += 1;
+    const started = await startSpatialAudio({
+      // A live glasses camera stream owns the Bluetooth radio on HFP;
+      // re-categorising the session would tear the stream down.
+      manageAudioSession: !settingsRef.current.useWearablesCamera,
+    });
+    spatialAudioReadyRef.current = started;
+
+    if (!started && spatialAudioAttemptsRef.current >= 3) {
+      console.warn('[SpatialAudio] giving up after 3 attempts — spoken guidance only');
+    }
+  }, []);
+
+  const stopTrackerSensors = useCallback(async () => {
+    if (!trackerSensorsStartedRef.current) return;
+    trackerSensorsStartedRef.current = false;
+    spatialAudioReadyRef.current = false;
+    spatialAudioAttemptsRef.current = 0;
+    await Promise.all([stopDeviceAttitude(), stopSpatialAudio()]);
   }, []);
 
   const stopRtabFeed = useCallback(() => {
@@ -1794,12 +1855,23 @@ function AppInner(): React.JSX.Element {
             // the container. Resume the main workflow; reacquiringRef keeps
             // the loop alive so Qwen detection retries.
             console.warn('⚠️ [SmartGuidance] Missing payload, resuming main workflow');
+            // No frame goes out, so no sonification comes back — silence now
+            // instead of letting the last cue ride the native stale timeout.
+            await silenceSpatialAudio();
             smartGuidanceActiveRef.current = false;
             smartGuidanceResumeMainRef.current = true;
             smartGuidanceSeededRef.current = false;
             reacquiringRef.current = true;
           } else {
             usedSmartGuidance = true;
+            await startTrackerSensors();
+
+            // Sampled here rather than at capture time because this is the
+            // first point where the frame is definitely going out. capture_ts
+            // in the payload is the sensor sample's own timestamp, so the
+            // tracker aligns on that, not on when we happened to read it.
+            const orientation = await getDeviceAttitude();
+
             const smartResponse = await sendToSmartGuidance(
               {
                 object: objectName,
@@ -1809,9 +1881,17 @@ function AppInner(): React.JSX.Element {
                 success: true,
                 session_id: getSessionId(),
                 confidence: cached?.confidence,
+                orientation,
+                language: getAppLanguage(),
               },
               abortCtrl.signal
             );
+
+            // Spatial cue first, before any TTS work below — it is the
+            // real-time channel, and the tracker already decided whether this
+            // frame should sound at all via `emit`. A missing block (WAITING /
+            // FULLY_LOST) silences rather than holding the last cue.
+            await updateSpatialAudio(smartResponse?.sonification);
             // Seed has now gone out — every later call sends an empty bbox.
             if (needsSeed) {
               smartGuidanceSeededRef.current = true;
@@ -1852,6 +1932,9 @@ function AppInner(): React.JSX.Element {
               // backend re-runs Qwen detection to reacquire the target.
               // reacquiringRef keeps the loop alive instead of exiting.
               console.log('🔄 [SmartGuidance] tracking lost — reacquiring via Qwen detection');
+              // The target's position is no longer known; a cue pointing at
+              // the last one would be actively misleading during reacquisition.
+              await silenceSpatialAudio();
               smartGuidanceActiveRef.current = false;
               smartGuidanceResumeMainRef.current = true;
               smartGuidanceSeededRef.current = false;
@@ -2106,6 +2189,12 @@ function AppInner(): React.JSX.Element {
 
         // ── Mode transitions ───────────────────────────────────────────────
         if (navigationActive && !reachingActive && loopMode !== 'navigation') {
+          // Release the tracker's sensors on the way into navigation. The
+          // ARKit navigation pipeline runs its own CMMotionManager via
+          // IMUSensorManager, and leaving ours up would have two of them
+          // sampling device motion for the whole route. Reaching restarts
+          // them lazily on its next smart-guidance send.
+          await stopTrackerSensors();
           startContinuousMode('navigation', result.loopDelay);
           announceIfNoVoiceOver('Switching to navigation.');
           result.text = ''; // Prevent downstream TTS from overlapping with transition speech
@@ -2179,6 +2268,7 @@ function AppInner(): React.JSX.Element {
     console.log('🔄 [ContinuousMode] Loop ended');
     await stopLatencyLoop();
     stopRtabFeed();
+    await stopTrackerSensors();
     isContinuousModeRunning.current = false;
     continuousBackendInFlightRef.current = false;
     continuousTtsSpeakingRef.current = false;
@@ -2212,7 +2302,9 @@ function AppInner(): React.JSX.Element {
     resolveReachingPipeline,
     speakContinuousSpeechAndWait,
     startRtabFeed,
+    startTrackerSensors,
     stopRtabFeed,
+    stopTrackerSensors,
     waitForGoodPosture,
   ]);
 
@@ -2628,6 +2720,9 @@ function AppInner(): React.JSX.Element {
       reacquiringRef.current;
     continuousModeAbortRef.current = true;
     stopRtabFeed();
+    // Kill the spatial cue on the interrupt itself. Waiting for the loop's
+    // cleanup block would leave it beeping through the in-flight request.
+    await stopTrackerSensors();
     arSessionAliveRef.current = false;
     try { await ARKitNavigationBridge.stopNavigation(); } catch { }
 
@@ -2655,7 +2750,7 @@ function AppInner(): React.JSX.Element {
       }
     }
     announceTapToStart('Stopped.');
-  }, [announceTapToStart, isNavigation, isReaching, resetContinuousSpeechQueue, stopRtabFeed]);
+  }, [announceTapToStart, isNavigation, isReaching, resetContinuousSpeechQueue, stopRtabFeed, stopTrackerSensors]);
 
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;

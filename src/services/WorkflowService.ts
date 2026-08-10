@@ -17,7 +17,7 @@ import {
 import { AccessibilityService } from './AccessibilityService';
 import { debugLogger } from './DebugLogger';
 import { mobileOrchestrator } from './MobileOrchestrator';
-import { strings } from '../i18n';
+import { strings, getAppLanguage } from '../i18n';
 
 // =============================================================================
 // iOS ARKit Native Module Bridge
@@ -564,6 +564,22 @@ export const sendToWorkflow = async (
 // SMART GUIDANCE (tracker-driven reaching)
 // =============================================================================
 
+/**
+ * Phone orientation posted alongside each tracked frame. Sampled from
+ * CMDeviceMotion.attitude immediately after capture — see
+ * src/native/DeviceAttitude.ts for the angle and reference-frame conventions.
+ * `capture_ts` is Unix epoch seconds for the sensor sample itself, so the
+ * tracker can align the pose against its own frame timing.
+ */
+export interface SmartGuidanceOrientation {
+  yaw_deg: number;
+  pitch_deg: number;
+  roll_deg: number;
+  capture_ts: number;
+  reference_frame?: string;
+  age_ms?: number;
+}
+
 export interface SmartGuidanceRequest {
   object: string;
   bbox: string;
@@ -572,6 +588,24 @@ export interface SmartGuidanceRequest {
   success: boolean;
   confidence?: number;
   session_id?: string;
+  /** Omitted when the sensor is unavailable rather than sent as zeros. */
+  orientation?: SmartGuidanceOrientation | null;
+  /** 'en' | 'fr' — the language the user has selected, not the device locale. */
+  language?: string;
+}
+
+/**
+ * Per-frame spatial-audio cue. Every key is always present; `null` on
+ * pan/pitch_hz/beep_rate_hz means that axis is carried by `position` this
+ * frame instead. See src/native/SpatialAudio.ts.
+ */
+export interface SmartGuidanceSonification {
+  emit: boolean;
+  position: { x: number; y: number; z: number };
+  centered: boolean | null;
+  pan: number | null;
+  pitch_hz: number | null;
+  beep_rate_hz: number | null;
 }
 
 export interface SmartGuidanceResponse {
@@ -583,6 +617,8 @@ export interface SmartGuidanceResponse {
   class_name?: string;
   confidence?: number;
   depth_estimate?: number;
+  /** Absent for WAITING / FULLY_LOST states — the client plays nothing. */
+  sonification?: SmartGuidanceSonification | null;
 }
 
 export const sendToSmartGuidance = async (
@@ -591,9 +627,19 @@ export const sendToSmartGuidance = async (
 ): Promise<SmartGuidanceResponse> => {
   const requestStartTime = Date.now();
 
+  // Language always goes out: the tracker phrases its guidance strings
+  // server-side, so it needs to know which language to speak before it can
+  // build a response. Falls back to the current app language rather than
+  // letting the backend guess from the device locale — a Quebec user may run
+  // an English iPhone and want French guidance.
+  const language = payload.language || getAppLanguage();
+
   debugLogger.logAPI(
     `→ POST ${SMART_GUIDANCE_URL.replace('https://cybersight.cim.mcgill.ca', '')}`,
-    `object=${payload.object} bbox=${payload.bbox}`,
+    `object=${payload.object} bbox=${payload.bbox} lang=${language}` +
+      (payload.orientation
+        ? ` yaw=${payload.orientation.yaw_deg.toFixed(1)}°`
+        : ' orientation=none'),
   );
 
   const response = await axios.post<any>(
@@ -610,6 +656,11 @@ export const sendToSmartGuidance = async (
         // per-session state on it. Fall back to the current session id
         // rather than dropping the field entirely.
         session_id: payload.session_id || getSessionId(),
+        language,
+        // Omitted entirely when the sensor gave us nothing — sending zeros
+        // would read as "phone perfectly level and facing yaw origin", which
+        // is a pose, not a missing value.
+        ...(payload.orientation ? { orientation: payload.orientation } : {}),
       },
     },
     {
