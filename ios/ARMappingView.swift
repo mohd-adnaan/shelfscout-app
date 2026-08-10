@@ -314,6 +314,17 @@ struct ARMappingView: View {
     /// in `mappingManager.activeMapID`.
     @State private var requestedARMapLoadID: String?
 
+    /// Whether the full posture-and-pan coaching has been spoken already in
+    /// this app run.
+    ///
+    /// Static on purpose: a multi-destination map hops from target to target
+    /// through separate mounts of this screen, and the user does not need to
+    /// be taught how to hold the phone again at every hop — they were told at
+    /// the first one and they are still holding it the same way. Subsequent
+    /// relocalizations open on the short form, and only if the search is
+    /// actually running long; the fast ones now finish in silence.
+    private static var hasCoachedRelocalization = false
+
     /// The coaching overlay is visual-only; a blind user standing in silence
     /// while the map searches gets spoken guidance instead, then a hard
     /// timeout so the JS side can recover rather than waiting forever.
@@ -794,10 +805,26 @@ struct ARMappingView: View {
         let cue: String
         if let recognized = mappingManager.recognizedPlaceName {
             cue = NavLoc.relocRecognizedPlaceCue(recognized)
+        } else if Self.hasCoachedRelocalization {
+            // Already coached earlier in this run. The first interval passes in
+            // silence — a relocalization that resolves inside it never needed
+            // narrating — and anything after it escalates straight to the cues
+            // that ask for something new.
+            switch relocalizationVoiceCueCount {
+            case 1:
+                return
+            case 2:
+                cue = NavLoc.relocPanBriefCue()
+            case 3:
+                cue = NavLoc.relocTurnFullCircleCue()
+            default:
+                cue = NavLoc.relocStepAndTurnCue()
+            }
         } else {
             switch relocalizationVoiceCueCount {
             case 1:
                 cue = NavLoc.relocLoadingCue()
+                Self.hasCoachedRelocalization = true
             case 2:
                 cue = NavLoc.relocTurnFullCircleCue()
             default:

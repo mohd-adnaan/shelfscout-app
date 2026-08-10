@@ -145,31 +145,35 @@ enum NavLoc {
         }
     }
 
+    // The slight-turn family drops its verb ("take a slight left" → "slight
+    // left"). These fire while the user is already walking a leg and only
+    // need the correction named; the verb was a syllable of latency before
+    // the part that carries the direction.
     static func slightLeftAtCorner() -> String {
         switch lang {
-        case .en: return "take a slight left at the corner"
-        case .fr: return "prenez légèrement à gauche au coin"
+        case .en: return "slight left at the corner"
+        case .fr: return "légèrement à gauche au coin"
         }
     }
 
     static func slightRightAtCorner() -> String {
         switch lang {
-        case .en: return "take a slight right at the corner"
-        case .fr: return "prenez légèrement à droite au coin"
+        case .en: return "slight right at the corner"
+        case .fr: return "légèrement à droite au coin"
         }
     }
 
     static func slightLeft() -> String {
         switch lang {
-        case .en: return "take a slight left"
-        case .fr: return "prenez légèrement à gauche"
+        case .en: return "slight left"
+        case .fr: return "légèrement à gauche"
         }
     }
 
     static func slightRight() -> String {
         switch lang {
-        case .en: return "take a slight right"
-        case .fr: return "prenez légèrement à droite"
+        case .en: return "slight right"
+        case .fr: return "légèrement à droite"
         }
     }
 
@@ -408,18 +412,18 @@ enum NavLoc {
     /// Opening cue of a journey. States where the route ends and how far it is
     /// before the first leg, so the user can judge the guidance against what
     /// they expect instead of hearing one leg's countdown out of context.
+    ///
+    /// The start node is deliberately NOT named. "Starting at Left turn 4" is
+    /// a capture label, not a place the user recognises, and it delayed the
+    /// only two facts that matter — where they are going and how far it is.
     static func startingJourney(
-        start: String,
         destination: String,
         distance: String,
         firstInstruction: String
     ) -> String {
         switch lang {
-        case .en: return "Starting at \(start). \(destination) is \(distance) away. \(firstInstruction)"
-        // "Départ à" is the time construction ("départ à 8 h"); a place takes
-        // "départ de", which would then need to contract with the label's
-        // article ("de le" → "du"). The colon form sidesteps both.
-        case .fr: return "Point de départ : \(start). \(destination) est à \(distance). \(firstInstruction)"
+        case .en: return "\(destination) is \(distance) away. \(firstInstruction)"
+        case .fr: return "\(destination) est à \(distance). \(firstInstruction)"
         }
     }
 
@@ -486,52 +490,61 @@ enum NavLoc {
         }
     }
 
-    static func inDistanceTurn(distance: String, turn: String) -> String {
+    /// The maneuver first, the distance second: "Turn right in 6 meters."
+    ///
+    /// Fronting the maneuver means the user knows WHAT is coming while the
+    /// distance is still being spoken. The old order ("In 6 meters, turn
+    /// right") made them hold a number for a sentence before learning what it
+    /// was a number of. `turn` arrives sentence-cased from the caller.
+    static func turnInDistance(turn: String, distance: String) -> String {
         switch lang {
-        case .en: return "In \(distance), \(turn)."
-        case .fr: return "Dans \(distance), \(turn)."
+        case .en: return "\(turn) in \(distance)."
+        case .fr: return "\(turn) dans \(distance)."
         }
     }
 
-    /// French takes a preposition before a walked distance. "sur" is used
-    /// rather than "de" throughout this catalog because every distance string
-    /// can begin with "environ", and "de environ" would need eliding to
-    /// "d'environ" — a contraction the interpolation cannot make.
-    static func walkDistance(distance: String, context: String) -> String {
+    /// A leg stated as distance plus what it runs toward: "12 meters, straight
+    /// ahead."
+    ///
+    /// The verb is gone on purpose. "Walk" opened every routine cue on the
+    /// route and carried no information — the user is already walking, and by
+    /// the third leg the word is pure latency in front of the number.
+    static func legDistance(distance: String, context: String) -> String {
         switch lang {
-        case .en: return "Walk \(distance), \(context)."
-        case .fr: return "Marchez sur \(distance), \(context)."
+        case .en: return "\(distance), \(context)."
+        case .fr: return "\(distance), \(context)."
         }
     }
 
-    static func walkDistancePassing(
+    static func legDistancePassing(
         distance: String,
         context: String,
         landmark: String
     ) -> String {
         switch lang {
-        case .en: return "Walk \(distance), \(context). Passing \(landmark)."
-        case .fr: return "Marchez sur \(distance), \(context). Vous passez \(landmark)."
+        case .en: return "\(distance), \(context). Passing \(landmark)."
+        case .fr: return "\(distance), \(context). Vous passez \(landmark)."
         }
     }
 
-    static func turnThenWalk(
+    static func turnThenLeg(
         prefix: String,
         turn: String,
         distance: String,
         context: String
     ) -> String {
         switch lang {
-        case .en: return "\(prefix)\(turn). Walk \(distance), \(context)."
-        case .fr: return "\(prefix)\(turn). Marchez sur \(distance), \(context)."
+        case .en: return "\(prefix)\(turn). \(distance), \(context)."
+        case .fr: return "\(prefix)\(turn). \(distance), \(context)."
         }
     }
 
-    static func atTheTurn(_ turn: String) -> String {
-        switch lang {
-        case .en: return "At the turn, \(turn)."
-        case .fr: return "Au virage, \(turn)."
-        }
+    /// A bare distance, spoken as its own cue: "3 meters." Used for the
+    /// countdown between the maneuver announcement and the maneuver itself,
+    /// where the context has already been established and repeating it is
+    /// what made the guidance feel like chatter.
+    static func distanceOnly(_ distance: String) -> String {
+        "\(distance)."
     }
 
     static func defaultRouteLabel() -> String {
@@ -573,7 +586,7 @@ enum NavLoc {
     }
 
     /// Final-leg approach cue, the destination's counterpart to
-    /// `inDistanceTurn` — spoken once as the destination comes up, not
+    /// `turnInDistance` — spoken once as the destination comes up, not
     /// repeated every meter.
     static func destinationInDistance(_ destination: String, distance: String) -> String {
         switch lang {
@@ -600,20 +613,19 @@ enum NavLoc {
         }
     }
 
-    static func switchingToReaching(object: String) -> String {
-        switch lang {
-        case .en: return "Switching to reaching guidance for \(object)."
-        case .fr: return "Je passe au guidage vers \(object)."
-        }
-    }
-
     /// Arrival where the target sits beside the last walked node rather than at
     /// the end of the route: `side` comes from the directional-context family
     /// ("on your left"). The user turns, they do not keep walking.
-    static func destinationOnSide(_ side: String) -> String {
+    ///
+    /// One sentence, not three. Arrival used to chain "Arrived at X." + "It is
+    /// on your left." + "Switching to reaching guidance for X." — and the
+    /// reaching handoff cut the tail off mid-word every time, so the side (the
+    /// one part that tells the user where to turn) was the part they lost. The
+    /// handoff sentence is gone because reaching announces itself anyway.
+    static func arrivedAtOnSide(_ target: String, side: String) -> String {
         switch lang {
-        case .en: return "It is \(side)."
-        case .fr: return "C’est \(side)."
+        case .en: return "Arrived at \(target), \(side)."
+        case .fr: return "Arrivée à \(target), \(side)."
         }
     }
 
@@ -624,14 +636,19 @@ enum NavLoc {
         }
     }
 
+    /// "Look toward the target to confirm arrival" used to follow this. It
+    /// asked a blind user to aim a camera at something they cannot see in
+    /// order to satisfy the app's own confirmation step — work for the user
+    /// that arrival detection does on its own a moment later.
     static func nearTargetConfirm(_ target: String) -> String {
         switch lang {
         case .en:
-            return "Near \(target). Look toward the target to confirm arrival."
+            return "Near \(target)."
         case .fr:
-            // The label goes after "vers", never after "de": "de" would have to
-            // contract with an article the label may carry ("de le" → "du").
-            return "Vous approchez de la cible. Tournez-vous vers \(target) pour confirmer l’arrivée."
+            // Apposition after "la cible", never "de \(target)": "de" would
+            // have to contract with an article the label may carry ("de le" →
+            // "du"), which the interpolation cannot do.
+            return "Vous approchez de la cible : \(target)."
         }
     }
 
@@ -653,10 +670,23 @@ enum NavLoc {
 
     // ── Relocalization and map improvement ──────────────────────────────────
 
+    /// First relocalization cue. Opens on the instruction, not on a status
+    /// report: "Loading the saved route" told the user what the app was doing
+    /// while they stood waiting to be told what to do.
     static func relocLoadingCue() -> String {
         switch lang {
-        case .en: return "Loading the saved route. Hold the phone at chest height and slowly pan left and right."
-        case .fr: return "Chargement du trajet enregistré. Tenez le téléphone à hauteur de poitrine et balayez lentement de gauche à droite."
+        case .en: return "Hold the phone at chest height and slowly pan left and right."
+        case .fr: return "Tenez le téléphone à hauteur de poitrine et balayez lentement de gauche à droite."
+        }
+    }
+
+    /// Shorter opener for a relocalization AFTER the first one in this app
+    /// run: the full posture-and-pan coaching has already been heard, and on a
+    /// multi-destination map the user hears it at every hop.
+    static func relocPanBriefCue() -> String {
+        switch lang {
+        case .en: return "Pan slowly left and right."
+        case .fr: return "Balayez lentement de gauche à droite."
         }
     }
 

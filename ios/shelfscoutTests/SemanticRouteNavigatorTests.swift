@@ -19,7 +19,10 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertTrue(started)
         XCTAssertEqual(navigator.phase, .navigating)
         XCTAssertTrue(navigator.currentInstruction.contains("Turn around to face the route."))
-        XCTAssertNotNil(navigator.currentInstruction.range(of: "walk", options: .caseInsensitive))
+        // One-leg route: the distance is stated once, the leg contributes the
+        // direction.
+        XCTAssertTrue(navigator.currentInstruction.contains("Milk is 8 meters away."))
+        XCTAssertTrue(navigator.currentInstruction.contains("toward milk."))
     }
 
     func testWrongTurnAtNextSegmentSpeaksCorrectAlignmentCue() {
@@ -68,7 +71,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
 
         XCTAssertEqual(navigator.phase, .navigating)
         XCTAssertFalse(navigator.currentInstruction.contains("face the route"))
-        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Walk"))
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("4 meters,"))
     }
 
     func testBackwardARMovementTriggersWrongDirectionRecovery() {
@@ -333,7 +336,10 @@ final class SemanticRouteNavigatorTests: XCTestCase {
 
         XCTAssertEqual(navigator.currentStepIndex, 0, "Turn must not be announced before AR reaches it")
         XCTAssertEqual(navigator.phase, .navigating)
-        XCTAssertFalse(navigator.currentInstruction.contains("At the turn"))
+        // At the turn the cue is the bare command; 2.5 m out it must still be
+        // the pre-announcement that carries a distance.
+        XCTAssertNotEqual(navigator.currentInstruction, "Turn right.")
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn right in "))
     }
 
     func testARDestinationProximityCompletesRouteDespitePDRLag() {
@@ -702,7 +708,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         navigator.forceStillnessRepromptWindowForTesting()
         navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
 
-        XCTAssertEqual(navigator.speechCue?.text.hasPrefix("Walk"), true)
+        XCTAssertEqual(navigator.speechCue?.text.hasPrefix("8 meters,"), true)
     }
 
     func testAlignmentCompletionSpeaksWalkResumeCue() {
@@ -723,7 +729,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // Turn completed → explicit walk resumption, not silence.
         navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
         XCTAssertEqual(navigator.speechCue?.text.hasPrefix("Good."), true)
-        XCTAssertNotNil(navigator.speechCue?.text.range(of: "walk", options: .caseInsensitive))
+        XCTAssertNotNil(navigator.speechCue?.text.range(of: "8 meters,"))
     }
 
     // MARK: - Bidirectional map coverage
@@ -873,8 +879,8 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // not walk a metre into it.
         XCTAssertTrue(navigator.currentInstruction.contains("Turn left to face the route."))
         XCTAssertFalse(navigator.currentInstruction.contains("less than one meter"))
-        // The dropped stub must not move where the user is told they are.
-        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Starting at Onions."))
+        // The dropped stub must not move where the user is judged to be.
+        XCTAssertEqual(navigator.spokenStartLabel, "Onions")
     }
 
     func testArrivalSpeaksWhichWayTheShelfIs() {
@@ -902,8 +908,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         )
 
         XCTAssertEqual(navigator.phase, .arrived)
-        XCTAssertTrue(navigator.currentInstruction.contains("Arrived at Onions."))
-        XCTAssertTrue(navigator.currentInstruction.contains("It is on your left."))
+        XCTAssertEqual(navigator.currentInstruction, "Arrived at Onions, on your left.")
     }
 
     func testStraightPointIsNeverSpokenAsAPlaceOrATurn() {
@@ -930,7 +935,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             speakLandmarks: false,
             arHeading: 218
         ))
-        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Starting at"))
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Onions is"))
 
         // ARKit finishes aligning to the saved map: the user was really 8 m
         // along, not at the route start.
@@ -943,7 +948,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
 
         // One correction cue, not a fresh journey announcement — restarting
         // re-resolves the start edge and can speak a different turn each time.
-        XCTAssertFalse(navigator.currentInstruction.hasPrefix("Starting at"))
+        XCTAssertFalse(navigator.currentInstruction.hasPrefix("Onions is"))
         XCTAssertEqual(navigator.speechCue?.text, navigator.currentInstruction)
         // Re-resolved from where they actually are, not from the route start.
         XCTAssertNotEqual(navigator.routeSteps.first?.from.name, "Cereals")
@@ -1207,7 +1212,8 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // The 180 reading is one instant of the sweep, not a facing: the
         // opening announcement must not command a turn from it.
         XCTAssertFalse(navigator.currentInstruction.contains("Turn around"))
-        XCTAssertNotNil(navigator.currentInstruction.range(of: "walk", options: .caseInsensitive))
+        XCTAssertTrue(navigator.currentInstruction.contains("Milk is 8 meters away."))
+        XCTAssertTrue(navigator.currentInstruction.contains("Toward Milk."))
 
         // Once the user settles still facing the wrong way, the cue is owed —
         // and now it is computed from a heading they actually hold.
@@ -1240,7 +1246,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // The stub was dropped and the first leg bears 23° — 65° off. That
         // turn happens AT the stub's far end; commanding it now told a
         // correctly-facing user to turn into the shelf.
-        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Starting at Onions."))
+        XCTAssertEqual(navigator.spokenStartLabel, "Onions")
         XCTAssertFalse(navigator.currentInstruction.contains("face the route"))
 
         navigator.update(

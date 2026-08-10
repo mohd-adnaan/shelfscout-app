@@ -2322,12 +2322,10 @@ function AppInner(): React.JSX.Element {
           console.warn('⚠️ [ARKitNavigation] Intro TTS warning:', e?.message || e);
         }
       }
-    } else if (!result.text) {
-      await speakContinuousSpeechAndWait(
-        `Starting ARKit route guidance to ${targetName}.`,
-        { ignoreAbort: true },
-      );
     }
+    // No "Starting ARKit route guidance to X" here. It named the pipeline to
+    // the one person who has no use for that word, and the native session
+    // announces the route itself a moment later ("Onions is 21 meters away").
 
     if (isEmergencyStopped.current) return true;
 
