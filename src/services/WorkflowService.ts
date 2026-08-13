@@ -578,6 +578,8 @@ export interface SmartGuidanceOrientation {
   capture_ts: number;
   reference_frame?: string;
   age_ms?: number;
+  /** CMAttitude.quaternion — the same rotation, without gimbal lock. */
+  quaternion?: { x: number; y: number; z: number; w: number };
 }
 
 export interface SmartGuidanceRequest {
@@ -592,6 +594,14 @@ export interface SmartGuidanceRequest {
   orientation?: SmartGuidanceOrientation | null;
   /** 'en' | 'fr' — the language the user has selected, not the device locale. */
   language?: string;
+  /**
+   * Unix epoch seconds for the frame in `image`, on the same clock as
+   * `orientation.capture_ts` so the two can be differenced directly. This is
+   * when takePhoto() returned, i.e. capture COMPLETION — it trails the actual
+   * shutter instant by the camera's processing latency. Sampled before the
+   * orientation fix-up pass, so that pass doesn't inflate it.
+   */
+  frame_ts?: number | null;
 }
 
 /**
@@ -639,7 +649,12 @@ export const sendToSmartGuidance = async (
     `object=${payload.object} bbox=${payload.bbox} lang=${language}` +
       (payload.orientation
         ? ` yaw=${payload.orientation.yaw_deg.toFixed(1)}°`
-        : ' orientation=none'),
+        : ' orientation=none') +
+      // Pose-to-frame skew is the number Melody actually cares about, so log
+      // the difference rather than two raw epochs nobody can subtract by eye.
+      (payload.frame_ts && payload.orientation
+        ? ` skew=${((payload.orientation.capture_ts - payload.frame_ts) * 1000).toFixed(0)}ms`
+        : ''),
   );
 
   const response = await axios.post<any>(
@@ -661,6 +676,10 @@ export const sendToSmartGuidance = async (
         // would read as "phone perfectly level and facing yaw origin", which
         // is a pose, not a missing value.
         ...(payload.orientation ? { orientation: payload.orientation } : {}),
+        // Same reasoning: absent beats a fabricated timestamp. A prefetched
+        // frame captured before this cycle still carries its own stamp, so
+        // this is never just "now".
+        ...(payload.frame_ts ? { frame_ts: payload.frame_ts } : {}),
       },
     },
     {

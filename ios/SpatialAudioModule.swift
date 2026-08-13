@@ -17,19 +17,27 @@
 //    azimuth    position.x, always — unless `pan` is non-null, in which case
 //               x is already flattened to 0 server-side and `pan` carries
 //               left/right as plain stereo pan.
-//    elevation  position.y — unless `pitch_hz` is non-null, in which case y
-//               is 0 and tone frequency carries up/down. This is the server
-//               default: generic HRTFs localize elevation poorly, and bone
-//               conduction bypasses the pinna entirely, which is where HRTF
-//               elevation filtering happens.
-//    depth      position.z — unless `beep_rate_hz` is non-null, in which case
-//               z sits at a fixed reference distance and repetition rate
-//               carries near/far. Also the server default: z is the axis that
-//               produces front/back confusion in HRTF.
+//    elevation  position.y when the server carries elevation via HRTF, and/or
+//               `pitch_hz` as the tone frequency. In the server's pitch mode y
+//               is flattened to 0 and frequency alone carries up/down: generic
+//               HRTFs localize elevation poorly, and bone conduction bypasses
+//               the pinna entirely, which is where HRTF elevation filtering
+//               happens.
+//    depth      position.z when depth is carried by HRTF, and/or
+//               `beep_rate_hz` as the repetition rate. In the server's beep
+//               mode z sits at a fixed reference distance and rate alone
+//               carries near/far: z is the axis that produces front/back
+//               confusion in HRTF.
 //
-//  So "non-null wins over the position axis" is the whole contract, and the
-//  module must not assume which mode is active — the server can flip any axis
-//  between frames.
+//  As of Melody's Aug 2026 change the server populates pitch_hz and
+//  beep_rate_hz on EVERY frame, including HRTF mode — in HRTF mode they set
+//  the carrier tone and pulse rate while position.y/z still carry the cue.
+//  So this module simply renders whatever it is given: it uses pitch_hz and
+//  beep_rate_hz for the tone whenever present, and position for placement,
+//  without inferring which mode the server is in. The flattening is the
+//  server's job and it has already happened by the time we see the values.
+//  The constants below are fallbacks for a field arriving null, not defaults
+//  the renderer expects to hit.
 //
 //  Listener orientation is FIXED facing forward and never rotated with device
 //  heading. The positions arriving from the server are already expressed
@@ -94,12 +102,11 @@ class SpatialAudioModule: NSObject {
 
   private static let sampleRate: Double = 44100
   private static let toneDuration: Double = 0.08
-  /// Carrier frequency when the server carries elevation via position.y and
-  /// therefore sends pitch_hz = null. A4, matching sonification.py's neutral.
+  /// Fallback carrier frequency if pitch_hz ever arrives null. A4, matching
+  /// sonification.py's neutral. The server now always sends a value.
   private static let defaultToneHz: Double = 440.0
-  /// Repetition rate when the server carries depth via position.z and
-  /// therefore sends beep_rate_hz = null. The source still has to pulse to be
-  /// localizable, it just stops encoding distance.
+  /// Fallback repetition rate if beep_rate_hz ever arrives null. The source
+  /// still has to pulse to be localizable. The server now always sends one.
   private static let defaultBeepRateHz: Double = 2.0
   /// Timer granularity — the beep interval is compared against elapsed time on
   /// each tick, so rate changes take effect without rescheduling the timer.

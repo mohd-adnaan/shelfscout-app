@@ -35,9 +35,12 @@
 //        unreliable indoors near steel shelving — which is exactly where this
 //        pipeline runs.
 //    "trueNorth"         → .xTrueNorthZVertical (also needs location).
-//  Default is "gravity" for the same reason the ARKit pipeline avoids
-//  .gravityAndHeading indoors: a heading-referenced frame in a grocery aisle
-//  stalls and swings. Switch it from JS if Melody wants absolute yaw.
+//
+//  .xArbitraryZVertical is Melody's confirmed choice (Aug 2026), for the same
+//  reason the ARKit pipeline avoids .gravityAndHeading indoors: a
+//  heading-referenced frame in a grocery aisle stalls and swings. The other
+//  frames stay reachable from JS, but switching mid-study invalidates
+//  previously collected runs — yaw would no longer mean the same thing.
 //
 
 import Foundation
@@ -153,6 +156,9 @@ class DeviceAttitudeModule: NSObject {
 
     let attitude = motion.attitude
     let radToDeg = 180.0 / Double.pi
+    // Same rotation as the Euler angles, in the form that survives gimbal
+    // lock and interpolates cleanly — the tracker consumes both.
+    let q = attitude.quaternion
 
     // CMDeviceMotion.timestamp is seconds since last boot (same clock as
     // ProcessInfo.systemUptime), so shift it onto the Unix epoch. Recomputed
@@ -175,6 +181,7 @@ class DeviceAttitudeModule: NSObject {
       // differently-referenced pose is visible rather than silently wrong.
       "reference_frame": frameName,
       "age_ms": ageMs,
+      "quaternion": ["x": q.x, "y": q.y, "z": q.z, "w": q.w],
     ])
   }
 

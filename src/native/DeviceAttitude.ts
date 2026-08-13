@@ -24,11 +24,12 @@ const { DeviceAttitudeModule } = NativeModules as {
 };
 
 /**
- * What yaw 0 means. `gravity` is the default: pitch/roll are absolute
- * (gravity-referenced) but yaw is relative to wherever the phone pointed when
- * updates started, and it drifts. The north-referenced frames give absolute
- * yaw at the cost of depending on the magnetometer, which is unreliable in a
- * grocery aisle full of steel shelving.
+ * What yaw 0 means. `gravity` is Melody's confirmed choice: pitch/roll are
+ * absolute (gravity-referenced) but yaw is relative to wherever the phone
+ * pointed when updates started, and it drifts. The north-referenced frames
+ * give absolute yaw at the cost of depending on the magnetometer, which is
+ * unreliable in a grocery aisle full of steel shelving. Do not change this
+ * mid-study — yaw would stop meaning the same thing across runs.
  */
 export type AttitudeReferenceFrame = 'gravity' | 'magneticNorth' | 'trueNorth';
 
@@ -45,6 +46,12 @@ export interface DeviceAttitude {
   reference_frame: AttitudeReferenceFrame;
   /** Sample age at read time. Large values mean the sensor stalled. */
   age_ms: number;
+  /**
+   * The same rotation as the Euler angles above, straight from
+   * CMAttitude.quaternion. Free of gimbal lock and safe to interpolate, which
+   * the degrees are not.
+   */
+  quaternion: { x: number; y: number; z: number; w: number };
 }
 
 const isSupported = (): boolean =>

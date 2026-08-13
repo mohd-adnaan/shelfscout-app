@@ -5,16 +5,19 @@
  *
  * The tracker returns a `sonification` block per frame; this hands it to the
  * native AVAudioEnvironmentNode renderer unchanged. The wire shape is stable —
- * every key is always present, and `null` means "this axis is not carried by
- * this parameter on this frame":
+ * every key is always present:
  *
- *   pan       non-null → azimuth is stereo pan, position.x is already 0
- *   pitch_hz  non-null → elevation is tone frequency, position.y is already 0
- *   beep_rate_hz non-null → depth is repetition rate, position.z is at a
- *                fixed reference distance
+ *   pan          non-null → azimuth is stereo pan and position.x is already 0;
+ *                null → azimuth is position.x under HRTF
+ *   pitch_hz     the tone's frequency. Also carries elevation on its own when
+ *                the server flattened position.y to 0
+ *   beep_rate_hz the pulse rate. Also carries depth on its own when the server
+ *                pinned position.z to a fixed reference distance
  *
- * Check for null, never for key presence. The server can flip any axis between
- * frames, so the renderer re-reads all three every update.
+ * Since Melody's Aug 2026 change, pitch_hz and beep_rate_hz are populated on
+ * every frame including HRTF mode, so the renderer just plays what it is
+ * given rather than inferring the mode. Any flattening already happened
+ * server-side. Check for null, never for key presence.
  *
  * iOS only — on Android these are no-ops and the loop falls back to spoken
  * guidance alone.

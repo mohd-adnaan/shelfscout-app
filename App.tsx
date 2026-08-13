@@ -875,6 +875,36 @@ function AppInner(): React.JSX.Element {
   useEffect(() => {
     waitForGoodPostureRef.current = waitForGoodPosture;
   }, [waitForGoodPosture]);
+
+  // ── Frame capture timestamps ──────────────────────────────────────────────
+  // Melody's tracker differences the frame time against the orientation
+  // sample time, so the stamp has to belong to the frame rather than to the
+  // moment we happen to send it: the loop routinely posts a PREFETCHED photo
+  // captured one or more cycles earlier, and stamping at send time would
+  // report that frame as seconds fresher than it is. Keyed by photo URI so
+  // the stamp travels with the image through the prefetch queue.
+  const frameCaptureTsRef = useRef<Map<string, number>>(new Map());
+
+  const rememberFrameCaptureTs = useCallback((uri: string, tsSeconds: number) => {
+    if (!uri) return;
+    const map = frameCaptureTsRef.current;
+    map.set(uri, tsSeconds);
+    // Only the in-flight and prefetched frames are ever looked up; the rest
+    // are dead weight. Insertion order makes the oldest key the first one.
+    while (map.size > 12) {
+      const oldest = map.keys().next().value;
+      if (oldest === undefined) break;
+      map.delete(oldest);
+    }
+  }, []);
+
+  // Non-destructive: the size cap already bounds the map, and consuming the
+  // entry would make a re-sent frame report no timestamp at all.
+  const getFrameCaptureTs = useCallback((uri: string): number | null => {
+    if (!uri) return null;
+    return frameCaptureTsRef.current.get(uri) ?? null;
+  }, []);
+
   const reactivateCameraAndCapture = useCallback(async (options?: {
     enableShutterSound?: boolean;
     busyStrategy?: 'wait' | 'skip' | 'wait-new';
@@ -926,6 +956,10 @@ function AppInner(): React.JSX.Element {
         if (settingsRef.current.useWearablesCamera) {
           try {
             const wearablesPhoto = await wearablesCamera.capturePhoto();
+            // Glasses frames travel over Bluetooth before they land here, so
+            // this stamp trails the shutter by more than the phone camera's
+            // does. Still the closest instant we can observe.
+            rememberFrameCaptureTs(wearablesPhoto, Date.now() / 1000);
             lastImageDimensions.current = { width: 0, height: 0 };
             lastCameraIntrinsics.current = undefined;
             return wearablesPhoto;
@@ -960,7 +994,11 @@ function AppInner(): React.JSX.Element {
             enableShutterSound: useSystemShutterSound,
             flash: 'off',
           });
+          // Stamped before the orientation fix-up, which rewrites the file and
+          // would otherwise add its own latency to the frame's reported age.
+          const capturedAtSeconds = Date.now() / 1000;
           const fixedImage = await fixImageOrientation(photo.path);
+          rememberFrameCaptureTs(fixedImage.uri, capturedAtSeconds);
           lastImageDimensions.current = {
             width: fixedImage.width || 0,
             height: fixedImage.height || 0,
@@ -1001,6 +1039,7 @@ function AppInner(): React.JSX.Element {
             const retry = await cameraRef.current.takePhoto({
               enableShutterSound: useSystemShutterSound,
             });
+            rememberFrameCaptureTs(retry.path, Date.now() / 1000);
             lastCameraIntrinsics.current = cameraIntrinsicsForUploadedImage(
               (retry as any).cameraCalibrationData,
               { width: retry.width, height: retry.height },
@@ -1019,7 +1058,7 @@ function AppInner(): React.JSX.Element {
 
     activeCapturePromiseRef.current = capturePromise;
     return capturePromise;
-  }, []);
+  }, [rememberFrameCaptureTs]);
   const reactivateCameraAndCaptureRef = useRef(reactivateCameraAndCapture);
   useEffect(() => {
     reactivateCameraAndCaptureRef.current = reactivateCameraAndCapture;
@@ -1871,6 +1910,9 @@ function AppInner(): React.JSX.Element {
             // in the payload is the sensor sample's own timestamp, so the
             // tracker aligns on that, not on when we happened to read it.
             const orientation = await getDeviceAttitude();
+            // Belongs to the frame itself, so a prefetched photo reports when
+            // it was actually taken rather than when it was sent.
+            const frameTs = getFrameCaptureTs(photoPath || '');
 
             const smartResponse = await sendToSmartGuidance(
               {
@@ -1883,6 +1925,7 @@ function AppInner(): React.JSX.Element {
                 confidence: cached?.confidence,
                 orientation,
                 language: getAppLanguage(),
+                frame_ts: frameTs,
               },
               abortCtrl.signal
             );
@@ -2305,6 +2348,7 @@ function AppInner(): React.JSX.Element {
     startTrackerSensors,
     stopRtabFeed,
     stopTrackerSensors,
+    getFrameCaptureTs,
     waitForGoodPosture,
   ]);
 
