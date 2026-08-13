@@ -201,10 +201,37 @@ struct ARViewContainer: UIViewRepresentable {
             let node = SCNNode(geometry: pyramid)
             node.simdPosition = position
             node.renderingOrder = 100
-            // A pyramid's apex points along +y; steer +y onto the (horizontal)
-            // travel direction so the arrow lies flat, pointing where to walk.
-            node.simdOrientation = simd_quatf(from: SIMD3<Float>(0, 1, 0), to: simd_normalize(direction))
+            node.simdOrientation = Self.floorArrowOrientation(direction: direction)
             return node
+        }
+
+        /// Lays a pyramid flat on the floor with its apex along `direction`.
+        ///
+        /// `simd_quatf(from:to:)` returns the MINIMAL rotation between two
+        /// vectors, which leaves the roll about the resulting axis
+        /// unconstrained. Taking the pyramid's apex (+y) onto a horizontal
+        /// travel direction therefore also takes its 0.28 m base width onto the
+        /// vertical and leaves the 0.05 m thickness horizontal: every chevron
+        /// rendered as a thin blade standing on edge, seen almost end-on from
+        /// behind. That is the "distorted arrows" in the 2026-08-11 pilot
+        /// screenshot — the trail was drawn as a row of slivers rather than
+        /// arrowheads. Build the basis explicitly instead, so the geometry's own
+        /// axes land where the comment always claimed: width across the aisle,
+        /// apex along travel, thickness on the vertical.
+        private static func floorArrowOrientation(direction: SIMD3<Float>) -> simd_quatf {
+            let horizontal = SIMD3<Float>(direction.x, 0, direction.z)
+            guard simd_length(horizontal) > 1e-4 else {
+                // A purely vertical leg cannot happen (every overlay point
+                // shares one floor height), but a degenerate basis would put
+                // NaNs in the scene graph, so fall back to unrotated.
+                return simd_quatf(angle: 0, axis: SIMD3<Float>(0, 1, 0))
+            }
+            let forward = simd_normalize(horizontal)
+            let up = SIMD3<Float>(0, 1, 0)
+            let right = simd_normalize(simd_cross(forward, up))
+            // Columns are where the geometry's own x/y/z end up. SCNPyramid
+            // spans `width` on x, `height` (apex) on y and `length` on z.
+            return simd_quatf(simd_float3x3(columns: (right, forward, up)))
         }
 
         /// A checkpoint ring standing across the active leg at eye height.
@@ -495,9 +522,29 @@ struct ARMappingView: View {
             return []
         }
         let floorY = cameraPosition.y - 1.35
-        return semanticNavigator.arFrameRoutePolyline(userARPosition: cameraPosition).map {
+        var points = semanticNavigator.arFrameRoutePolyline(userARPosition: cameraPosition).map {
             SIMD3<Float>(Float($0.x), floorY, Float(-$0.y))
         }
+        // The polyline's first vertex is the BELIEVED position on the route, not
+        // where the camera is. Those differ by the belief's cross-track and
+        // along-track error — 0.39 m and 0.51 m median, 3.3 m worst case across
+        // the two 2026-08-11 pilot journeys — and the trail, its 1.6 m lead-in
+        // and the eye-height gate are all measured from that first vertex. A
+        // metre of lateral belief error therefore swings the first chevron ~30°
+        // off the aisle and stands the gate in front of the shelving, which is
+        // the "arrows point into the shelf while the spoken leg is right"
+        // report: guidance steers on the leg BEARING and survives the offset,
+        // the overlay draws raw geometry and does not.
+        //
+        // Only the leading vertex is moved. Every node, turn pillar and the
+        // destination beacon keep their true map positions, so the active leg is
+        // drawn from the user's feet toward the node they are actually walking
+        // to, and a genuine off-route offset still shows up as a diagonal first
+        // segment instead of a whole trail shifted sideways.
+        if !points.isEmpty {
+            points[0] = SIMD3<Float>(cameraPosition.x, floorY, cameraPosition.z)
+        }
+        return points
     }
 
     /// Why the overlay is showing what it is. Logged with the rebuild so a

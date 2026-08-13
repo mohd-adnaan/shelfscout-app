@@ -1523,12 +1523,45 @@ final class SemanticRouteNavigator: ObservableObject {
         if let previousID = lastCapturedNodeID,
            let previousIndex = workingMap.nodes.firstIndex(where: { $0.id == previousID }),
            workingMap.nodes[previousIndex].point.distance(to: pose) <= manualNodeSnapDistance {
-            workingMap.nodes[previousIndex].name = name
-            workingMap.nodes[previousIndex].kind = kind
-            workingMap.nodes[previousIndex].turnHint = turnHint
-            workingMap.nodes[previousIndex].headingDegrees = heading
-            workingMap.nodes[previousIndex].aliases = Self.aliases(for: name)
-            workingMap.nodes[previousIndex].poiAnchorId = poiAnchorId
+            // ⚠️ A structural mark landing on the node just captured must not
+            // erase what that node IS.
+            //
+            // "Mark the shelf, then mark the turn you take at it" is the normal
+            // capture gesture, and when the two marks are made without walking
+            // (< `manualNodeSnapDistance`) this branch used to rename the
+            // destination into "Left turn 1", flip its kind to .intersection and
+            // drop its `poiAnchorId` — and `sanitizedMap` then deleted its
+            // `reachingObjectName` too, because it only keeps that field on
+            // destinations. In the 2026-08-11 pilot's "Test" map that removed
+            // Biscuits from the graph outright: guidance still routed there
+            // through the landmark captureLandmark had left behind and still
+            // spoke "Arrived at Biscuits", but the node it arrived at carried no
+            // reaching object, so the handoff never fired. Onions, whose turn
+            // was marked 0.40 m away — just outside this 0.28 m radius — kept
+            // its node and reached correctly. That is the whole difference
+            // between the first destination and the second.
+            //
+            // Keep the named point's identity and take only what the new mark
+            // actually adds: the turn hint and a fresh heading.
+            let existingKind = workingMap.nodes[previousIndex].kind
+            let isNamedPoint = existingKind == .destination || existingKind == .entrance
+            let isStructuralMark = kind != .destination && kind != .entrance
+            let keepsIdentity = isNamedPoint && isStructuralMark
+            let existingName = workingMap.nodes[previousIndex].name
+            if keepsIdentity {
+                // A hintless mark (a plain route point) adds nothing here, and
+                // must not wipe a turn already recorded at this shelf.
+                workingMap.nodes[previousIndex].turnHint =
+                    turnHint ?? workingMap.nodes[previousIndex].turnHint
+                workingMap.nodes[previousIndex].headingDegrees = heading
+            } else {
+                workingMap.nodes[previousIndex].name = name
+                workingMap.nodes[previousIndex].kind = kind
+                workingMap.nodes[previousIndex].turnHint = turnHint
+                workingMap.nodes[previousIndex].headingDegrees = heading
+                workingMap.nodes[previousIndex].aliases = Self.aliases(for: name)
+                workingMap.nodes[previousIndex].poiAnchorId = poiAnchorId
+            }
             if kind == .entrance {
                 workingMap.startNodeId = workingMap.nodes[previousIndex].id
             } else if kind == .destination {
@@ -1551,9 +1584,20 @@ final class SemanticRouteNavigator: ObservableObject {
             lastAutoSampledAt = Date()
             currentSegmentDraftMeters = 0
             refreshCaptureMetrics(for: workingMap)
-            currentInstruction = kind == .intersection
-                ? "Marked \(name). Continue walking after the \(turnHint?.isCorner == true ? "corner" : "turn")."
-                : "Updated route point \(name)."
+            let turnWord = turnHint?.isCorner == true ? "corner" : "turn"
+            if keepsIdentity {
+                // Name the point the mark landed on, not the label that was
+                // discarded: the mapper has to be able to hear that the turn was
+                // recorded ON the shelf they just named rather than as a node of
+                // its own, because that is what the saved graph now says.
+                currentInstruction = kind == .intersection
+                    ? "Marked the \(turnWord) at \(existingName). Continue walking after the \(turnWord)."
+                    : "Updated \(existingName)."
+            } else {
+                currentInstruction = kind == .intersection
+                    ? "Marked \(name). Continue walking after the \(turnWord)."
+                    : "Updated route point \(name)."
+            }
             emitCue(currentInstruction, priority: .regular)
             rebuildRAGContext()
             return true

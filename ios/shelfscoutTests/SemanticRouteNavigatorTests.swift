@@ -1662,6 +1662,95 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertEqual(abs(reversed ?? 0), 180, accuracy: 12)
     }
 
+    // MARK: - Capture: a turn marked at a destination
+
+    /// Marking the turn you take AT a shelf, without stepping away from it,
+    /// must not delete the shelf.
+    ///
+    /// The 2026-08-11 pilot's "Test" capture marked "Biscuits", linked its
+    /// reaching object, then marked the turn from the same spot. The
+    /// snap-to-previous branch renamed the destination into "Left turn 1" and
+    /// flipped its kind, `sanitizedMap` then dropped the reaching object it no
+    /// longer considered a destination's, and arrival at Biscuits had nothing
+    /// to hand off to — while Onions, whose turn was marked 0.40 m away, kept
+    /// its node and reached correctly.
+    func testTurnMarkedAtADestinationKeepsTheDestinationAndItsReachingObject() {
+        let navigator = SemanticRouteNavigator()
+        navigator.beginRouteCapture(named: "Pilot")
+        XCTAssertTrue(navigator.captureStart(
+            named: "Intersection",
+            arPosition: simd_float3(0, 0, 0),
+            arHeading: 297,
+            imuState: Self.imu(bearing: 297)
+        ))
+
+        // Walk to the shelf, name it, and link the object to reach for there.
+        let shelf = SemanticRoutePoint(x: -1.98, y: 1.21)
+        XCTAssertTrue(navigator.captureLandmark(
+            named: "Biscuits",
+            side: .right,
+            context: "",
+            arPosition: Self.arPosition(shelf),
+            isDestination: true
+        ))
+        XCTAssertTrue(navigator.attachReachingObject(named: "Oreos"))
+
+        // The turn is taken at the shelf: same spot, a few cm of hand jitter.
+        XCTAssertTrue(navigator.captureTurn(
+            .left,
+            arPosition: Self.arPosition(SemanticRoutePoint(x: -1.99, y: 1.25)),
+            arHeading: 206,
+            imuState: Self.imu(x: -1.99, y: 1.25, bearing: 206)
+        ))
+
+        let biscuits = navigator.activeMap?.nodes.first { $0.name == "Biscuits" }
+        XCTAssertNotNil(biscuits, "the destination must survive the turn mark")
+        XCTAssertEqual(biscuits?.kind, .destination)
+        XCTAssertEqual(biscuits?.turnHint, .left, "the turn is recorded on it")
+        XCTAssertEqual(navigator.reachingObjectName(forTarget: "Biscuits"), "Oreos")
+        XCTAssertFalse(
+            navigator.activeMap?.nodes.contains { $0.name == "Left turn 1" } ?? true,
+            "no rival node is minted at the same spot either"
+        )
+
+        // `sanitizedMap` keeps `reachingObjectName` only on nodes that are
+        // still destinations, so the kind above is what carries the link
+        // through the save. Assert the field itself rather than saving, which
+        // would persist a fixture to disk.
+        XCTAssertEqual(biscuits?.reachingObjectName, "Oreos")
+    }
+
+    /// Control: the snap itself still works. Two structural marks made from one
+    /// spot are still one node — that is what keeps a corrected turn from
+    /// leaving a stub behind.
+    func testTurnRemarkedAtTheSameSpotStillCollapsesToOneNode() {
+        let navigator = SemanticRouteNavigator()
+        navigator.beginRouteCapture(named: "Pilot")
+        XCTAssertTrue(navigator.captureStart(
+            named: "Intersection",
+            arPosition: simd_float3(0, 0, 0),
+            arHeading: 297,
+            imuState: Self.imu(bearing: 297)
+        ))
+        let corner = SemanticRoutePoint(x: -1.98, y: 1.21)
+        XCTAssertTrue(navigator.captureTurn(
+            .left,
+            arPosition: Self.arPosition(corner),
+            arHeading: 206,
+            imuState: Self.imu(x: corner.x, y: corner.y, bearing: 206)
+        ))
+        XCTAssertTrue(navigator.captureTurn(
+            .right,
+            arPosition: Self.arPosition(SemanticRoutePoint(x: -1.99, y: 1.25)),
+            arHeading: 26,
+            imuState: Self.imu(x: -1.99, y: 1.25, bearing: 26)
+        ))
+
+        let turns = navigator.activeMap?.nodes.filter { $0.kind == .intersection } ?? []
+        XCTAssertEqual(turns.count, 1, "the second mark corrects the first")
+        XCTAssertEqual(turns.first?.turnHint, .right)
+    }
+
     private static func arPosition(_ point: SemanticRoutePoint) -> simd_float3 {
         // Route y is the negation of ARKit z; the navigator converts back.
         simd_float3(Float(point.x), 0, Float(-point.y))
