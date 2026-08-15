@@ -704,7 +704,17 @@ private struct ARKitRouteHostView: View {
             .environmentObject(ttsManager)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
+                    // "Done" alone tells a VoiceOver user nothing about what it
+                    // finishes, and while guidance runs it is the only control
+                    // on screen and the only way out. The app is not listening
+                    // during navigation, so this button IS the interface.
                     Button("Done", action: onDone)
+                        .accessibilityLabel(
+                            launchTargetName == nil ? "Done" : NavLoc.stopGuidanceButton()
+                        )
+                        .accessibilityHint(
+                            launchTargetName == nil ? "" : NavLoc.stopGuidanceButtonHint()
+                        )
                 }
             }
         }

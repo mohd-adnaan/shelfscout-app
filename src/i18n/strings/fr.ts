@@ -77,7 +77,7 @@ export const fr: StringCatalog = {
     // "quand vous l'avez" fixes the object as singular; a plural target ("les
     // céréales") needs "les avez". Naming the article dodges the clitic.
     guidingTo: (target: string) =>
-      `Je vous guide vers ${target}. Suivez les signaux sonores. Touchez l’écran quand vous avez l’article.`,
+      `Je vous guide vers ${target}. Touchez l’écran quand vous l’avez.`,
     // NOT `${object} atteint!` — the participle would have to agree with the
     // object's gender and number, and "la bouteille atteint" also reads as the
     // present tense of atteindre. After "avoir" no agreement is required.
@@ -107,6 +107,41 @@ export const fr: StringCatalog = {
       `Je vous guide vers ${target}. Initialisation du module ARKit.`,
     emptyResponse: 'Le serveur a renvoyé une réponse vide. Réessayez.',
     navigationStopped: 'Navigation arrêtée. ShelfScout est prêt.',
+  },
+
+  // ── Navigation par trajet ARKit ──────────────────────────────────────────
+  //
+  // Les libellés de destination sont interpolés tels qu’ils ont été
+  // enregistrés à la cartographie, souvent en anglais (« Onions »). D’où
+  // « vers Onions » plutôt qu’un tour de phrase qui exigerait le genre du
+  // nom : aucune de ces formules ne doit s’accorder avec l’étiquette.
+  navigation: {
+    targetNotFoundWithList: (target: string, known: string) =>
+      `Je ne trouve pas ${target} dans vos trajets enregistrés. Destinations disponibles : ${known}.`,
+    targetNotFoundNoMap: (target: string) =>
+      `Je ne trouve pas ${target} dans vos trajets enregistrés. Cartographiez-le d’abord dans les réglages.`,
+    targetUnclear:
+      'Je n’ai pas compris la destination. Redemandez-la, s’il vous plaît.',
+    arrivedAt: (target: string) => `Vous êtes arrivé à ${target}.`,
+    arrivedSwitchingToReaching: (target: string, object: string) =>
+      `Vous êtes arrivé à ${target}. Je passe au guidage de préhension pour ${object}.`,
+    couldNotStartReaching: (object: string) =>
+      `Je n’ai pas pu démarrer le guidage de préhension pour ${object}.`,
+    holdPhoneStraight:
+      'Tenez le téléphone droit, caméra vers l’avant, puis redemandez.',
+    unavailableFallback:
+      'La navigation ARKit n’est pas disponible sur cet appareil. Je bascule sur la navigation Rtab.',
+    mapNotFound: (target: string) =>
+      `Aucune carte de trajet AR enregistrée pour ${target}. Ouvrez les réglages, Gérer les cartes de trajet AR, et cartographiez le trajet d’abord.`,
+    targetNotInMaps: (target: string) =>
+      `${target} ne figure pas dans les cartes de trajet AR enregistrées. Ajoutez-le comme destination ou point de repère, puis réessayez.`,
+    relocalizationFailed:
+      'Je n’arrive pas à me repérer sur la carte AR enregistrée. Placez-vous n’importe où sur le trajet cartographié, tenez le téléphone à hauteur de poitrine et balayez lentement les tablettes.',
+    arrivalUnverified: (target: string) =>
+      `Je n’ai pas pu confirmer votre position à ${target}. Marchez le long du trajet cartographié et redemandez.`,
+    cancelled: 'Navigation ARKit annulée.',
+    ended: 'Navigation ARKit terminée.',
+    endedWithError: 'La navigation ARKit s’est terminée par une erreur.',
   },
 
   settings: {

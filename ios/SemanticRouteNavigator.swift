@@ -460,6 +460,16 @@ final class SemanticRouteNavigator: ObservableObject {
     /// approach, landmark and reassurance cues from stacking on each other.
     private var lastRoutineCueAt: Date?
     private var spokenDestinationApproachCue = false
+    /// Metres past the destination along the final leg, from the live AR pose.
+    /// Recomputed every tick next to `lastARNodeDistanceMeters`; nil whenever
+    /// the pose cannot answer the question.
+    private var destinationOvershootDistanceMeters: Double?
+    /// Dead-reckoned distance walked since the final leg's own progress model
+    /// saturated. The AR half of the signal needs a localized pose; this half
+    /// is what still works when the pose is the thing that has gone stale.
+    private var destinationOvershootWalkMeters: Double = 0
+    private var destinationOvershootStartedAt: Date?
+    private var lastDestinationOvershootCueAt: Date?
     /// Whether this leg's maneuver has been named yet. The first approach gate
     /// names it; the rest of the countdown is bare distances.
     private var spokenLegManeuverCue = false
@@ -678,6 +688,15 @@ final class SemanticRouteNavigator: ObservableObject {
     private let recoveryCueCooldownSeconds: TimeInterval = 5.0
     private let beliefHoldGraceSeconds: TimeInterval = 1.25
     private let beliefHoldRepeatSeconds: TimeInterval = 7.0
+    /// A lost route stays SILENT for this long before it apologises.
+    ///
+    /// The snap escalation fires at 5 s and clears most holds without the user
+    /// ever needing to know one happened, so anything spoken before then is an
+    /// interruption about a problem that was already being fixed. Sitting just
+    /// past it means the apology only reaches the user when the quick recovery
+    /// has actually failed — which is the one case where the pilot participant
+    /// wanted to hear something.
+    private let beliefHoldSpokenAfterSeconds: TimeInterval = 5.5
     /// After this long in a belief hold, stop asking the user to pan and
     /// actively snap back onto the best-matching route position.
     private let beliefRelocalizeAfterSeconds: TimeInterval = 5.0
@@ -694,6 +713,19 @@ final class SemanticRouteNavigator: ObservableObject {
     /// this before the advance is blocked.
     private let arStepCompletionSlackMeters = 1.0
     private let destinationJustAheadMeters = 1.6
+    /// How far past the destination, measured along the final leg, before the
+    /// user is told they have overshot it.
+    ///
+    /// Comfortably outside `destinationJustAheadMeters` so the approach cue and
+    /// the arrival gate own everything up to the shelf, and outside the metre
+    /// or so of belief noise that a stationary user shows: telling someone to
+    /// turn around when they have not passed anything is a worse failure than
+    /// the silence this replaces.
+    private let destinationOvershootMeters = 2.2
+    /// And sustained for this long, so one bad pose cannot trigger it.
+    private let destinationOvershootHoldSeconds: TimeInterval = 1.5
+    /// Repeat cadence while they keep walking the wrong way.
+    private let destinationOvershootRepeatSeconds: TimeInterval = 6.0
     private let trackingLimitedPrefixCooldownSeconds: TimeInterval = 10.0
     private let guidanceIntroProtectionSeconds: TimeInterval = 4.0
     private let autoSampleDistanceMeters = 0.60
@@ -2309,10 +2341,23 @@ final class SemanticRouteNavigator: ObservableObject {
             "map": activeMap.map { traceMapGraph($0) } ?? NSNull(),
             "openingInstruction": currentInstruction
         ])
+        // Teach the exit once per launch, on the opening cue rather than as a
+        // second one — `speechCue` holds a single value, so a follow-up emitted
+        // in the same tick would overwrite the route itself. Once, because the
+        // participant needs to learn it, not to be told it on every leg of a
+        // shopping trip.
+        if !Self.didSpeakStopGuidanceHint {
+            Self.didSpeakStopGuidanceHint = true
+            currentInstruction += NavLoc.stopGuidanceHint()
+        }
         emitCue(currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
     }
+
+    /// App-launch scoped: this navigator is recreated with the AR screen, so an
+    /// instance flag would re-teach the exit on every journey.
+    private static var didSpeakStopGuidanceHint = false
 
     func stopNavigation(resetInstruction: Bool = true) {
         routeSteps.removeAll()
@@ -2476,6 +2521,7 @@ final class SemanticRouteNavigator: ObservableObject {
         tracePose = arPoint
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
+        destinationOvershootDistanceMeters = nil
         if let arPoint,
            activeMap?.coordinateSpace == "ar_world_xz" {
             let projection = Self.projectDetailed(arPoint, onto: step)
@@ -2483,6 +2529,13 @@ final class SemanticRouteNavigator: ObservableObject {
             crossTrackError = projection.crossTrackMeters
             if arLocalized {
                 lastARNodeDistanceMeters = arPoint.distance(to: step.to.point)
+                // `projectDetailed` clamps to the leg, so its along-track can
+                // never say "past the end" — which is exactly the state that
+                // needs saying on the final leg. Measure it unclamped.
+                if currentStepIndex >= routeSteps.count - 1 {
+                    let beyond = Self.metersBeyondNode(arPoint, on: step)
+                    if beyond > 0 { destinationOvershootDistanceMeters = beyond }
+                }
                 if projection.crossTrackMeters <= offAxisProgressThresholdMeters(for: step) {
                     lastTrustedARRemainingMeters = max(0, step.edge.distanceMeters - projection.alongTrackMeters)
                 }
@@ -2615,6 +2668,38 @@ final class SemanticRouteNavigator: ObservableObject {
 
         segmentProgressMeters = min(segmentProgressMeters, step.edge.distanceMeters)
         segmentRemainingMeters = max(0, step.edge.distanceMeters - segmentProgressMeters)
+
+        // ── Overshoot, the dead-reckoned half ────────────────────────────────
+        //
+        // The clamp directly above is why nothing could ever say "you have gone
+        // too far": progress saturates at the leg length and the excess is
+        // discarded every tick. On 11 Aug 2026 that reached a pilot participant
+        // as "about 1 meter, toward Onions" repeating while she walked past the
+        // shelf and away — the belief was pinned at the end of the leg and the
+        // AR pose, which is the other half of this signal, was not localized
+        // enough to contradict it.
+        //
+        // So bank the excess instead: once the route says the final leg is
+        // finished and the user is still taking steps, every one of those steps
+        // is distance away from the destination. `isAtFinalDestination` runs
+        // earlier in this tick and returns before here whenever arrival is
+        // plausible, so this only ever accumulates once that check has already
+        // declined — i.e. the user is walking, past the end, and not arriving.
+        if currentStepIndex >= routeSteps.count - 1 {
+            if segmentRemainingMeters <= 0.01, imuState.isMoving {
+                destinationOvershootWalkMeters += max(0, gatedDelta)
+            } else if segmentRemainingMeters > 0.5 {
+                destinationOvershootWalkMeters = 0
+            }
+            if destinationOvershootWalkMeters > 0 {
+                destinationOvershootDistanceMeters = max(
+                    destinationOvershootDistanceMeters ?? 0,
+                    destinationOvershootWalkMeters
+                )
+            }
+        } else {
+            destinationOvershootWalkMeters = 0
+        }
         confidence = Self.confidence(
             observationConfidence: observationConfidence,
             headingError: headingError,
@@ -3692,15 +3777,15 @@ final class SemanticRouteNavigator: ObservableObject {
                 }
             ]))
         }
-        var instruction = routeLocalizationStatus == .lost
-            ? "Route lost. Stop and slowly look around."
-            : "Hold on. Pan the phone slowly."
-        // On repeats, add something actionable instead of the same sentence:
-        // point the camera at a mapped landmark so visual matching can lock.
-        if !cueChanged, let hint = expectedRecoveryLandmarkHint() {
-            instruction += " Look for \(hint)."
-        }
-        currentInstruction = instruction
+        // Both of these were raw English, so a French session heard them in the
+        // wrong language, and both told the user to stop and work the camera.
+        // Pilot feedback, 11 Aug 2026: the user does not want a job here, and
+        // usually there is nothing to do — the hold clears on its own. The
+        // system now says what IT is doing, and only once it has been at it
+        // long enough to be worth mentioning.
+        currentInstruction = routeLocalizationStatus == .lost
+            ? NavLoc.realigningApology()
+            : NavLoc.realigningStatus()
 
         // A re-entry moments after a snap or exit is the same episode, not
         // news; speech stays quiet inside the re-entry window while the banner
@@ -3713,7 +3798,13 @@ final class SemanticRouteNavigator: ObservableObject {
         // shows it, the recovery still runs, and the cue the hold was masking
         // — the turn at the end of the leg — arrives on time. A genuinely lost
         // route keeps its voice: that one the user does have to act on.
+        //
+        // Even a lost route now waits: recovery usually lands inside
+        // `beliefHoldSpokenAfterSeconds` (the snap and the rebuild escalations
+        // above both fire before it), and announcing a wobble the system is
+        // about to fix itself is what made a working route sound broken.
         let holdIsSpoken = routeLocalizationStatus == .lost
+            && holdDuration >= beliefHoldSpokenAfterSeconds
         if holdIsSpoken,
            (cueChanged && cueAge >= beliefHoldReentryQuietSeconds) || cueAge >= beliefHoldRepeatSeconds {
             emitCue(currentInstruction, priority: .critical)
@@ -3976,7 +4067,7 @@ final class SemanticRouteNavigator: ObservableObject {
         didRebuildRouteThisUpdate = true
 
         let turn = Self.relativeTurnCommand(from: liveHeading, to: rejoinEdge.bearingDegrees, style: turnPhrasing)
-        let nodeName = Self.sanitizedSpokenLabel(best.node.name, fallback: NavLoc.defaultRouteLabel())
+        let nodeName = Self.spokenNodeLabel(best.node).nilIfBlank ?? NavLoc.defaultRouteLabel()
         let rejoinDistance = Self.formatDistance(rejoinEdge.distanceMeters)
         currentInstruction = turn.key == "straight"
             ? NavLoc.rejoinStraight(distance: rejoinDistance, node: nodeName)
@@ -5176,7 +5267,12 @@ final class SemanticRouteNavigator: ObservableObject {
         } else {
             landmarkPrefix = ""
         }
-        currentInstruction = NavLoc.turnThenLeg(prefix: landmarkPrefix, turn: Self.sentenceCased(turn), distance: Self.formatDistance(next.edge.distanceMeters), context: nextContext)
+        // "Walk" belongs on exactly this cue and no other: it is what tells the
+        // user the turn is finished and they should start moving again. Pilot
+        // participants completed the turn and then stood still waiting for a
+        // further instruction. Every later cue on the leg drops back to the
+        // bare `legDistance` phrasing, so the word never becomes filler.
+        currentInstruction = NavLoc.turnThenWalkLeg(prefix: landmarkPrefix, turn: Self.sentenceCased(turn), distance: Self.formatDistance(next.edge.distanceMeters), context: nextContext)
         emitCue(currentInstruction, priority: .critical)
         // This already told them which way to turn, so the alignment cue must
         // not repeat it a tick later while they are still turning.
@@ -5200,7 +5296,44 @@ final class SemanticRouteNavigator: ObservableObject {
         if let hint = step.to.turnHint, hint.isCorner { return NavLoc.towardTheCorner() }
         if let hint = step.to.turnHint, hint != .straight { return NavLoc.towardTheNextTurn() }
         if step.to.turnHint == .straight { return NavLoc.straightAheadContext() }
-        return NavLoc.towardPlace(Self.sanitizedSpokenLabel(step.to.name, fallback: NavLoc.theNextPointLabel()))
+        return NavLoc.towardPlace(Self.spokenNodeLabel(step.to))
+    }
+
+    /// A node's name as it should be SPOKEN, with capture bookkeeping stripped.
+    ///
+    /// Turn nodes are auto-named "Left turn 2" / "Corner 1" at capture time so
+    /// the mapper can tell them apart in the inspector. Read aloud, the ordinal
+    /// is a number the user cannot use and cannot look for. A hintless turn
+    /// node — which is how "10 meters, toward Left turn 2" reached a pilot
+    /// participant, since `walkContext` only generalises nodes that still carry
+    /// their hint — is caught here by its label instead.
+    ///
+    /// Real places (destinations, entrances, named landmarks) keep their names:
+    /// those are what the user asked for.
+    private static func spokenNodeLabel(_ node: SemanticRouteNode) -> String {
+        let name = sanitizedSpokenLabel(node.name)
+        if let hint = node.turnHint {
+            switch hint {
+            case .left: return NavLoc.theLeftTurn()
+            case .right: return NavLoc.theRightTurn()
+            case .corner, .cornerLeft, .cornerRight: return NavLoc.theCornerLabel()
+            case .straight: break
+            }
+        }
+        guard node.kind == .intersection || name.isEmpty else { return name }
+        // Auto-generated labels are always built from `SemanticTurnHint
+        // .nodeName` plus an ordinal, in English, whatever the app language is.
+        let lowered = name.lowercased()
+        if lowered.hasPrefix("left turn") { return NavLoc.theLeftTurn() }
+        if lowered.hasPrefix("right turn") { return NavLoc.theRightTurn() }
+        if lowered.hasPrefix("corner") || lowered.hasPrefix("left corner")
+            || lowered.hasPrefix("right corner") {
+            return NavLoc.theCornerLabel()
+        }
+        if name.isEmpty || lowered.hasPrefix("turn") || lowered.hasPrefix("straight point") {
+            return NavLoc.theNextTurnLabel()
+        }
+        return name
     }
 
     // MARK: - Session trace
@@ -5418,12 +5551,16 @@ final class SemanticRouteNavigator: ObservableObject {
                 NavLoc.destinationAheadOnSide(destination, side: Self.sidePhrase($0.side))
             } ?? NavLoc.destinationJustAhead(destination)
         } else {
-            let landmarkContext = shouldSpeakLandmarks ? nextLandmarkPhrase(on: step, after: segmentProgressMeters) : nil
-            if let landmarkContext {
-                currentInstruction = NavLoc.legDistancePassing(distance: Self.formatDistance(cueRemainingMeters), context: context, landmark: landmarkContext)
-            } else {
-                currentInstruction = NavLoc.legDistance(distance: Self.formatDistance(cueRemainingMeters), context: context)
-            }
+            // No landmark clause here. `nearbyLandmarkCue` below already
+            // announces the landmark as its own cue, timed to when the user
+            // reaches it; appending it to the leg distance said the same thing
+            // a second time and turned the opening cue into "Onions is 25
+            // meters away. 6 meters, toward the next turn. Passing Biscuits
+            // ahead in less than one meter." — three clauses before the user
+            // has taken a step, one of which was about a shelf they were
+            // already standing at. Pilot feedback, 11 Aug 2026: too much text
+            // at the start.
+            currentInstruction = NavLoc.legDistance(distance: Self.formatDistance(cueRemainingMeters), context: context)
         }
 
         let pastIntroProtection = guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
@@ -5437,6 +5574,12 @@ final class SemanticRouteNavigator: ObservableObject {
                 lastTrackingLimitedPrefixAt = now
             }
         }
+
+        // Ahead of the intro protection and the pacing floor both: walking away
+        // from the destination is the one thing on this leg the user cannot
+        // afford to hear late, and every cue below it describes a route that is
+        // now behind them.
+        if speakDestinationOvershootIfDue() { return }
 
         let routineSpeechAllowed = forceSpeech || guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
         guard routineSpeechAllowed else { return }
@@ -5458,6 +5601,63 @@ final class SemanticRouteNavigator: ObservableObject {
         if speakDestinationApproachIfDue(remainingMeters: cueRemainingMeters) { return }
         if speakApproachCueIfDue(on: step, remainingMeters: cueRemainingMeters) { return }
         speakQuietPeriodReassuranceIfDue(remainingMeters: cueRemainingMeters)
+    }
+
+    /// The user has walked past the destination and is still walking.
+    ///
+    /// Nothing used to say so. `segmentProgressMeters` saturates at the end of
+    /// the leg and `cueRemainingMeters` is capped by the leg length, so the
+    /// guidance model's most emphatic statement about an overshoot is "about 1
+    /// meter, toward Onions" — which is what a pilot participant heard on
+    /// repeat, walking away, until they worked it out for themselves.
+    ///
+    /// Returns true when it spoke, so the routine cue for a leg the user has
+    /// left behind does not follow it out.
+    private func speakDestinationOvershootIfDue() -> Bool {
+        guard phase == .navigating || phase == .recovering,
+              currentStepIndex >= routeSteps.count - 1,
+              let overshoot = destinationOvershootDistanceMeters,
+              overshoot >= destinationOvershootMeters else {
+            destinationOvershootStartedAt = nil
+            return false
+        }
+
+        let now = Date()
+        guard let since = destinationOvershootStartedAt else {
+            destinationOvershootStartedAt = now
+            return false
+        }
+        guard now.timeIntervalSince(since) >= destinationOvershootHoldSeconds else {
+            return false
+        }
+
+        let isFirstCue = lastDestinationOvershootCueAt == nil
+        if let last = lastDestinationOvershootCueAt,
+           now.timeIntervalSince(last) < destinationOvershootRepeatSeconds {
+            return false
+        }
+        lastDestinationOvershootCueAt = now
+
+        let destination = Self.sanitizedSpokenLabel(
+            targetName,
+            fallback: NavLoc.defaultDestinationLabel()
+        )
+        // First call names the correction; repeats give the distance back, so
+        // someone who has already turned around hears progress rather than the
+        // same sentence.
+        currentInstruction = isFirstCue
+            ? NavLoc.passedDestinationTurnAround(destination)
+            : NavLoc.passedDestinationWalkBack(
+                destination,
+                distance: Self.formatDistance(overshoot)
+            )
+        NavigationTrace.shared.log("nav.destinationOvershoot", traceState(extra: [
+            "overshootM": overshoot,
+            "heldSeconds": now.timeIntervalSince(since),
+            "text": currentInstruction
+        ]))
+        emitCue(currentInstruction, priority: .critical)
+        return true
     }
 
     /// The last thing spoken before arrival is what tells a blind user to slow
@@ -5554,6 +5754,9 @@ final class SemanticRouteNavigator: ObservableObject {
         lastSpokenApproachGateMeters = nil
         spokenDestinationApproachCue = false
         spokenLegManeuverCue = false
+        destinationOvershootStartedAt = nil
+        lastDestinationOvershootCueAt = nil
+        destinationOvershootWalkMeters = 0
         lastRoutineCueAt = Date()
     }
 
@@ -5677,14 +5880,6 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         .min { $0.ahead < $1.ahead }
         .map { ($0.id, $0.phrase) }
-    }
-
-    private func expectedRecoveryLandmarkHint() -> String? {
-        guard let step = activeStep else { return nil }
-        if let landmark = nearbyLandmarkCue(on: step, after: max(0, segmentProgressMeters - 1.0)) {
-            return landmark.phrase.replacingOccurrences(of: ".", with: "")
-        }
-        return nextLandmarkPhrase(on: step, after: max(0, segmentProgressMeters - 1.0))
     }
 
     private func currentVisualRouteMatch(
@@ -7066,6 +7261,17 @@ final class SemanticRouteNavigator: ObservableObject {
         )
     }
 
+    /// Signed metres past `step.to`, measured along the leg's own direction.
+    /// Negative before the node, positive after it. Unclamped on purpose —
+    /// `projectDetailed` saturates at the node and cannot express an overshoot.
+    private static func metersBeyondNode(_ point: SemanticRoutePoint, on step: SemanticRouteStep) -> Double {
+        let dx = step.to.point.x - step.from.point.x
+        let dy = step.to.point.y - step.from.point.y
+        let lengthSquared = max(dx * dx + dy * dy, 0.0001)
+        let rawT = ((point.x - step.from.point.x) * dx + (point.y - step.from.point.y) * dy) / lengthSquared
+        return (rawT - 1.0) * step.edge.distanceMeters
+    }
+
     private static func project(_ point: SemanticRoutePoint, from: SemanticRoutePoint, to: SemanticRoutePoint, distance: Double) -> (alongTrackMeters: Double, crossTrackMeters: Double) {
         let dx = to.x - from.x
         let dy = to.y - from.y
@@ -8116,6 +8322,10 @@ final class SemanticRouteNavigator: ObservableObject {
 #if DEBUG
 extension SemanticRouteNavigator {
     func replaceMapsForTesting(_ maps: [SemanticRouteMap], activeMapID: String? = nil) {
+        // The stop-guidance hint is launch-scoped, so in a test process it
+        // would land on whichever test happened to navigate first. Suppress it
+        // by default and let `armStopGuidanceHintForTesting` opt in.
+        Self.didSpeakStopGuidanceHint = true
         stopNavigation(resetInstruction: false)
         let cleaned = maps.map(Self.sanitizedMap)
         self.maps = cleaned
@@ -8171,6 +8381,22 @@ extension SemanticRouteNavigator {
     func expireCourseCorrectionHoldForTesting() -> Bool {
         guard courseCorrectionSince != nil else { return false }
         courseCorrectionSince = Date().addingTimeInterval(-(courseCorrectionHoldSeconds + 0.1))
+        return true
+    }
+
+    func armStopGuidanceHintForTesting() {
+        Self.didSpeakStopGuidanceHint = false
+    }
+
+    /// Backdates the overshoot hold, so a test can reach the "you have passed
+    /// it" cue without walking past the destination for a real second and a
+    /// half. Returns false when no overshoot is being tracked, which is itself
+    /// the assertion the control test wants.
+    @discardableResult
+    func expireDestinationOvershootHoldForTesting() -> Bool {
+        guard destinationOvershootStartedAt != nil else { return false }
+        destinationOvershootStartedAt = Date()
+            .addingTimeInterval(-(destinationOvershootHoldSeconds + 0.1))
         return true
     }
 

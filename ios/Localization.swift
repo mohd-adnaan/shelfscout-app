@@ -465,6 +465,42 @@ enum NavLoc {
         }
     }
 
+    // ── Structural node labels ──────────────────────────────────────────────
+    //
+    // "Left turn 2" is a CAPTURE label: the ordinal exists so the mapper can
+    // tell two turns apart in the route inspector. Spoken to a walking user it
+    // is noise at best — "ten meters toward Left turn 2" invites them to look
+    // for a thing called "left turn two" — and pilot feedback on 11 Aug 2026
+    // asked for the numbers to go. The turn itself is the whole message.
+
+    static func theLeftTurn() -> String {
+        switch lang {
+        case .en: return "the left turn"
+        case .fr: return "le virage à gauche"
+        }
+    }
+
+    static func theRightTurn() -> String {
+        switch lang {
+        case .en: return "the right turn"
+        case .fr: return "le virage à droite"
+        }
+    }
+
+    static func theCornerLabel() -> String {
+        switch lang {
+        case .en: return "the corner"
+        case .fr: return "le coin"
+        }
+    }
+
+    static func theNextTurnLabel() -> String {
+        switch lang {
+        case .en: return "the next turn"
+        case .fr: return "le prochain virage"
+        }
+    }
+
     // ── Landmarks passed along a leg ────────────────────────────────────────
     //
     // These were built inline in SemanticRouteNavigator until the French pilot
@@ -516,26 +552,24 @@ enum NavLoc {
         }
     }
 
-    static func legDistancePassing(
-        distance: String,
-        context: String,
-        landmark: String
-    ) -> String {
-        switch lang {
-        case .en: return "\(distance), \(context). Passing \(landmark)."
-        case .fr: return "\(distance), \(context). Vous passez \(landmark)."
-        }
-    }
-
-    static func turnThenLeg(
+    /// The first cue of a new leg, spoken the moment the turn is called:
+    /// "Turn right. Walk 11 meters toward the next turn."
+    ///
+    /// The verb is back, and ONLY here. `legDistance` above dropped it because
+    /// it opened every routine cue on a leg the user was already walking; at a
+    /// turn the opposite is true — pilot participants completed the turn and
+    /// then stood still, because nothing in "Turn right. 11 meters, toward the
+    /// next turn." told them the turn was over and walking had resumed. It is
+    /// the transition that needs the verb, not the repetition.
+    static func turnThenWalkLeg(
         prefix: String,
         turn: String,
         distance: String,
         context: String
     ) -> String {
         switch lang {
-        case .en: return "\(prefix)\(turn). \(distance), \(context)."
-        case .fr: return "\(prefix)\(turn). \(distance), \(context)."
+        case .en: return "\(prefix)\(turn). Walk \(distance) \(context)."
+        case .fr: return "\(prefix)\(turn). Marchez \(distance) \(context)."
         }
     }
 
@@ -633,6 +667,27 @@ enum NavLoc {
         switch lang {
         case .en: return "\(destination) is just ahead, \(side)."
         case .fr: return "\(destination) est juste devant, \(side)."
+        }
+    }
+
+    /// The user has walked past the destination and is still going.
+    ///
+    /// There was nothing for this on 11 Aug 2026: a pilot participant walked
+    /// past Onions and heard "about 1 meter, toward Onions" on repeat, because
+    /// the route's own progress model saturates at the end of the leg and
+    /// cannot express "behind you". They recovered by themselves.
+    static func passedDestinationTurnAround(_ destination: String) -> String {
+        switch lang {
+        case .en: return "You've passed \(destination). Turn around."
+        case .fr: return "Vous avez dépassé \(destination). Faites demi-tour."
+        }
+    }
+
+    /// The same, once they are facing back: how far to walk to return.
+    static func passedDestinationWalkBack(_ destination: String, distance: String) -> String {
+        switch lang {
+        case .en: return "\(destination) is \(distance) behind you."
+        case .fr: return "\(destination) est à \(distance) derrière vous."
         }
     }
 
@@ -808,10 +863,59 @@ enum NavLoc {
         }
     }
 
+    /// Said once per app launch, on the first journey.
+    ///
+    /// Guidance owns the microphone-free part of the session: the app is not
+    /// listening while it runs, and a pilot participant spoke to it and waited.
+    /// Naming the way out is what makes the silence legible — she does not have
+    /// to wonder whether it heard her, because she knows what the exit is.
+    static func stopGuidanceHint() -> String {
+        switch lang {
+        case .en: return " Tap Done to stop guidance."
+        case .fr: return " Touchez Terminé pour arrêter le guidage."
+        }
+    }
+
+    /// The AR screen's exit control, for VoiceOver.
+    static func stopGuidanceButton() -> String {
+        switch lang {
+        case .en: return "Stop guidance"
+        case .fr: return "Arrêter le guidage"
+        }
+    }
+
+    static func stopGuidanceButtonHint() -> String {
+        switch lang {
+        case .en: return "Double tap to end navigation"
+        case .fr: return "Touchez deux fois pour terminer la navigation"
+        }
+    }
+
     static func guidanceRealigned() -> String {
         switch lang {
         case .en: return "Guidance realigned. Continue."
         case .fr: return "Guidage réaligné. Continuez."
+        }
+    }
+
+    /// Spoken only once a belief hold has outlasted the window it normally
+    /// resolves in. Apologetic and self-directed on purpose: pilot feedback on
+    /// 11 Aug 2026 was that "Hold on. Pan the phone slowly." and "Route lost.
+    /// Stop and slowly look around." both hand the user a job to do, which
+    /// reads as the route having failed. The system is the one recovering, so
+    /// it says so and the user keeps walking.
+    static func realigningApology() -> String {
+        switch lang {
+        case .en: return "Sorry, let me realign."
+        case .fr: return "Désolé, je me réaligne."
+        }
+    }
+
+    /// The banner text for the same state. Not spoken.
+    static func realigningStatus() -> String {
+        switch lang {
+        case .en: return "Realigning…"
+        case .fr: return "Réalignement en cours…"
         }
     }
 
@@ -1111,17 +1215,23 @@ enum ReachLoc {
         }
     }
 
+    /// Carries the exit instruction on purpose.
+    ///
+    /// A pilot participant reached the object and then waited, because nothing
+    /// had told her the session ends on a tap — it was said once, in the
+    /// opening line, thirty seconds and one aisle earlier. Reaching distance is
+    /// where that sentence is worth saying.
     static func almostThereReachFor(_ object: String) -> String {
         switch lang {
-        case .en: return "Almost there. Reach forward for \(object)."
-        case .fr: return "Vous y êtes presque. Tendez la main vers \(object)."
+        case .en: return "Reach forward for \(object). Tap the screen when you have it."
+        case .fr: return "Tendez la main vers \(object). Touchez l’écran quand vous l’avez."
         }
     }
 
     static func almostThereGrab(_ object: String) -> String {
         switch lang {
-        case .en: return "Almost there. Grab \(object)."
-        case .fr: return "Vous y êtes presque. Attrapez \(object)."
+        case .en: return "Grab \(object). Tap the screen when you have it."
+        case .fr: return "Attrapez \(object). Touchez l’écran quand vous l’avez."
         }
     }
 
@@ -1220,24 +1330,28 @@ enum ReachLoc {
 
     // ── Session start, handoff and AR status ────────────────────────────────
 
+    /// Two clauses, not three. The middle one ("point phone toward it") was
+    /// advice the beeps give continuously and better, and it pushed the tap
+    /// instruction — the only thing here the user has to remember — to the end
+    /// of a long sentence spoken while they were still turning around.
     static func guidingPointPhoneThenTap(_ object: String) -> String {
         switch lang {
-        case .en: return "Guiding to \(object). Point phone toward it. Tap anywhere when you have it."
-        case .fr: return "Je vous guide vers \(object). Pointez le téléphone vers l’objet. Touchez l’écran quand vous avez l’article."
+        case .en: return "Guiding to \(object). Tap the screen when you have it."
+        case .fr: return "Je vous guide vers \(object). Touchez l’écran quand vous l’avez."
         }
     }
 
     static func guidingPointPhoneThenRaiseHand(_ object: String) -> String {
         switch lang {
-        case .en: return "Guiding to \(object). Point phone toward it. I'll tell you when to raise your hand."
-        case .fr: return "Je vous guide vers \(object). Pointez le téléphone vers l’objet. Je vous dirai quand lever la main."
+        case .en: return "Guiding to \(object). I'll tell you when to raise your hand."
+        case .fr: return "Je vous guide vers \(object). Je vous dirai quand lever la main."
         }
     }
 
     static func guidingToSavedSpot(_ object: String) -> String {
         switch lang {
-        case .en: return "Guiding you to the saved spot near \(object). It is within arm's reach from there."
-        case .fr: return "Je vous guide vers l’endroit enregistré près de \(object). De là, ce sera à portée de main."
+        case .en: return "Guiding to the saved spot near \(object), within arm's reach."
+        case .fr: return "Je vous guide vers l’endroit enregistré près de \(object), à portée de main."
         }
     }
 

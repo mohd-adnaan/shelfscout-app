@@ -66,8 +66,11 @@ export const en = {
 
   // ── Reaching guidance ────────────────────────────────────────────────────
   reaching: {
+    // Two clauses. "Follow the audio beeps" described what was already
+    // audible and pushed the tap instruction — the one thing the user has to
+    // remember to end the session — to the tail of a long sentence.
     guidingTo: (target: string) =>
-      `Guiding you to ${target}. Follow the audio beeps. Tap anywhere when you have it.`,
+      `Guiding you to ${target}. Tap the screen when you have it.`,
     reached: (object: string) => `${object} reached!`,
     ended: 'Reaching guidance ended.',
     error: (detail: string) => `Reaching error: ${detail}`,
@@ -89,6 +92,41 @@ export const en = {
       `Guiding you to ${target}. ARKit module initializing.`,
     emptyResponse: 'Server returned empty response. Please try again.',
     navigationStopped: 'Navigation stopped. ShelfScout is ready.',
+  },
+
+  // ── ARKit route navigation ───────────────────────────────────────────────
+  //
+  // Everything here used to be an English literal in App.tsx, which meant a
+  // French participant asking for « les oignons » and missing heard the refusal
+  // — the longest, most confusing sentence in the whole session — in English,
+  // read out by a French voice. Pilot, 11 Aug 2026.
+  navigation: {
+    targetNotFoundWithList: (target: string, known: string) =>
+      `I could not find ${target} in your saved routes. Saved destinations include: ${known}.`,
+    targetNotFoundNoMap: (target: string) =>
+      `I could not find ${target} in your saved routes. Map it first from Settings.`,
+    targetUnclear:
+      'I could not identify the navigation target. Please ask for the destination again.',
+    arrivedAt: (target: string) => `Arrived at ${target}.`,
+    arrivedSwitchingToReaching: (target: string, object: string) =>
+      `Arrived at ${target}. Switching to reaching guidance for ${object}.`,
+    couldNotStartReaching: (object: string) =>
+      `I could not start reaching guidance for ${object}.`,
+    holdPhoneStraight:
+      'Hold the phone straight with the camera facing forward, then ask again.',
+    unavailableFallback:
+      'ARKit navigation is not available on this device. Falling back to Rtab navigation.',
+    mapNotFound: (target: string) =>
+      `No saved AR route map was found for ${target}. Open Settings, Manage AR Route Maps, and map the route first.`,
+    targetNotInMaps: (target: string) =>
+      `${target} is not in the saved AR route maps. Add it as a destination or landmark, then try again.`,
+    relocalizationFailed:
+      'I could not relocalize against the saved AR map. Walk to any spot on the mapped route, hold the phone at chest height, and slowly scan the shelves.',
+    arrivalUnverified: (target: string) =>
+      `I could not confirm your position at ${target}. Walk along the mapped route and ask again.`,
+    cancelled: 'ARKit navigation cancelled.',
+    ended: 'ARKit navigation ended.',
+    endedWithError: 'ARKit navigation ended with an error.',
   },
 
   // ── Settings: language section ───────────────────────────────────────────

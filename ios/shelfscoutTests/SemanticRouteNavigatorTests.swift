@@ -1662,6 +1662,195 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertEqual(abs(reversed ?? 0), 180, accuracy: 12)
     }
 
+    // MARK: - Pilot cue-wording fixes (11 Aug 2026)
+
+    /// The cue that calls a turn also has to restart the walking. Participants
+    /// completed the turn and stood still, because "Turn right. 11 meters,
+    /// toward the next turn." never said to move.
+    func testTurnCueTellsTheUserToWalkAndLaterCuesDoNot() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        // Standing on the turn node: the advance fires and calls the turn.
+        navigator.update(
+            imuState: Self.imu(isMoving: true, x: 0, y: 3.9, bearing: 0),
+            arPosition: simd_float3(0, 0, -3.9),
+            arHeading: 0,
+            arLocalized: true
+        )
+        XCTAssertEqual(navigator.currentStepIndex, 1)
+        XCTAssertTrue(
+            navigator.currentInstruction.contains("Walk "),
+            "the turn cue must restart the walk, got: \(navigator.currentInstruction)"
+        )
+
+        // Mid-leg, walking the new leg: the verb is spent and does not repeat.
+        navigator.update(
+            imuState: Self.imu(isMoving: true, x: 1.5, y: 4, bearing: 90),
+            arPosition: simd_float3(1.5, 0, -4),
+            arHeading: 90,
+            arLocalized: true
+        )
+        XCTAssertFalse(
+            navigator.currentInstruction.contains("Walk "),
+            "routine leg cues stay bare, got: \(navigator.currentInstruction)"
+        )
+    }
+
+    /// The opening cue used to append the landmark it was about to pass, so a
+    /// user who had not moved yet heard three clauses, one of them about a
+    /// shelf they were standing at. The standalone landmark cue still fires.
+    func testOpeningCueDoesNotAppendThePassingLandmarkClause() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnMapWithSecondSegmentLandmark()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: true,
+            arHeading: 0
+        ))
+
+        XCTAssertFalse(
+            navigator.currentInstruction.contains("Passing"),
+            "got: \(navigator.currentInstruction)"
+        )
+    }
+
+    /// "Left turn 2" is a capture label. Spoken, the ordinal is a number the
+    /// user cannot use.
+    func testCaptureTurnOrdinalsAreNeverSpoken() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.igaMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Onions",
+            arPosition: nil,
+            imuState: Self.imu(x: 0, y: 0, bearing: 217),
+            speakLandmarks: false,
+            arHeading: 217
+        ))
+
+        for step in navigator.routeSteps {
+            let spoken = navigator.currentInstruction
+            XCTAssertFalse(spoken.contains("turn 1"), "got: \(spoken)")
+            XCTAssertFalse(spoken.contains("turn 2"), "got: \(spoken)")
+            XCTAssertFalse(spoken.contains("turn 3"), "got: \(spoken)")
+            XCTAssertFalse(spoken.contains("turn 4"), "got: \(spoken)")
+            _ = step
+        }
+    }
+
+    /// Walking past the destination had no voice at all: progress saturates at
+    /// the end of the leg, so the strongest thing guidance could say was "about
+    /// 1 meter, toward Onions" — on repeat, while the user walked away.
+    func testWalkingPastTheDestinationSaysToTurnAround() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        // The belief is pinned mid-leg — which is the state the pilot hit, with
+        // guidance saying "about 1 meter, toward Onions" — while the AR pose
+        // says the user is 6 m beyond Milk (which sits at y = 8) and walking.
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 1.0)
+        navigator.expireGuidanceIntroProtectionForTesting()
+        let past = simd_float3(0, 0, -14)
+        navigator.update(
+            imuState: Self.imu(isMoving: true, x: 0, y: 14, bearing: 0),
+            arPosition: past,
+            arHeading: 0,
+            arLocalized: true
+        )
+        XCTAssertTrue(
+            navigator.expireDestinationOvershootHoldForTesting(),
+            "the overshoot must be tracked from the first tick that sees it"
+        )
+        navigator.update(
+            imuState: Self.imu(isMoving: true, x: 0, y: 14, bearing: 0),
+            arPosition: past,
+            arHeading: 0,
+            arLocalized: true
+        )
+
+        XCTAssertTrue(
+            navigator.currentInstruction.contains("Turn around")
+                || navigator.currentInstruction.contains("behind you"),
+            "expected an overshoot correction, got: \(navigator.currentInstruction)"
+        )
+    }
+
+    /// Control: standing just short of the destination is not an overshoot.
+    func testApproachingTheDestinationIsNotReportedAsAnOvershoot() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "ar_world_xz")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        navigator.update(
+            imuState: Self.imu(isMoving: true, x: 0, y: 6.5, bearing: 0),
+            arPosition: simd_float3(0, 0, -6.5),
+            arHeading: 0,
+            arLocalized: true
+        )
+
+        XCTAssertFalse(
+            navigator.expireDestinationOvershootHoldForTesting(),
+            "1.5 m short of the destination is not an overshoot"
+        )
+        XCTAssertFalse(navigator.currentInstruction.contains("Turn around"))
+        XCTAssertFalse(navigator.currentInstruction.contains("behind you"))
+    }
+
+    /// The app is deaf while guidance runs, so the one control that exists has
+    /// to be taught. Once per launch, not once per leg.
+    func testStopGuidanceHintIsTaughtOnceAndNotRepeated() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        navigator.armStopGuidanceHintForTesting()
+
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        XCTAssertTrue(
+            navigator.currentInstruction.contains("Done"),
+            "got: \(navigator.currentInstruction)"
+        )
+
+        navigator.stopNavigation()
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        XCTAssertFalse(
+            navigator.currentInstruction.contains("Done"),
+            "the second journey re-taught it: \(navigator.currentInstruction)"
+        )
+    }
+
     // MARK: - Capture: a turn marked at a destination
 
     /// Marking the turn you take AT a shelf, without stepping away from it,

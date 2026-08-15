@@ -2379,7 +2379,7 @@ function AppInner(): React.JSX.Element {
         try { await options.introSpeechPromise; } catch { }
       }
       await speakContinuousSpeechAndWait(
-        'I could not identify the navigation target. Please ask for the destination again.',
+        strings().navigation.targetUnclear,
         { ignoreAbort: true },
       );
       setIsNavigation(false);
@@ -2413,8 +2413,8 @@ function AppInner(): React.JSX.Element {
         const known = grounding.availableTargets.slice(0, 6).join(', ');
         await speakContinuousSpeechAndWait(
           known
-            ? `I could not find ${targetName} in your saved routes. Saved destinations include: ${known}.`
-            : `I could not find ${targetName} in your saved routes. Map it first from Settings.`,
+            ? strings().navigation.targetNotFoundWithList(targetName, known)
+            : strings().navigation.targetNotFoundNoMap(targetName),
           { ignoreAbort: true },
         );
         setIsNavigation(false);
@@ -2441,7 +2441,7 @@ function AppInner(): React.JSX.Element {
         try { await options.introSpeechPromise; } catch { }
       }
       await speakContinuousSpeechAndWait(
-        'ARKit navigation is not available on this device. Falling back to Rtab navigation.',
+        strings().navigation.unavailableFallback,
         { ignoreAbort: true },
       );
       result.navigation = true;
@@ -2547,8 +2547,8 @@ function AppInner(): React.JSX.Element {
       await speakContinuousSpeechAndWait(
         navResult.message ||
           (reachingObjectName
-            ? `Arrived at ${targetName}. Switching to reaching guidance for ${reachingObjectName}.`
-            : `Arrived at ${targetName}.`),
+            ? strings().navigation.arrivedSwitchingToReaching(targetName, reachingObjectName)
+            : strings().navigation.arrivedAt(targetName)),
         { ignoreAbort: true },
       );
 
@@ -2575,7 +2575,7 @@ function AppInner(): React.JSX.Element {
 
         if (!handled) {
           await speakContinuousSpeechAndWait(
-            `I could not start reaching guidance for ${reachingObjectName}.`,
+            strings().navigation.couldNotStartReaching(reachingObjectName),
             { ignoreAbort: true },
           );
           setIsReaching(false);
@@ -2606,7 +2606,7 @@ function AppInner(): React.JSX.Element {
       const postureOk = await waitForGoodPostureRef.current('capture');
       if (!postureOk) {
         await speakContinuousSpeechAndWait(
-          'Hold the phone straight with the camera facing forward, then ask again.',
+          strings().navigation.holdPhoneStraight,
           { ignoreAbort: true },
         );
         setIsReaching(false);
@@ -2708,7 +2708,7 @@ function AppInner(): React.JSX.Element {
 
     if (navResult.reason === 'ar_unavailable') {
       await speakContinuousSpeechAndWait(
-        navResult.message || 'ARKit navigation is unavailable. Falling back to Rtab navigation.',
+        navResult.message || strings().navigation.unavailableFallback,
         { ignoreAbort: true },
       );
       setIsProcessing(false);
@@ -2718,17 +2718,20 @@ function AppInner(): React.JSX.Element {
       return false;
     }
 
+    // `navResult.message` comes from native, which already speaks the session
+    // language, so preferring it stays correct in French.
+    const navStrings = strings().navigation;
     const fallbackMessages: Record<string, string> = {
-      map_not_found: `No saved AR route map was found for ${targetName}. Open Settings, Manage AR Route Maps, and map the route first.`,
-      target_not_found: `${targetName} is not in the saved AR route maps. Add it as a destination or landmark, then try again.`,
-      relocalization_failed: navResult.message || 'I could not relocalize against the saved AR map. Walk to any spot on the mapped route, hold the phone at chest height, and slowly scan the shelves.',
-      arrival_unverified: navResult.message || `I could not confirm your position at ${targetName}. Walk along the mapped route and ask again.`,
-      cancelled: 'ARKit navigation cancelled.',
-      error: navResult.message || 'ARKit navigation ended with an error.',
+      map_not_found: navStrings.mapNotFound(targetName),
+      target_not_found: navStrings.targetNotInMaps(targetName),
+      relocalization_failed: navResult.message || navStrings.relocalizationFailed,
+      arrival_unverified: navResult.message || navStrings.arrivalUnverified(targetName),
+      cancelled: navStrings.cancelled,
+      error: navResult.message || navStrings.endedWithError,
     };
 
     await speakContinuousSpeechAndWait(
-      fallbackMessages[navResult.reason] || navResult.message || 'ARKit navigation ended.',
+      fallbackMessages[navResult.reason] || navResult.message || navStrings.ended,
       { ignoreAbort: true },
     );
     stopContinuousMode('ARKit navigation ended', false);
@@ -3103,8 +3106,25 @@ function AppInner(): React.JSX.Element {
     finalText = stripVoiceOverListeningPrefix(finalText);
 
     if (!finalText) {
+      // ⚠️ This used to announce and return, leaving the session half-open: the
+      // listening sound kept playing, STT was never cancelled (both of those
+      // happen further down, past this early return), and no state was reset —
+      // so the app sat in a listening state that no longer had a recognizer
+      // behind it, and the next tap fell through to "ready" without ever having
+      // spoken. Pilot, 11 Aug 2026: "breaks the no-response after twice, goes
+      // to speak without speaking, then to ready."
+      //
+      // Unwind the same way every other abandoned turn does.
+      await stopListenSound();
+      try { await cancelSTT(); } catch { }
+      finalTranscriptRef.current = '';
+      setIsProcessing(false);
+      isProcessingRef.current = false;
+      isCapturingPhotoRef.current = false;
+      setIsCameraActive(true);
       AccessibilityInfo.announceForAccessibility(strings().speech.noVoiceInput);
       if (!screenReaderEnabledRef.current) { playErrorSound(); }
+      announceTapToStart('');
       return;
     }
 
