@@ -688,6 +688,13 @@ private struct ARKitRouteHostView: View {
         self.onAutomationComplete = onAutomationComplete
     }
 
+    /// Non-nil only for a guidance run, where the exit is the whole screen.
+    /// The route manager is a screen of controls and keeps its Done button as
+    /// the single way out — a stray tap there must not close it.
+    private var guidanceExitHandler: (() -> Void)? {
+        launchTargetName == nil ? nil : onDone
+    }
+
     var body: some View {
         NavigationView {
             ARMappingView(
@@ -698,16 +705,18 @@ private struct ARKitRouteHostView: View {
                 launchErrorRecovery: errorRecovery,
                 launchClockFaceDirections: clockFaceDirections,
                 launchVoiceOverEnabled: voiceOverEnabled,
-                onAutomationComplete: onAutomationComplete
+                onAutomationComplete: onAutomationComplete,
+                onExitRequested: guidanceExitHandler
             )
             .environmentObject(sensorManager)
             .environmentObject(ttsManager)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
                     // "Done" alone tells a VoiceOver user nothing about what it
-                    // finishes, and while guidance runs it is the only control
-                    // on screen and the only way out. The app is not listening
-                    // during navigation, so this button IS the interface.
+                    // finishes. It is no longer the only way out of a guidance
+                    // run — the whole screen is — but it stays as the visible
+                    // control a sighted observer expects, and as the route
+                    // manager's only exit.
                     Button("Done", action: onDone)
                         .accessibilityLabel(
                             launchTargetName == nil ? "Done" : NavLoc.stopGuidanceButton()

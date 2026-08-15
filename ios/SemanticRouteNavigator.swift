@@ -2341,23 +2341,18 @@ final class SemanticRouteNavigator: ObservableObject {
             "map": activeMap.map { traceMapGraph($0) } ?? NSNull(),
             "openingInstruction": currentInstruction
         ])
-        // Teach the exit once per launch, on the opening cue rather than as a
-        // second one — `speechCue` holds a single value, so a follow-up emitted
-        // in the same tick would overwrite the route itself. Once, because the
-        // participant needs to learn it, not to be told it on every leg of a
-        // shopping trip.
-        if !Self.didSpeakStopGuidanceHint {
-            Self.didSpeakStopGuidanceHint = true
-            currentInstruction += NavLoc.stopGuidanceHint()
-        }
+        // No exit instruction here. It used to be taught once per launch, on
+        // this cue, because the Done button was the only way out and nothing
+        // else named it. The exit is now the whole screen — on this one and on
+        // the reaching screen that follows arrival — so the sentence buys
+        // nothing and costs the participant a longer opening announcement in
+        // front of the part that matters: where they are going and the first
+        // turn. Destinations with no reaching object attached are told so
+        // directly rather than by a generic hint bolted onto every journey.
         emitCue(currentInstruction, priority: .critical)
         rebuildRAGContext()
         return true
     }
-
-    /// App-launch scoped: this navigator is recreated with the AR screen, so an
-    /// instance flag would re-teach the exit on every journey.
-    private static var didSpeakStopGuidanceHint = false
 
     func stopNavigation(resetInstruction: Bool = true) {
         routeSteps.removeAll()
@@ -8322,10 +8317,6 @@ final class SemanticRouteNavigator: ObservableObject {
 #if DEBUG
 extension SemanticRouteNavigator {
     func replaceMapsForTesting(_ maps: [SemanticRouteMap], activeMapID: String? = nil) {
-        // The stop-guidance hint is launch-scoped, so in a test process it
-        // would land on whichever test happened to navigate first. Suppress it
-        // by default and let `armStopGuidanceHintForTesting` opt in.
-        Self.didSpeakStopGuidanceHint = true
         stopNavigation(resetInstruction: false)
         let cleaned = maps.map(Self.sanitizedMap)
         self.maps = cleaned
@@ -8382,10 +8373,6 @@ extension SemanticRouteNavigator {
         guard courseCorrectionSince != nil else { return false }
         courseCorrectionSince = Date().addingTimeInterval(-(courseCorrectionHoldSeconds + 0.1))
         return true
-    }
-
-    func armStopGuidanceHintForTesting() {
-        Self.didSpeakStopGuidanceHint = false
     }
 
     /// Backdates the overshoot hold, so a test can reach the "you have passed

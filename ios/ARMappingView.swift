@@ -62,6 +62,11 @@ struct ARViewContainer: UIViewRepresentable {
             coachingOverlay.activatesAutomatically = false
             coachingOverlay.translatesAutoresizingMaskIntoConstraints = false
             coachingOverlay.isHidden = true
+            // It is a full-screen view with no controls of ours on it, and it
+            // is visible exactly while the map is being searched for — the
+            // stretch a participant is most likely to want out of. Letting it
+            // eat touches would make the screen's exit stop working there.
+            coachingOverlay.isUserInteractionEnabled = false
 
             arView.addSubview(coachingOverlay)
             NSLayoutConstraint.activate([
@@ -320,6 +325,9 @@ struct ARMappingView: View {
     private let launchClockFaceDirections: Bool
     private let launchVoiceOverEnabled: Bool
     private let onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)?
+    /// Manual exit from an automated guidance run. Wired to the same handler as
+    /// the toolbar's Done button so the whole screen can end the session.
+    private let onExitRequested: (() -> Void)?
     @State private var newPOIName: String = ""
     @State private var mapName: String = ""
     @State private var showsMapInspector: Bool = false
@@ -373,7 +381,8 @@ struct ARMappingView: View {
         launchErrorRecovery: Bool = true,
         launchClockFaceDirections: Bool = false,
         launchVoiceOverEnabled: Bool = UIAccessibility.isVoiceOverRunning,
-        onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)? = nil
+        onAutomationComplete: ((ARKitNavigationNativeResult) -> Void)? = nil,
+        onExitRequested: (() -> Void)? = nil
     ) {
         _sourceSelection = sourceSelection
         self.launchTargetName = launchTargetName
@@ -384,6 +393,7 @@ struct ARMappingView: View {
         self.launchClockFaceDirections = launchClockFaceDirections
         self.launchVoiceOverEnabled = launchVoiceOverEnabled
         self.onAutomationComplete = onAutomationComplete
+        self.onExitRequested = onExitRequested
     }
 
     var body: some View {
@@ -459,49 +469,75 @@ struct ARMappingView: View {
     }
 
     private var arSceneContent: AnyView {
-        AnyView(
-            ZStack {
-                ARViewContainer(
-                    session: mappingManager.session,
-                    isSessionActive: mappingManager.sessionMode != .idle,
-                    showsCoaching: mappingManager.isMapping || (mappingManager.isRelocalizing && !mappingManager.isLocalized),
-                    routeOverlayPoints: routeOverlayWorldPoints,
-                    routeOverlayContext: routeOverlayContext
-                )
-                .ignoresSafeArea()
+        let scene = ZStack {
+            ARViewContainer(
+                session: mappingManager.session,
+                isSessionActive: mappingManager.sessionMode != .idle,
+                showsCoaching: mappingManager.isMapping || (mappingManager.isRelocalizing && !mappingManager.isLocalized),
+                routeOverlayPoints: routeOverlayWorldPoints,
+                routeOverlayContext: routeOverlayContext
+            )
+            .ignoresSafeArea()
 
-                if mappingManager.sessionMode == .idle {
-                    Color.black.opacity(0.82)
-                        .ignoresSafeArea()
-                }
+            if mappingManager.sessionMode == .idle {
+                Color.black.opacity(0.82)
+                    .ignoresSafeArea()
+            }
 
-                if let headingError = activeLegHeadingErrorDegrees {
-                    // Upper third, not centre: the manual Guide sheet reaches
-                    // past mid-screen, and an indicator the panel covers is an
-                    // indicator that does not exist in the field.
-                    VStack {
-                        routeDirectionHUD(headingErrorDegrees: headingError)
-                            .padding(.top, 84)
-                        Spacer(minLength: 0)
-                    }
-                    .allowsHitTesting(false)
-                }
-
-                if !isAutomatedNavigation && showsMapInspector && hasInspectionContent {
-                    VStack {
-                        mapInspectorPanel
-                            .padding(.horizontal, 16)
-                            .padding(.top, 12)
-                        Spacer(minLength: 0)
-                    }
-                }
-
+            if let headingError = activeLegHeadingErrorDegrees {
+                // Upper third, not centre: the manual Guide sheet reaches
+                // past mid-screen, and an indicator the panel covers is an
+                // indicator that does not exist in the field.
                 VStack {
+                    routeDirectionHUD(headingErrorDegrees: headingError)
+                        .padding(.top, 84)
                     Spacer(minLength: 0)
-                    bottomSheetContent
+                }
+                .allowsHitTesting(false)
+            }
+
+            if !isAutomatedNavigation && showsMapInspector && hasInspectionContent {
+                VStack {
+                    mapInspectorPanel
+                        .padding(.horizontal, 16)
+                        .padding(.top, 12)
+                    Spacer(minLength: 0)
                 }
             }
+
+            VStack {
+                Spacer(minLength: 0)
+                bottomSheetContent
+            }
+        }
+
+        // The route manager is a screen full of controls, so it keeps its
+        // buttons. A guidance run is the opposite: the app is not listening,
+        // nothing on screen is meant to be read, and until now the single way
+        // out was a Done button in the far top corner — a target a blind
+        // participant has no way to find. Under guidance the screen IS the
+        // exit. The gesture sits on the container, so the panel's log-export
+        // button (inner views win a tap) still works for the researcher, and
+        // the two VoiceOver gestures are wired up because VoiceOver never
+        // delivers the plain tap.
+        guard isAutomatedNavigation else { return AnyView(scene) }
+        return AnyView(
+            scene
+                .contentShape(Rectangle())
+                .onTapGesture(perform: requestGuidanceExit)
+                .accessibilityAction(.magicTap, requestGuidanceExit)
+                .accessibilityAction(.escape, requestGuidanceExit)
         )
+    }
+
+    /// Manual end of an automated guidance run, from anywhere on the screen.
+    private func requestGuidanceExit() {
+        guard isAutomatedNavigation, let onExitRequested else { return }
+        NavigationTrace.shared.log("nav.exit.tap", [
+            "target": automatedTargetName ?? launchTargetName ?? "",
+            "phase": String(describing: semanticNavigator.phase)
+        ])
+        onExitRequested()
     }
 
     /// Route-frame polyline mapped into the live AR session's world frame for

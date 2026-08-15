@@ -2730,6 +2730,15 @@ function AppInner(): React.JSX.Element {
       error: navResult.message || navStrings.endedWithError,
     };
 
+    // A tap anywhere on the guidance screen is now what ends it, and a tap a
+    // blind participant cannot see the result of needs an immediate answer —
+    // the same earcon a manual reaching exit plays, so the two exits sound
+    // identical. It lands before the sentence, which is what makes it a
+    // confirmation of the tap rather than a decoration on the message.
+    if (navResult.reason === 'cancelled' && !screenReaderEnabledRef.current) {
+      await playStopReachingSound();
+    }
+
     await speakContinuousSpeechAndWait(
       fallbackMessages[navResult.reason] || navResult.message || navStrings.ended,
       { ignoreAbort: true },

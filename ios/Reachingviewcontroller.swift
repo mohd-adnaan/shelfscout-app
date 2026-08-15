@@ -484,6 +484,8 @@ class ReachingViewController: UIViewController {
   var directionLabel: UILabel!
   var objectNameLabel: UILabel!
   var cancelButton: UIButton!
+  /// Full-screen, invisible exit control. See `setupTapToDismiss`.
+  var exitTapOverlay: UIControl!
   var progressRing: CAShapeLayer!
   var distanceLabel: UILabel!
   var depthHintLabel: UILabel!
@@ -695,20 +697,34 @@ class ReachingViewController: UIViewController {
   // MARK: - Tap to Dismiss
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /// The exit is the whole screen, not the Done button.
+  ///
+  /// A tap gesture on `view` covered the sighted case but left the VoiceOver
+  /// one to luck: VoiceOver does not deliver a plain tap, it activates whatever
+  /// element is focused, so exiting depended on focus happening to sit on one
+  /// of the few labels wired to `cancelTapped`. Land on the AR view, the depth
+  /// hint or the method readout and the double-tap did nothing, which is the
+  /// "only the Done button works" a participant experiences.
+  ///
+  /// A real full-screen control removes the guesswork in both directions: it
+  /// takes every touch, and as the view's ONLY accessibility element it is
+  /// always what VoiceOver has focused — so double-tap anywhere ends reaching.
+  /// Nothing is lost by hiding the labels from VoiceOver: object name,
+  /// direction and distance are all spoken continuously by the guidance itself.
   private func setupTapToDismiss() {
-    let tap = UITapGestureRecognizer(target: self, action: #selector(handleBackgroundTap(_:)))
-    tap.cancelsTouchesInView = false
-    view.addGestureRecognizer(tap)
-  }
-
-  @objc private func handleBackgroundTap(_ gesture: UITapGestureRecognizer) {
-    guard !hasCompleted else { return }
-    let pt = gesture.location(in: view)
-    if cancelButton.frame.contains(pt) { return }
-    // NOTE: Removed topBar/bottomBar exclusions — tapping anywhere should cancel.
-    // With VoiceOver, these exclusions prevented exit since VoiceOver focuses
-    // on topBar elements and double-tap triggers within their frame.
-    cancelTapped()
+    let overlay = UIControl(frame: view.bounds)
+    overlay.backgroundColor = .clear
+    overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+    overlay.addTarget(self, action: #selector(cancelTapped), for: .touchUpInside)
+    overlay.isAccessibilityElement = true
+    overlay.accessibilityTraits = .button
+    overlay.accessibilityLabel = ReachLoc.exitOverlayLabel(objectName)
+    overlay.accessibilityHint = ReachLoc.exitOverlayHint()
+    // Added last, so it sits above the bars, the labels and the Done button.
+    // Covering the button costs nothing — the overlay runs the same action.
+    view.addSubview(overlay)
+    exitTapOverlay = overlay
+    view.accessibilityElements = [overlay]
   }
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1034,52 +1050,21 @@ class ReachingViewController: UIViewController {
       cancelButton.heightAnchor.constraint(equalToConstant: 44),
     ])
 
-    view.accessibilityLabel = "Reaching guidance for \(objectName). Point camera toward object. Tap anywhere to confirm."
-
     // ── VoiceOver Configuration ──────────────────────────────────────────────
-    // Make the objectNameLabel (which gets initial VoiceOver focus) actionable.
-    // UILabel doesn't respond to VoiceOver double-tap by default — we need
-    // userInteractionEnabled + a tap gesture so VoiceOver's synthetic tap fires.
-    objectNameLabel.isAccessibilityElement = true
-    objectNameLabel.accessibilityLabel = "Guiding to \(objectName). Point camera toward it. Double tap to confirm."
-    objectNameLabel.accessibilityTraits = .button
-    objectNameLabel.isUserInteractionEnabled = true
-    let nameTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
-    objectNameLabel.addGestureRecognizer(nameTap)
-
-    // Same for topBar and bottomBar — VoiceOver may focus on them
-    topBar.isUserInteractionEnabled = true
-    let topTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
-    topBar.addGestureRecognizer(topTap)
-    topBar.isAccessibilityElement = false // children are the elements
-
-    bottomBar.isUserInteractionEnabled = true
-    let botTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
-    bottomBar.addGestureRecognizer(botTap)
+    // Everything on this screen is chrome for an observer, not an interface:
+    // the exit is the full-screen control `setupTapToDismiss` installs, and it
+    // is the only accessibility element the view publishes. Per-label tap
+    // recognizers and rotor actions used to stand in for that overlay and are
+    // gone with it — they only ever fired when VoiceOver focus happened to land
+    // on the right label.
+    cancelButton.isAccessibilityElement = false
+    objectNameLabel.isAccessibilityElement = false
+    distanceLabel.isAccessibilityElement = false
+    directionLabel.isAccessibilityElement = false
+    depthHintLabel.isAccessibilityElement = false
+    depthMethodLabel.isAccessibilityElement = false
+    topBar.isAccessibilityElement = false
     bottomBar.isAccessibilityElement = false
-
-    // Make direction label readable but not actionable
-    directionLabel.isAccessibilityElement = true
-    directionLabel.accessibilityLabel = "Direction guidance"
-    directionLabel.accessibilityTraits = .updatesFrequently
-    directionLabel.isUserInteractionEnabled = true
-    let dirTap = UITapGestureRecognizer(target: self, action: #selector(cancelTapped))
-    directionLabel.addGestureRecognizer(dirTap)
-
-    // Cancel button — proper accessibility (also reachable via full-screen tap)
-    cancelButton.isAccessibilityElement = true
-    cancelButton.accessibilityLabel = "Confirm. I have the object."
-    cancelButton.accessibilityHint = "Double tap to exit reaching guidance"
-
-    // Add custom accessibility action on the view so ANY focused element
-    // can trigger exit via the actions rotor
-    view.accessibilityCustomActions = [
-      UIAccessibilityCustomAction(
-        name: "I have it",
-        target: self,
-        selector: #selector(cancelTapped)
-      )
-    ]
   }
 
   func updateDirectionUI(_ newDir: Direction) {

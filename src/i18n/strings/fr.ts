@@ -144,6 +144,19 @@ export const fr: StringCatalog = {
     endedWithError: 'La navigation ARKit s’est terminée par une erreur.',
   },
 
+  // ── Réponses de l’orchestrateur en mode local ────────────────────────────
+  //
+  // Les exemples de « didNotCatch » sont des commandes que l’utilisateur peut
+  // répéter telles quelles : ce sont donc de vraies commandes françaises, pas
+  // la traduction des exemples anglais.
+  assistant: {
+    didNotCatch:
+      'Je n’ai pas bien compris. Essayez, par exemple : prends la bouteille d’eau, amène-moi à la porte, ou qu’est-ce qu’il y a devant moi.',
+    couldNotAnalyzeImage: 'Je n’ai pas pu analyser l’image. Réessayez.',
+    pointCameraFirst:
+      'Pointez la caméra vers ce que vous voulez faire décrire, puis redemandez.',
+  },
+
   settings: {
     languageSection: 'Langue',
     languageDescription:

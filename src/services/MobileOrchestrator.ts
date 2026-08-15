@@ -12,6 +12,7 @@ import { IntentClassification, LocalLLMResult, llmRouter } from './LLMRouter';
 import { orchestratorConfig } from './OrchestratorConfig';
 import { groqIntentClient } from './GroqIntentClient';
 import { groqVisionClient } from './GroqVisionClient';
+import { AppLanguage, getAppLanguage, strings } from '../i18n';
 
 type SessionMode = 'default' | 'navigation' | 'reaching' | 'reaching_ios';
 
@@ -61,6 +62,77 @@ export function parseExplicitNavigationCommand(
   }
 
   return null;
+}
+
+/// "Is this the milk bag?" — the user has something in their hand and wants it
+/// checked. Per language, the openings that can only be that.
+///
+/// Pilot, 14 Aug 2026: three of these, all transcribed perfectly, all answered
+/// with "I did not catch that". The classifier is one network call on a store
+/// wifi away from returning `unknown`, and when it does the user is told their
+/// speech failed — which is the one thing that did not. So this decision is
+/// taken off the model, exactly as `parseExplicitNavigationCommand` takes
+/// navigation off it: a verification question is a question about the frame,
+/// and the frame is already in hand.
+const VERIFICATION_QUESTION_PATTERNS: Record<AppLanguage, RegExp[]> = {
+  en: [
+    /^(?:is|are)\s+(?:this|that|it|these|those|they)\b/,
+    /^(?:am|are)\s+i\b/,
+    /^(?:do|does|did|have|had)\s+i\b/,
+    /^(?:what|which)\b[^?]*\b(?:this|that|it|i|holding|hand)\b/,
+    /^(?:is|are)\s+(?:the|a|an|my)\b[^?]*\b(?:right|correct|one)\b/,
+  ],
+  fr: [
+    /^(?:est-ce|est\s+ce|c(?:'|’)est|es-tu\s+s[ûu]r)\b/,
+    /^(?:ai-je|j(?:'|’)ai|est-ce\s+que\s+j(?:'|’)ai)\b/,
+    /^qu(?:'|’)est-ce\s+que\s+je\b/,
+    /^(?:quel|quelle)\b[^?]*\b(?:je|main|tiens|ceci|cela|[çc]a)\b/,
+  ],
+};
+
+/// Broader net: anything shaped like a question at all. Only consulted on the
+/// classifier's `unknown`, where the alternative is telling the user we did not
+/// hear them.
+const QUESTION_OPENERS: Record<AppLanguage, RegExp> = {
+  en: /^(?:is|are|am|was|were|do|does|did|have|has|can|could|should|would|will|what|what's|where|which|who|whose|how|why|any)\b/,
+  fr: /^(?:est-ce|est|sont|c(?:'|’)est|ai-je|as-tu|y\s+a-t-il|qu(?:'|’)est-ce|que|quoi|quel|quelle|quels|quelles|o[uù]|comment|pourquoi|combien|qui|puis-je|peux-tu)\b/,
+};
+
+/// Guidance verbs, per language. A question is only answered from the frame
+/// when it contains none of these: « est-ce que tu peux m'amener au lait ? »
+/// is question-shaped and is still a navigation request. English has
+/// `parseExplicitNavigationCommand` to catch that on the way past; French has
+/// no deterministic parser and leans entirely on the classifier, so a question
+/// net without this guard would swallow a French destination request whole.
+const GUIDANCE_REQUEST_PATTERNS: Record<AppLanguage, RegExp> = {
+  en: /\b(?:take|bring|guide|lead|walk|navigate|escort)\s+(?:me|us)\b|\b(?:reach|grab|pick\s+up)\b/,
+  fr: /\b(?:am[èe]ne|emm[èe]ne|conduis|guide|accompagne|dirige)[-\s]?(?:moi|nous)\b|\b(?:prends|attrape|saisis|donne)\b/,
+};
+
+const normalizedUtterance = (rawText: string | undefined): string =>
+  rawText?.trim().toLowerCase().replace(/[.!]+$/, '') ?? '';
+
+/** True when the utterance asks to be guided somewhere or to something. */
+const asksForGuidance = (text: string): boolean =>
+  GUIDANCE_REQUEST_PATTERNS[getAppLanguage()].test(text);
+
+/**
+ * True when the utterance asks the app to confirm or identify what the camera
+ * is looking at ("is this the milk bag", « c'est bien le lait »). Such a turn
+ * is always answered against the current frame, whatever the classifier said.
+ */
+export function looksLikeVerificationQuestion(rawText: string | undefined): boolean {
+  const text = normalizedUtterance(rawText).replace(/\?+$/, '').trim();
+  if (!text || asksForGuidance(text)) return false;
+  return VERIFICATION_QUESTION_PATTERNS[getAppLanguage()].some(pattern => pattern.test(text));
+}
+
+/** True when the utterance is question-shaped in the active language. */
+export function looksLikeQuestion(rawText: string | undefined): boolean {
+  const text = normalizedUtterance(rawText);
+  if (!text || asksForGuidance(text)) return false;
+  if (text.endsWith('?')) return true;
+  return QUESTION_OPENERS[getAppLanguage()].test(text.replace(/\?+$/, '').trim());
 }
 
 export interface MobileSessionMemory {
@@ -304,10 +376,36 @@ class MobileOrchestrator {
     // deterministically and override the classifier; anything not matching
     // still falls through to the model exactly as before.
     const explicitNav = parseExplicitNavigationCommand(request.text);
-    const intent = explicitNav ? 'navigation' : localIntent.json?.intent;
+
+    // Same reasoning one level down, for the other command the classifier must
+    // not be allowed to lose: "is this the milk bag?" is a question about the
+    // frame we are already holding, and misrouting it either strands the user
+    // ("I did not catch that") or — worse — reads as `reaching` and launches a
+    // guidance session they did not ask for.
+    const verification =
+      !explicitNav &&
+      Boolean(request.imageUri) &&
+      looksLikeVerificationQuestion(request.text);
+    if (verification) {
+      trace.push({
+        provider: 'verification_question',
+        ok: true,
+        confidence: 1,
+        needsRemote: false,
+        diagnostics: { overrodeIntent: localIntent.json?.intent ?? 'none' },
+      });
+    }
+
+    const intent = explicitNav
+      ? 'navigation'
+      : verification
+        ? 'chat'
+        : localIntent.json?.intent;
     const target = explicitNav
       ? explicitNav.target
-      : localIntent.json?.target?.trim() || undefined;
+      : verification
+        ? undefined
+        : localIntent.json?.target?.trim() || undefined;
     const provider = localIntent.usedProvider;
 
     // ── Reaching → in-device spatial-target ARKit reaching (bbox-free) ───────
@@ -369,17 +467,26 @@ class MobileOrchestrator {
         return this.neutralInDeviceResponse(sessionId, trace, answer);
       }
       const why = request.imageUri
-        ? 'I could not analyze the image just now. Please try again.'
-        : 'Point your camera at what you want described, then ask again.';
+        ? strings().assistant.couldNotAnalyzeImage
+        : strings().assistant.pointCameraFirst;
       return this.neutralInDeviceResponse(sessionId, trace, why);
     }
 
+    // ── Unknown, but still a question, and we are holding a frame ────────────
+    //
+    // The last defence for a turn the classifier gave up on. A question we
+    // cannot route is still a question, and answering it from the frame is
+    // strictly better than telling a user whose speech was transcribed
+    // perfectly that they were not heard.
+    if (request.imageUri && looksLikeQuestion(request.text)) {
+      const answer = await this.visionAnswerInDevice(request, 'chat', trace);
+      if (answer) {
+        return this.neutralInDeviceResponse(sessionId, trace, answer);
+      }
+    }
+
     // ── Unknown / no clear action ────────────────────────────────────────────
-    return this.neutralInDeviceResponse(
-      sessionId,
-      trace,
-      'I did not catch that. Try, for example, reach the water bottle, take me to the door, or what is in front of me.',
-    );
+    return this.neutralInDeviceResponse(sessionId, trace, strings().assistant.didNotCatch);
   }
 
   // Scene → full-surroundings description; chat/other → question answered

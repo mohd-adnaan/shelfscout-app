@@ -1818,26 +1818,16 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertFalse(navigator.currentInstruction.contains("behind you"))
     }
 
-    /// The app is deaf while guidance runs, so the one control that exists has
-    /// to be taught. Once per launch, not once per leg.
-    func testStopGuidanceHintIsTaughtOnceAndNotRepeated() {
+    /// The opening cue states the journey and nothing else.
+    ///
+    /// It used to carry " Tap Done to stop guidance." on the first journey of
+    /// a launch, back when that button was the only exit. The exit is the whole
+    /// screen now, and the sentence only made the one announcement a
+    /// participant has to hold in their head longer.
+    func testOpeningCueDoesNotTeachAnExitControl() {
         let navigator = SemanticRouteNavigator()
         navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
-        navigator.armStopGuidanceHintForTesting()
 
-        XCTAssertTrue(navigator.startNavigation(
-            to: "Milk",
-            arPosition: nil,
-            imuState: Self.imu(bearing: 0),
-            speakLandmarks: false,
-            arHeading: 0
-        ))
-        XCTAssertTrue(
-            navigator.currentInstruction.contains("Done"),
-            "got: \(navigator.currentInstruction)"
-        )
-
-        navigator.stopNavigation()
         XCTAssertTrue(navigator.startNavigation(
             to: "Milk",
             arPosition: nil,
@@ -1847,7 +1837,11 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         ))
         XCTAssertFalse(
             navigator.currentInstruction.contains("Done"),
-            "the second journey re-taught it: \(navigator.currentInstruction)"
+            "got: \(navigator.currentInstruction)"
+        )
+        XCTAssertFalse(
+            navigator.currentInstruction.lowercased().contains("tap"),
+            "got: \(navigator.currentInstruction)"
         )
     }
 

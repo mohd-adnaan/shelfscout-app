@@ -863,20 +863,9 @@ enum NavLoc {
         }
     }
 
-    /// Said once per app launch, on the first journey.
-    ///
-    /// Guidance owns the microphone-free part of the session: the app is not
-    /// listening while it runs, and a pilot participant spoke to it and waited.
-    /// Naming the way out is what makes the silence legible — she does not have
-    /// to wonder whether it heard her, because she knows what the exit is.
-    static func stopGuidanceHint() -> String {
-        switch lang {
-        case .en: return " Tap Done to stop guidance."
-        case .fr: return " Touchez Terminé pour arrêter le guidage."
-        }
-    }
-
-    /// The AR screen's exit control, for VoiceOver.
+    /// The AR screen's exit control, for VoiceOver. The whole screen carries
+    /// it now, so the label describes the screen rather than the toolbar
+    /// button it is also attached to.
     static func stopGuidanceButton() -> String {
         switch lang {
         case .en: return "Stop guidance"
@@ -886,8 +875,8 @@ enum NavLoc {
 
     static func stopGuidanceButtonHint() -> String {
         switch lang {
-        case .en: return "Double tap to end navigation"
-        case .fr: return "Touchez deux fois pour terminer la navigation"
+        case .en: return "Double tap anywhere on the screen to end navigation"
+        case .fr: return "Touchez deux fois n’importe où sur l’écran pour terminer la navigation"
         }
     }
 
@@ -1271,6 +1260,23 @@ enum ReachLoc {
         switch lang {
         case .en: return "Done"
         case .fr: return "Terminé"
+        }
+    }
+
+    /// VoiceOver label for the full-screen exit control. It is the whole
+    /// screen, so it says so — a participant who hears "button" and hunts for
+    /// its edges is doing work the control was built to remove.
+    static func exitOverlayLabel(_ object: String) -> String {
+        switch lang {
+        case .en: return "I have \(object). Tap anywhere to finish."
+        case .fr: return "J’ai \(object). Touchez n’importe où pour terminer."
+        }
+    }
+
+    static func exitOverlayHint() -> String {
+        switch lang {
+        case .en: return "Double tap anywhere on the screen to end reaching guidance"
+        case .fr: return "Touchez deux fois n’importe où sur l’écran pour terminer le guidage"
         }
     }
 

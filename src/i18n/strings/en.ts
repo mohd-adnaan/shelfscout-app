@@ -129,6 +129,19 @@ export const en = {
     endedWithError: 'ARKit navigation ended with an error.',
   },
 
+  // ── In-device orchestrator replies ───────────────────────────────────────
+  //
+  // What the app says when a spoken turn resolves to no action. These were
+  // English literals inside MobileOrchestrator, so a French participant heard
+  // them in English — and they are exactly the moments where being understood
+  // matters most, because the user is already unsure whether they were heard.
+  assistant: {
+    didNotCatch:
+      'I did not catch that. Try, for example, reach the water bottle, take me to the door, or what is in front of me.',
+    couldNotAnalyzeImage: 'I could not analyze the image just now. Please try again.',
+    pointCameraFirst: 'Point your camera at what you want described, then ask again.',
+  },
+
   // ── Settings: language section ───────────────────────────────────────────
   settings: {
     languageSection: 'Language',

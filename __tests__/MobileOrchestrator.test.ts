@@ -226,4 +226,161 @@ describe('MobileOrchestrator', () => {
     expect(result.intent_provider).toBe('apple_foundation_models');
     expect(result.apple_fm_available).toBe(true);
   });
+
+  // ── In-device mode: verification questions ────────────────────────────────
+  //
+  // Pilot, 14 Aug 2026: "is this the milk bag?", transcribed correctly, three
+  // separate times, answered "I did not catch that." Both the routing override
+  // and the unknown-intent safety net below exist for that turn.
+  describe('verification questions (in-device mode)', () => {
+    const loadInDevice = (options: {
+      classifyIntent?: jest.Mock;
+      answerQuestion?: jest.Mock;
+      describeScene?: jest.Mock;
+    } = {}) => {
+      jest.resetModules();
+      jest.doMock('@react-native-async-storage/async-storage', () => createAsyncStorageMock());
+      jest.doMock('react-native', () => ({
+        Platform: { OS: 'ios', select: (v: Record<string, any>) => v.ios ?? v.default },
+        NativeModules: {},
+      }));
+
+      const classifyIntent =
+        options.classifyIntent ??
+        jest.fn().mockResolvedValue({
+          available: true,
+          usedProvider: 'groq',
+          confidence: 0.3,
+          needsBackend: false,
+          json: { intent: 'unknown', target: null, needsImage: false, confidence: 0.3 },
+        });
+      const answerQuestion =
+        options.answerQuestion ??
+        jest.fn().mockResolvedValue({ ok: true, provider: 'groq_vision', text: 'Yes, that is a bag of milk.' });
+      const describeScene =
+        options.describeScene ??
+        jest.fn().mockResolvedValue({ ok: true, provider: 'groq_vision', text: 'A shelf ahead.' });
+
+      jest.doMock('../src/services/GroqIntentClient', () => ({
+        groqIntentClient: { isConfigured: () => true, classifyIntent, resolveTargetLabel: jest.fn() },
+      }));
+      jest.doMock('../src/services/GroqVisionClient', () => ({
+        groqVisionClient: { isConfigured: () => true, answerQuestion, describeScene },
+      }));
+
+      require('../src/services/OrchestratorConfig').orchestratorConfig.setInDeviceMode(true);
+      return {
+        classifyIntent,
+        answerQuestion,
+        describeScene,
+        mobileOrchestrator: require('../src/services/MobileOrchestrator').mobileOrchestrator,
+      };
+    };
+
+    afterEach(() => {
+      jest.dontMock('../src/services/GroqIntentClient');
+      jest.dontMock('../src/services/GroqVisionClient');
+    });
+
+    it('answers "is this the milk bag?" from the frame even when the classifier says unknown', async () => {
+      const { mobileOrchestrator, answerQuestion } = loadInDevice();
+
+      const result = await mobileOrchestrator.process(
+        { text: 'Is this the milk bag?', imageUri: 'file:///tmp/frame.jpg' },
+        undefined,
+        { backendWorkflowProvider, getSessionId: () => 'session-verify' },
+      );
+
+      expect(backendWorkflowProvider).not.toHaveBeenCalled();
+      expect(answerQuestion).toHaveBeenCalledWith('file:///tmp/frame.jpg', 'Is this the milk bag?');
+      expect(result.text).toBe('Yes, that is a bag of milk.');
+      expect(result.reaching_ios).toBe(false);
+      expect(result.navigation).toBe(false);
+      expect(
+        result.provider_trace?.some((entry: any) => entry.provider === 'verification_question'),
+      ).toBe(true);
+    });
+
+    it('does not launch reaching when the classifier reads a verification question as a grab', async () => {
+      const { mobileOrchestrator, answerQuestion } = loadInDevice({
+        classifyIntent: jest.fn().mockResolvedValue({
+          available: true,
+          usedProvider: 'groq',
+          confidence: 0.8,
+          needsBackend: false,
+          json: { intent: 'reaching', target: 'milk bag', needsImage: false, confidence: 0.8 },
+        }),
+      });
+
+      const result = await mobileOrchestrator.process(
+        { text: 'is that the milk bag', imageUri: 'file:///tmp/frame.jpg' },
+        undefined,
+        { backendWorkflowProvider, getSessionId: () => 'session-verify-2' },
+      );
+
+      expect(result.reaching_ios).toBe(false);
+      expect(answerQuestion).toHaveBeenCalled();
+      expect(result.text).toBe('Yes, that is a bag of milk.');
+    });
+
+    it('answers an unclassified question from the frame instead of saying it was not heard', async () => {
+      const { mobileOrchestrator, answerQuestion } = loadInDevice({
+        answerQuestion: jest
+          .fn()
+          .mockResolvedValue({ ok: true, provider: 'groq_vision', text: 'Two dollars and forty nine.' }),
+      });
+
+      const result = await mobileOrchestrator.process(
+        { text: 'how much does it cost', imageUri: 'file:///tmp/frame.jpg' },
+        undefined,
+        { backendWorkflowProvider, getSessionId: () => 'session-question' },
+      );
+
+      expect(answerQuestion).toHaveBeenCalled();
+      expect(result.text).toBe('Two dollars and forty nine.');
+    });
+
+    it('still says it did not catch a non-question it cannot route', async () => {
+      const { mobileOrchestrator, answerQuestion } = loadInDevice();
+
+      const result = await mobileOrchestrator.process(
+        { text: 'mmm hmm okay then', imageUri: 'file:///tmp/frame.jpg' },
+        undefined,
+        { backendWorkflowProvider, getSessionId: () => 'session-noise' },
+      );
+
+      expect(answerQuestion).not.toHaveBeenCalled();
+      expect(result.text).toContain('I did not catch that');
+    });
+
+    it('leaves a question-shaped guidance request to the classifier', async () => {
+      // « est-ce que tu peux m'amener au lait ? » in English shape. French
+      // navigation has no deterministic parser, so the question net must not
+      // answer a destination request with a description of the shelf in front.
+      const { mobileOrchestrator, answerQuestion } = loadInDevice();
+
+      const result = await mobileOrchestrator.process(
+        { text: 'could you walk me over to the milk', imageUri: 'file:///tmp/frame.jpg' },
+        undefined,
+        { backendWorkflowProvider, getSessionId: () => 'session-nav-question' },
+      );
+
+      expect(answerQuestion).not.toHaveBeenCalled();
+      expect(result.text).toContain('I did not catch that');
+    });
+
+    it('keeps explicit navigation ahead of the question net', async () => {
+      const { mobileOrchestrator, answerQuestion } = loadInDevice();
+
+      const result = await mobileOrchestrator.process(
+        { text: 'take me to the milk', imageUri: 'file:///tmp/frame.jpg' },
+        undefined,
+        { backendWorkflowProvider, getSessionId: () => 'session-nav' },
+      );
+
+      expect(answerQuestion).not.toHaveBeenCalled();
+      expect(result.navigation).toBe(true);
+      expect(result.navigation_target).toBe('milk');
+    });
+  });
 });

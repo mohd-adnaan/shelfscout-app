@@ -86,8 +86,12 @@ Return a JSON object with exactly these keys:
 - "pointers": A brief response to the user's question, looking at image if needed.
 - "visual_data": A detailed, objective description of the visual elements relevant to the question.`;
 
+// The yes/no rule is the whole answer to a verification question ("is this the
+// milk bag?"). A user holding the item wants the verdict first and can stop
+// listening there; a description that eventually implies the verdict makes them
+// wait through it and then infer it.
 const USR_CHAT = (transcript: string) =>
-  `You are a virtual AI assistant for a blind or low-vision user. Answer in AT MOST 2 short sentences, spoken aloud. Answer the question and nothing else — no preamble, no restating the question, no offer of further help. Avoid lighting, colours, layout and other detail unless it is what was asked about. If the image cannot answer the question, say so in one sentence.\n\nAnswer this question by the user: "${transcript}".`;
+  `You are a virtual AI assistant for a blind or low-vision user. Answer in AT MOST 2 short sentences, spoken aloud. Answer the question and nothing else — no preamble, no restating the question, no offer of further help. If the question can be answered yes or no, the FIRST word is "Yes" or "No"; then name what you actually see, and if it is not what they asked about, say what it is instead. Avoid lighting, colours, layout and other detail unless it is what was asked about. If the image cannot answer the question, say so in one sentence.\n\nAnswer this question by the user: "${transcript}".`;
 
 // The "phrased EXACTLY as received" rule is a behavioral contract, not a style
 // note: clock positions, distances and sequence markers are what the reaching
@@ -159,7 +163,7 @@ Retourne un objet JSON avec exactement ces clés. Les NOMS DES CLÉS restent en 
 - "visual_data" : une description objective et détaillée des éléments visuels pertinents pour la question.`;
 
 const USR_CHAT_FR = (transcript: string) =>
-  `Tu es un assistant pour une personne aveugle ou malvoyante. Réponds en AU PLUS 2 phrases courtes, lues à voix haute. Réponds à la question et rien d’autre : aucune introduction, aucune reformulation de la question, aucune offre d’aide à la fin. Évite l’éclairage, les couleurs, l’agencement et les autres détails, sauf si c’est précisément ce qu’on te demande. Si l’image ne permet pas de répondre, dis-le en une phrase.\n\nRéponds à cette question de l’utilisateur : « ${transcript} ».`;
+  `Tu es un assistant pour une personne aveugle ou malvoyante. Réponds en AU PLUS 2 phrases courtes, lues à voix haute. Réponds à la question et rien d’autre : aucune introduction, aucune reformulation de la question, aucune offre d’aide à la fin. Si la question appelle une réponse par oui ou non, le PREMIER mot est « Oui » ou « Non » ; nomme ensuite ce que tu vois vraiment, et si ce n’est pas ce qu’on te demandait, dis ce que c’est à la place. Évite l’éclairage, les couleurs, l’agencement et les autres détails, sauf si c’est précisément ce qu’on te demande. Si l’image ne permet pas de répondre, dis-le en une phrase.\n\nRéponds à cette question de l’utilisateur : « ${transcript} ».`;
 
 const SYS_SYNTHESIZE_FR = `${TRAIT_COMM_STYLE_FR}
 

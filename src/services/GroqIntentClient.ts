@@ -50,6 +50,7 @@ Rules:
 - "stop": cancel / stop / pause / emergency. target = null.
 - "unknown": anything else or too ambiguous. Keep confidence low.
 Distinguish carefully: naming an object with a grab/guide verb is "reaching"; naming an object with an ask/where/is-there/price/read verb is "chat".
+VERIFICATION questions are "chat", never "reaching" and never "unknown". The user is holding something, or standing in front of it, and wants it confirmed: "is this the milk bag", "is that the right one", "am I holding the cereal", "did I get the two percent", "is this it". These name an object but ask about it rather than for it. target = the named object if any, needsImage = true, confidence high.
 If the user only names an object or an object-with-location fragment with NO verb at all (e.g. "bottle on the table", "the milk carton", "cereal box"), classify as "chat" with that object as target and needsImage true — do NOT use "unknown". Reserve "unknown" for utterances with no identifiable object, place, or question.`;
 
 // French (fr-CA) router prompt.
@@ -78,6 +79,7 @@ Règles :
 - "stop" : annuler / arrêter / pause / urgence (« arrête », « stop », « annule »). target = null.
 - "unknown" : tout le reste ou trop ambigu. Garde une confiance faible.
 Distingue bien : nommer un objet avec un verbe de préhension ou de guidage donne "reaching" ; nommer un objet avec un verbe de question (où / est-ce qu'il y a / prix / lire) donne "chat".
+Les questions de VÉRIFICATION sont toujours "chat", jamais "reaching" ni "unknown". L'utilisateur tient un article, ou se trouve devant, et veut le faire confirmer : « est-ce que c'est le sac de lait », « c'est bien le bon », « est-ce que je tiens les céréales », « ai-je pris le 2 % », « c'est ça ? ». Elles nomment un objet mais posent une question à son sujet au lieu de le demander. target = l'objet nommé s'il y en a un, needsImage = true, confiance élevée.
 Si l'utilisateur nomme seulement un objet ou un fragment objet-plus-lieu SANS aucun verbe (par exemple « la bouteille sur la table », « le carton de lait », « la boîte de céréales »), classe en "chat" avec cet objet comme target et needsImage true — n'utilise PAS "unknown". Réserve "unknown" aux énoncés sans objet, lieu ni question identifiable.`;
 
 const SYSTEM_PROMPTS: Record<AppLanguage, string> = {
