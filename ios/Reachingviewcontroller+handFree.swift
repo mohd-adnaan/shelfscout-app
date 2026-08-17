@@ -225,9 +225,10 @@ extension ReachingViewController {
   /// Convert distance to human-friendly description based on distanceUnit setting
   func distanceDescription(_ dist: Float) -> String {
     if distanceUnit == "cm" {
-      let cm = Int(dist * 100)
-      if cm < 30 { return ReachLoc.armsReachDistance() }
-      return ReachLoc.centimeters(cm)
+      // Rounded to the nearest half metre, not spoken to the centimetre: see
+      // `ReachLoc.roundedReachDistance`.
+      if dist < 0.30 { return ReachLoc.armsReachDistance() }
+      return ReachLoc.roundedReachDistance(Double(dist))
     } else {
       let steps = Int(round(dist / 0.75))  // 75cm per step
       if steps <= 0 { return ReachLoc.armsReachDistance() }

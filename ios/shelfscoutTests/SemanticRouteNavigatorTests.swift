@@ -4,6 +4,22 @@ import simd
 
 @MainActor
 final class SemanticRouteNavigatorTests: XCTestCase {
+    /// Did guidance command a turn?
+    ///
+    /// Alignment cues used to be recognisable by their "to face the route"
+    /// clause. That clause was removed on reviewer instruction (15 Aug 2026) and
+    /// the cue is now the bare turn command, so the test for "was a turn
+    /// commanded here" is a prefix on the command family instead.
+    private static func isTurnCommand(_ instruction: String) -> Bool {
+        guard instruction.hasPrefix("Turn ") || instruction.hasPrefix("Go straight") else {
+            return false
+        }
+        // "Turn right in 3 meters." is the approach pre-announcement, not an
+        // alignment cue: it names the turn at the END of a leg the user is
+        // walking correctly, which is the opposite of being told to reorient.
+        return !instruction.contains(" in ")
+    }
+
     func testWrongInitialHeadingSpeaksAlignmentBeforeWalking() {
         let navigator = SemanticRouteNavigator()
         navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
@@ -18,7 +34,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
 
         XCTAssertTrue(started)
         XCTAssertEqual(navigator.phase, .navigating)
-        XCTAssertTrue(navigator.currentInstruction.contains("Turn around to face the route."))
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn around."))
         // One-leg route: the distance is stated once, the leg contributes the
         // direction.
         XCTAssertTrue(navigator.currentInstruction.contains("Milk is 8 meters away."))
@@ -46,7 +62,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
 
         XCTAssertEqual(navigator.currentStepIndex, 1)
         XCTAssertEqual(navigator.phase, .navigating)
-        XCTAssertEqual(navigator.currentInstruction, "Turn right to face the route.")
+        XCTAssertEqual(navigator.currentInstruction, "Turn right.")
     }
 
     func testHeadingAlignmentCueSuppressedWhenErrorRecoveryDisabled() {
@@ -70,8 +86,8 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         )
 
         XCTAssertEqual(navigator.phase, .navigating)
-        XCTAssertFalse(navigator.currentInstruction.contains("face the route"))
-        XCTAssertTrue(navigator.currentInstruction.hasPrefix("4 meters,"))
+        XCTAssertFalse(Self.isTurnCommand(navigator.currentInstruction))
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("4 meters "))
     }
 
     func testBackwardARMovementTriggersWrongDirectionRecovery() {
@@ -95,7 +111,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         )
 
         XCTAssertEqual(navigator.phase, .recovering)
-        XCTAssertEqual(navigator.currentInstruction, "Wrong direction.")
+        XCTAssertEqual(navigator.currentInstruction, "Turn around.")
         XCTAssertTrue(navigator.recoveryReason?.contains("Backward movement") == true)
     }
 
@@ -121,7 +137,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         )
 
         XCTAssertEqual(navigator.phase, .navigating)
-        XCTAssertNotEqual(navigator.currentInstruction, "Wrong direction.")
+        XCTAssertNotEqual(navigator.currentInstruction, "Turn around.")
         XCTAssertNil(navigator.recoveryReason)
     }
 
@@ -708,7 +724,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         navigator.forceStillnessRepromptWindowForTesting()
         navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
 
-        XCTAssertEqual(navigator.speechCue?.text.hasPrefix("8 meters,"), true)
+        XCTAssertEqual(navigator.speechCue?.text, "Walk 8 meters.")
     }
 
     func testAlignmentCompletionSpeaksWalkResumeCue() {
@@ -724,12 +740,12 @@ final class SemanticRouteNavigatorTests: XCTestCase {
 
         // Facing away from the route → alignment cue arms the resume follow-up.
         navigator.update(imuState: Self.imu(bearing: 180), arPosition: nil, arHeading: 180, arLocalized: false)
-        XCTAssertTrue(navigator.currentInstruction.contains("face the route"))
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn around."))
 
         // Turn completed → explicit walk resumption, not silence.
         navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
         XCTAssertEqual(navigator.speechCue?.text.hasPrefix("Good."), true)
-        XCTAssertNotNil(navigator.speechCue?.text.range(of: "8 meters,"))
+        XCTAssertNotNil(navigator.speechCue?.text.range(of: "Walk 8 meters."))
     }
 
     // MARK: - Bidirectional map coverage
@@ -877,7 +893,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertEqual(navigator.routeSteps.last?.to.name, "Cereals")
         // Facing the shelf, the first thing to do is turn back to the aisle —
         // not walk a metre into it.
-        XCTAssertTrue(navigator.currentInstruction.contains("Turn left to face the route."))
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn left."))
         XCTAssertFalse(navigator.currentInstruction.contains("less than one meter"))
         // The dropped stub must not move where the user is judged to be.
         XCTAssertEqual(navigator.spokenStartLabel, "Onions")
@@ -996,7 +1012,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             speakLandmarks: false,
             arHeading: 51
         ))
-        XCTAssertTrue(navigator.currentInstruction.contains("face the route"))
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn around."))
 
         navigator.speechCue = nil
         navigator.update(
@@ -1224,7 +1240,147 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             arHeading: 180,
             arLocalized: false
         )
-        XCTAssertTrue(navigator.currentInstruction.contains("Turn around to face the route."))
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn around."))
+    }
+
+    // MARK: - Turn countdown (reviewer feedback, 15 Aug 2026)
+
+    /// "I thought we agreed that the countdown to the turn instruction would
+    /// start around 3 meters before the turn." The 6 m gate fired a metre into
+    /// a seven-metre leg, so the advance notice was spent long before the turn
+    /// and the turn itself arrived unheralded.
+    func testTurnCountdownStartsAtThreeMetersAndNamesTheManeuverOnce() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+
+        // 3.5 m from the turn on a 4 m leg: nothing is owed yet.
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 0.5)
+        navigator.speechCue = nil
+        navigator.expireCuePacingWindowForTesting()
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+        XCTAssertNil(navigator.speechCue, "no gate sits between the leg start and 3 m to go")
+
+        // 3 m out: the maneuver is named, with the distance attached.
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 1.0)
+        navigator.expireCuePacingWindowForTesting()
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+        XCTAssertEqual(navigator.speechCue?.text, "Turn right in 3 meters.")
+
+        // 2 m out: a bare beat. Repeating the whole instruction — or the leg's
+        // "toward the next turn" context — is what made the countdown chatter.
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 2.0)
+        navigator.speechCue = nil
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+        XCTAssertEqual(navigator.speechCue?.text, "2.")
+    }
+
+    /// A countdown beat must not be spoken to someone the AR pose says is
+    /// already standing at the turn: "3 meters" followed immediately by the
+    /// turn is what made the position estimate sound like it was jumping.
+    func testCountdownBeatIsSuppressedWhenARSaysTheTurnIsUnderfoot() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 3.0)
+        navigator.speechCue = nil
+        navigator.expireCuePacingWindowForTesting()
+
+        // The 1 m gate is crossed, but the localized pose puts the turn 0.9 m
+        // away — inside the band the turn cue owns. Still 0.55 m short of the
+        // step-completion window, so nothing has advanced yet either.
+        navigator.update(
+            imuState: Self.imu(bearing: 0),
+            arPosition: simd_float3(0, 0, -3.1),
+            arHeading: 0,
+            arLocalized: true
+        )
+
+        XCTAssertEqual(navigator.currentStepIndex, 0)
+        XCTAssertNil(navigator.speechCue, "the turn owns the last metre, not a stale beat")
+    }
+
+    // MARK: - Short legs (reviewer feedback, 15 Aug 2026)
+
+    /// "Walk less than 1 meter" is "at best confusing and more likely
+    /// dangerous… the system should only convey the turn information
+    /// immediately." Both turns go out together, because the second is a
+    /// second away and the reviewer was otherwise turning before being told to.
+    func testShortLegBetweenTwoTurnsSpeaksBothTurnsInsteadOfAOneMetreWalk() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.doglegMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        XCTAssertEqual(navigator.routeSteps.count, 3, "the one-metre jog is a leg of its own")
+
+        navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 6.0)
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+
+        XCTAssertEqual(navigator.currentStepIndex, 1)
+        XCTAssertEqual(navigator.currentInstruction, "Turn right, then turn left.")
+        XCTAssertFalse(navigator.currentInstruction.contains("less than one meter"))
+        XCTAssertFalse(navigator.currentInstruction.contains("Walk"))
+    }
+
+    /// And the far turn is still spoken AT the turn, not only in advance —
+    /// "missing the actual turn instruction at the point the participant should
+    /// turn" was the other half of the same note.
+    func testFarSideOfAShortLegStillAnnouncesItsTurnOnArrival() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.doglegMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        navigator.setRouteProgressForTesting(stepIndex: 1, progressMeters: 1.0)
+        navigator.update(imuState: Self.imu(bearing: 90), arPosition: nil, arHeading: 90, arLocalized: false)
+
+        XCTAssertEqual(navigator.currentStepIndex, 2)
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Turn left. Walk "))
+    }
+
+    // MARK: - Clock-face phrasing (reviewer feedback, 15 Aug 2026)
+
+    /// Six o'clock names no direction to rotate in, and the clock branch used to
+    /// run ahead of every magnitude test — so a 180° correction was spoken as
+    /// "Turn to 6 o'clock" and a 210° one as "Head to 7 o'clock, 7 meters".
+    func testClockFaceStillSaysTurnAroundForAReversal() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 180),
+            speakLandmarks: false,
+            clockFaceDirections: true,
+            arHeading: 180
+        ))
+
+        XCTAssertTrue(navigator.currentInstruction.contains("Turn around."))
+        XCTAssertFalse(navigator.currentInstruction.contains("o'clock"))
     }
 
     // MARK: - Dropped leading stub facing
@@ -1247,7 +1403,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // turn happens AT the stub's far end; commanding it now told a
         // correctly-facing user to turn into the shelf.
         XCTAssertEqual(navigator.spokenStartLabel, "Onions")
-        XCTAssertFalse(navigator.currentInstruction.contains("face the route"))
+        XCTAssertFalse(Self.isTurnCommand(navigator.currentInstruction))
 
         navigator.update(
             imuState: Self.imu(x: 0.736, y: -0.817, bearing: 318),
@@ -1255,7 +1411,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             arHeading: 318,
             arLocalized: false
         )
-        XCTAssertFalse(navigator.currentInstruction.contains("face the route"))
+        XCTAssertFalse(Self.isTurnCommand(navigator.currentInstruction))
     }
 
     // MARK: - Re-capture node reuse
@@ -1516,6 +1672,28 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             coordinateSpace: "ar_world_xz",
             nodes: [start, corner, spur, junction, target]
         )
+    }
+
+    /// Two turns a metre apart — the dogleg an aisle-end jog produces. The
+    /// middle leg is too short to instruct as a walk.
+    private static func doglegMap() -> SemanticRouteMap {
+        let start = node(id: "start", name: "Entrance", point: SemanticRoutePoint(x: 0, y: 0), kind: .entrance)
+        let first = node(
+            id: "jog1",
+            name: "Right turn 1",
+            point: SemanticRoutePoint(x: 0, y: 6),
+            kind: .intersection,
+            turnHint: .right
+        )
+        let second = node(
+            id: "jog2",
+            name: "Left turn 2",
+            point: SemanticRoutePoint(x: 1.0, y: 6),
+            kind: .intersection,
+            turnHint: .left
+        )
+        let target = node(id: "checkout", name: "Checkout", point: SemanticRoutePoint(x: 1.0, y: 12), kind: .destination)
+        return map(id: "dogleg", coordinateSpace: "pdr_xy", nodes: [start, first, second, target])
     }
 
     private static func lTurnARMap() -> SemanticRouteMap {

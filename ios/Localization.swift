@@ -104,10 +104,10 @@ enum NavigationUnits {
 ///
 /// Every entry returns a COMPLETE phrase. Do not build sentences by
 /// concatenating fragments across languages: English composes
-/// "Turn right" + " to face the route", but French needs
-/// « Tournez à droite pour faire face au trajet », where the verb and the
-/// preposition are bound together. Fragment-splicing is exactly how machine
-/// translation of navigation apps ends up unintelligible.
+/// "Off route." + "Walk 4 meters to aisle 3.", but French binds the verb to
+/// its preposition — « Marchez sur 4 mètres pour rejoindre l'allée 3 » —
+/// so the seam falls in a different place. Fragment-splicing is exactly how
+/// machine translation of navigation apps ends up unintelligible.
 ///
 /// Keep in sync with `src/i18n/strings/*.ts` when a phrase is shared.
 enum NavLoc {
@@ -345,20 +345,16 @@ enum NavLoc {
         }
     }
 
-    /// Nudge with an optional trailing distance: "Step right, 2 meters."
-    static func nudgeWithDistance(_ nudge: String, distance: String?) -> String {
-        guard let distance else { return "\(nudge)." }
-        switch lang {
-        case .en: return "\(nudge), \(distance)."
-        case .fr: return "\(nudge), \(distance)."
-        }
-    }
-
-    static func wrongDirection() -> String {
-        switch lang {
-        case .en: return "Wrong direction."
-        case .fr: return "Mauvaise direction."
-        }
+    /// A recovery nudge, as a sentence of its own.
+    ///
+    /// It used to carry a trailing distance — "Head to 2 o'clock, 3 meters." —
+    /// and that second clause is what a reviewer called clearly broken on 15
+    /// Aug 2026. A correction is one action: which way. The distance turned it
+    /// into a two-number instruction delivered at the moment the user is least
+    /// able to hold numbers, and the number itself described a diagonal to a
+    /// pursuit point rather than anything the user could pace out.
+    static func recoveryNudge(_ nudge: String) -> String {
+        "\(nudge)."
     }
 
     static func offRoute() -> String {
@@ -383,29 +379,15 @@ enum NavLoc {
     }
 
     // ── Route alignment ─────────────────────────────────────────────────────
-
-    static func faceTheRoute() -> String {
-        switch lang {
-        case .en: return "Face the route."
-        case .fr: return "Placez-vous face au trajet."
-        }
-    }
-
-    static func turnAroundToFaceRoute() -> String {
-        switch lang {
-        case .en: return "Turn around to face the route."
-        case .fr: return "Faites demi-tour pour faire face au trajet."
-        }
-    }
-
-    /// "Turn right to face the route." — `turn` is a fragment from the
-    /// turn-command family with its trailing period already removed.
-    static func alignToRoute(turn: String) -> String {
-        switch lang {
-        case .en: return "\(turn) to face the route."
-        case .fr: return "\(turn) pour faire face au trajet."
-        }
-    }
+    //
+    // There is no phrasing here any more, on purpose. Alignment cues used to
+    // append "to face the route" to the turn command — "Turn to 6 o'clock to
+    // face the route." — and a reviewer asked on 15 Aug 2026 for the clause to
+    // be removed outright. It named the goal rather than the action, arrived
+    // after the part the user has to act on, and made an alignment nudge sound
+    // like a different kind of instruction from the identical turn command the
+    // recovery path speaks. `routeAlignmentInstruction` now returns the bare
+    // turn command from the `turn*Command` family above.
 
     // ── Progress and arrival ────────────────────────────────────────────────
 
@@ -526,10 +508,10 @@ enum NavLoc {
         }
     }
 
-    /// The maneuver first, the distance second: "Turn right in 6 meters."
+    /// The maneuver first, the distance second: "Turn right in 3 meters."
     ///
     /// Fronting the maneuver means the user knows WHAT is coming while the
-    /// distance is still being spoken. The old order ("In 6 meters, turn
+    /// distance is still being spoken. The old order ("In 3 meters, turn
     /// right") made them hold a number for a sentence before learning what it
     /// was a number of. `turn` arrives sentence-cased from the caller.
     static func turnInDistance(turn: String, distance: String) -> String {
@@ -539,16 +521,60 @@ enum NavLoc {
         }
     }
 
-    /// A leg stated as distance plus what it runs toward: "12 meters, straight
+    /// A leg stated as distance plus what it runs toward: "12 meters straight
     /// ahead."
     ///
     /// The verb is gone on purpose. "Walk" opened every routine cue on the
     /// route and carried no information — the user is already walking, and by
     /// the third leg the word is pure latency in front of the number.
+    ///
+    /// No comma either. The synthesizer honours it as a real pause, so "2
+    /// meters, toward the next turn" reached a reviewer on 15 Aug 2026 as a
+    /// number, a silence, and then a fragment — the break landing in the one
+    /// place the sentence has no seam. The pause the listener actually needs is
+    /// the one BEFORE the distance, which is a sentence boundary and is now
+    /// spoken as one; see `TTSManager`.
     static func legDistance(distance: String, context: String) -> String {
         switch lang {
-        case .en: return "\(distance), \(context)."
-        case .fr: return "\(distance), \(context)."
+        case .en: return "\(distance) \(context)."
+        case .fr: return "\(distance) \(context)."
+        }
+    }
+
+    /// Re-announcing a leg the user is already walking: "Walk 8 meters."
+    ///
+    /// Every path that re-states an in-progress leg — the stillness reprompt,
+    /// the resumption after a corrective turn, the exit from recovery — used to
+    /// re-speak `legDistance` verbatim. A reviewer heard the same sentence
+    /// twice in five seconds ("2 meters toward the next turn"), and heard the
+    /// leg's context repeated at 8, 7, 6 and 3 metres on legs where nothing had
+    /// changed. The distance is the only part that is new, and the verb is what
+    /// makes it a resumption rather than a countdown beat.
+    static func walkDistance(_ distance: String) -> String {
+        switch lang {
+        case .en: return "Walk \(distance)."
+        case .fr: return "Marchez \(distance)."
+        }
+    }
+
+    /// Two maneuvers one after the other, where the leg between them is too
+    /// short to walk as its own instruction: "Turn right, then turn left."
+    ///
+    /// `first` arrives sentence-cased with its trailing period removed;
+    /// `second` is a bare turn fragment. Both come from `turnInstruction`.
+    static func turnThenTurn(first: String, second: String) -> String {
+        switch lang {
+        case .en: return "\(first), then \(second)."
+        case .fr: return "\(first), puis \(second)."
+        }
+    }
+
+    /// A turn that lands the user at the destination without a walk between:
+    /// "Turn right. Beer is just ahead."
+    static func turnThenDestination(turn: String, destination: String) -> String {
+        switch lang {
+        case .en: return "\(turn). \(destination)"
+        case .fr: return "\(turn). \(destination)"
         }
     }
 
@@ -1166,10 +1192,52 @@ enum ReachLoc {
         }
     }
 
-    static func centimeters(_ count: Int) -> String {
+    /// A reaching distance, rounded to the nearest half metre.
+    ///
+    /// The exact figure used to be spoken — "straight ahead, 92 centimeters" —
+    /// and a reviewer called it ridiculous on 15 Aug 2026 on two counts: the
+    /// depth estimate is nowhere near that accurate, and nobody can track their
+    /// own movement at that scale. Half-metre steps are the coarsest reading
+    /// that still separates "a couple of paces away" from "right in front of
+    /// you", which is the only distinction the user acts on.
+    ///
+    /// Rounding is counted in half-metre units, so 1 is half a metre, 2 is one
+    /// metre, 3 is one and a half. Never zero: below the arm's-reach threshold
+    /// the caller speaks `armsReachDistance()` instead.
+    static func roundedReachDistance(_ distanceMeters: Double) -> String {
+        let halves = max(1, Int((max(0, distanceMeters) / 0.5).rounded()))
+        if halves == 1 { return halfMeter() }
+        if halves == 2 { return oneMeterDistance() }
+        let whole = halves / 2
+        if halves.isMultiple(of: 2) { return wholeMeters(whole) }
+        return metersAndAHalf(whole)
+    }
+
+    private static func halfMeter() -> String {
         switch lang {
-        case .en: return "\(count) centimeters"
-        case .fr: return "\(count) centimètres"
+        case .en: return "half a meter"
+        case .fr: return "un demi-mètre"
+        }
+    }
+
+    private static func oneMeterDistance() -> String {
+        switch lang {
+        case .en: return "1 meter"
+        case .fr: return "1 mètre"
+        }
+    }
+
+    private static func wholeMeters(_ count: Int) -> String {
+        switch lang {
+        case .en: return "\(count) meters"
+        case .fr: return "\(count) mètres"
+        }
+    }
+
+    private static func metersAndAHalf(_ count: Int) -> String {
+        switch lang {
+        case .en: return "\(count) and a half meters"
+        case .fr: return "\(count) mètres et demi"
         }
     }
 
