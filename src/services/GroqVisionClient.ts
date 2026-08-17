@@ -1,7 +1,7 @@
 // src/services/GroqVisionClient.ts
 //
 // On-device vision orchestration via Groq — the frontend equivalent of the
-// backend Scene / Object / Chat vision nodes, now with EXACT two-pass parity:
+// backend Scene / Object / Chat vision nodes, now with EXACT three-pass parity:
 //
 //   Pass 1 (vision):     the multimodal model returns structured JSON, using
 //                        the same system/user prompts as the backend Config
@@ -9,6 +9,11 @@
 //   Pass 2 (synthesize): a fast text model turns that JSON into a short spoken
 //                        answer, styled by trait_comm_style — mirroring the
 //                        backend "Synthesize result" node.
+//   Pass 3 (shorten):    ONLY if pass 2 came back over SPOKEN_MAX_CHARS, the
+//                        same text model compresses it again — mirroring the
+//                        backend "response length" → "If6" → "Synthesize
+//                        result2" loop. Skipped entirely on short answers, so
+//                        the common case still costs two calls.
 //
 // Before Pass 1 the captured frame is DOWNSCALED via the native
 // ImageOrientationFixer (max 768px, q0.7) so the base64 upload is small and
@@ -37,6 +42,13 @@ try {
 const GROQ_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const VISION_TIMEOUT_MS = 20000;
 const SYNTH_TIMEOUT_MS = 8000;
+
+// Length gate for the shortening pass, mirroring the backend "response length"
+// node (`answer.length > 300`). Kept at the backend's number so the two
+// pipelines stay comparable in the study — this is a spoken-length budget, not
+// a token budget: ~300 characters is about 8 seconds of TTS, which is already
+// long for someone standing still in an aisle waiting to move.
+const SPOKEN_MAX_CHARS = 300;
 
 // Groq reserves max_tokens against the per-minute token budget, and the vision
 // model's free-tier ceiling is 8k TPM — so this is sized to the ~450 tokens a
@@ -120,6 +132,21 @@ For other responses:
 
 const USR_SYNTHESIZE = (content: string) => `VISUAL INFORMATION:\n${content}\nNow Begin!`;
 
+// Pass 3, the backend "Synthesize result2" node. Two things this prompt has to
+// get right that the backend's version did not:
+//   1. It must be STRICTLY tighter than pass 2, never looser. The backend asked
+//      pass 1 for "1-3 sentences" and pass 2 for "2-3", so a long single
+//      sentence could legally come back longer than it went in.
+//   2. It is a compression of an already-written answer, not a fresh answer, so
+//      it gets the user's question as well — without it the model cannot tell
+//      which half of a two-part answer was the part actually asked about.
+// The sentence cap is a number rather than "be concise" for the same reason as
+// USR_SCENE: models comply with counts and ignore adjectives.
+const USR_SHORTEN = (transcript: string, answer: string) =>
+  `The following answer is too long to speak aloud. Compress it.\n\n${
+    transcript.trim() ? `The user asked: "${transcript.trim()}"\n\n` : ''
+  }Answer to compress:\n${answer}\n\nHard rules: - AT MOST 2 short sentences and under ${SPOKEN_MAX_CHARS} characters. - Your output MUST be shorter than the answer above. - Keep only what answers the question; drop every other detail. - Preserve any clock position, distance, measurement or step count EXACTLY as written. - Keep the first word if it is "Yes" or "No". - Output only the compressed answer: no preamble, no explanation, no quotes around it.`;
+
 // ── French (fr-CA) prompts ─────────────────────────────────────────────────
 //
 // These are what a Quebec participant actually hears: scene descriptions and
@@ -191,6 +218,15 @@ Pour les autres réponses :
 const USR_SYNTHESIZE_FR = (content: string) =>
   `INFORMATION VISUELLE :\n${content}\nCommence maintenant!`;
 
+// Pass 3 in French. This mirror is not optional: pass 3 rewrites the sentence
+// the participant actually hears, so an English prompt here would hand a
+// Quebec participant an English answer even though passes 1 and 2 were French —
+// the exact failure this file's French block was added to prevent.
+const USR_SHORTEN_FR = (transcript: string, answer: string) =>
+  `La réponse suivante est trop longue à lire à voix haute. Comprime-la.\n\n${
+    transcript.trim() ? `L’utilisateur a demandé : « ${transcript.trim()} »\n\n` : ''
+  }Réponse à comprimer :\n${answer}\n\nRègles strictes : - AU PLUS 2 phrases courtes et moins de ${SPOKEN_MAX_CHARS} caractères. - Ta sortie DOIT être plus courte que la réponse ci-dessus. - Ne garde que ce qui répond à la question ; écarte tout le reste. - Conserve EXACTEMENT telles quelles les positions horaires, les distances, les mesures et les nombres de pas. - Garde le premier mot s’il s’agit de « Oui » ou « Non ». - Réponds en français. - Ne donne que la réponse comprimée : aucune introduction, aucune explication, aucun guillemet autour.`;
+
 // ── Per-language prompt selection ──────────────────────────────────────────
 
 const SYS_SCENE_BY_LANGUAGE: Record<AppLanguage, string> = {
@@ -217,13 +253,25 @@ const USR_SYNTHESIZE_BY_LANGUAGE: Record<AppLanguage, (content: string) => strin
   en: USR_SYNTHESIZE,
   fr: USR_SYNTHESIZE_FR,
 };
+const USR_SHORTEN_BY_LANGUAGE: Record<
+  AppLanguage,
+  (transcript: string, answer: string) => string
+> = {
+  en: USR_SHORTEN,
+  fr: USR_SHORTEN_FR,
+};
 
 export interface GroqVisionResult {
   ok: boolean;
   text?: string;
   provider: 'groq_vision' | 'none';
   fallbackReason?: string;
+  /** Pass 2 produced the text. False means it failed and this is the raw-JSON fallback. */
   twoPass?: boolean;
+  /** Pass 3 ran and its output was accepted (i.e. it really was shorter). */
+  shortened?: boolean;
+  /** Spoken length before pass 3, so a regression shows up in the trace. */
+  lengthBeforeShorten?: number;
 }
 
 let keyCursor = 0;
@@ -290,23 +338,26 @@ class GroqVisionClient {
   async describeScene(imageUri: string, transcript?: string): Promise<GroqVisionResult> {
     const language = getAppLanguage();
     const userText = (transcript && transcript.trim()) || USR_SCENE_BY_LANGUAGE[language];
-    return this.twoPass(SYS_SCENE_BY_LANGUAGE[language], userText, imageUri);
+    return this.runPasses(SYS_SCENE_BY_LANGUAGE[language], userText, imageUri, transcript || '');
   }
 
   async answerQuestion(imageUri: string, transcript: string): Promise<GroqVisionResult> {
     const language = getAppLanguage();
-    return this.twoPass(
+    return this.runPasses(
       SYS_CHAT_BY_LANGUAGE[language],
       USR_CHAT_BY_LANGUAGE[language](transcript.trim()),
       imageUri,
+      transcript,
     );
   }
 
   // Pass 1: vision → structured JSON. Pass 2: JSON → spoken text.
-  private async twoPass(
+  // Pass 3 (only when pass 2 overruns): spoken text → shorter spoken text.
+  private async runPasses(
     visionSystem: string,
     visionUserText: string,
     imageUri: string,
+    transcript: string,
   ): Promise<GroqVisionResult> {
     if (!this.isConfigured()) return { ok: false, provider: 'none', fallbackReason: 'groq_not_configured' };
     if (!imageUri) return { ok: false, provider: 'none', fallbackReason: 'no_image' };
@@ -356,7 +407,58 @@ class GroqVisionClient {
       return { ok: false, provider: 'none', fallbackReason: synth.fallbackReason || 'synthesize_failed' };
     }
 
-    return { ok: true, provider: 'groq_vision', text: synth.text.trim(), twoPass: true };
+    const spoken = synth.text.trim();
+    if (spoken.length <= SPOKEN_MAX_CHARS) {
+      return { ok: true, provider: 'groq_vision', text: spoken, twoPass: true };
+    }
+
+    // ── Pass 3: shorten ──
+    const shortened = await this.shorten(spoken, transcript);
+    return {
+      ok: true,
+      provider: 'groq_vision',
+      text: shortened ?? spoken,
+      twoPass: true,
+      shortened: shortened !== null,
+      lengthBeforeShorten: spoken.length,
+    };
+  }
+
+  /**
+   * Compress an over-long spoken answer. Returns null — meaning "keep what you
+   * had" — whenever the pass cannot be trusted, so this can only ever shorten
+   * the utterance, never lengthen it, empty it, or block it.
+   *
+   * The result is checked in code as well as asked for in the prompt. That
+   * belt-and-braces is deliberate: the backend relied on the prompt alone and
+   * its shortening pass silently ran with the wrong instructions for weeks
+   * without anybody noticing, because a summarizer that returns the text
+   * unchanged looks exactly like a summarizer that is working.
+   */
+  private async shorten(answer: string, transcript: string): Promise<string | null> {
+    const language = getAppLanguage();
+    const pass = await this.post(
+      GROQ_TEXT_MODEL,
+      [
+        { role: 'system', content: SYS_SYNTHESIZE_BY_LANGUAGE[language] },
+        { role: 'user', content: USR_SHORTEN_BY_LANGUAGE[language](transcript, answer) },
+      ],
+      { jsonMode: false, timeout: SYNTH_TIMEOUT_MS, maxTokens: 150 },
+    );
+
+    if (!pass.ok || !pass.text) {
+      console.warn(`[GroqVision] Shorten pass failed (${pass.fallbackReason}); speaking pass-2 answer`);
+      return null;
+    }
+
+    const candidate = pass.text.trim();
+    if (!candidate || candidate.length >= answer.length) {
+      console.warn(
+        `[GroqVision] Shorten pass did not shorten (${answer.length} → ${candidate.length}); speaking pass-2 answer`,
+      );
+      return null;
+    }
+    return candidate;
   }
 
   // Best-effort spoken fallback if the synthesize pass fails.

@@ -518,7 +518,16 @@ class MobileOrchestrator {
       confidence: result.ok ? 0.9 : 0,
       needsRemote: false,
       fallbackReason: result.fallbackReason,
-      diagnostics: { intent },
+      diagnostics: {
+        intent,
+        spokenChars: result.text?.length,
+        // Present only when the answer overran the spoken budget: `shortened`
+        // false means the third pass ran and was rejected for not actually
+        // shortening, which is the one case worth reading the log over.
+        ...(result.lengthBeforeShorten !== undefined
+          ? { lengthBeforeShorten: result.lengthBeforeShorten, shortened: result.shortened }
+          : {}),
+      },
     });
 
     if (!result.ok) {
