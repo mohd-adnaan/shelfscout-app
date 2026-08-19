@@ -1,5 +1,6 @@
 import { NativeModules, Platform } from 'react-native';
 import type { AppLanguage } from '../i18n';
+import type { NavigationDistanceUnit } from '../context/SettingsContext';
 
 export type ARKitNavigationReason =
   | 'arrived'
@@ -23,9 +24,11 @@ export interface ARKitNavigationConfig {
   /**
    * Unit spoken route distances are measured in. Steps are for users who
    * cannot estimate metres without sight — "walk 12 steps" is countable,
-   * "walk 8 meters" is not. Defaults to meters natively when omitted.
+   * "walk 8 meters" is not; feet are for users who grew up pre-metric and
+   * would otherwise convert every distance themselves. Defaults to meters
+   * natively when omitted.
    */
-  distanceUnit?: 'meters' | 'steps';
+  distanceUnit?: NavigationDistanceUnit;
   voiceOverEnabled?: boolean;
   ttsRate?: number;
   /** Language for native spoken guidance ('en' | 'fr'). */

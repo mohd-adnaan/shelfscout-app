@@ -18,6 +18,7 @@ import {
   StatusBar,
 } from 'react-native';
 import { useSettings } from '../context/SettingsContext';
+import type { NavigationDistanceUnit } from '../context/SettingsContext';
 import {
   AppLanguage,
   LANGUAGE_ENDONYMS,
@@ -420,13 +421,14 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
   );
 
   const handleNavigationDistanceUnit = useCallback(
-    async (unit: 'meters' | 'steps') => {
+    async (unit: NavigationDistanceUnit) => {
       await updateNavigationDistanceUnit(unit);
-      await speechOutput.announce(
-        unit === 'steps'
-          ? 'Route distances will be spoken in steps.'
-          : 'Route distances will be spoken in meters.',
-      );
+      const spoken = {
+        meters: 'Route distances will be spoken in meters.',
+        feet: 'Route distances will be spoken in feet.',
+        steps: 'Route distances will be spoken in steps.',
+      }[unit];
+      await speechOutput.announce(spoken);
     },
     [updateNavigationDistanceUnit],
   );
@@ -457,6 +459,29 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
           <Text style={styles.pipelineOptionName}>Meters</Text>
           <Text style={styles.pipelineOptionDesc}>"Walk 8 meters"</Text>
           {settings.navigationDistanceUnit === 'meters' && <View style={styles.activeDot} />}
+        </TouchableOpacity>
+
+        <View style={styles.pipelineDivider} />
+
+        <TouchableOpacity
+          style={[
+            styles.pipelineOption,
+            settings.navigationDistanceUnit === 'feet' && styles.pipelineOptionActiveAlt,
+          ]}
+          accessible={true}
+          accessibilityRole="button"
+          accessibilityLabel={`Feet${
+            settings.navigationDistanceUnit === 'feet' ? ', currently selected' : ''
+          }`}
+          accessibilityHint="Double tap to select"
+          onPress={() => handleNavigationDistanceUnit('feet')}
+        >
+          <Text style={styles.pipelineOptionIcon}>📐</Text>
+          <Text style={styles.pipelineOptionName}>Feet</Text>
+          <Text style={styles.pipelineOptionDesc}>"Walk 26 feet"</Text>
+          {settings.navigationDistanceUnit === 'feet' && (
+            <View style={[styles.activeDot, { backgroundColor: C.warning }]} />
+          )}
         </TouchableOpacity>
 
         <View style={styles.pipelineDivider} />

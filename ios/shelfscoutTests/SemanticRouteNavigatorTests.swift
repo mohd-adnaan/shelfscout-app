@@ -11,13 +11,14 @@ final class SemanticRouteNavigatorTests: XCTestCase {
     /// the cue is now the bare turn command, so the test for "was a turn
     /// commanded here" is a prefix on the command family instead.
     private static func isTurnCommand(_ instruction: String) -> Bool {
-        guard instruction.hasPrefix("Turn ") || instruction.hasPrefix("Go straight") else {
-            return false
-        }
-        // "Turn right in 3 meters." is the approach pre-announcement, not an
+        // "In 3 meters, turn right." is the approach pre-announcement, not an
         // alignment cue: it names the turn at the END of a leg the user is
         // walking correctly, which is the opposite of being told to reorient.
-        return !instruction.contains(" in ")
+        // Since the distance moved to the front (see `NavLoc.turnInDistance`)
+        // the two families no longer share a prefix, which is what this test
+        // helper keys on.
+        guard !instruction.hasPrefix("In ") else { return false }
+        return instruction.hasPrefix("Turn ") || instruction.hasPrefix("Go straight")
     }
 
     func testWrongInitialHeadingSpeaksAlignmentBeforeWalking() {
@@ -355,7 +356,8 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // At the turn the cue is the bare command; 2.5 m out it must still be
         // the pre-announcement that carries a distance.
         XCTAssertNotEqual(navigator.currentInstruction, "Turn right.")
-        XCTAssertTrue(navigator.currentInstruction.contains("Turn right in "))
+        XCTAssertTrue(navigator.currentInstruction.hasPrefix("In "))
+        XCTAssertTrue(navigator.currentInstruction.contains("turn right"))
     }
 
     func testARDestinationProximityCompletesRouteDespitePDRLag() {
@@ -675,7 +677,10 @@ final class SemanticRouteNavigatorTests: XCTestCase {
 
     func testStepsUnitSpeaksRouteDistancesAsSteps() {
         NavigationUnits.current = .steps
-        defer { NavigationUnits.current = .meters }
+        defer {
+            NavigationUnits.current = .meters
+            NavigationUnits.resetMetersPerStep()
+        }
 
         let navigator = SemanticRouteNavigator()
         navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
@@ -691,6 +696,116 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // it is spoken exactly.
         XCTAssertTrue(navigator.currentInstruction.contains("12 steps"))
         XCTAssertFalse(navigator.currentInstruction.contains("meters"))
+    }
+
+    /// A step count is only useful in the walker's own steps.
+    ///
+    /// The pilot heard "20 steps" and arrived in 12 to 14 — the metres were
+    /// right, the divisor was someone else's stride. Once enough of her own
+    /// steps have been measured the count must follow them.
+    func testStepCountFollowsTheWalkersMeasuredStride() {
+        NavigationUnits.current = .steps
+        defer {
+            NavigationUnits.current = .meters
+            NavigationUnits.resetMetersPerStep()
+        }
+
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        XCTAssertTrue(navigator.currentInstruction.contains("12 steps"), "opens on the default gait")
+
+        // A long-strided walker: twelve confirmed steps of 1.0 m.
+        for step in 1...12 {
+            navigator.update(
+                imuState: Self.imu(
+                    stepCount: step,
+                    isMoving: true,
+                    bearing: 0,
+                    currentStepLength: 1.0
+                ),
+                arPosition: nil,
+                arHeading: 0,
+                arLocalized: false
+            )
+        }
+
+        XCTAssertEqual(NavigationUnits.metersPerStep, 1.0, accuracy: 0.001)
+
+        // The same 8 m leg, announced again, is now 8 of her steps rather than
+        // 12 of a stranger's.
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        XCTAssertTrue(navigator.currentInstruction.contains("8 steps"))
+        XCTAssertFalse(navigator.currentInstruction.contains("12 steps"))
+    }
+
+    /// One bad step detection must not rescale the whole route.
+    func testOutlierStepLengthsDoNotMoveTheSpokenGait() {
+        defer { NavigationUnits.resetMetersPerStep() }
+
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        // Ten honest 0.70 m steps with two absurd ones dropped in the middle.
+        let lengths: [Double] = [0.70, 0.70, 0.70, 4.00, 0.70, 0.70,
+                                 0.05, 0.70, 0.70, 0.70, 0.70, 0.70]
+        for (index, length) in lengths.enumerated() {
+            navigator.update(
+                imuState: Self.imu(
+                    stepCount: index + 1,
+                    isMoving: true,
+                    bearing: 0,
+                    currentStepLength: length
+                ),
+                arPosition: nil,
+                arHeading: 0,
+                arLocalized: false
+            )
+        }
+
+        // Both outliers are outside a believable gait and never enter the
+        // window; the median of what remains is the walker's real stride.
+        XCTAssertEqual(NavigationUnits.metersPerStep, 0.70, accuracy: 0.001)
+    }
+
+    func testFeetUnitSpeaksRouteDistancesInFeet() {
+        NavigationUnits.current = .feet
+        defer { NavigationUnits.current = .meters }
+
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.straightMap(coordinateSpace: "pdr_xy")])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Milk",
+            arPosition: nil,
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+
+        // 8 m is 26.2 ft — past the rounding threshold, so it is spoken as a
+        // round number the way long step counts are.
+        XCTAssertTrue(navigator.currentInstruction.contains("about 25 feet"))
+        XCTAssertFalse(navigator.currentInstruction.contains("meters"))
+        XCTAssertFalse(navigator.currentInstruction.contains("steps"))
     }
 
     func testMetersRemainTheDefaultUnit() {
@@ -851,9 +966,12 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             arHeading: 217
         ))
 
-        XCTAssertTrue(navigator.currentInstruction.contains("Onions is 21 meters away."))
+        XCTAssertTrue(navigator.currentInstruction.contains("Onions is 21 meters away"))
         // The old failure: the whole 22 m route opened on the 1.4 m stub.
         XCTAssertFalse(navigator.currentInstruction.contains("less than one meter"))
+        // The overview carries the SHAPE of the journey as well as its length
+        // — see `NavLoc.startingJourney`. This route bends twice.
+        XCTAssertTrue(navigator.currentInstruction.contains("turns."))
     }
 
     func testCollinearStubLegMergesIntoTheLegItContinues() {
@@ -1272,7 +1390,7 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         navigator.setRouteProgressForTesting(stepIndex: 0, progressMeters: 1.0)
         navigator.expireCuePacingWindowForTesting()
         navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
-        XCTAssertEqual(navigator.speechCue?.text, "Turn right in 3 meters.")
+        XCTAssertEqual(navigator.speechCue?.text, "In 3 meters, turn right.")
 
         // 2 m out: a bare beat. Repeating the whole instruction — or the leg's
         // "toward the next turn" context — is what made the countdown chatter.
@@ -2081,6 +2199,115 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         XCTAssertEqual(biscuits?.reachingObjectName, "Oreos")
     }
 
+    /// The first reaching anchor of a multi-destination map used to be lost.
+    ///
+    /// A participant on 17 Aug 2026 pinned a cereal box at Cereals, kept
+    /// walking, and pinned onions at Onions. Only the onions worked. The
+    /// cereal object was swept onto the edge LEAVING Cereals when that edge
+    /// was created — `attachPendingEvidence` could not tell "no edge yet" from
+    /// "not on an edge at all" — and from then on it belonged to a segment the
+    /// arrival at Cereals never walks, so nothing surfaced it. The onions
+    /// survived only because the walk ended there and no outgoing edge was
+    /// ever built to claim them.
+    func testReachingObjectStaysWithItsDestinationWhenTheWalkContinues() {
+        let navigator = SemanticRouteNavigator()
+        navigator.beginRouteCapture(named: "Nadia Onions")
+        XCTAssertTrue(navigator.captureStart(
+            named: "Drinks",
+            arPosition: simd_float3(0, 0, 0),
+            arHeading: 199,
+            imuState: Self.imu(bearing: 199)
+        ))
+
+        // First destination, mid-walk, with its reaching object.
+        XCTAssertTrue(navigator.captureLandmark(
+            named: "Cereals",
+            side: .left,
+            context: "",
+            arPosition: Self.arPosition(SemanticRoutePoint(x: -1.71, y: -14.20)),
+            isDestination: true
+        ))
+        XCTAssertTrue(navigator.attachReachingObject(named: "All Brain Kelloggs"))
+
+        // The walk carries on — this is the edge that used to steal the anchor.
+        XCTAssertTrue(navigator.captureTurn(
+            .left,
+            arPosition: Self.arPosition(SemanticRoutePoint(x: -4.77, y: -19.35)),
+            arHeading: 201,
+            imuState: Self.imu(x: -4.77, y: -19.35, bearing: 201)
+        ))
+
+        // Second destination, at the end of the walk, with its own object.
+        XCTAssertTrue(navigator.captureLandmark(
+            named: "Onions",
+            side: .left,
+            context: "",
+            arPosition: Self.arPosition(SemanticRoutePoint(x: 0.18, y: -30.49)),
+            isDestination: true
+        ))
+        XCTAssertTrue(navigator.attachReachingObject(named: "Onion Bags"))
+
+        let landmarks = navigator.activeMap?.landmarks ?? []
+        let kelloggs = landmarks.first { $0.name == "All Brain Kelloggs" }
+        let onionBags = landmarks.first { $0.name == "Onion Bags" }
+        XCTAssertNotNil(kelloggs)
+        XCTAssertNotNil(onionBags)
+
+        // The whole bug in one assertion: the first object must be anchored to
+        // its node exactly the way the last one is.
+        XCTAssertNil(
+            kelloggs?.edgeID,
+            "a reaching object belongs to its destination, not to the leg out of it"
+        )
+        XCTAssertNil(onionBags?.edgeID)
+
+        let cereals = navigator.activeMap?.nodes.first { $0.name == "Cereals" }
+        XCTAssertEqual(kelloggs?.nodeID, cereals?.id)
+        XCTAssertEqual(navigator.reachingObjectName(forTarget: "Cereals"), "All Brain Kelloggs")
+        XCTAssertEqual(navigator.reachingObjectName(forTarget: "Onions"), "Onion Bags")
+    }
+
+    /// The other half of the same sweep: the object must not be narrated as a
+    /// landmark of the leg walking AWAY from the shelf it sits on.
+    func testReachingObjectIsNotAdoptedAsContextOfTheOutgoingLeg() {
+        let navigator = SemanticRouteNavigator()
+        navigator.beginRouteCapture(named: "Nadia Onions")
+        XCTAssertTrue(navigator.captureStart(
+            named: "Drinks",
+            arPosition: simd_float3(0, 0, 0),
+            arHeading: 199,
+            imuState: Self.imu(bearing: 199)
+        ))
+        XCTAssertTrue(navigator.captureLandmark(
+            named: "Cereals",
+            side: .left,
+            context: "",
+            arPosition: Self.arPosition(SemanticRoutePoint(x: -1.71, y: -14.20)),
+            isDestination: true
+        ))
+        XCTAssertTrue(navigator.attachReachingObject(named: "All Brain Kelloggs"))
+        XCTAssertTrue(navigator.captureTurn(
+            .left,
+            arPosition: Self.arPosition(SemanticRoutePoint(x: -4.77, y: -19.35)),
+            arHeading: 201,
+            imuState: Self.imu(x: -4.77, y: -19.35, bearing: 201)
+        ))
+
+        let cereals = navigator.activeMap?.nodes.first { $0.name == "Cereals" }
+        let outgoing = navigator.activeMap?.edges.first { $0.fromNodeID == cereals?.id }
+        XCTAssertNotNil(outgoing, "the walk did continue past Cereals")
+        XCTAssertFalse(
+            outgoing?.landmarkIds?.contains { id in
+                navigator.activeMap?.landmarks.first { $0.id == id }?.name == "All Brain Kelloggs"
+            } ?? false,
+            "the shelf object is not a landmark of the aisle leading away from it"
+        )
+        let spoken = [outgoing?.spokenContext, outgoing?.leftContext, outgoing?.rightContext]
+            .compactMap { $0 }
+            .joined(separator: " ")
+        XCTAssertFalse(spoken.contains("All Brain Kelloggs"))
+    }
+
     /// Control: the snap itself still works. Two structural marks made from one
     /// spot are still one node — that is what keeps a corrected turn from
     /// leaving a stub behind.
@@ -2231,14 +2458,15 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         isMoving: Bool = false,
         x: Double = 0,
         y: Double = 0,
-        bearing: Double
+        bearing: Double,
+        currentStepLength: Double = 0.65
     ) -> IMUState {
         IMUState(
             position: Position(x: x, y: y, bearing: bearing),
             stepCount: stepCount,
             isCalibrated: true,
             isMoving: isMoving,
-            currentStepLength: 0.65,
+            currentStepLength: currentStepLength,
             isStepCalibrationValid: true,
             bearing: bearing,
             headingReliability: 0.9,

@@ -473,6 +473,20 @@ final class SemanticRouteNavigator: ObservableObject {
     /// Whether this leg's maneuver has been named yet. The first approach gate
     /// names it; the rest of the countdown is bare distances.
     private var spokenLegManeuverCue = false
+    /// Recent per-step lengths measured by `IMUSensorManager`, newest last.
+    /// Sampled once per confirmed step, never per tick — the same value
+    /// repeats across the ~30 ticks between steps and would otherwise swamp
+    /// the median with whatever the last step happened to be.
+    private var observedStepLengths: [Double] = []
+    /// `imuState.stepCount` at the last sample, so a step is counted once.
+    private var lastObservedStepCount: Int?
+    /// When the walker last stopped, in ANY guidance phase.
+    ///
+    /// Deliberately not `stillnessStartedAt`: that one is the walk-reprompt
+    /// clock and only runs while `.navigating`, so during recovery — the exact
+    /// state a user is in when they step aside for a person — it is never set
+    /// and cannot answer "have they paused?".
+    private var movementStoppedAt: Date?
     /// The place the journey started from, resolved for speech. Not spoken
     /// any more — see `startNavigation` — but still the ground truth for which
     /// node the user was judged to be standing at.
@@ -586,6 +600,22 @@ final class SemanticRouteNavigator: ObservableObject {
     /// so two systems each cueing "reasonably often" still reach the user as
     /// one run-on contradiction. This is the floor under all of them.
     private var lastTurnCueAt: Date?
+    /// Corrective cues spoken in a row without the user getting back on route.
+    ///
+    /// A pilot participant on 17 Aug 2026 walked into a group of people, had
+    /// to go around them, and heard the route insist on the direction she was
+    /// deliberately not taking: "I have to turn left to avoid this person and
+    /// it kept saying turn right… it was telling me to walk through the
+    /// obstacle." Her verdict on the recovery that was supposed to help was
+    /// that it "backfired", and what she wanted was to step aside and have it
+    /// be quiet for a second.
+    ///
+    /// The system cannot see the obstacle, so it cannot know she is right. But
+    /// a correction repeated several times without effect is evidence in
+    /// itself — either she cannot comply or she has chosen not to — and in
+    /// both cases saying it louder and more often is the wrong move. This
+    /// counts the repeats so the cue can back off instead of escalating.
+    private var consecutiveCorrectiveCues = 0
     /// When the live course first left the corridor's tolerance, and when the
     /// last course nudge was spoken. See the course-correction constants: the
     /// persistence window is what separates a drift from a glance at a shelf.
@@ -638,10 +668,20 @@ final class SemanticRouteNavigator: ObservableObject {
     private var leadingStubMeters: Double = 0
 
     private let arrivalThresholdMeters = 0.55
-    private let destinationProximityMeters = 0.75
+    /// How close to the destination node counts as arrived.
+    ///
+    /// Raised from 0.75 m on pilot feedback (17 Aug 2026). At 0.75 m the route
+    /// was still counting a blind walker down — "one more step, one more step"
+    /// — into a shelf she could not see and was already close enough to reach.
+    /// Her words: "I was a comfortable distance away to figure out what cereal
+    /// I might want, I didn't need to be right up at the shelf." Arrival is
+    /// where browsing starts, and browsing starts at arm's length plus room to
+    /// stand, not at contact. Reaching guidance takes over from here and is
+    /// the thing that closes the last metre.
+    private let destinationProximityMeters = 1.35
     /// Stillness-fallback arrival: near the destination and stopped this long
     /// completes the route even when the strict arrival window can't be met.
-    private let destinationStillnessRadiusMeters = 0.9
+    private let destinationStillnessRadiusMeters = 1.4
     private let destinationStillnessArrivalSeconds: TimeInterval = 2.0
     /// Standing at the turn: the instruction is the bare command.
     private let turnAnnouncementThresholdMeters = 0.75
@@ -897,6 +937,27 @@ final class SemanticRouteNavigator: ObservableObject {
     private let leadingStubFacingToleranceDegrees = 40.0
     /// A turn that stops part-way gets one repeat after this long.
     private let routeAlignmentStalledCueSeconds: TimeInterval = 6.0
+    // ── Corrective-cue backoff ──────────────────────────────────────────────
+    //
+    // See `consecutiveCorrectiveCues`. The first few corrections are spoken at
+    // full cadence, because most of the time the user simply has not heard yet
+    // or is mid-turn. Past that the cue is demonstrably not working, and the
+    // pilot's experience of hearing it anyway was "overwhelming" and
+    // "stressful" — so each further repeat waits longer, up to a cap that is
+    // long enough to walk around a person and rejoin without being talked at.
+    private let correctiveCueFreeRepeats = 2
+    private let correctiveCueBackoffStepSeconds: TimeInterval = 3.0
+    private let correctiveCueBackoffMaxSeconds: TimeInterval = 12.0
+    /// How long a user must be stopped before corrections go quiet entirely.
+    ///
+    /// "I just wanted to step aside and pause and be quiet for a second."
+    /// Someone who has stopped walking is not lost, they are dealing with
+    /// something — a person in the aisle, a display, a question from a
+    /// stranger. Repeating a turn command at a standing user cannot help them
+    /// and is the single behaviour the pilot named as making recovery worse
+    /// than no recovery. The route is still tracked; it just stops talking
+    /// until they move again.
+    private let correctiveCueStillnessQuietSeconds: TimeInterval = 1.5
     // ── Course correction (staying centred in the aisle) ────────────────────
     //
     // Pilot, clock-face condition: a participant walking a straight aisle but
@@ -2296,6 +2357,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastRouteRebuildAttemptAt = nil
         stillnessStartedAt = nil
         lastStillnessRepromptAt = nil
+        movementStoppedAt = nil
         pendingAlignmentResumeCue = false
         resetRouteCorrectionGuards()
         resetCourseCorrectionState()
@@ -2368,6 +2430,7 @@ final class SemanticRouteNavigator: ObservableObject {
         currentInstruction = NavLoc.startingJourney(
             destination: spokenTarget,
             distance: totalDistanceText,
+            turns: Self.turnCount(in: steps),
             firstInstruction: firstInstruction
         )
         NavigationTrace.shared.log("nav.start", [
@@ -2487,6 +2550,9 @@ final class SemanticRouteNavigator: ObservableObject {
         // earlier journey would bake the correction into the map itself.
         let isGuiding = phase == .navigating || phase == .recovering
         let arHeading = isGuiding ? mapFrameHeading(rawARHeading) : rawARHeading
+        // Learn the walker's stride from the walker, and notice when they stop.
+        observeStepLength(imuState)
+        recordMovementState(imuState)
         // Sampled in every phase: the sweep to expose is the relocalization
         // pan that happens BEFORE guidance starts.
         recordHeadingSample(arHeading)
@@ -2859,7 +2925,8 @@ final class SemanticRouteNavigator: ObservableObject {
         if issueHeadingAlignmentCueIfNeeded(
             on: step,
             liveHeading: liveHeading,
-            headingError: headingError
+            headingError: headingError,
+            isMoving: imuState.isMoving
         ) {
             rebuildRAGContext()
             return
@@ -4315,10 +4382,48 @@ final class SemanticRouteNavigator: ObservableObject {
         turnPhrasing == .clockFace ? 3.2 : routeAlignmentCueMinimumGapSeconds
     }
 
+    /// Extra silence owed on top of a corrective cue's normal cooldown,
+    /// because the same correction has already been given and not taken.
+    private var correctiveCueBackoffSeconds: TimeInterval {
+        let extra = consecutiveCorrectiveCues - correctiveCueFreeRepeats
+        guard extra > 0 else { return 0 }
+        return min(correctiveCueBackoffMaxSeconds, Double(extra) * correctiveCueBackoffStepSeconds)
+    }
+
+    /// True once the correction is repeating itself. Past this point a cue
+    /// whose WORDS changed no longer earns an immediate re-speak: a user
+    /// turning to get around something sweeps through several bands, and
+    /// "turn left… turn sharp left… turn around" inside a few seconds is the
+    /// run-on contradiction the pilot described being unable to follow.
+    private var isCorrectiveCueBackingOff: Bool {
+        consecutiveCorrectiveCues > correctiveCueFreeRepeats
+    }
+
+    /// Has the user deliberately stopped after already being corrected once?
+    /// See `correctiveCueStillnessQuietSeconds`.
+    ///
+    /// The FIRST correction is never suppressed, however still the user is:
+    /// someone standing at the start of a route facing the wrong way needs to
+    /// hear it, and silence there is the bug this would otherwise introduce.
+    /// What the pilot asked for was an end to the repeats — "it kept saying
+    /// turn right" — while she stood still sorting out an obstacle.
+    private func isPausedForCorrectiveQuiet(isMoving: Bool) -> Bool {
+        guard consecutiveCorrectiveCues > 0 else { return false }
+        guard !isMoving, let since = movementStoppedAt else { return false }
+        return Date().timeIntervalSince(since) >= correctiveCueStillnessQuietSeconds
+    }
+
+    /// The user is back where the route wants them; the next problem starts
+    /// its own count rather than inheriting the last one's patience.
+    private func resetCorrectiveCueBackoff() {
+        consecutiveCorrectiveCues = 0
+    }
+
     private func issueHeadingAlignmentCueIfNeeded(
         on step: SemanticRouteStep,
         liveHeading: Double,
-        headingError: Double
+        headingError: Double,
+        isMoving: Bool
     ) -> Bool {
         // Alignment nudges are corrective guidance. With error recovery
         // disabled the user asked for turn-by-turn only — no "turn around"
@@ -4386,10 +4491,15 @@ final class SemanticRouteNavigator: ObservableObject {
         let shouldSpeak: Bool
         if sinceAnyTurnCue < sharedTurnCueMinimumGapSeconds {
             shouldSpeak = false
+        } else if isPausedForCorrectiveQuiet(isMoving: isMoving) {
+            // Stopped on purpose. Say nothing until they walk again.
+            shouldSpeak = false
         } else if isTurningTowardRoute {
             // They are already turning the right way; only speak again if the
             // turn stalls part-way.
             shouldSpeak = cueAge >= routeAlignmentStalledCueSeconds
+        } else if isCorrectiveCueBackingOff {
+            shouldSpeak = cueAge >= routeAlignmentCueCooldownSeconds + correctiveCueBackoffSeconds
         } else {
             shouldSpeak = cueChanged || cueAge >= routeAlignmentCueCooldownSeconds
         }
@@ -4400,6 +4510,7 @@ final class SemanticRouteNavigator: ObservableObject {
             lastHeadingAlignmentCueKey = key
             lastHeadingAlignmentErrorDegrees = headingError
             lastTurnCueAt = now
+            consecutiveCorrectiveCues += 1
             // Once the user finishes this turn, follow up with an explicit
             // "walk" resumption instead of going silent.
             pendingAlignmentResumeCue = true
@@ -4625,12 +4736,14 @@ final class SemanticRouteNavigator: ObservableObject {
     }
 
     private func destinationArrivalRadiusMeters(for step: SemanticRouteStep) -> Double {
-        // Floor kept at 0.45 m, not 0.24 m: a short final segment (e.g. 0.6 m
-        // right after a sharp turn) collapses the scaled radius so tight that the
-        // AR pose at the user's real stopping point — after 50 m of accumulated
-        // drift — never lands inside it, and "arrived" never fires. Only affects
-        // destination arrival; mid-route turns use nodeArrivalRadiusMeters.
-        min(destinationProximityMeters, max(0.45, step.edge.distanceMeters * 0.30))
+        // Floor raised to 1.0 m with `destinationProximityMeters`: a short
+        // final segment (e.g. 0.6 m right after a sharp turn) collapses the
+        // scaled radius so tight that the AR pose at the user's real stopping
+        // point — after 50 m of accumulated drift — never lands inside it, and
+        // "arrived" never fires. It is also the case where the walker is most
+        // obviously already there. Only affects destination arrival; mid-route
+        // turns use nodeArrivalRadiusMeters.
+        min(destinationProximityMeters, max(1.0, step.edge.distanceMeters * 0.30))
     }
 
     private func stepCompletionWindowMeters(for step: SemanticRouteStep) -> Double {
@@ -4842,8 +4955,13 @@ final class SemanticRouteNavigator: ObservableObject {
         return min(destinationCorridorMaxMeters, max(0.85, halfWidth + destinationCorridorExtraMeters))
     }
 
+    /// How much of the final leg may still be unwalked and still count as
+    /// arrived. Capped at `destinationProximityMeters` deliberately: the
+    /// radius says the pose is at the shelf and this says the progress model
+    /// agrees, so the two must call arrival at the same distance or the
+    /// looser one silently becomes the real threshold.
     private func destinationAlongTrackArrivalWindowMeters(for step: SemanticRouteStep) -> Double {
-        min(1.10, max(0.45, step.edge.distanceMeters * 0.35))
+        min(destinationProximityMeters, max(1.0, step.edge.distanceMeters * 0.35))
     }
 
     private func isAtFinalDestination(
@@ -4917,6 +5035,7 @@ final class SemanticRouteNavigator: ObservableObject {
            visualMatch.confidence >= visualRouteSnapConfidence,
            visualMatch.stepIndex >= currentStepIndex,
            visualMatch.stepIndex <= currentStepIndex + 1 {
+            resetCorrectiveCueBackoff()
             if phase == .recovering {
                 exitRecovery(announce: true)
             } else {
@@ -4928,6 +5047,9 @@ final class SemanticRouteNavigator: ObservableObject {
         }
 
         guard crossTrackBad || backwardBad || headingBad || lowConfidenceBad || localizationBad else {
+            // Nothing is wrong any more: whatever the user was doing, they are
+            // back. The next problem gets the full cue cadence again.
+            resetCorrectiveCueBackoff()
             if phase == .recovering {
                 let sinceRecovery = lastRecoveredAt?.timeIntervalSinceNow ?? -10
                 if arLocalized || sinceRecovery < -1.0 {
@@ -5043,14 +5165,20 @@ final class SemanticRouteNavigator: ObservableObject {
         // subsystems was still a run-on contradiction to the person listening.
         let sinceAnyTurnCue = lastTurnCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
         guard sinceAnyTurnCue >= sharedTurnCueMinimumGapSeconds else { return }
-        guard cueChanged || cueAge >= recoveryCueCooldownSeconds else {
-            return
+        // Stopped on purpose — see `correctiveCueStillnessQuietSeconds`. The
+        // recovery state stays exactly as it is; only the speech waits.
+        guard !isPausedForCorrectiveQuiet(isMoving: isMoving) else { return }
+        if isCorrectiveCueBackingOff {
+            guard cueAge >= recoveryCueCooldownSeconds + correctiveCueBackoffSeconds else { return }
+        } else {
+            guard cueChanged || cueAge >= recoveryCueCooldownSeconds else { return }
         }
 
         emitCue(currentInstruction, priority: .critical)
         lastRecoveryCueAt = now
         lastRecoveryCueKey = cue.key
         lastTurnCueAt = now
+        consecutiveCorrectiveCues += 1
     }
 
     private func recoveryCue(
@@ -5954,7 +6082,9 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         let next = routeSteps[currentStepIndex + 1]
         let turn = turnInstruction(at: step.to, from: step.edge.bearingDegrees, to: next.edge.bearingDegrees)
-        return NavLoc.turnInDistance(turn: Self.sentenceCased(turn), distance: distance)
+        // Bare fragment, not sentence-cased: `turnInDistance` now leads with
+        // the distance, so the capital belongs to that.
+        return NavLoc.turnInDistance(turn: turn, distance: distance)
     }
 
     /// What to SAY when re-announcing a leg the user is already walking.
@@ -5994,6 +6124,9 @@ final class SemanticRouteNavigator: ObservableObject {
         lastDestinationOvershootCueAt = nil
         destinationOvershootWalkMeters = 0
         lastRoutineCueAt = Date()
+        // Reaching a new leg is the clearest evidence there is that the user
+        // is where the route wants them.
+        resetCorrectiveCueBackoff()
     }
 
     private func rebuildRAGContext() {
@@ -6874,6 +7007,24 @@ final class SemanticRouteNavigator: ObservableObject {
         baseEdgeID: String,
         reversed: Bool
     ) -> Double? {
+        // A node-anchored reaching object IS its node — it has no position
+        // along any leg, so every edge rule below would be answering a
+        // question it cannot be asked. Straight to the node fallbacks.
+        //
+        // This is also what heals maps saved before `attachPendingEvidence`
+        // stopped sweeping these onto the destination's outgoing edge: the
+        // stale edgeID is simply never consulted. The study's already-mapped
+        // stores keep working without a re-capture.
+        if Self.isNodeAnchored(landmark) {
+            // Only on the leg that ARRIVES at the node. Reaching objects exist
+            // to confirm an arrival, so narrating one on the way out of the
+            // destination that owns it ("All Brain Kelloggs ahead", walking
+            // away from cereals) is noise on a route already criticised for
+            // talking too much.
+            guard landmark.nodeID == step.to.id else { return nil }
+            return max(0, step.edge.distanceMeters - 0.5)
+        }
+
         if let landmarkEdgeID = landmark.edgeID,
            let span = step.edgeSpans[landmarkEdgeID] {
             guard let offset = landmark.offsetMeters else {
@@ -7589,6 +7740,34 @@ final class SemanticRouteNavigator: ObservableObject {
         }
     }
 
+    /// A landmark pinned AT a node rather than somewhere along an edge.
+    ///
+    /// `attachReachingObject` creates exactly these: the object sits at the
+    /// destination, so it has no offset along any leg and faces whoever is
+    /// standing there. `captureRoutePoint`'s landmarks always carry an offset,
+    /// because they were passed at a measured distance into a leg.
+    ///
+    /// The distinction matters because `edgeID == nil` means two different
+    /// things — "not on an edge at all" for these, and "the edge does not
+    /// exist yet" for a landmark captured at a node the walk is about to leave
+    /// — and `attachPendingEvidence` used to resolve the ambiguity the wrong
+    /// way for reaching objects. See there.
+    private static func isNodeAnchored(_ landmark: SemanticRouteLandmark) -> Bool {
+        landmark.kind == .destinationContext && landmark.offsetMeters == nil
+    }
+
+    /// Adopts landmarks and keyframes captured at `fromNodeID` into the edge
+    /// that has just been created leaving it.
+    ///
+    /// Node-anchored reaching objects are deliberately excluded. Sweeping them
+    /// in is what broke the first reaching anchor of every multi-destination
+    /// map: a participant on 17 Aug 2026 pinned "All Brain Kelloggs" at
+    /// Cereals, kept walking to Onions, and the walk's next edge (Cereals →
+    /// Left turn 4) claimed the Cereals object on its way past. Arriving at
+    /// Cereals afterwards, `landmarkProgressMeters` refused it — correctly,
+    /// for a landmark that belongs to a different segment — so the anchor
+    /// never surfaced. The object at Onions worked only because the walk ended
+    /// there and no outgoing edge was ever built to steal it.
     private static func attachPendingEvidence(
         to edge: inout SemanticRouteEdge,
         in map: inout SemanticRouteMap,
@@ -7597,7 +7776,8 @@ final class SemanticRouteNavigator: ObservableObject {
         var landmarkIds = edge.landmarkIds ?? []
         for index in map.landmarks.indices {
             guard map.landmarks[index].edgeID == nil,
-                  map.landmarks[index].nodeID == fromNodeID else {
+                  map.landmarks[index].nodeID == fromNodeID,
+                  !isNodeAnchored(map.landmarks[index]) else {
                 continue
             }
             map.landmarks[index].edgeID = edge.id
@@ -7772,6 +7952,26 @@ final class SemanticRouteNavigator: ObservableObject {
         relativeTurnCommand(from: heading, to: targetBearing, style: style).text
     }
 
+    /// How many real turns the route contains, for the opening overview.
+    ///
+    /// Counts joints, not nodes: a route of N legs has N−1 joints, and a joint
+    /// the walker crosses without changing direction is not a turn they need
+    /// to be warned about. The 18° floor is `turnInstruction`'s own
+    /// straight-ahead threshold, so the overview promises exactly as many
+    /// turns as the route will go on to speak.
+    private static func turnCount(in steps: [SemanticRouteStep]) -> Int {
+        guard steps.count > 1 else { return 0 }
+        return zip(steps, steps.dropFirst()).reduce(into: 0) { total, pair in
+            let diff = SemanticRouteMath.signedAngleDifference(
+                pair.1.edge.bearingDegrees,
+                pair.0.edge.bearingDegrees
+            )
+            if abs(diff) >= straightAheadMaximumDegrees { total += 1 }
+        }
+    }
+
+    private static let straightAheadMaximumDegrees = 18.0
+
     private static func turnInstruction(
         from currentBearing: Double,
         to nextBearing: Double,
@@ -7779,7 +7979,7 @@ final class SemanticRouteNavigator: ObservableObject {
     ) -> String {
         let diff = SemanticRouteMath.signedAngleDifference(nextBearing, currentBearing)
         let magnitude = abs(diff)
-        if magnitude < 18 { return NavLoc.continueStraight() }
+        if magnitude < straightAheadMaximumDegrees { return NavLoc.continueStraight() }
         // Before the style branch: see `turnAroundMinimumDegrees`.
         if magnitude >= turnAroundMinimumDegrees { return NavLoc.turnAroundFragment() }
         if style == .clockFace {
@@ -7823,6 +8023,56 @@ final class SemanticRouteNavigator: ObservableObject {
         }
     }
 
+    /// Feeds the walker's own stride into the spoken step count.
+    ///
+    /// A pilot participant heard "20 steps" and arrived in 12 to 14, on every
+    /// leg, and asked the right question: the route metres were correct, so
+    /// why was the count not? Because the count was metres ÷ 0.65, and 0.65 m
+    /// was never her stride. `IMUSensorManager` had been measuring the real
+    /// one all along — per step, and calibrated per user — and nothing was
+    /// reading it.
+    ///
+    /// A median, not a mean: step length is `beta * pvDiff^0.25`, and a single
+    /// stumble or a jostle in a crowded aisle produces an outlier that a mean
+    /// would carry into every distance spoken afterwards.
+    /// `stepLengthMinimumSamples` must land before the estimate is trusted at
+    /// all, so a route's opening cue is not built on two steps of evidence.
+    ///
+    /// Guidance phases only. A capture walk is paced by whoever is mapping the
+    /// store, and their stride is not the stride the participant who later
+    /// walks the route will take.
+    private func observeStepLength(_ imuState: IMUState) {
+        guard phase == .navigating || phase == .recovering else { return }
+        guard imuState.stepCount > (lastObservedStepCount ?? -1) else { return }
+        lastObservedStepCount = imuState.stepCount
+        let measured = imuState.currentStepLength
+        guard measured.isFinite,
+              measured >= NavigationDistanceUnit.minimumMetersPerStep,
+              measured <= NavigationDistanceUnit.maximumMetersPerStep else {
+            return
+        }
+        observedStepLengths.append(measured)
+        if observedStepLengths.count > Self.stepLengthWindow {
+            observedStepLengths.removeFirst(observedStepLengths.count - Self.stepLengthWindow)
+        }
+        guard observedStepLengths.count >= Self.stepLengthMinimumSamples else { return }
+        let sorted = observedStepLengths.sorted()
+        NavigationUnits.metersPerStep = sorted[sorted.count / 2]
+    }
+
+    private static let stepLengthWindow = 20
+    private static let stepLengthMinimumSamples = 8
+
+    /// Tracks whether the walker is moving, independently of the walk-reprompt
+    /// clock. See `movementStoppedAt`.
+    private func recordMovementState(_ imuState: IMUState) {
+        if imuState.isMoving {
+            movementStoppedAt = nil
+        } else if movementStoppedAt == nil {
+            movementStoppedAt = Date()
+        }
+    }
+
     /// A distance as the user asked to hear it. Every SPOKEN distance goes
     /// through here; `formatMeters` stays literal metres for the mapping
     /// screen and the diagnostic reason strings, which are read by whoever is
@@ -7830,6 +8080,7 @@ final class SemanticRouteNavigator: ObservableObject {
     private static func formatDistance(_ meters: Double) -> String {
         switch NavigationUnits.current {
         case .meters: return formatMeters(meters)
+        case .feet: return formatFeet(meters)
         case .steps: return formatSteps(meters)
         }
     }
@@ -7847,8 +8098,10 @@ final class SemanticRouteNavigator: ObservableObject {
         switch NavigationUnits.current {
         case .meters:
             count = max(1, Int(clamped.rounded()))
+        case .feet:
+            count = max(1, Int((clamped * NavigationDistanceUnit.feetPerMeter).rounded()))
         case .steps:
-            count = max(1, Int((clamped / NavigationDistanceUnit.metersPerStep).rounded()))
+            count = max(1, Int((clamped / NavigationUnits.metersPerStep).rounded()))
         }
         return count <= 2 ? String(count) : formatDistance(clamped)
     }
@@ -7856,8 +8109,11 @@ final class SemanticRouteNavigator: ObservableObject {
     /// Metres → walking steps. Never returns zero: "less than one step" is not
     /// something a walking user can act on, and every call site here is
     /// already guarded by an arrival check for the genuinely-there case.
+    ///
+    /// The divisor is the WALKER's measured stride, not a constant — see
+    /// `NavigationUnits.metersPerStep`.
     private static func formatSteps(_ meters: Double) -> String {
-        let raw = max(0, meters) / NavigationDistanceUnit.metersPerStep
+        let raw = max(0, meters) / NavigationUnits.metersPerStep
         let count = max(1, Int(raw.rounded()))
         if count == 1 { return NavLoc.oneStep() }
         // Past this the exact count is false precision — it is well inside the
@@ -7870,6 +8126,22 @@ final class SemanticRouteNavigator: ObservableObject {
     }
 
     private static let stepCountRoundingThreshold = 20
+
+    /// Metres → feet, rounded the way a walker can hold: exact under 20 ft,
+    /// to the nearest 5 above it.
+    private static func formatFeet(_ meters: Double) -> String {
+        let raw = max(0, meters) * NavigationDistanceUnit.feetPerMeter
+        if raw < 1 { return NavLoc.lessThanOneFoot() }
+        let count = max(1, Int(raw.rounded()))
+        if count == 1 { return NavLoc.oneFoot() }
+        if count > feetRoundingThreshold {
+            let rounded = Int((Double(count) / 5.0).rounded()) * 5
+            return NavLoc.aboutFeet(max(5, rounded))
+        }
+        return NavLoc.feet(count)
+    }
+
+    private static let feetRoundingThreshold = 20
 
     private static func formatMeters(_ meters: Double) -> String {
         let clamped = max(0, meters)

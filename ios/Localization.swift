@@ -62,6 +62,7 @@ enum AppLocale {
 /// are a unit the user carries with them.
 enum NavigationDistanceUnit: String {
     case meters
+    case feet
     case steps
 
     /// Tolerant parse for the bridged value. Anything unrecognised falls back
@@ -74,15 +75,21 @@ enum NavigationDistanceUnit: String {
         self = NavigationDistanceUnit(rawValue: code.lowercased()) ?? .meters
     }
 
-    /// Metres covered by one walking step.
+    static let feetPerMeter = 3.280839895
+
+    /// Fallback metres per walking step, used until the user's own gait has
+    /// been measured.
     ///
-    /// Matches `IMUSensorManager`'s own step model (0.65 m default, 0.67 m
-    /// typical calibrated value), so a spoken step count agrees with the
-    /// odometry the same guidance is built on. Deliberately shorter than the
-    /// reaching pipeline's 0.75 m: that measures an arm's-length approach,
-    /// this measures a walking gait. Erring short overstates the count a
-    /// little, which stops a user short of an obstacle rather than past it.
-    static let metersPerStep = 0.65
+    /// Matches `IMUSensorManager`'s default step model so a spoken count
+    /// agrees with the odometry the same guidance is built on. It is only a
+    /// starting guess: see `NavigationUnits.metersPerStep`.
+    static let defaultMetersPerStep = 0.65
+
+    /// The widest gait this will believe. A single mis-detected step can push
+    /// the instantaneous estimate anywhere, and a spoken count is worse than
+    /// useless if it drifts with the estimator rather than with the walker.
+    static let minimumMetersPerStep = 0.45
+    static let maximumMetersPerStep = 1.10
 }
 
 /// Process-wide distance unit for native spoken guidance.
@@ -93,10 +100,40 @@ enum NavigationDistanceUnit: String {
 enum NavigationUnits {
     private static let queue = DispatchQueue(label: "com.shelfscout.navunits")
     private static var _current: NavigationDistanceUnit = .meters
+    private static var _metersPerStep = NavigationDistanceUnit.defaultMetersPerStep
 
     static var current: NavigationDistanceUnit {
         get { queue.sync { _current } }
         set { queue.sync { _current = newValue } }
+    }
+
+    /// The walker's OWN step length, in metres.
+    ///
+    /// A pilot participant on 17 Aug 2026 was told 20 steps and arrived in 12
+    /// to 14, every leg, and reasonably asked why "10 metres is 10 metres" did
+    /// not survive the conversion. It did — the metres were right. What was
+    /// wrong was the divisor: a fixed 0.65 m is not her stride, and no amount
+    /// of route accuracy can rescue a count taken in someone else's units.
+    ///
+    /// `IMUSensorManager` already measures this per step and already
+    /// calibrates it per user; nothing was reading it. Guidance now feeds the
+    /// measured value in, clamped to a believable gait so one bad step
+    /// detection cannot rescale the whole route.
+    static var metersPerStep: Double {
+        get { queue.sync { _metersPerStep } }
+        set {
+            let clamped = min(
+                NavigationDistanceUnit.maximumMetersPerStep,
+                max(NavigationDistanceUnit.minimumMetersPerStep, newValue)
+            )
+            queue.sync { _metersPerStep = clamped }
+        }
+    }
+
+    /// Back to the default gait. Call when the device changes hands — one
+    /// user's stride must never be spoken to the next.
+    static func resetMetersPerStep() {
+        queue.sync { _metersPerStep = NavigationDistanceUnit.defaultMetersPerStep }
     }
 }
 
@@ -391,21 +428,48 @@ enum NavLoc {
 
     // ── Progress and arrival ────────────────────────────────────────────────
 
-    /// Opening cue of a journey. States where the route ends and how far it is
-    /// before the first leg, so the user can judge the guidance against what
-    /// they expect instead of hearing one leg's countdown out of context.
+    /// Opening cue of a journey: how far, how many turns, then the first leg.
+    /// States the shape of the route before walking it, so the user can judge
+    /// the guidance against what they expect instead of hearing one leg's
+    /// countdown out of context.
     ///
     /// The start node is deliberately NOT named. "Starting at Left turn 4" is
     /// a capture label, not a place the user recognises, and it delayed the
-    /// only two facts that matter — where they are going and how far it is.
+    /// only facts that matter — where they are going and how far it is.
+    ///
+    /// The turn count was added on pilot feedback (17 Aug 2026). Asked what
+    /// was missing, the participant asked for exactly this — "how far, this
+    /// many turns… that helps me anticipate and plan" — and gave the reason it
+    /// matters more for a blind walker than a sighted one: without a shape for
+    /// the journey there is no way to tell a system that is lost from a system
+    /// that simply has further to go, so the only way to check the guidance is
+    /// against your own senses, which is the trust the route is supposed to
+    /// buy back.
+    ///
+    /// A straight run says nothing about turns rather than "0 turns": a
+    /// negation is a thing to hold, and there is nothing to hold here.
     static func startingJourney(
         destination: String,
         distance: String,
+        turns: Int,
         firstInstruction: String
     ) -> String {
+        guard turns > 0 else {
+            switch lang {
+            case .en: return "\(destination) is \(distance) away. \(firstInstruction)"
+            case .fr: return "\(destination) est à \(distance). \(firstInstruction)"
+            }
+        }
         switch lang {
-        case .en: return "\(destination) is \(distance) away. \(firstInstruction)"
-        case .fr: return "\(destination) est à \(distance). \(firstInstruction)"
+        case .en: return "\(destination) is \(distance) away, with \(turnCount(turns)). \(firstInstruction)"
+        case .fr: return "\(destination) est à \(distance), avec \(turnCount(turns)). \(firstInstruction)"
+        }
+    }
+
+    private static func turnCount(_ count: Int) -> String {
+        switch lang {
+        case .en: return count == 1 ? "1 turn" : "\(count) turns"
+        case .fr: return count == 1 ? "1 virage" : "\(count) virages"
         }
     }
 
@@ -508,16 +572,24 @@ enum NavLoc {
         }
     }
 
-    /// The maneuver first, the distance second: "Turn right in 3 meters."
+    /// The distance first, the maneuver second: "In 3 meters, turn right."
     ///
-    /// Fronting the maneuver means the user knows WHAT is coming while the
-    /// distance is still being spoken. The old order ("In 3 meters, turn
-    /// right") made them hold a number for a sentence before learning what it
-    /// was a number of. `turn` arrives sentence-cased from the caller.
+    /// This order was tried the other way round — maneuver first, on the
+    /// theory that the user learns WHAT is coming while the number is still
+    /// being spoken. A pilot participant on 17 Aug 2026 reported the cost of
+    /// that: hearing "turn left" she began turning immediately, then had to
+    /// undo it when the "in 5 steps" arrived. The verb is a command, and a
+    /// command fronted is a command obeyed. Leading with the distance makes
+    /// the sentence a plan rather than an instruction, which is also the order
+    /// every mainstream turn-by-turn app uses and therefore the one users
+    /// arrive already fluent in.
+    ///
+    /// `turn` arrives as a bare lowercase fragment ("turn left", "turn to 3
+    /// o'clock"); the sentence case belongs to the distance now.
     static func turnInDistance(turn: String, distance: String) -> String {
         switch lang {
-        case .en: return "\(turn) in \(distance)."
-        case .fr: return "\(turn) dans \(distance)."
+        case .en: return "In \(distance), \(turn)."
+        case .fr: return "Dans \(distance), \(turn)."
         }
     }
 
@@ -647,11 +719,11 @@ enum NavLoc {
 
     /// Final-leg approach cue, the destination's counterpart to
     /// `turnInDistance` — spoken once as the destination comes up, not
-    /// repeated every meter.
+    /// repeated every meter. Distance-first for the same reason; see there.
     static func destinationInDistance(_ destination: String, distance: String) -> String {
         switch lang {
-        case .en: return "\(destination) in \(distance)."
-        case .fr: return "\(destination) dans \(distance)."
+        case .en: return "In \(distance), \(destination)."
+        case .fr: return "Dans \(distance), \(destination)."
         }
     }
 
@@ -992,6 +1064,42 @@ enum NavLoc {
         switch lang {
         case .en: return "\(count) meters"
         case .fr: return "\(count) mètres"
+        }
+    }
+
+    // ── Feet ────────────────────────────────────────────────────────────────
+    //
+    // Requested by a pilot participant on 17 Aug 2026: a walker who grew up
+    // pre-metric estimates in feet and has to convert every metre before they
+    // can act on it, which is exactly the tax metres were supposed to remove.
+
+    static func lessThanOneFoot() -> String {
+        switch lang {
+        case .en: return "less than one foot"
+        case .fr: return "moins d’un pied"
+        }
+    }
+
+    static func oneFoot() -> String {
+        switch lang {
+        case .en: return "1 foot"
+        case .fr: return "1 pied"
+        }
+    }
+
+    static func feet(_ count: Int) -> String {
+        switch lang {
+        case .en: return "\(count) feet"
+        case .fr: return "\(count) pieds"
+        }
+    }
+
+    /// Long distances in feet are rounded the way step counts are: "about 40
+    /// feet" is holdable, "38 feet" is false precision on a walked estimate.
+    static func aboutFeet(_ count: Int) -> String {
+        switch lang {
+        case .en: return "about \(count) feet"
+        case .fr: return "environ \(count) pieds"
         }
     }
 

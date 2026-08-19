@@ -29,6 +29,8 @@ import { syncReachingPreferences } from '../native/ReachingModule';
 export type WearablesMicrophoneSource = 'wearables' | 'phone';
 export type NavigationPipeline = 'rtab' | 'arkit';
 export type ReachingPipeline = 'visionBox' | 'spatialTarget' | 'standard';
+/** Mirrors `NavigationDistanceUnit` in `ios/Localization.swift`. */
+export type NavigationDistanceUnit = 'meters' | 'feet' | 'steps';
 
 export interface AppSettings {
   /**
@@ -78,10 +80,12 @@ export interface AppSettings {
    * Unit ARKit route guidance speaks distances in. The pilot found several
    * participants could not act on metres — a distance you have never had to
    * judge without sight is not one you can walk — while steps are countable
-   * against their own gait. Separate from `distanceUnit`, which is reaching's
+   * against their own gait. Feet were added on 17 Aug 2026 for participants
+   * who grew up pre-metric and were silently converting every metre before
+   * they could use it. Separate from `distanceUnit`, which is reaching's
    * arm's-length steps-vs-centimetres choice.
    */
-  navigationDistanceUnit: 'meters' | 'steps';
+  navigationDistanceUnit: NavigationDistanceUnit;
   /**
    * Language ShelfScout speaks, listens, and renders in. Seeded from the
    * device language on first launch, then user-controlled: a Quebec user may
@@ -108,7 +112,7 @@ interface SettingsContextValue {
   updateEnableAcquisitionAutoExit: (value: boolean) => Promise<void>;
   updateNavigationErrorRecovery: (value: boolean) => Promise<void>;
   updateNavigationClockFaceDirections: (value: boolean) => Promise<void>;
-  updateNavigationDistanceUnit: (unit: 'meters' | 'steps') => Promise<void>;
+  updateNavigationDistanceUnit: (unit: NavigationDistanceUnit) => Promise<void>;
   updateLanguage: (language: AppLanguage) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
@@ -406,7 +410,7 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
   );
 
   const updateNavigationDistanceUnit = useCallback(
-    async (unit: 'meters' | 'steps') => {
+    async (unit: NavigationDistanceUnit) => {
       const next = { ...settings, navigationDistanceUnit: unit };
       setSettings(next);
       await persist(next);
