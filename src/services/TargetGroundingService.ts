@@ -11,7 +11,8 @@
 //   2. bounded edit distance (plural drift, one-letter slips)
 //   3. phonetic consonant-skeleton key ("serial" ↔ "cereal")
 //   4. token containment ("400 lounge room" ↔ "400 lounge")
-//   5. Groq LLM label resolution against the candidate list
+//   5. phonetic token containment ("crave" / "serials" ↔ "Krave cereal")
+//   6. Groq LLM label resolution against the candidate list
 //
 // The pure matching functions are exported separately so they are testable
 // without the native bridge.
@@ -20,7 +21,13 @@ import { ARKitNavigationBridge, ARKitNavigationTargetEntry } from '../native/ARK
 import { groqIntentClient } from './GroqIntentClient';
 import { AppLanguage, getAppLanguage } from '../i18n';
 
-export type GroundingMethod = 'exact' | 'fuzzy' | 'phonetic' | 'contains' | 'llm';
+export type GroundingMethod =
+  | 'exact'
+  | 'fuzzy'
+  | 'phonetic'
+  | 'contains'
+  | 'phonetic_contains'
+  | 'llm';
 
 export interface GroundingResult {
   status: 'matched' | 'no_match' | 'no_vocabulary';
@@ -279,11 +286,76 @@ export const containmentScore = (label: string, requested: string): number => {
   const requestedTokens = b.split(' ').filter(Boolean);
   if (!labelTokens.length || !requestedTokens.length) return 0;
 
+  return consumeTokens(labelTokens, requestedTokens);
+};
+
+/**
+ * Token containment where the tokens are compared by phonetic key.
+ *
+ * `containmentScore` above compares tokens literally, which means one ASR slip
+ * anywhere in a multi-word label collapses the whole rung. The saved label
+ * "Krave cereal" is the case that broke in the field: dictation hears "crave",
+ * "serial", or both, and the target the classifier hands back is often only
+ * part of the label ("crave") or the label plus a filler ("crave cereal
+ * aisle"). Every one of those scores 0 here:
+ *
+ *   requested        whole-string phonetic   literal containment
+ *   "crave"          "krv" ≠ "krv srl"       "crave" ∉ {krave, cereal}
+ *   "serials"        "srl" ≠ "krv srl"       "serials" ∉ {krave, cereal}
+ *   "crave cereal"   "krv srl" = "krv srl"   ✗ but the rung above saves it
+ *   "crave cereal aisle"  no                 "krave" ∉ {crave, cereal, aisle}
+ *
+ * so guidance dead-ended with "I could not find … saved destinations include
+ * Krave cereal", and whether a query worked came down to whether the
+ * classifier happened to return the exact full label — which is why the same
+ * request succeeded roughly once in ten.
+ *
+ * Comparing token keys instead makes all of them collide deterministically,
+ * with no network call in the path. The guards that keep it honest are
+ * unchanged: digit tokens must still agree exactly, and the caller still
+ * refuses to guess between two labels that tie.
+ *
+ * Mirrors `SemanticRouteNavigator.phoneticContainmentScore`.
+ */
+export const phoneticContainmentScore = (label: string, requested: string): number => {
+  const a = normalizeSpokenLabel(label);
+  const b = normalizeSpokenLabel(requested);
+  if (!a || !b) return 0;
+  if (digitTokens(a) !== digitTokens(b)) return 0;
+
+  // Digits keep their literal form (phoneticKey passes them through), so the
+  // digit guard above still holds after keying.
+  const labelKeys = a.split(' ').filter(Boolean).map(phoneticKey);
+  const requestedKeys = b.split(' ').filter(Boolean).map(phoneticKey);
+  if (!labelKeys.length || !requestedKeys.length) return 0;
+
+  // A one-character skeleton carries almost no information — "eau" and "eye"
+  // both reduce to a single letter — and matching on one would let unrelated
+  // words collide. Same threshold the whole-string phonetic rung uses.
+  //
+  // Digits are exempt: phoneticKey passes them through unchanged, so a single
+  // digit is a literal, not a weak skeleton. Without the exemption "Aisle 3"
+  // keys to ["asl", "3"], the "3" trips the length test, and this rung is
+  // silently dead for every numbered label — while the digit guard above is
+  // already what keeps "aisle 3" and "aisle 4" apart.
+  const tooWeak = (key: string): boolean => !/^[0-9]+$/.test(key) && key.length < 2;
+  if ([...labelKeys, ...requestedKeys].some(tooWeak)) return 0;
+
+  return consumeTokens(labelKeys, requestedKeys);
+};
+
+/**
+ * Is the shorter token list wholly contained in the longer one?
+ *
+ * Matches are consumed so a repeated token needs a partner on both sides.
+ * Returns how many tokens had to line up, which the caller uses to prefer the
+ * most specific label and to detect ties.
+ */
+const consumeTokens = (labelTokens: string[], requestedTokens: string[]): number => {
   const [shorter, longer] = labelTokens.length <= requestedTokens.length
     ? [labelTokens, requestedTokens]
     : [requestedTokens, labelTokens];
 
-  // Consume matches so a repeated token needs a partner on both sides.
   const pool = [...longer];
   for (const token of shorter) {
     const index = pool.indexOf(token);
@@ -349,20 +421,36 @@ export const matchTargetAgainstVocabulary = (
   // label wins ("400 lounge" over a bare "lounge"), and a tie between two
   // different labels is left unresolved for the LLM rather than guessed at —
   // walking a blind user to the wrong room is worse than asking again.
-  let best: { entry: ARKitNavigationTargetEntry; score: number } | null = null;
-  let bestIsAmbiguous = false;
-  for (const entry of entries) {
-    const label = normalizeSpokenLabel(entry.label);
-    const score = containmentScore(label, requested);
-    if (!score) continue;
-    if (!best || score > best.score) {
-      best = { entry, score };
-      bestIsAmbiguous = false;
-    } else if (score === best.score && label !== normalizeSpokenLabel(best.entry.label)) {
-      bestIsAmbiguous = true;
+  //
+  // Two passes, strict before loose: literal token containment first, then the
+  // same rule over phonetic keys. Keeping them separate means a label that
+  // matches literally can never be displaced by one that only matches by
+  // sound, while a request that carries an ASR slip still resolves locally
+  // instead of falling through to the network.
+  const bestContainment = (
+    score: (label: string, requested: string) => number,
+  ): ARKitNavigationTargetEntry | null => {
+    let best: { entry: ARKitNavigationTargetEntry; score: number } | null = null;
+    let bestIsAmbiguous = false;
+    for (const entry of entries) {
+      const label = normalizeSpokenLabel(entry.label);
+      const value = score(label, requested);
+      if (!value) continue;
+      if (!best || value > best.score) {
+        best = { entry, score: value };
+        bestIsAmbiguous = false;
+      } else if (value === best.score && label !== normalizeSpokenLabel(best.entry.label)) {
+        bestIsAmbiguous = true;
+      }
     }
-  }
-  if (best && !bestIsAmbiguous) return matched(best.entry, 'contains');
+    return best && !bestIsAmbiguous ? best.entry : null;
+  };
+
+  const literal = bestContainment(containmentScore);
+  if (literal) return matched(literal, 'contains');
+
+  const sounded = bestContainment(phoneticContainmentScore);
+  if (sounded) return matched(sounded, 'phonetic_contains');
 
   return { status: 'no_match', availableTargets };
 };

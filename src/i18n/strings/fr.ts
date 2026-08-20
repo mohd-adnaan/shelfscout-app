@@ -30,6 +30,11 @@ export const fr: StringCatalog = {
       'Attention : la photo n’a pas pu être prise. Je continue avec la voix seulement.',
     stoppedTimeLimit: 'Arrêt : limite de temps atteinte.',
     requestFailed: 'Erreur lors du traitement de votre demande. Réessayez.',
+    // Prononcé uniquement par le chien de garde, quand une requête a cessé de
+    // progresser et a été interrompue automatiquement. Volontairement distinct
+    // de `requestFailed` : l'utilisateur n'a rien fait de mal, et ce qu'il doit
+    // savoir, c'est que l'application est de nouveau à l'écoute.
+    recoveredFromStall: "Cela prenait trop de temps, j'ai arrêté. Je suis prêt.",
     genericError: (detail: string) => `Erreur : ${detail}`,
   },
 

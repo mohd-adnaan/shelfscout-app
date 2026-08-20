@@ -22,6 +22,11 @@ export const en = {
       'Warning: Failed to capture photo. Continuing with voice only.',
     stoppedTimeLimit: 'Stopped due to time limit.',
     requestFailed: 'Error processing your request. Try again.',
+    // Spoken only by the turn watchdog, when a request stopped making progress
+    // and was unwound automatically. Distinct from `requestFailed` on purpose:
+    // nothing failed that the user did, and the one thing they need to know is
+    // that the app is listening again rather than still working.
+    recoveredFromStall: 'That took too long, so I stopped it. I am ready.',
     genericError: (detail: string) => `Error: ${detail}`,
   },
 

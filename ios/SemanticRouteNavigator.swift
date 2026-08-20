@@ -456,6 +456,9 @@ final class SemanticRouteNavigator: ObservableObject {
     /// closer, so one value is the whole schedule: everything larger is behind
     /// the user and spent.
     private var lastSpokenApproachGateMeters: Double?
+    /// Last progress-beat boundary spoken on this leg; see
+    /// `speakWalkProgressCueIfDue`.
+    private var lastSpokenProgressBeatMeters: Double?
     /// When routine walking speech last went out — the pacing floor that keeps
     /// approach, landmark and reassurance cues from stacking on each other.
     private var lastRoutineCueAt: Date?
@@ -718,6 +721,41 @@ final class SemanticRouteNavigator: ObservableObject {
     /// deletion; more headroom would push the 3 m gate off every leg under 5 m,
     /// which is most of them.
     private let approachGateHeadroomMeters = 1.0
+    /// Spacing of the bare-distance beats that carry the walk *above* the
+    /// approach gates.
+    ///
+    /// Between a leg opening ("Onions, 8 meters, toward the next turn") and the
+    /// 3 m gate there was no cue at all. The only thing covering that stretch
+    /// was the 20 s quiet-period backstop, and 5 m of walking takes well under
+    /// 20 s, so the backstop never fired and the user walked the whole approach
+    /// in silence — "only stated 8m ahead and then turn right in 3m, nothing in
+    /// between" (pilot, 20 Aug 2026).
+    ///
+    /// These are deliberately NOT approach gates. A gate above 3 m would be the
+    /// first gate crossed on the leg and would therefore take over the
+    /// maneuver-naming cue, which is the exact regression a reviewer rejected
+    /// on 15 Aug 2026 — advance notice spent metres before the turn, leaving
+    /// the turn itself unheralded. A progress beat speaks the remaining
+    /// distance and nothing else, so the naming cue stays where it belongs at
+    /// 3 m.
+    private let walkProgressBeatIntervalMeters = 2.0
+    /// Progress beats stop here and hand over to the approach gates.
+    ///
+    /// Set a full interval clear of the top gate (3 m) rather than flush
+    /// against it. A beat landing at 4 m starts the pacing window barely a
+    /// second before the 3 m gate comes due, and the naming cue — which does
+    /// observe a short floor so it cannot land on another cue's heels — then
+    /// slid to 2.4 m. "Turn right in 3 meters" arriving at 2.4 m is precisely
+    /// the late advance notice the 15 Aug 2026 review was about, so the beats
+    /// give the gate room instead.
+    private let walkProgressBeatFloorMeters = 5.0
+    /// Pacing floor for progress beats.
+    ///
+    /// Shorter than `routineCueMinimumSpacingSeconds` because a beat is one or
+    /// two words rather than a sentence, and at walking pace a 2 m interval
+    /// comes round every three seconds or so — on the 6 s routine floor every
+    /// other beat would be dropped and the cadence would read as random.
+    private let walkProgressBeatMinimumSpacingSeconds: TimeInterval = 3.0
     /// Floor under the maneuver-naming cue specifically.
     ///
     /// It used to share the 6 s routine floor, and that is what deleted the
@@ -736,7 +774,19 @@ final class SemanticRouteNavigator: ObservableObject {
     /// which is what made the position estimate sound like it was jumping.
     /// Saying nothing there is honest; the turn is a moment away and owns the
     /// space.
-    private let approachCueSuppressWithinMeters = 1.0
+    ///
+    /// ⚠️ Must stay strictly below `approachCueGatesMeters.min()`, and this is
+    /// load-bearing rather than a matter of taste. The cue distance is
+    /// `min(legLength, max(deadReckoned, arDistance))`, so it is never below
+    /// the AR distance — which means the final gate becoming eligible
+    /// (`cueRemaining <= 1.0`) *implies* `arDistance <= 1.0`. While this was
+    /// also 1.0 the two conditions were the same condition, the suppression
+    /// fired every single time the last gate came due, and the "1" beat was
+    /// unreachable code: the countdown always ended on "2". Pilot report,
+    /// 20 Aug 2026 — "after 3 it should be like the countdown 3 meter, 2,
+    /// then 1". At 0.6 the beat still lands, and speaks the live distance, so
+    /// it is honest at the moment it is said.
+    private let approachCueSuppressWithinMeters = 0.6
     /// Floor between two routine spoken cues. Maneuver, arrival and recovery
     /// speech ignores it — those are decisions, not pacing.
     private let routineCueMinimumSpacingSeconds: TimeInterval = 6.0
@@ -5910,6 +5960,8 @@ final class SemanticRouteNavigator: ObservableObject {
 
         if speakDestinationApproachIfDue(remainingMeters: cueRemainingMeters) { return }
         if speakApproachCueIfDue(on: step, remainingMeters: cueRemainingMeters) { return }
+        // Above the approach gates, keep the walk narrated rather than silent.
+        if speakWalkProgressCueIfDue(on: step, remainingMeters: cueRemainingMeters) { return }
         speakQuietPeriodReassuranceIfDue(remainingMeters: cueRemainingMeters)
     }
 
@@ -6049,6 +6101,50 @@ final class SemanticRouteNavigator: ObservableObject {
         return true
     }
 
+    /// Carries the walk between the leg-start instruction and the 3 m approach
+    /// gate, speaking the bare remaining distance every couple of metres.
+    ///
+    /// A beat is due once the remaining distance has closed by a full interval
+    /// since the last one, seeded from the leg's own length so the first beat
+    /// is one interval below the distance the leg-start cue just announced.
+    /// On an 8 m leg that gives "8 meters" (leg start), "6", "4", and then the
+    /// approach gates take over with "Turn right in 3 meters", "2", "1".
+    ///
+    /// Measuring from the last beat rather than from absolute multiples is
+    /// what keeps a beat from landing on top of the opening cue: at 7.9 m
+    /// remaining the nearest lower multiple of 2 is 6, but the user has not
+    /// walked to 6 yet and the honest thing to say there is nothing.
+    ///
+    /// The phrase always carries the live distance, so a beat delayed by the
+    /// pacing floor still states what the user actually has left.
+    private func speakWalkProgressCueIfDue(on step: SemanticRouteStep, remainingMeters: Double) -> Bool {
+        guard phase == .navigating else { return false }
+        // Below the floor the approach gates own the cadence.
+        guard remainingMeters > walkProgressBeatFloorMeters else { return false }
+
+        let interval = walkProgressBeatIntervalMeters
+        guard interval > 0 else { return false }
+
+        let reference = lastSpokenProgressBeatMeters ?? step.edge.distanceMeters
+        let threshold = reference - interval
+        // Strictly decreasing, so standing still or drifting backwards cannot
+        // re-announce a distance already spoken.
+        guard threshold > walkProgressBeatFloorMeters, remainingMeters <= threshold else {
+            return false
+        }
+
+        if let last = lastRoutineCueAt,
+           Date().timeIntervalSince(last) < walkProgressBeatMinimumSpacingSeconds {
+            // Not dropped — retried on the next tick, where it will speak
+            // whatever distance is true then.
+            return false
+        }
+
+        lastSpokenProgressBeatMeters = threshold
+        emitCue(NavLoc.distanceOnly(Self.formatDistance(remainingMeters)), priority: .regular)
+        return true
+    }
+
     /// Backstop for long legs: a 25 m straight has no gate between its start
     /// and 3 m to go, and a blind walker has nothing but the cues to confirm
     /// the system still has them. Speaks the bare remaining distance — the
@@ -6118,6 +6214,7 @@ final class SemanticRouteNavigator: ObservableObject {
     /// its own gates from the top.
     private func resetLegCueSchedule() {
         lastSpokenApproachGateMeters = nil
+        lastSpokenProgressBeatMeters = nil
         spokenDestinationApproachCue = false
         spokenLegManeuverCue = false
         destinationOvershootStartedAt = nil
@@ -7083,7 +7180,16 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         // Extra-word tolerance ("400 lounge room" → "400 lounge"), last because
         // it is the loosest rule — every exact/fuzzy/phonetic hit outranks it.
-        if let node = bestContainmentMatch(for: target, in: map) {
+        if let node = bestContainmentMatch(for: target, in: map, scorer: Self.containmentScore) {
+            return (node, false)
+        }
+        // Same rule over phonetic keys, strictly after the literal pass so a
+        // label that matches literally is never displaced by one that only
+        // matches by sound. This is what rescues a partial or filler-carrying
+        // target whose tokens are also misheard — "crave", "serials", and
+        // "crave cereal aisle" all against a saved "Krave cereal" — none of
+        // which reach any earlier rung.
+        if let node = bestContainmentMatch(for: target, in: map, scorer: Self.phoneticContainmentScore) {
             return (node, false)
         }
         return nil
@@ -7092,13 +7198,17 @@ final class SemanticRouteNavigator: ObservableObject {
     /// Most specific label whose tokens are contained in the spoken target (or
     /// vice versa). A tie between two different labels resolves to nothing:
     /// walking a blind user to the wrong room is worse than asking again.
-    private func bestContainmentMatch(for target: String, in map: SemanticRouteMap) -> SemanticRouteNode? {
+    private func bestContainmentMatch(
+        for target: String,
+        in map: SemanticRouteMap,
+        scorer: (String, String) -> Int
+    ) -> SemanticRouteNode? {
         var best: (node: SemanticRouteNode, key: String, score: Int)?
         var isAmbiguous = false
 
         func consider(_ node: SemanticRouteNode, name: String, aliases: [String]) {
             let score = ([name] + aliases)
-                .map { Self.containmentScore($0, target) }
+                .map { scorer($0, target) }
                 .max() ?? 0
             guard score > 0 else { return }
             let key = Self.normalizedLookupKey(name)
@@ -8225,10 +8335,59 @@ final class SemanticRouteNavigator: ObservableObject {
         let rhsTokens = b.split(separator: " ").map(String.init)
         guard !lhsTokens.isEmpty, !rhsTokens.isEmpty else { return 0 }
 
+        return consumeTokens(lhsTokens, rhsTokens)
+    }
+
+    /// Token containment where the tokens are compared by phonetic key.
+    ///
+    /// `containmentScore` compares tokens literally, so a single ASR slip
+    /// anywhere in a multi-word label collapses the rung entirely. The saved
+    /// label "Krave cereal" is the field case: dictation hears "crave",
+    /// "serial", or both, and the target handed down is often only part of the
+    /// label ("crave") or the label plus a filler ("crave cereal aisle").
+    /// None of those reach the whole-string phonetic key either, because that
+    /// compares the full string — so guidance dead-ended, and whether a query
+    /// worked came down to whether the classifier happened to return the exact
+    /// full label.
+    ///
+    /// Comparing token keys makes them collide deterministically. The guards
+    /// are unchanged: digit tokens must agree exactly, one-character skeletons
+    /// are refused as too weak to be evidence, and the caller still declines
+    /// to guess between two labels that tie.
+    ///
+    /// ⚠️ Mirrors `phoneticContainmentScore` in
+    ///    `src/services/TargetGroundingService.ts`.
+    static func phoneticContainmentScore(_ lhs: String, _ rhs: String) -> Int {
+        let a = normalizedLookupKey(lhs)
+        let b = normalizedLookupKey(rhs)
+        guard !a.isEmpty, !b.isEmpty else { return 0 }
+        guard digitTokens(a) == digitTokens(b) else { return 0 }
+
+        // Digits pass through phoneticKey unchanged, so the digit guard above
+        // still holds after keying.
+        let lhsKeys = a.split(separator: " ").map { phoneticKey(String($0)) }
+        let rhsKeys = b.split(separator: " ").map { phoneticKey(String($0)) }
+        guard !lhsKeys.isEmpty, !rhsKeys.isEmpty else { return 0 }
+        // Digits are exempt from the minimum-skeleton test: phoneticKey passes
+        // them through unchanged, so a single digit is a literal rather than a
+        // weak skeleton. Without the exemption "Aisle 3" keys to ["asl", "3"],
+        // the "3" trips the test, and this rung is silently dead for every
+        // numbered label — while the digit guard above is already what keeps
+        // "aisle 3" and "aisle 4" apart.
+        let tooWeak: (String) -> Bool = { key in
+            !key.allSatisfy(\.isNumber) && key.count < 2
+        }
+        guard !(lhsKeys + rhsKeys).contains(where: tooWeak) else { return 0 }
+
+        return consumeTokens(lhsKeys, rhsKeys)
+    }
+
+    /// Is the shorter token list wholly contained in the longer one? Matches
+    /// are consumed so a repeated token needs a partner on both sides.
+    private static func consumeTokens(_ lhsTokens: [String], _ rhsTokens: [String]) -> Int {
         let shorter = lhsTokens.count <= rhsTokens.count ? lhsTokens : rhsTokens
         var pool = lhsTokens.count <= rhsTokens.count ? rhsTokens : lhsTokens
 
-        // Consume matches so a repeated token needs a partner on both sides.
         for token in shorter {
             guard let index = pool.firstIndex(of: token) else { return 0 }
             pool.remove(at: index)

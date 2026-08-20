@@ -75,7 +75,7 @@ import {
 } from './src/utils/soundEffects';
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
-import { NAVIGATION_CONFIG, DETECTION_URL, ACQUISITION_URL } from './src/utils/constants';
+import { CONFIG, NAVIGATION_CONFIG, DETECTION_URL, ACQUISITION_URL } from './src/utils/constants';
 import { WATCHDOG_TIMEOUTS, nativeCall, withTimeout } from './src/utils/asyncWatchdog';
 import { fixImageOrientation } from './src/services/fixImageOrientation';
 import {
@@ -3951,7 +3951,14 @@ function AppInner(): React.JSX.Element {
   }, [recoverFromStuckTurn]);
 
   useEffect(() => {
-    const STUCK_TURN_MS = 45_000;
+    // Must exceed the longest step a healthy turn can legitimately spend
+    // without reporting progress, or the backstop becomes the bug: the
+    // workflow request is bounded at CONFIG.REQUEST_TIMEOUT and
+    // marks progress only when it returns, so anything at or below that would
+    // tear down requests that were still going to succeed. Derived rather than
+    // hardcoded so raising the request timeout cannot silently reintroduce
+    // that. The margin covers the bounded audio and TTS work on either side.
+    const STUCK_TURN_MS = CONFIG.REQUEST_TIMEOUT + 30_000;
     const CHECK_INTERVAL_MS = 5_000;
 
     // Speech counts as progress. A long response is spoken as a sequence of

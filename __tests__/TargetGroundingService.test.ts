@@ -116,6 +116,78 @@ describe('TargetGroundingService', () => {
     expect(matchTargetAgainstVocabulary('lounge room', rooms).status).toBe('no_match');
   });
 
+  // ── Phonetic containment ────────────────────────────────────────────────
+  // Field failure, 20 Aug 2026: the saved label was "Krave cereal" and the
+  // request kept dead-ending with "I could not find … saved destinations
+  // include Krave cereal". Dictation hears "crave"/"serial", and the target
+  // handed down is often only part of the label or the label plus a filler —
+  // none of which reach the whole-string phonetic rung, because that compares
+  // the full string. Whether a query worked came down to whether the
+  // classifier happened to return the exact label, which is why the same
+  // request succeeded roughly once in ten.
+  describe('phonetic containment', () => {
+    const shelves = [
+      { label: 'Krave cereal', mapId: 'map-4', mapName: 'Store Route' },
+      { label: 'Onions', mapId: 'map-4', mapName: 'Store Route' },
+    ];
+
+    it.each([
+      ['crave', 'a partial label with a hard-c slip'],
+      ['serials', 'a partial label with a soft-c slip and plural drift'],
+      ['cereals', 'a partial label with plural drift'],
+      ['crave cereal aisle', 'the full label plus a filler word'],
+      ['the crave serial', 'an article, plus slips in both tokens'],
+    ])('resolves %s (%s)', requested => {
+      const result = matchTargetAgainstVocabulary(requested, shelves);
+      expect(result.status).toBe('matched');
+      expect(result.label).toBe('Krave cereal');
+    });
+
+    it('never outranks a literal containment match', () => {
+      // "contains", not "phonetic_contains": the literal pass runs first so a
+      // label that matches on the words themselves is never displaced by one
+      // that only matches by sound.
+      const rooms = [
+        { label: '400 Lounge', mapId: 'map-5', mapName: 'Office Route' },
+        { label: 'Kitchen', mapId: 'map-5', mapName: 'Office Route' },
+      ];
+      expect(matchTargetAgainstVocabulary('400 lounge room', rooms).method).toBe('contains');
+    });
+
+    it('still refuses the invariants the looser rung could have crossed', () => {
+      // Short words must not cross on sound alone, digits must still agree,
+      // and an unrelated word must not collide with a short skeleton.
+      expect(matchTargetAgainstVocabulary('silk', vocabulary).status).toBe('no_match');
+      expect(matchTargetAgainstVocabulary('aisle 4', vocabulary).status).toBe('no_match');
+      expect(matchTargetAgainstVocabulary('quinoa', vocabulary).status).toBe('no_match');
+    });
+
+    it('keeps working for numbered labels', () => {
+      // phoneticKey passes digits through, so "Cereal 3" keys to ["srl", "3"].
+      // A blanket minimum-skeleton-length test would trip on that single-digit
+      // "3" and silently disable this rung for every numbered label — while the
+      // digit guard is already what keeps "3" and "4" apart.
+      const aisles = [
+        { label: 'Cereal 3', mapId: 'map-6', mapName: 'Store Route' },
+        { label: 'Kitchen', mapId: 'map-6', mapName: 'Store Route' },
+      ];
+      const result = matchTargetAgainstVocabulary('serials 3 shelf', aisles);
+      expect(result.status).toBe('matched');
+      expect(result.label).toBe('Cereal 3');
+
+      // The digit still has to agree.
+      expect(matchTargetAgainstVocabulary('serials 4 shelf', aisles).status).toBe('no_match');
+    });
+
+    it('refuses to guess between two labels that tie on sound', () => {
+      const rooms = [
+        { label: 'North Lounge', mapId: 'map-7', mapName: 'Office Route' },
+        { label: 'South Lounge', mapId: 'map-7', mapName: 'Office Route' },
+      ];
+      expect(matchTargetAgainstVocabulary('lounge', rooms).status).toBe('no_match');
+    });
+  });
+
   it('reports available targets for spoken feedback on a miss', () => {
     const result = matchTargetAgainstVocabulary('quinoa', vocabulary);
     expect(result.status).toBe('no_match');
