@@ -76,6 +76,7 @@ import {
 import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
 import { NAVIGATION_CONFIG, DETECTION_URL, ACQUISITION_URL } from './src/utils/constants';
+import { WATCHDOG_TIMEOUTS, nativeCall, withTimeout } from './src/utils/asyncWatchdog';
 import { fixImageOrientation } from './src/services/fixImageOrientation';
 import {
   CameraIntrinsicsPayload,
@@ -458,6 +459,84 @@ function AppInner(): React.JSX.Element {
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
   const screenReaderEnabledRef = useRef(false);
+
+  // ── Turn watchdog ──────────────────────────────────────────────────────────
+  // `isProcessingRef` and `isCapturingPhotoRef` gate ALL user input: while
+  // either is true every tap and every auto-submit returns early. They are
+  // cleared in `finally` blocks, which is correct right up until an `await`
+  // never settles — then the `finally` never runs, the latch stays true, and
+  // the app is silently deaf until it is force-quit. That is the pilot
+  // "unresponsive, closing and reopening fixes it" report, and it showed up in
+  // scene description and navigation alike because many different awaits can
+  // strand.
+  //
+  // Individual fixes (bounded native calls, per-utterance TTS resolvers, the
+  // native ARKit watchdogs) each remove one cause. This is the backstop that
+  // covers the ones nobody has found yet: if a turn holds the input gate with
+  // no forward progress for long enough, it is unwound and the app is handed
+  // back to the user, out loud.
+  const isNavigationRef = useRef(false);
+  const isReachingRef = useRef(false);
+  // Seeded with "now", not 0: a turn that gates within the first watchdog tick
+  // would otherwise measure its staleness against the epoch and be recovered
+  // instantly.
+  const lastTurnProgressAtRef = useRef(Date.now());
+  const turnWatchdogRecoveringRef = useRef(false);
+
+  useEffect(() => { isNavigationRef.current = isNavigation; }, [isNavigation]);
+  useEffect(() => { isReachingRef.current = isReaching; }, [isReaching]);
+
+  /**
+   * Record forward progress on the current turn.
+   *
+   * Called at every step that proves the pipeline is still moving. The
+   * watchdog measures silence since the last call, not total turn duration,
+   * so a genuinely slow-but-working turn is never interrupted.
+   */
+  const markTurnProgress = useCallback((label: string) => {
+    lastTurnProgressAtRef.current = Date.now();
+    if (__DEV__) console.log(`⏳ [turn] ${label}`);
+  }, []);
+
+  // handleAutoSubmit is intentionally []-memoized and reads everything through
+  // refs, so it needs one for this too.
+  const markTurnProgressRef = useRef(markTurnProgress);
+  useEffect(() => { markTurnProgressRef.current = markTurnProgress; }, [markTurnProgress]);
+
+  /**
+   * Drop every latch that gates user input. Synchronous and await-free by
+   * design — this must be safe to call from a wedged state, so it may never
+   * depend on a native module answering.
+   *
+   * Deliberately covers the loop-ownership flags too. They are not input
+   * gates themselves, but a loop flag left set makes the *next* turn refuse to
+   * start its loop, which reads to the user as the same silent unresponsiveness.
+   */
+  const releaseInputGates = useCallback((reason: string) => {
+    console.log(`🔓 Releasing input gates: ${reason}`);
+
+    // Primary input gates.
+    isProcessingRef.current = false;
+    isCapturingPhotoRef.current = false;
+    isCapturingRef.current = false;
+    finalTranscriptRef.current = '';
+
+    // Loop ownership.
+    isContinuousModeRunning.current = false;
+    isNavigationLoopRunning.current = false;
+    continuousBackendInFlightRef.current = false;
+    continuousTtsSpeakingRef.current = false;
+    continuousSpeechDrainingRef.current = false;
+
+    // Smart-guidance / tracker bookkeeping.
+    smartGuidanceActiveRef.current = false;
+    smartGuidanceResumeMainRef.current = false;
+    smartGuidanceSeededRef.current = false;
+    reacquiringRef.current = false;
+    rtabIsSendingRef.current = false;
+
+    lastTurnProgressAtRef.current = Date.now();
+  }, []);
 
   // ── Animation ──────────────────────────────────────────────────────────────
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -943,7 +1022,7 @@ function AppInner(): React.JSX.Element {
     }
     isCapturingRef.current = true;
 
-    const capturePromise = (async (): Promise<string> => {
+    const captureBody = (async (): Promise<string> => {
       try {
         console.log('📷 Reactivating camera for capture...');
         setIsCameraActive(true);
@@ -1051,10 +1130,33 @@ function AppInner(): React.JSX.Element {
           }
         }
       } finally {
+        // Normal completion clears here; the outer `.finally` below is what
+        // covers the case where this body never completes at all.
         isCapturingRef.current = false;
         activeCapturePromiseRef.current = null;
       }
     })();
+
+    // Bound the capture, and do the bookkeeping outside the body.
+    //
+    // Neither VisionCamera's takePhoto nor the glasses' Bluetooth capture has
+    // a timeout of its own, and either can be issued at a moment when it will
+    // never call back — mid session-reconfiguration, or while the glasses link
+    // is renegotiating. The cleanup used to live in the body's own `finally`,
+    // so a capture that never returned left `activeCapturePromiseRef` pointing
+    // at a dead promise forever — and the reuse path above hands that same
+    // dead promise to every subsequent capture, so the camera stayed broken
+    // for the rest of the process even after the turn that started it moved on.
+    //
+    // Racing here means the cleanup runs on time no matter what the body does.
+    const capturePromise = withTimeout(
+      captureBody,
+      WATCHDOG_TIMEOUTS.CAMERA_CAPTURE,
+      'reactivateCameraAndCapture',
+    ).finally(() => {
+      isCapturingRef.current = false;
+      activeCapturePromiseRef.current = null;
+    });
 
     activeCapturePromiseRef.current = capturePromise;
     return capturePromise;
@@ -2718,6 +2820,17 @@ function AppInner(): React.JSX.Element {
       return false;
     }
 
+    // A launch that was torn down because a newer one replaced it. Native
+    // now always answers a waiting caller rather than dropping the resolver
+    // (dropping it used to hang this turn forever), but the newer request is
+    // already running — announcing "navigation ended" over it would be wrong.
+    // Unwind quietly and let the replacement own the audio.
+    if (navResult.reason === 'superseded') {
+      console.log('⏩ ARKit navigation superseded by a newer request — unwinding quietly');
+      setIsProcessing(false);
+      return true;
+    }
+
     // `navResult.message` comes from native, which already speaks the session
     // language, so preferring it stays correct in French.
     const navStrings = strings().navigation;
@@ -2852,8 +2965,15 @@ function AppInner(): React.JSX.Element {
       }
       isProcessingRef.current = true;
       setIsProcessing(true);
+      markTurnProgressRef.current('command accepted');
 
-      try { await cancelSTT(); } catch { }
+      await nativeCall(
+        () => cancelSTT(),
+        WATCHDOG_TIMEOUTS.STT_CONTROL,
+        'cancelSTT (handleVoiceCommand)',
+        undefined,
+      );
+      markTurnProgressRef.current('stt cancelled');
 
       // Skip earcons/SFX when VoiceOver is on — audio session conflicts.
       // Also skip in glasses mode — the audio session is locked by BluetoothHFP
@@ -2863,11 +2983,26 @@ function AppInner(): React.JSX.Element {
       const shouldPlaySFX = !screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera;
       if (shouldPlaySFX) {
         // FIX: Restore full-volume audio session after STT's Record+Measurement
-        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+        //
+        // Bounded: an AVAudioSession category switch can block indefinitely
+        // when another process (or the glasses' HFP link) holds the session.
+        // Losing the earcon is a cosmetic failure; hanging here was a fatal one.
+        await nativeCall(
+          () => configurePlaybackSession(!settingsRef.current.useWearablesCamera),
+          WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+          'configurePlaybackSession',
+          undefined,
+        );
 
-        await stopListenSound();
+        await nativeCall(
+          () => stopListenSound(),
+          WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+          'stopListenSound',
+          undefined,
+        );
         playThinkingStarted();
       }
+      markTurnProgressRef.current('audio session ready');
 
 
       if (!photoPath) {
@@ -2898,6 +3033,7 @@ function AppInner(): React.JSX.Element {
         },
         abortCtrl.signal
       );
+      markTurnProgressRef.current('workflow responded');
 
       if (isEmergencyStopped.current) return;
 
@@ -2905,10 +3041,20 @@ function AppInner(): React.JSX.Element {
         rtabLastObjectRef.current = result.object;
       }
 
-      await stopLatencyLoop();
+      await nativeCall(
+        () => stopLatencyLoop(),
+        WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+        'stopLatencyLoop (post-response)',
+        undefined,
+      );
       // Bug 3 defense: second stop catches the race where iOS audio session
       // switch during the first stop re-queued a play.
-      await stopLatencyLoop();
+      await nativeCall(
+        () => stopLatencyLoop(),
+        WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+        'stopLatencyLoop (post-response, 2nd)',
+        undefined,
+      );
       //await playSuccessChime();          // ← plays jbl_success_sae.caf
 
       console.log('✅ Response:', {
@@ -3142,12 +3288,45 @@ function AppInner(): React.JSX.Element {
     // Reject transcripts that are clearly VoiceOver UI text, not user speech.
     // Uses ref (not state) because handleAutoSubmit has stable [] deps.
     if (screenReaderEnabledRef.current) {
+      // Unwinding a rejected turn.
+      //
+      // These two paths used to `return` bare, which left the session
+      // half-open in exactly the way the empty-transcript case above was
+      // fixed for on 11 Aug: the listening sound kept playing and STT was
+      // never cancelled, so the app sat in a listening state with no
+      // recognizer behind it and the next tap fell through without ever
+      // speaking. Every abandoned turn has to unwind the same way.
+      //
+      // The one thing this must NOT do is announce: VoiceOver would read the
+      // announcement, the mic would pick it up, and it would come back as the
+      // next transcript — which is the very noise being rejected here.
+      const unwindRejectedTurn = async (why: string) => {
+        console.log(`♿ VoiceOver noise rejected (${why}):`, finalText);
+        await nativeCall(
+          () => stopListenSound(),
+          WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+          'stopListenSound (VO noise)',
+          undefined,
+        );
+        await nativeCall(
+          () => cancelSTT(),
+          WATCHDOG_TIMEOUTS.STT_CONTROL,
+          'cancelSTT (VO noise)',
+          undefined,
+        );
+        finalTranscriptRef.current = '';
+        setIsProcessing(false);
+        isProcessingRef.current = false;
+        isCapturingPhotoRef.current = false;
+        setIsCameraActive(true);
+      };
+
       const lower = finalText.toLowerCase().trim();
       if (
         lower.length <= 12 &&
         ['speak', 'tap', 'ready', 'start', 'listen', 'listening', 'button'].includes(lower)
       ) {
-        console.log('♿ VoiceOver noise rejected (short):', finalText);
+        await unwindRejectedTurn('short');
         return;
       }
       const voPatterns = [
@@ -3160,10 +3339,10 @@ function AppInner(): React.JSX.Element {
         'please speak your command', 'please speak your',
       ];
       if (voPatterns.some(p => lower.includes(p))) {
-        console.log('♿ VoiceOver noise rejected:', finalText);
         // CRITICAL: Do NOT announce anything here. Any announceForAccessibility
         // call gets read by VoiceOver, the mic picks it up, and it becomes
         // the transcript for the NEXT listening session ("please speak your command").
+        await unwindRejectedTurn('pattern');
         return;
       }
     }
@@ -3186,8 +3365,14 @@ function AppInner(): React.JSX.Element {
 
     setIsProcessing(true);
     isCapturingPhotoRef.current = true;
+    markTurnProgressRef.current('auto-submit accepted');
     try {
-      try { await cancelSTT(); } catch { }
+      await nativeCall(
+        () => cancelSTT(),
+        WATCHDOG_TIMEOUTS.STT_CONTROL,
+        'cancelSTT (handleAutoSubmit)',
+        undefined,
+      );
 
       await new Promise<void>(resolve => setTimeout(() => resolve(), AUDIO_SESSION_RELEASE_DELAY_MS));
 
@@ -3199,9 +3384,14 @@ function AppInner(): React.JSX.Element {
 
       let photoPath = '';
       try {
+        // reactivateCameraAndCapture bounds itself, so a capture that never
+        // calls back surfaces here as a TimeoutError rather than hanging the
+        // turn. The voice-only fallback below already handles a failed
+        // capture gracefully.
         photoPath = await reactivateCameraAndCaptureRef.current({
           enableShutterSound: false,
         });
+        markTurnProgressRef.current('photo captured');
       } catch (e: any) {
         console.error('❌ Camera error:', e);
 
@@ -3570,37 +3760,79 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   const emergencyStop = async () => {
     console.log('🚨 EMERGENCY STOP');
+
+    // ── Release every input gate FIRST, before any await ──────────────────
+    // This ordering is the whole point. The teardown below talks to native
+    // modules, and emergency stop is precisely the moment when one of them is
+    // most likely to be wedged — that is usually why the user is reaching for
+    // it. Awaiting native work before clearing the latches meant the recovery
+    // path could hang on the same module it was trying to recover from,
+    // leaving the app permanently deaf: the one action guaranteed to save the
+    // session was the one that could not complete.
+    //
+    // Clearing synchronously first means the app is responsive again the
+    // instant the user taps, whatever native does afterwards.
+    releaseInputGates('emergency stop');
     isEmergencyStopped.current = true;
     isStartingRef.current = false; // ← release re-entry guard
     continuousModeAbortRef.current = true;
     arSessionAliveRef.current = false;
-    try { await ARKitNavigationBridge.stopNavigation(); } catch { }
+    continuousTtsGenerationRef.current++;
+
+    setIsProcessing(false);
+    setIsSpeaking(false);
+    setIsNavigation(false);
+    setIsReaching(false);
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
     }
 
-    await stopLatencyLoop(); // FIX: kill thinking SFX immediately on emergency stop
-    continuousTtsGenerationRef.current++;
     resetContinuousSpeechQueue();
-    await speachesSentenceChunker.stop();
-    try { await cancelSTT(); } catch { }
-    // Pause wake word listening during emergency stop
-    try { await wakeWordPauseRef.current?.(); } catch { }
+    stopContinuousMode('emergency stop', false);
+
+    // ── Best-effort teardown, all bounded ─────────────────────────────────
+    // Every one of these can wedge. None of them may block the others, and
+    // none of them can block the user any more.
+    await nativeCall(
+      () => ARKitNavigationBridge.stopNavigation(),
+      WATCHDOG_TIMEOUTS.AR_TEARDOWN,
+      'ARKitNavigationBridge.stopNavigation',
+      undefined,
+    );
+    await nativeCall(
+      () => stopLatencyLoop(),
+      WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+      'stopLatencyLoop',
+      undefined,
+    );
+    await nativeCall(
+      () => speachesSentenceChunker.stop(),
+      WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+      'speachesSentenceChunker.stop',
+      undefined,
+    );
+    await nativeCall(
+      () => cancelSTT(),
+      WATCHDOG_TIMEOUTS.STT_CONTROL,
+      'cancelSTT',
+      undefined,
+    );
+    await nativeCall(
+      () => Promise.resolve(wakeWordPauseRef.current?.()),
+      WATCHDOG_TIMEOUTS.STT_CONTROL,
+      'wakeWordPause',
+      undefined,
+    );
 
     await new Promise<void>(resolve => setTimeout(() => resolve(), 300));
 
+    // Re-assert: the bounded teardown above yields, and an in-flight turn
+    // could have set a gate again on its way out.
+    releaseInputGates('emergency stop settled');
     setIsProcessing(false);
     setIsSpeaking(false);
-    setIsNavigation(false);
-    setIsReaching(false);
-    isProcessingRef.current = false;
-    finalTranscriptRef.current = '';
-    isCapturingPhotoRef.current = false;
-    isContinuousModeRunning.current = false;
-
-    stopContinuousMode('emergency stop', false);
     setIsCameraActive(true);
     // NOTE: Do NOT clear isEmergencyStopped here. It is cleared in
     // startListening() when the user initiates a new interaction.
@@ -3620,6 +3852,201 @@ function AppInner(): React.JSX.Element {
     }
     console.log('✅ Emergency stop complete');
   };
+
+  // ============================================================================
+  // Turn watchdog — the backstop that makes a hang self-clearing
+  // ============================================================================
+  // Every specific fix in this change removes one way for a turn to strand.
+  // This removes the *consequence* of stranding, including for causes not yet
+  // identified: a turn that holds the input gate without making progress is
+  // unwound automatically and the user is told, out loud, that they can speak
+  // again. No force-quit, no silent deaf app, no lost pilot session.
+  //
+  // The trigger is silence, not duration. `markTurnProgress` is called at each
+  // real step, so a slow-but-working turn keeps resetting the clock and is
+  // never interrupted. Active AR sessions are exempt entirely: navigation and
+  // reaching legitimately run for minutes with no JS-side activity, and both
+  // now carry their own native watchdogs.
+  const recoverFromStuckTurn = useCallback(async (heldForMs: number) => {
+    if (turnWatchdogRecoveringRef.current) return;
+    turnWatchdogRecoveringRef.current = true;
+
+    console.error(
+      `🚑 [turn-watchdog] Input has been gated for ${Math.round(heldForMs / 1000)}s ` +
+      'with no forward progress — force-recovering',
+    );
+    debugLogger.logAPI(
+      '🚑 Turn watchdog recovery',
+      `heldForMs=${heldForMs} processing=${isProcessingRef.current} ` +
+      `capturing=${isCapturingPhotoRef.current}`,
+    );
+
+    try {
+      // Free the gates before anything else, for the same reason emergency
+      // stop does: the teardown may itself be talking to a wedged module.
+      releaseInputGates('turn watchdog');
+      setIsProcessing(false);
+      setIsSpeaking(false);
+
+      if (abortControllerRef.current) {
+        abortControllerRef.current.abort();
+        abortControllerRef.current = null;
+      }
+
+      continuousTtsGenerationRef.current++;
+      resetContinuousSpeechQueue();
+      stopContinuousMode('turn watchdog recovery', false);
+
+      await nativeCall(
+        () => stopLatencyLoop(),
+        WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+        'stopLatencyLoop (watchdog)',
+        undefined,
+      );
+      await nativeCall(
+        () => speachesSentenceChunker.stop(),
+        WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+        'chunker.stop (watchdog)',
+        undefined,
+      );
+      await nativeCall(
+        () => cancelSTT(),
+        WATCHDOG_TIMEOUTS.STT_CONTROL,
+        'cancelSTT (watchdog)',
+        undefined,
+      );
+
+      releaseInputGates('turn watchdog settled');
+      setIsCameraActive(true);
+
+      // Say something. A blind user has been waiting on silence; the one
+      // thing they must not have to do is guess whether the app is alive.
+      const message = strings().speech.requestFailed;
+      if (screenReaderEnabledRef.current) {
+        AccessibilityInfo.announceForAccessibility(message);
+      } else {
+        await nativeCall(
+          () => speachesSentenceChunker.synthesizeSpeechChunked(message),
+          WATCHDOG_TIMEOUTS.TTS_CHUNK,
+          'watchdog recovery speech',
+          undefined,
+        );
+        audioFeedback.playEarcon('ready');
+      }
+      announceTapToStart('Ready.');
+
+      if (settingsRef.current.useWearablesCamera) {
+        isEmergencyStopped.current = false;
+        wakeWordResumeRef.current?.();
+      }
+    } finally {
+      turnWatchdogRecoveringRef.current = false;
+    }
+  }, [announceTapToStart, cancelSTT, releaseInputGates, resetContinuousSpeechQueue]);
+
+  // Read through a ref so the interval below can be created exactly once.
+  const recoverFromStuckTurnRef = useRef(recoverFromStuckTurn);
+  useEffect(() => {
+    recoverFromStuckTurnRef.current = recoverFromStuckTurn;
+  }, [recoverFromStuckTurn]);
+
+  useEffect(() => {
+    const STUCK_TURN_MS = 45_000;
+    const CHECK_INTERVAL_MS = 5_000;
+
+    // Speech counts as progress. A long response is spoken as a sequence of
+    // chunks, and each chunk is individually bounded by the TTS safety timer,
+    // so an advancing chunk index proves the pipeline is moving even though no
+    // JS step is running. Without this the watchdog would cut off a long but
+    // perfectly healthy answer mid-sentence.
+    let lastSpeechMarker = '';
+
+    // Empty deps, everything read through refs: this interval must be created
+    // once and live for the life of the screen. If it were rebuilt on every
+    // render — which is what happens the moment a dependency stops being
+    // stable — the 5s timer would keep restarting and the watchdog would
+    // silently never fire, which is the one failure this code cannot have.
+    const timer = setInterval(() => {
+      if (speachesSentenceChunker.isCurrentlyPlaying()) {
+        const { current, total } = speachesSentenceChunker.getProgress();
+        const marker = `${current}/${total}`;
+        if (marker !== lastSpeechMarker) {
+          lastSpeechMarker = marker;
+          lastTurnProgressAtRef.current = Date.now();
+        }
+      } else {
+        lastSpeechMarker = '';
+      }
+
+      const gated = isProcessingRef.current || isCapturingPhotoRef.current;
+      if (!gated) {
+        // Idle: keep the clock fresh so the next turn starts from now.
+        lastTurnProgressAtRef.current = Date.now();
+        return;
+      }
+
+      // A live AR session is allowed to take as long as the walk takes.
+      if (
+        isNavigationRef.current ||
+        isReachingRef.current ||
+        arSessionAliveRef.current
+      ) {
+        lastTurnProgressAtRef.current = Date.now();
+        return;
+      }
+
+      if (turnWatchdogRecoveringRef.current) return;
+
+      const heldForMs = Date.now() - lastTurnProgressAtRef.current;
+      if (heldForMs > STUCK_TURN_MS) {
+        void recoverFromStuckTurnRef.current(heldForMs);
+      }
+    }, CHECK_INTERVAL_MS);
+
+    return () => clearInterval(timer);
+  }, []);
+
+  // ============================================================================
+  // Foreground recovery
+  // ============================================================================
+  // iOS suspends the app when it goes to the background, and native callbacks
+  // that were in flight at that moment are often simply never delivered — the
+  // AR session is interrupted, the audio session is handed to another app, the
+  // speech recognizer is torn down. Coming back to the foreground with a latch
+  // still held is the other way a session used to die, and it is why "close
+  // and reopen" worked: relaunching was the only thing that reset the flags.
+  //
+  // Reopening should not be necessary. If the app returns to the foreground
+  // gated but with no AR session running, that turn is over — its callbacks
+  // are not coming — so release it and let the user speak.
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', state => {
+      if (state !== 'active') return;
+
+      const gated = isProcessingRef.current || isCapturingPhotoRef.current;
+      const arActive =
+        isNavigationRef.current ||
+        isReachingRef.current ||
+        arSessionAliveRef.current;
+
+      if (gated && !arActive) {
+        console.warn(
+          '🚑 [foreground] Returned to foreground with input still gated — releasing',
+        );
+        releaseInputGates('returned to foreground');
+        setIsProcessing(false);
+        setIsSpeaking(false);
+        setIsCameraActive(true);
+        announceTapToStart('Ready.');
+      }
+
+      // Whatever happened while suspended, do not let stale time trip the
+      // turn watchdog the moment we come back.
+      lastTurnProgressAtRef.current = Date.now();
+    });
+
+    return () => sub.remove();
+  }, [announceTapToStart, releaseInputGates]);
 
   // ============================================================================
   // Accessibility helpers

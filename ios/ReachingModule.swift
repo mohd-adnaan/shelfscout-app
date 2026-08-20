@@ -964,7 +964,22 @@ class ReachingModule: NSObject {
       )
       ReachingModule.activeVC = vc
       vc.modalPresentationStyle = .fullScreen
-      top.present(vc, animated: true)
+      top.present(vc, animated: true) {
+        // The guards above catch every *known* reason UIKit refuses a
+        // present, but a refusal it does not catch is silent: no error, no
+        // callback, and `onDone` — the only thing that resolves this promise
+        // — can never fire. The JS side would then await forever while
+        // holding the input gate, which is the app-wide hang this whole
+        // change set exists to make impossible.
+        //
+        // Confirm the screen is genuinely on-screen; if it is not, fall back
+        // into the same retry ladder rather than stranding the caller.
+        if vc.viewIfLoaded?.window == nil {
+          NSLog("🎯 [ReachingModule] present() completed but the screen is not in a window — retrying")
+          if ReachingModule.activeVC === vc { ReachingModule.activeVC = nil }
+          retryLater("present did not attach")
+        }
+      }
     }
   }
 }

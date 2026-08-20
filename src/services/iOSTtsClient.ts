@@ -2,6 +2,7 @@
 
 import Tts from 'react-native-tts';
 import { NativeEventEmitter, NativeModules, Platform } from 'react-native';
+import { WATCHDOG_TIMEOUTS, nativeCall } from '../utils/asyncWatchdog';
 import {
   AppLanguage,
   LANGUAGE_LOCALES,
@@ -83,15 +84,51 @@ const DEFAULT_SPEECH_RATE = 0.5;
 
 const SAFETY_TIMEOUT_MS = 30_000;
 
+/**
+ * One in-flight utterance.
+ *
+ * Each carries its OWN resolver and its OWN safety timer. The previous design
+ * kept a single `_resolveSpeak` slot and a single `_safetyTimer` shared by
+ * whatever was speaking at the time, which had a permanent-hang failure mode:
+ *
+ *   A calls synthesizeSpeech → _resolveSpeak = resolveA, safety timer TA armed
+ *   B calls synthesizeSpeech → _startSafetyTimer() CLEARS TA, arms TB,
+ *                              and overwrites _resolveSpeak with resolveB
+ *   tts-finish fires once     → resolves B
+ *   ⇒ resolveA is never called and TA no longer exists. A's `await` hangs
+ *     forever, and with it whatever turn was awaiting it — which is why the
+ *     app went dead in scene description and navigation alike and only a
+ *     restart brought it back.
+ *
+ * Per-utterance identity removes the shared mutable slot, so no call can
+ * strand another's resolver or disarm another's timer.
+ */
+interface PendingUtterance {
+  id: number;
+  resolve: () => void;
+  timer: ReturnType<typeof setTimeout> | null;
+}
+
 class IOSTtsClient {
   private _isPlaying = false;
   private _isStopped = false;
   private _initialized = false;
   private _initializing = false;
   private _selectedVoice: string | null = null;
-  private _resolveSpeak: (() => void) | null = null;
-  private _safetyTimer: ReturnType<typeof setTimeout> | null = null;
   private _subscriptions: Array<{ remove: () => void }> = [];
+
+  /**
+   * In-flight utterances, oldest first.
+   *
+   * A list rather than a single slot is what makes concurrent callers safe.
+   * Two calls that race past the internal `stop()` both get an entry, and the
+   * two native finish events settle them in order — where the old single slot
+   * would have kept only the newer resolver and stranded the older caller
+   * forever. Barge-in still works exactly as before: the newer call's
+   * `stop()` settles the older entry rather than abandoning it.
+   */
+  private _pending: PendingUtterance[] = [];
+  private _nextUtteranceId = 1;
 
   // ── User-controllable settings ─────────────────────────────────────────
   private _speechRate: number = DEFAULT_SPEECH_RATE;
@@ -273,39 +310,57 @@ class IOSTtsClient {
   // ========================================================================
   private _onFinish = (_event: any) => {
     console.log('✅ iOS TTS finished (event received)');
-    this._resolvePending();
+    this._settleOldest();
   };
 
   private _onCancel = (_event: any) => {
     console.log('🛑 iOS TTS cancelled (event received)');
-    this._resolvePending();
+    this._settleOldest();
   };
 
-  private _resolvePending(): void {
+  /**
+   * Settle the oldest in-flight utterance.
+   *
+   * Native emits one tts-finish / tts-cancel per utterance and AVSpeech-
+   * Synthesizer plays them in submission order, so FIFO is the correct
+   * pairing. Settling only one per event means a queued second utterance
+   * keeps its own pending entry (and its own timer) rather than being
+   * silently dropped.
+   */
+  private _settleOldest(): void {
+    const entry = this._pending.shift();
+    if (entry) {
+      this._settle(entry);
+    }
+    if (this._pending.length === 0) {
+      this._isPlaying = false;
+    }
+  }
+
+  /** Resolve one entry exactly once and dispose of its timer. */
+  private _settle(entry: PendingUtterance): void {
+    if (entry.timer) {
+      clearTimeout(entry.timer);
+      entry.timer = null;
+    }
+    entry.resolve();
+  }
+
+  /**
+   * Settle every in-flight utterance. Used by stop() and by any path that
+   * invalidates the whole queue — no entry may ever be dropped without being
+   * resolved, because something is always awaiting it.
+   */
+  private _settleAll(reason: string): void {
+    if (this._pending.length > 0) {
+      console.log(`🔧 Resolving ${this._pending.length} pending TTS utterance(s): ${reason}`);
+    }
+    const entries = this._pending;
+    this._pending = [];
+    for (const entry of entries) {
+      this._settle(entry);
+    }
     this._isPlaying = false;
-    this._clearSafetyTimer();
-    if (this._resolveSpeak) {
-      this._resolveSpeak();
-      this._resolveSpeak = null;
-    }
-  }
-
-  // ========================================================================
-  // Safety Timer
-  // ========================================================================
-  private _clearSafetyTimer(): void {
-    if (this._safetyTimer) {
-      clearTimeout(this._safetyTimer);
-      this._safetyTimer = null;
-    }
-  }
-
-  private _startSafetyTimer(): void {
-    this._clearSafetyTimer();
-    this._safetyTimer = setTimeout(() => {
-      console.warn('⚠️ iOS TTS safety timeout — force-resolving');
-      this._resolvePending();
-    }, SAFETY_TIMEOUT_MS);
   }
 
   // ========================================================================
@@ -354,6 +409,13 @@ class IOSTtsClient {
   // Public API — Speak
   // ========================================================================
 
+  /**
+   * Speak one utterance, resolving when native reports it finished.
+   *
+   * Preemptive, as it has always been: a new call stops whatever is speaking
+   * and takes over. The difference is that stopping now *settles* the
+   * displaced utterance instead of dropping its resolver on the floor.
+   */
   async synthesizeSpeech(text: string): Promise<void> {
     const trimmed = (text || '').trim();
     if (!trimmed) {
@@ -365,19 +427,38 @@ class IOSTtsClient {
       await this._initializeAsync();
     }
 
-    // Stop any in-progress speech
+    // Stop any in-progress speech. This settles previous utterances rather
+    // than abandoning them.
     await this.stop();
     this._isStopped = false;
 
     return new Promise<void>((resolve) => {
-      this._resolveSpeak = resolve;
+      const entry: PendingUtterance = {
+        id: this._nextUtteranceId++,
+        resolve,
+        timer: null,
+      };
+
+      // Every utterance owns its safety net. Nothing else can disarm it, so
+      // even a native event that never arrives resolves this await on time.
+      entry.timer = setTimeout(() => {
+        console.warn(
+          `⚠️ iOS TTS safety timeout on utterance ${entry.id} — force-resolving`,
+        );
+        this._pending = this._pending.filter(p => p !== entry);
+        if (this._pending.length === 0) {
+          this._isPlaying = false;
+        }
+        this._settle(entry);
+      }, SAFETY_TIMEOUT_MS);
+
+      this._pending.push(entry);
       this._isPlaying = true;
-      this._startSafetyTimer();
 
       console.log(
         '🎤 iOS TTS speaking:',
         trimmed.substring(0, 50) + (trimmed.length > 50 ? '...' : ''),
-        `[rate=${this._speechRate}]`,
+        `[rate=${this._speechRate}, utterance=${entry.id}]`,
       );
 
       // ── Per-utterance options ─────────────────────────────────────────
@@ -395,7 +476,12 @@ class IOSTtsClient {
         Tts.speak(trimmed, speakOptions);
       } catch (err: any) {
         console.error('❌ Tts.speak() error:', err);
-        this._resolvePending();
+        // Native never started, so no finish event is coming for this entry.
+        this._pending = this._pending.filter(p => p !== entry);
+        if (this._pending.length === 0) {
+          this._isPlaying = false;
+        }
+        this._settle(entry);
       }
     });
   }
@@ -405,34 +491,34 @@ class IOSTtsClient {
   // ========================================================================
 
   async stop(): Promise<void> {
-    this._clearSafetyTimer();
-
-    if (!this._isPlaying && !this._resolveSpeak) return;
+    if (!this._isPlaying && this._pending.length === 0) return;
 
     console.log('🛑 Stopping iOS TTS...');
     this._isStopped = true;
-    this._isPlaying = false;
 
     // Stop native AVSpeechSynthesizer immediately.
     // The BOOL→double patch in react-native-tts+4.1.1.patch ensures
     // this actually reaches the native stopSpeakingAtBoundary: call
     // on New Architecture. Without that patch, Tts.stop() silently
     // fails and speech continues in the background.
-    try {
-      await Tts.stop();
-    } catch (error: any) {
-      console.warn('⚠️ Tts.stop() error:', error.message,
-        '— ensure patches/react-native-tts+4.1.1.patch is applied (npx patch-package)');
-    }
+    //
+    // Bounded: stop() is on the recovery path (emergency stop, barge-in,
+    // language change). If the native bridge is wedged, an unbounded await
+    // here would hang the very code meant to unhang the app.
+    await nativeCall(
+      () => Tts.stop(),
+      WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+      'Tts.stop()',
+      undefined,
+    );
 
-    // Give native tts-cancel event 50ms to fire, then force-resolve
+    // Give native tts-cancel events a moment to fire on their own.
     await new Promise<void>((r) => setTimeout(r, 50));
 
-    if (this._resolveSpeak) {
-      console.log('🔧 Force-resolving pending speak promise');
-      this._resolveSpeak();
-      this._resolveSpeak = null;
-    }
+    // Anything still outstanding gets resolved here. A caller awaiting an
+    // utterance we just cancelled must not be left waiting for an event that
+    // is no longer coming.
+    this._settleAll('stop() called');
 
     console.log('✅ iOS TTS stopped');
   }

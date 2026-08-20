@@ -10,6 +10,12 @@ export type ARKitNavigationReason =
   | 'ar_unavailable'
   | 'relocalization_failed'
   | 'arrival_unverified'
+  /**
+   * The launch was torn down because a newer one replaced it. Native always
+   * answers a waiting caller now — dropping the resolver instead used to leave
+   * the JS turn awaiting a promise that could never settle.
+   */
+  | 'superseded'
   | 'error';
 
 export interface ARKitNavigationConfig {

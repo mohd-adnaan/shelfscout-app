@@ -16,6 +16,24 @@ final class ARKitNavigationModule: NSObject {
     /// retarget without paying another relocalization.
     private var keepSessionAlive = false
 
+    /// How long a launch may sit without the AR screen actually appearing
+    /// before we conclude the presentation failed and recover.
+    private static let presentationWatchdogSeconds: TimeInterval = 6
+
+    /// Guards against a launch that never produces a visible screen.
+    ///
+    /// `pendingResolve` is a single slot, and `startNavigation` refuses to
+    /// launch while it is occupied ("ARKit navigation is already running").
+    /// So if a launch ever sets it without the screen coming up — UIKit
+    /// silently refuses to present when the presenter is already presenting
+    /// something, which happens whenever a JS `Alert.alert` or the reaching
+    /// screen is on top — then `onDone` can never fire, the slot stays
+    /// occupied for the life of the process, and navigation is dead until the
+    /// app is force-quit. That is one of the pilot "app hangs" reports.
+    ///
+    /// This timer resolves the caller and clears the slot instead.
+    private var presentationWatchdog: DispatchWorkItem?
+
     @objc
     static func requiresMainQueueSetup() -> Bool {
         true
@@ -228,8 +246,74 @@ final class ARKitNavigationModule: NSObject {
             let controller = UIHostingController(rootView: host)
             controller.modalPresentationStyle = .fullScreen
             self.presentedController = controller
-            presenter.present(controller, animated: true)
+
+            // Arm before presenting: if `present` is silently refused (the
+            // presenter is already presenting), no callback of ours will ever
+            // run and only this timer can free the module.
+            self.armPresentationWatchdog(targetName: targetName,
+                                         routeMapId: routeMapId,
+                                         routeMapName: routeMapName)
+
+            presenter.present(controller, animated: true) { [weak self] in
+                // The screen is up and its own callbacks now govern the
+                // session's lifetime, which may legitimately last minutes.
+                self?.cancelPresentationWatchdog()
+            }
         }
+    }
+
+    /// Fail the pending launch if the AR screen has not appeared in time.
+    private func armPresentationWatchdog(
+        targetName: String,
+        routeMapId: String?,
+        routeMapName: String?
+    ) {
+        cancelPresentationWatchdog()
+
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            guard self.presentationWatchdog != nil else { return }
+            self.presentationWatchdog = nil
+
+            // Presented successfully in the meantime? Nothing to do.
+            if let controller = self.presentedController,
+               controller.viewIfLoaded?.window != nil {
+                return
+            }
+
+            NSLog("[ARKitNavigationModule] AR screen never appeared — recovering so navigation is not wedged")
+
+            let controller = self.presentedController
+            self.presentedController = nil
+            controller?.dismiss(animated: false)
+
+            ARKitNavigationSession.shared.end()
+            self.keepSessionAlive = false
+            self.activeTargetName = nil
+
+            let resolver = self.pendingResolve
+            self.pendingResolve = nil
+            resolver?(ARKitNavigationNativeResult(
+                success: false,
+                reason: "error",
+                targetName: targetName,
+                routeMapId: routeMapId,
+                routeName: routeMapName,
+                targetWorldPosition: nil,
+                message: "Could not open ARKit navigation. Please try again."
+            ).dictionary())
+        }
+
+        presentationWatchdog = work
+        DispatchQueue.main.asyncAfter(
+            deadline: .now() + Self.presentationWatchdogSeconds,
+            execute: work
+        )
+    }
+
+    private func cancelPresentationWatchdog() {
+        presentationWatchdog?.cancel()
+        presentationWatchdog = nil
     }
 
     /// Start the next leg of a journey on the AR screen already on top.
@@ -305,6 +389,9 @@ final class ARKitNavigationModule: NSObject {
 
     private func finishNavigation(_ result: ARKitNavigationNativeResult) {
         DispatchQueue.main.async {
+            // The screen reported an outcome, so it clearly came up.
+            self.cancelPresentationWatchdog()
+
             let resolver = self.pendingResolve
             self.pendingResolve = nil
             self.activeTargetName = nil
@@ -333,7 +420,11 @@ final class ARKitNavigationModule: NSObject {
             ARKitNavigationSession.shared.end()
             let shouldResolveBeforeDismiss = result.success && result.reason == "arrived"
 
+            // Resolve at most once, whichever path gets there first.
+            var didResolve = false
             let resolveResult: () -> Void = {
+                guard !didResolve else { return }
+                didResolve = true
                 resolver?(result.dictionary())
             }
 
@@ -344,6 +435,17 @@ final class ARKitNavigationModule: NSObject {
                     controller.dismiss(animated: true)
                 } else {
                     controller.dismiss(animated: true, completion: resolveResult)
+                    // Backstop: UIKit skips the completion block if this
+                    // controller is not the one actually presented (an alert
+                    // or the reaching screen got on top, or it was already
+                    // dismissed). Without this the resolver is dropped and
+                    // the JS turn hangs forever.
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                        if !didResolve {
+                            NSLog("[ARKitNavigationModule] dismiss completion never ran — resolving anyway")
+                            resolveResult()
+                        }
+                    }
                 }
             } else {
                 resolveResult()
@@ -351,7 +453,17 @@ final class ARKitNavigationModule: NSObject {
         }
     }
 
+    /// Tear down the AR screen.
+    ///
+    /// `resolveCancelledNavigation` selects the *reason* reported to a waiting
+    /// caller, not whether one is answered at all. A pending resolver is
+    /// ALWAYS invoked: this used to drop it on the `false` path, which left
+    /// the JS `await ARKitNavigationBridge.startNavigation(...)` waiting on a
+    /// promise that could never settle, holding `isProcessingRef` true and
+    /// silently swallowing every later tap.
     private func dismissPresentedController(resolveCancelledNavigation: Bool) {
+        cancelPresentationWatchdog()
+
         let resolver = pendingResolve
         let targetName = activeTargetName
         pendingResolve = nil
@@ -359,31 +471,44 @@ final class ARKitNavigationModule: NSObject {
         keepSessionAlive = false
         ARKitNavigationSession.shared.end()
 
+        let result = ARKitNavigationNativeResult(
+            success: false,
+            reason: resolveCancelledNavigation ? "cancelled" : "superseded",
+            targetName: targetName,
+            routeMapId: nil,
+            routeName: nil,
+            targetWorldPosition: nil,
+            message: resolveCancelledNavigation
+                ? "ARKit navigation cancelled."
+                : "ARKit navigation was replaced by a newer request."
+        ).dictionary()
+
+        // Resolve at most once, whichever path gets there first.
+        var didResolve = false
+        let resolveResult: () -> Void = {
+            guard !didResolve else { return }
+            didResolve = true
+            resolver?(result)
+        }
+
         if let controller = presentedController {
             presentedController = nil
-            controller.dismiss(animated: true) {
-                if resolveCancelledNavigation {
-                    resolver?(ARKitNavigationNativeResult(
-                        success: false,
-                        reason: "cancelled",
-                        targetName: targetName,
-                        routeMapId: nil,
-                        routeName: nil,
-                        targetWorldPosition: nil,
-                        message: "ARKit navigation cancelled."
-                    ).dictionary())
+            // Resolve from the completion, as before: JS reacts to this result
+            // by reclaiming the RN camera, and the AR screen must have finished
+            // going away — and released the camera — before that happens.
+            controller.dismiss(animated: true, completion: resolveResult)
+            // Backstop for the case that made this a hang: UIKit skips the
+            // completion entirely when this controller is not the one actually
+            // presented, and a skipped completion means the JS turn waits on a
+            // promise that can never settle.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) {
+                if !didResolve {
+                    NSLog("[ARKitNavigationModule] dismiss completion never ran — resolving anyway")
+                    resolveResult()
                 }
             }
-        } else if resolveCancelledNavigation {
-            resolver?(ARKitNavigationNativeResult(
-                success: false,
-                reason: "cancelled",
-                targetName: targetName,
-                routeMapId: nil,
-                routeName: nil,
-                targetWorldPosition: nil,
-                message: "ARKit navigation cancelled."
-            ).dictionary())
+        } else {
+            resolveResult()
         }
     }
 
