@@ -861,12 +861,32 @@ enum NavLoc {
         }
     }
 
-    /// Spoken when an attempt times out but the AR session is left searching,
-    /// so asking again continues the same attempt rather than restarting it.
+    /// Opening cue for a leg that starts where the last one ended.
+    ///
+    /// The app has just guided the user to `origin` and confirmed it out loud,
+    /// so opening the next leg with a bare "pan left and right" reads as
+    /// amnesia — a 25 Aug 2026 participant's exact objection ("it knows that it
+    /// was at the destination"). Naming both ends says what it knows and what
+    /// it is doing before it asks the user to do anything.
+    static func relocResumingFromCue(origin: String, destination: String) -> String {
+        switch lang {
+        case .en:
+            return "Starting from \(origin). Finding the route to \(destination) — hold the phone at chest height and pan slowly left and right."
+        case .fr:
+            return "Départ de \(origin). Je cherche le trajet vers \(destination) — tenez le téléphone à hauteur de poitrine et balayez lentement de gauche à droite."
+        }
+    }
+
+    /// Spoken once when a search runs long. It used to end with "ask me again",
+    /// because the automation resolved as a failure at that point and the user
+    /// really did have to re-ask. It no longer does — the search stays live and
+    /// starts the route by itself the moment it lands — so asking the user to
+    /// do anything but keep looking around would be telling them to redo work
+    /// the app is already doing.
     static func relocStillSearchingMessage() -> String {
         switch lang {
-        case .en: return "I have not found your position yet, but I am still looking. Keep walking along the mapped route and ask me again — I will pick up where I left off."
-        case .fr: return "Je n’ai pas encore trouvé votre position, mais je continue de chercher. Continuez le long du trajet cartographié et redemandez-moi — je reprendrai où j’en étais."
+        case .en: return "Still looking for your position. Keep the phone up and keep turning slowly — I will start the route as soon as I find it."
+        case .fr: return "Je cherche encore votre position. Gardez le téléphone levé et continuez à tourner lentement — je lancerai le trajet dès que je l’aurai trouvée."
         }
     }
 

@@ -71,11 +71,23 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     /// waiting user hears instead of a blind "keep panning".
     @Published private(set) var recognizedPlaceName: String?
 
-    let session = ARSession()
+    /// The AR session this manager drives.
+    ///
+    /// A `var` because the return leg of a journey ADOPTS a session instead of
+    /// running one: reaching hands its live, already-relocalized session back
+    /// when it finishes, and `loadMapAndRelocalize` takes ownership of that
+    /// object rather than resetting tracking on a fresh one. See
+    /// `adoptOfferedLiveSession(forMapID:)`.
+    private(set) var session = ARSession()
     /// True while another owner (the reaching session) is driving this session.
     /// Teardown must not pause it then — the point of the handoff is that
     /// reaching inherits tracking that is *already* relocalized.
     private(set) var isSessionHandedOff = false
+    /// Bumped every time `session` is replaced, so the SwiftUI container knows
+    /// to re-point the `ARSCNView` and the coaching overlay at the new object.
+    /// `session` itself cannot be `@Published`: it is read from the session
+    /// delegate queue on every frame.
+    @Published private(set) var sessionRevision = 0
     private let sessionDelegateQueue = DispatchQueue(label: "placefinder.arkit.mapping.session", qos: .userInitiated)
     private let poiRecordsQueue = DispatchQueue(label: "placefinder.arkit.mapping.poi-records", attributes: .concurrent)
     private let imuMotionQueue = DispatchQueue(label: "placefinder.arkit.mapping.imu-motion", attributes: .concurrent)
@@ -420,6 +432,95 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         return session
     }
 
+    /// Takes back a live session reaching finished with, instead of relocalizing.
+    ///
+    /// The one-way handoff was a known, measured cost: every leg after a
+    /// reaching arrival cold-loaded the ARWorldMap and relocalized again, at
+    /// 4.6–11.4 s across the 11 Aug 2026 pilot traces and 36.7 / 39.1 s in the
+    /// 25 Aug lab test — long enough that the automation gave up 0.85 s and
+    /// 2.8 s before ARKit actually landed, so the return route was never built
+    /// at all. This is the other end of `detachLiveSessionForHandoff`: the same
+    /// ARSession object, still tracking in the same map frame, comes back.
+    ///
+    /// ⚠️ The session is NOT re-run. `run()` on a relocalized session reverts
+    /// the world-frame yaw within ~0.2 s (see `upgradeSessionToFullFidelity`),
+    /// which would move every map-frame coordinate sideways by r·θ and defeat
+    /// the whole point of keeping it. It keeps the lean relocalization config
+    /// navigation started it with, and `didUpgradeSessionFidelity` is latched
+    /// so nothing re-runs it later either.
+    ///
+    /// Promotion still goes through the normal confirmation path rather than
+    /// being asserted here: `hasRestoredMapAnchors` is recomputed from
+    /// `frame.anchors` on every frame (NOT accumulated from `session(_:didAdd:)`,
+    /// which would never re-fire for anchors an adopted session already holds),
+    /// so the map's named anchors satisfy the alignment proof immediately and
+    /// the hold clock is the only thing left to run — about a second.
+    ///
+    /// Returns false when there is nothing to adopt, and the caller cold-starts.
+    private func adoptOfferedLiveSession(forMapID mapID: String) -> Bool {
+        guard let adopted = ARLiveSessionHandoff.shared.claim(mapID: mapID) else { return false }
+        guard adopted.configuration != nil, let frame = adopted.currentFrame else {
+            // Offered but dead: it was paused, or never delivered a frame.
+            // Cold-starting is the correct fallback, but this session has no
+            // owner left, so stop it rather than leaving it on the camera.
+            NSLog("🗺️ [ARMapping] Offered session has no live frame — cold relocalization instead")
+            adopted.pause()
+            return false
+        }
+
+        if session !== adopted {
+            // Our own session has never run on a freshly presented screen, so
+            // this is normally a no-op — but a manager that had one going must
+            // not leave it holding the camera next to the adopted one.
+            session.delegate = nil
+            session.pause()
+            session = adopted
+            sessionRevision &+= 1
+        }
+        adopted.delegate = self
+        adopted.delegateQueue = sessionDelegateQueue
+        isSessionHandedOff = false
+        // Reaching ran whatever configuration navigation handed it, which is
+        // already the lean relocalization config. Latching this keeps
+        // `addPOIAnchor`'s on-demand upgrade from re-running the session.
+        didUpgradeSessionFidelity = true
+        fidelityUpgradeAt = nil
+
+        // ⚠️ The confirmation window has to be seeded by hand here.
+        //
+        // `relocalizationNormalSince` — the clock `confirmRelocalizationIfStable`
+        // guards on, and the ONLY thing that opens it — is set from
+        // `cameraDidChangeTrackingState`. Installing a delegate does not replay
+        // that callback, and an adopted session is ALREADY `.normal`: the change
+        // it would be waiting for happened minutes ago and will never happen
+        // again. Without this the screen relocalizes forever against a session
+        // that is already relocalized — a worse hang than the cold path it
+        // replaces, because nothing would ever end it but the total budget.
+        //
+        // Tracking that is merely `.limited` needs no seed: ARKit will report
+        // the transition to `.normal` itself and the usual path takes over.
+        let isTrackingNormally: Bool
+        if case .normal = frame.camera.trackingState { isTrackingNormally = true }
+        else { isTrackingNormally = false }
+        if isTrackingNormally {
+            relocalizationNormalSince = Date()
+            preLocalizationPosition = nil
+        }
+
+        NavigationTrace.shared.log("ar.sessionAdopted", [
+            "mapID": mapID,
+            "mapName": activeMapName ?? NSNull(),
+            "expectedRestoredPOIs": expectedRestoredPOICount,
+            "anchorsInFrame": frame.anchors.count,
+            "namedAnchorsInFrame": frame.anchors.filter { $0.name?.isEmpty == false }.count,
+            "trackingNormal": isTrackingNormally,
+            "worldMappingStatus": Self.describe(frame.worldMappingStatus)
+        ])
+        NSLog("🗺️ [ARMapping] 🤝 Adopted the live session back from reaching — no relocalization needed")
+        statusMessage = "Continuing on the live map."
+        return true
+    }
+
     /// Takes the session back before a mapping/relocalization run. Both entry
     /// points re-run it with `.resetTracking`, so whatever reaching left behind
     /// is discarded — only the delegate has to be re-installed, because the
@@ -591,6 +692,18 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     self.locallyCreatedAnchorIDs.removeAll()
                     self.lastTracedVetoReason = nil
                     self.reclaimSessionAfterHandoff()
+
+                    // The return leg of a journey. Reaching gave its live,
+                    // already-relocalized session back when it finished, so the
+                    // map frame this screen needs is established already and the
+                    // 27–39 s cold relocalization below is pure waste — that is
+                    // the wait the 25 Aug 2026 lab test spent standing at 421
+                    // being coached to turn a full circle. Adopting returns
+                    // early: everything above (POIs, metadata, published state)
+                    // has already been applied and is what the adopted frame is
+                    // read against.
+                    if self.adoptOfferedLiveSession(forMapID: metadata.id) { return }
+
                     let config = self.makeWorldTrackingConfiguration(initialWorldMap: map, lightweight: true)
                     NavigationTrace.shared.log("ar.mapLoaded", [
                         "mapID": metadata.id,
@@ -3755,25 +3868,70 @@ final class ARLiveSessionHandoff: @unchecked Sendable {
     private var heldSession: ARSession?
     private var heldMapID: String?
     private var expiry: DispatchWorkItem?
+    /// Which map each session currently out on loan belongs to.
+    ///
+    /// Whoever finishes with a borrowed session has to say which map it is for
+    /// when offering it back, and the reaching screen has no reason to carry a
+    /// map *id* through its own call chain (it only knows the name). Recording
+    /// it at loan time lets `offerBack` supply it instead.
+    private var loanedMapIDs: [ObjectIdentifier: String] = [:]
 
     /// Long enough for the JS round trip (arrival → announcement → bridge call
     /// → up to 3.6 s of modal-presentation retries), short enough that a
     /// dropped handoff releases the camera promptly.
-    private let holdSeconds: TimeInterval = 25
+    static let arrivalHoldSeconds: TimeInterval = 25
+
+    /// The return leg's budget: reaching finishes, the user hears the result,
+    /// thinks, and only then asks for somewhere else. That gap is human-paced,
+    /// not machine-paced, so it is far longer than the arrival handoff's — and
+    /// the session holds the camera the whole time, which is why it is bounded
+    /// at all. JS releases it explicitly (`stopNavigation`) the moment it needs
+    /// the camera back, so this is only the backstop for a user who walks away.
+    static let returnHoldSeconds: TimeInterval = 120
 
     private init() {}
 
-    func offer(session: ARSession, mapID: String?) {
+    func offer(session: ARSession, mapID: String?, holdSeconds: TimeInterval = ARLiveSessionHandoff.arrivalHoldSeconds) {
         lock.lock()
         expiry?.cancel()
         heldSession = session
         heldMapID = mapID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        loanedMapIDs.removeValue(forKey: ObjectIdentifier(session))
         let work = DispatchWorkItem { [weak self] in self?.expire() }
         expiry = work
         lock.unlock()
         NSLog("🤝 [SessionHandoff] Live session offered for map %@ — held for %.0fs",
               mapID ?? "unknown", holdSeconds)
         DispatchQueue.main.asyncAfter(deadline: .now() + holdSeconds, execute: work)
+    }
+
+    /// Records that `session` was handed to another owner directly, without
+    /// going through `offer`/`claim` — the manual arrival path passes it as a
+    /// call argument. Only so that owner can hand it back by `offerBack`.
+    func noteLoan(session: ARSession, mapID: String?) {
+        let trimmed = mapID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !trimmed.isEmpty else { return }
+        lock.lock()
+        loanedMapIDs[ObjectIdentifier(session)] = trimmed
+        lock.unlock()
+    }
+
+    /// Hands a borrowed session back for the next navigation leg to adopt.
+    ///
+    /// Returns false when this session was never on loan from here, which is
+    /// the caller's signal to pause it as it always did — a session nobody can
+    /// identify a map for is one no navigation leg could safely adopt.
+    @discardableResult
+    func offerBack(session: ARSession, holdSeconds: TimeInterval = ARLiveSessionHandoff.returnHoldSeconds) -> Bool {
+        lock.lock()
+        let mapID = loanedMapIDs.removeValue(forKey: ObjectIdentifier(session))
+        lock.unlock()
+        guard let mapID else {
+            NSLog("🤝 [SessionHandoff] Session offered back but was never loaned from here — not holding it")
+            return false
+        }
+        offer(session: session, mapID: mapID, holdSeconds: holdSeconds)
+        return true
     }
 
     /// Takes the offered session, if one is waiting and it belongs to the map
@@ -3795,7 +3953,14 @@ final class ARLiveSessionHandoff: @unchecked Sendable {
         expiry = nil
         heldSession = nil
         heldMapID = nil
-        NSLog("🤝 [SessionHandoff] ✅ Reaching claimed the live navigation session")
+        // Remember which map it is for, so the claimant can offer it back
+        // without carrying the id through its own call chain.
+        if !held.isEmpty {
+            loanedMapIDs[ObjectIdentifier(session)] = held
+        } else if !wanted.isEmpty {
+            loanedMapIDs[ObjectIdentifier(session)] = wanted
+        }
+        NSLog("🤝 [SessionHandoff] ✅ Live navigation session claimed")
         return session
     }
 

@@ -12,6 +12,7 @@
  */
 
 import { Vibration, Platform } from 'react-native';
+import { earcons } from '../a11y/earcons';
 //old :import { speachesTTS } from './speachesTtsClient';
 import { iOSTts } from './iOSTtsClient';
 import { AccessibilityService } from './AccessibilityService';
@@ -48,9 +49,19 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
       cancel: [75, 100, 75],
     };
 
+    // This path predates `src/a11y/earcons`, which owns haptics now and honours
+    // both the "Sound & Vibration Cues" setting and the native-AR-screen mute.
+    // These calls honoured neither, so they were the one vibration source a
+    // user could not turn off and this code could not account for. Delegating
+    // the gate keeps the two in step without rewriting the callers.
+    if (!earcons.hapticsAllowed()) {
+      console.log(`📳 Haptic suppressed: ${state}`);
+      return;
+    }
+
     try {
       const pattern = patterns[state];
-      
+
       if (!pattern) {
         console.warn(`⚠️ Unknown earcon state: ${state}`);
         return;
@@ -58,7 +69,7 @@ playEarcon(state: 'ready' | 'listening' | 'thinking' | 'speaking' | 'error' | 'c
 
       Vibration.vibrate(pattern);
       console.log(`📳 Haptic: ${state}`);
-      
+
     } catch (error: any) {
       // WCAG 3.3.1: Don't crash on vibration errors
       console.warn('⚠️ Vibration not available:', error.message);

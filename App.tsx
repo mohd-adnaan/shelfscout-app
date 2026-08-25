@@ -59,21 +59,26 @@ import {
   stopSpatialAudio,
 } from './src/native/SpatialAudio';
 import { VoiceVisualizer } from './src/components/VoiceVisualizer';
+import { ActionMenu, MenuActionId } from './src/components/ActionMenu';
+import { ActivityOverlay } from './src/components/ActivityOverlay';
+import { GearIcon } from './src/components/MenuIcons';
+import { DestinationPicker } from './src/components/DestinationPicker';
+import Announcer from './src/a11y/Announcer';
+import earcons from './src/a11y/earcons';
+import { canonicalizeMenuCommand } from './src/a11y/menuCommands';
 import {
   initSounds,
   releaseSounds,
-  playListenSound,
   stopListenSound,
   playThinkingStarted,
   stopLatencyLoop,
-  playSuccessChime,
   playErrorSound,
   prepareForRecording,
   configurePlaybackSession,
   setWearablesMode,
+  setScreenReaderMode,
   playStopReachingSound,
 } from './src/utils/soundEffects';
-import { audioFeedback } from './src/services/AudioFeedbackService';
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
 import { CONFIG, NAVIGATION_CONFIG, DETECTION_URL, ACQUISITION_URL } from './src/utils/constants';
 import { WATCHDOG_TIMEOUTS, nativeCall, withTimeout } from './src/utils/asyncWatchdog';
@@ -364,6 +369,32 @@ function AppInner(): React.JSX.Element {
   const [showSettings, setShowSettings] = useState(false);
   const [showStartupLoader, setShowStartupLoader] = useState(true);
 
+  // ── Menu-driven interaction ────────────────────────────────────────────
+  //
+  // `homeView` is only meaningful while the app is idle; once a turn starts,
+  // the active view takes over regardless. Keeping it separate from the
+  // busy-state flags means returning to idle always lands the user back on
+  // the surface they left, which is what makes the app feel like it has
+  // places rather than modes.
+  const [homeView, setHomeView] = useState<'menu' | 'destinations'>('menu');
+  /**
+   * Which menu row opened the microphone, or null when the user started
+   * listening without choosing an action first.
+   *
+   * This is the whole reliability story for the two voice-driven rows. When
+   * the user has already said "Find an object" by pressing a button, the
+   * transcript no longer has to carry that intent — it only has to carry the
+   * object name. So the transcript is wrapped in a canonical command before
+   * it reaches the pipeline, and the classifier sees an unambiguous sentence
+   * built around a single unknown word instead of having to infer the whole
+   * request from speech.
+   */
+  const [pendingAction, setPendingAction] = useState<MenuActionId | null>(null);
+  /** Latest spoken answer, so "Repeat that" needs neither network nor model. */
+  const [lastAnswer, setLastAnswer] = useState<string | null>(null);
+  /** Human-readable description of the running turn, shown in ActivityOverlay. */
+  const [activityStatus, setActivityStatus] = useState<string>('');
+
   // ── Settings ───────────────────────────────────────────────────────────────
   const { settings, resolveReachingPipeline, resolveNavigationPipeline } = useSettings();
   // Ref always holds the latest settings — avoids stale closure in useCallback
@@ -459,6 +490,10 @@ function AppInner(): React.JSX.Element {
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
   const screenReaderEnabledRef = useRef(false);
+  // handleVoiceCommand and handleAutoSubmit are []-memoized and read
+  // everything through refs, so the menu state needs mirrors too.
+  const pendingActionRef = useRef<MenuActionId | null>(null);
+  const lastAnswerRef = useRef<string | null>(null);
 
   // ── Turn watchdog ──────────────────────────────────────────────────────────
   // `isProcessingRef` and `isCapturingPhotoRef` gate ALL user input: while
@@ -579,31 +614,60 @@ function AppInner(): React.JSX.Element {
     return () => clearTimeout(timer);
   }, []);
 
+  // ── Menu-state mirrors ─────────────────────────────────────────────────
+  useEffect(() => { pendingActionRef.current = pendingAction; }, [pendingAction]);
+  useEffect(() => { lastAnswerRef.current = lastAnswer; }, [lastAnswer]);
+
   // ── Accessibility ──────────────────────────────────────────────────────────
+  //
+  // Screen-reader state is now published to three places, not one:
+  //   • React state / ref, as before, for render and gating decisions;
+  //   • Announcer, which switches to queued announcements so speech never
+  //     interrupts VoiceOver or eats the user's next double-tap;
+  //   • soundEffects, which switches the audio session from exclusive to
+  //     mixable so sound cues can play *alongside* VoiceOver rather than
+  //     being suppressed.
+  //
+  // All three must move together. A VoiceOver toggle mid-session that updated
+  // only some of them would leave the app in the state this work exists to
+  // remove: a blind user with the cues turned off.
+  const applyScreenReaderState = useCallback((enabled: boolean) => {
+    setScreenReaderEnabled(enabled);
+    screenReaderEnabledRef.current = enabled;
+    Announcer.setScreenReaderEnabled(enabled);
+    setScreenReaderMode(enabled);
+  }, []);
+
   useEffect(() => {
+    Announcer.initialize();
+
     (async () => {
       try {
         const [sr, rm] = await Promise.all([
           AccessibilityInfo.isScreenReaderEnabled(),
           AccessibilityInfo.isReduceMotionEnabled(),
         ]);
-        setScreenReaderEnabled(sr);
-        screenReaderEnabledRef.current = sr;
+        applyScreenReaderState(sr);
         setReduceMotionEnabled(rm);
-        // NOTE: Do NOT announce here — VoiceOver will read the button's
-        // accessibilityLabel automatically when focus lands on it.
-        // A programmatic announcement creates double-speech:
-        // "CyberSight is ready tap to speak button tap to start speaking"
+        // NOTE: Do NOT announce here — VoiceOver will read the focused
+        // element's accessibilityLabel automatically. A programmatic
+        // announcement on top of that is the double-speech the Announcer's
+        // `duplicatesFocusedLabel` option exists to suppress.
       } catch (e) { console.error('❌ Accessibility check:', e); }
     })();
 
     const srSub = AccessibilityInfo.addEventListener('screenReaderChanged', (enabled: boolean) => {
-      setScreenReaderEnabled(enabled);
-      screenReaderEnabledRef.current = enabled;
+      applyScreenReaderState(enabled);
     });
     const rmSub = AccessibilityInfo.addEventListener('reduceMotionChanged', setReduceMotionEnabled);
-    return () => { srSub?.remove(); rmSub?.remove(); };
-  }, []);
+    return () => { srSub?.remove(); rmSub?.remove(); Announcer.teardown(); };
+  }, [applyScreenReaderState]);
+
+  // ── Sound cue preferences ──────────────────────────────────────────────
+  useEffect(() => {
+    earcons.setHapticsEnabled(settings.soundCues);
+    earcons.setWearablesMode(settings.useWearablesCamera || !settings.soundCues);
+  }, [settings.soundCues, settings.useWearablesCamera]);
 
   // ── Sound Check ──────────────────────────────────────────────────────────
   useEffect(() => {
@@ -754,11 +818,11 @@ function AppInner(): React.JSX.Element {
       'or restart the Meta AI app and try again.';
     const spoken = raw && raw.length < 200 ? raw : fallback;
 
-    if (!screenReaderEnabledRef.current) {
-      audioFeedback.playEarcon('cancel');
-      await playErrorSound();
-    }
-    AccessibilityInfo.announceForAccessibility(spoken);
+    // Unconditional: this is a hard failure, and the user who cannot see the
+    // "glasses disconnected" state on screen is the one who most needs to hear
+    // that something broke rather than that nothing happened.
+    await earcons.playAndWait('error');
+    Announcer.announceStatus(spoken);
     if (screenReaderEnabledRef.current) {
       return;
     }
@@ -769,7 +833,7 @@ function AppInner(): React.JSX.Element {
   //
   // When VoiceOver is ON, the button's accessibilityLabel is automatically
   // read aloud on every state change (Ready → Listening → Thinking → ...).
-  // Calling AccessibilityInfo.announceForAccessibility() with text that
+  // Calling Announcer.announceStatus() with text that
   // duplicates the label produces two simultaneous utterances → user hears
   // double voice / echo / cut-off.
   //
@@ -779,33 +843,24 @@ function AppInner(): React.JSX.Element {
   // to handleScreenTap). That's why VoiceOver users need many taps to act.
   //
   // Use this helper everywhere the announcement duplicates the label.
-  // For genuinely-new info (errors, guidance text) just call the regular
-  // API directly — VoiceOver SHOULD speak those.
+  // For genuinely-new info (errors, guidance text) use Announcer directly —
+  // VoiceOver SHOULD speak those, and Announcer now queues them so they no
+  // longer reset VoiceOver's queue or consume the next gesture.
+  //
+  // Both helpers now delegate rather than branching locally, so there is a
+  // single output channel with a single set of rules. `duplicatesFocusedLabel`
+  // is precisely what they were expressing by hand.
   // ────────────────────────────────────────────────────────────────────────
   const announceIfNoVoiceOver = useCallback((message: string) => {
-    if (screenReaderEnabledRef.current) {
-      // VoiceOver will read the label change automatically; do nothing.
-      return;
-    }
-    AccessibilityInfo.announceForAccessibility(message);
+    Announcer.announce(message, { duplicatesFocusedLabel: true });
   }, []);
 
   const announceTapToStart = useCallback((prefix: string) => {
-    // ── Bug 1 fix: When VoiceOver is on, do NOT announce here. ───────
-    // VoiceOver will automatically read the button's accessibilityLabel
-    // when focus returns to it. A programmatic announcement creates
-    // overlapping speech: VoiceOver reads the label AND speaks the
-    // announcement simultaneously.
-    if (screenReaderEnabledRef.current) {
-      // Just log — VoiceOver reads the label automatically.
-      console.log('♿ [announceTapToStart] Skipping (VoiceOver reads label)');
-      return;
-    }
     const suffix = 'Tap to speak.';
     const trimmedPrefix = prefix.trim();
-    AccessibilityInfo.announceForAccessibility(
-      trimmedPrefix ? `${trimmedPrefix} ${suffix}` : suffix
-    );
+    Announcer.announce(trimmedPrefix ? `${trimmedPrefix} ${suffix}` : suffix, {
+      duplicatesFocusedLabel: true,
+    });
   }, []);
 
   // ────────────────────────────────────────────────────────────────────────
@@ -895,10 +950,8 @@ function AppInner(): React.JSX.Element {
 
     lastPostureWarningRef.current = now;
 
-    if (!screenReaderEnabledRef.current) {
-      audioFeedback.playEarcon('error');
-    }
-    AccessibilityInfo.announceForAccessibility(message);
+    earcons.play('error');
+    Announcer.announceStatus(message);
 
     if (!screenReaderEnabledRef.current) {
       if (context === 'continuous') {
@@ -1024,6 +1077,17 @@ function AppInner(): React.JSX.Element {
 
     const captureBody = (async (): Promise<string> => {
       try {
+        // An AR session left alive for the next navigation leg is holding the
+        // camera. Whatever this capture is for, it is not that leg, so let the
+        // session go before asking for the device — two owners means one of
+        // them silently gets nothing, and it is always this one.
+        if (arSessionAliveRef.current) {
+          console.log('📷 Releasing the warm AR session before capture');
+          earcons.setNativeSessionActive(false);
+          arSessionAliveRef.current = false;
+          try { await ARKitNavigationBridge.stopNavigation(); } catch { }
+        }
+
         console.log('📷 Reactivating camera for capture...');
         setIsCameraActive(true);
 
@@ -1552,7 +1616,7 @@ function AppInner(): React.JSX.Element {
     if (!spoken || isEmergencyStopped.current) return;
 
     if (screenReaderEnabledRef.current) {
-      AccessibilityInfo.announceForAccessibility(spoken);
+      Announcer.announceStatus(spoken);
       const waitMs = Math.min(6500, Math.max(1200, spoken.length * 55));
       await new Promise<void>(resolve => setTimeout(() => resolve(), waitMs));
       return;
@@ -1605,12 +1669,15 @@ function AppInner(): React.JSX.Element {
       console.log('◎ [SpatialTarget] Launching native reaching for:', targetName);
       prewarmDAv2InBackground('spatial target reaching');
 
-      AccessibilityInfo.announceForAccessibility(strings().reaching.guidingTo(targetName));
+      Announcer.announceStatus(strings().reaching.guidingTo(targetName));
 
       setIsCameraActive(false);
       setIsReaching(true);
       await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
 
+      // Same reason as the navigation launch: the reaching screen owns all
+      // feedback while it is up, so this layer must not buzz from behind it.
+      earcons.setNativeSessionActive(true);
       try {
         const { ReachingModule } = NativeModules;
         if (ReachingModule?.startSpatialTargetReaching) {
@@ -1645,6 +1712,7 @@ function AppInner(): React.JSX.Element {
           }
 
           const reachingResult = await reachingPromise;
+          earcons.setNativeSessionActive(false);
           console.log('✅ [SpatialTarget] Native result:', reachingResult);
 
           if (
@@ -1654,6 +1722,17 @@ function AppInner(): React.JSX.Element {
             await playStopReachingSound();
           }
 
+          // Reaching inherited the navigation session at arrival and, when it
+          // is still tracking at the end, hands it back instead of pausing it.
+          // That is what lets the NEXT destination skip relocalization — the
+          // step that took 36.7 s and 39.1 s from a destination in the 25 Aug
+          // 2026 lab test, longer than the automation was willing to wait, so
+          // the return route was never built at all.
+          //
+          // It is also still holding the camera, so the RN camera has to stay
+          // off until something releases it (see reactivateCameraAndCapture).
+          arSessionAliveRef.current = reachingResult?.sessionAlive === true;
+
           const msg = reachingResult?.reason === 'user_confirmed'
             ? 'Reaching complete.'
             : reachingResult?.success
@@ -1661,10 +1740,10 @@ function AppInner(): React.JSX.Element {
               : reachingResult?.reason === 'spatial_relocalization_timeout'
                 ? strings().reaching.relocalizationTimeout
                 : strings().reaching.ended;
-          AccessibilityInfo.announceForAccessibility(msg);
+          Announcer.announceStatus(msg);
         } else {
           console.warn('⚠️ startSpatialTargetReaching not available — native module not linked');
-          AccessibilityInfo.announceForAccessibility(strings().reaching.spatialTargetUnavailable);
+          Announcer.announceCritical(strings().reaching.spatialTargetUnavailable);
         }
       } catch (e: any) {
         console.error('❌ [SpatialTarget] Native module error:', e);
@@ -1674,14 +1753,18 @@ function AppInner(): React.JSX.Element {
           : code === 'MAP_NOT_FOUND'
             ? strings().reaching.mapNotFound
             : strings().reaching.error(e.message || strings().reaching.unknownError);
-        AccessibilityInfo.announceForAccessibility(message);
+        Announcer.announceStatus(message);
       }
 
+      earcons.setNativeSessionActive(false);
       resetSessionId();
       setIsReaching(false);
-      setIsCameraActive(true);
+      // A live AR session handed back for the next leg is still on the camera.
+      // Turning the RN camera on here would fight it for the device — the same
+      // reason the no-reaching-object arrival leaves it off.
+      setIsCameraActive(!arSessionAliveRef.current);
       setIsProcessing(false);
-      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      earcons.play('ready');
       announceTapToStart('Ready.');
       return true;
     }
@@ -1711,7 +1794,7 @@ function AppInner(): React.JSX.Element {
         result.object || strings().reaching.defaultObjectName,
       );
       if (screenReaderEnabledRef.current) {
-        AccessibilityInfo.announceForAccessibility(noBboxMessage);
+        Announcer.announceCritical(noBboxMessage);
         await new Promise<void>(resolve => setTimeout(() => resolve(), 3500));
       } else {
         await speachesSentenceChunker.synthesizeSpeechChunked(noBboxMessage);
@@ -1719,7 +1802,7 @@ function AppInner(): React.JSX.Element {
       setIsSpeaking(false);                // ← release speaking guard
       // Clean transition to ready (matches the ARKit-success path below)
       setIsCameraActive(true);
-      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      earcons.play('ready');
       announceTapToStart('Ready.');
       return true; // Handled (but without ARKit)
     }
@@ -1727,14 +1810,14 @@ function AppInner(): React.JSX.Element {
     console.log('🎯 [ARKit] Launching native reaching for:', result.object, 'bbox:', bbox);
     prewarmDAv2InBackground('reaching_ios response');
 
-    AccessibilityInfo.announceForAccessibility(
-      strings().reaching.guidingTo(result.object || strings().reaching.defaultObjectName),
-    );
+    Announcer.announceStatus(strings().reaching.guidingTo(result.object || strings().reaching.defaultObjectName),);
 
     setIsCameraActive(false);
     setIsReaching(true);
     await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
 
+    // The native reaching screen owns feedback while it is up.
+    earcons.setNativeSessionActive(true);
     try {
       const { ReachingModule } = NativeModules;
       if (ReachingModule?.startReaching) {
@@ -1792,20 +1875,21 @@ function AppInner(): React.JSX.Element {
           : reachingResult?.success
             ? strings().reaching.reached(result.object || strings().reaching.defaultObjectName)
             : strings().reaching.ended;
-        AccessibilityInfo.announceForAccessibility(msg);
+        Announcer.announceStatus(msg);
       } else {
         console.warn('⚠️ ReachingModule not available — native module not linked');
-        AccessibilityInfo.announceForAccessibility(strings().reaching.moduleUnavailable);
+        Announcer.announceCritical(strings().reaching.moduleUnavailable);
       }
     } catch (e: any) {
       console.error('❌ [ARKit] Native module error:', e);
-      AccessibilityInfo.announceForAccessibility(strings().reaching.error(e.message || strings().reaching.unknownError));
+      Announcer.announceCritical(strings().reaching.error(e.message || strings().reaching.unknownError));
     }
 
+    earcons.setNativeSessionActive(false);
     resetSessionId();
     setIsReaching(false);
     setIsCameraActive(true);
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+    earcons.play('ready');
     announceTapToStart('Ready.');
     return true;
   }, [announceTapToStart, resolveReachingPipeline]);
@@ -1870,7 +1954,7 @@ function AppInner(): React.JSX.Element {
       }
 
       if (shouldPreventInfiniteLoop()) {
-        AccessibilityInfo.announceForAccessibility(strings().speech.stoppedTimeLimit);
+        Announcer.announceCritical(strings().speech.stoppedTimeLimit);
         break;
       }
 
@@ -2400,11 +2484,10 @@ function AppInner(): React.JSX.Element {
         continuousTtsSpeakingRef.current = false;
         continuousTtsGenerationRef.current++;
         await stopLatencyLoop();
-        if (!screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera) {
-          audioFeedback.playEarcon('cancel');
-          await playErrorSound();
+        if (!settingsRef.current.useWearablesCamera) {
+          await earcons.playAndWait('error');
         }
-        AccessibilityInfo.announceForAccessibility(`Error: ${error.message}`);
+        Announcer.announceCritical(`Error: ${error.message}`);
         break;
       }
     }
@@ -2430,7 +2513,7 @@ function AppInner(): React.JSX.Element {
     setIsProcessing(false);
     setIsSpeaking(false);
     setIsCameraActive(true);
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+    earcons.play('ready');
     announceTapToStart('Ready.');
 
     // Resume wake word listening if in glasses mode
@@ -2487,7 +2570,7 @@ function AppInner(): React.JSX.Element {
       setIsNavigation(false);
       setIsProcessing(false);
       setIsCameraActive(true);
-      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      earcons.play('ready');
       announceTapToStart('Ready.');
       return true;
     }
@@ -2522,7 +2605,7 @@ function AppInner(): React.JSX.Element {
         setIsNavigation(false);
         setIsProcessing(false);
         setIsCameraActive(true);
-        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        earcons.play('ready');
         announceTapToStart('Ready.');
         return true;
       }
@@ -2604,10 +2687,16 @@ function AppInner(): React.JSX.Element {
       keepSessionAlive:
         resolveReachingPipeline({ reaching_ios: true, reaching: true }) === 'spatialTarget',
     };
+    // The native screen is about to cover the RN UI and owns every cue until
+    // it comes back. Muting this layer's earcons for that window is what stops
+    // a soundless "ready"/"error" haptic reaching the user as an unexplained
+    // buzz mid-walk.
+    earcons.setNativeSessionActive(true);
     try {
       // A previous leg that arrived without a reaching handoff left the AR
-      // session mounted and localized. Continuing on it is what makes a
-      // destination-to-destination hop skip relocalization — the step that
+      // session mounted and localized — or reaching handed its session back
+      // when it finished. Continuing on either is what makes a
+      // destination-to-destination hop skip relocalization: the step that
       // fails when the user stands at a destination facing the way they came.
       navResult = arSessionAliveRef.current
         ? await ARKitNavigationBridge.continueNavigation(navConfig)
@@ -2619,6 +2708,8 @@ function AppInner(): React.JSX.Element {
         targetName,
         message: e?.message || 'ARKit navigation ended with an error.',
       };
+    } finally {
+      earcons.setNativeSessionActive(false);
     }
 
     arSessionAliveRef.current = navResult?.sessionAlive === true;
@@ -2646,13 +2737,19 @@ function AppInner(): React.JSX.Element {
       setIsNavigation(false);
       setIsSpeaking(false);
 
-      await speakContinuousSpeechAndWait(
-        navResult.message ||
-          (reachingObjectName
-            ? strings().navigation.arrivedSwitchingToReaching(targetName, reachingObjectName)
-            : strings().navigation.arrivedAt(targetName)),
-        { ignoreAbort: true },
-      );
+      // Native holds its own screen open until "Arrived at X" has finished
+      // being spoken, then reports `messageSpoken`. Repeating it here is what
+      // truncated it: the second start interrupts the first, and the user is
+      // handed to reaching without ever hearing that they arrived.
+      if (!navResult.messageSpoken) {
+        await speakContinuousSpeechAndWait(
+          navResult.message ||
+            (reachingObjectName
+              ? strings().navigation.arrivedSwitchingToReaching(targetName, reachingObjectName)
+              : strings().navigation.arrivedAt(targetName)),
+          { ignoreAbort: true },
+        );
+      }
 
       if (isEmergencyStopped.current) {
         setIsReaching(false);
@@ -2683,7 +2780,7 @@ function AppInner(): React.JSX.Element {
           setIsReaching(false);
           setIsProcessing(false);
           setIsCameraActive(true);
-          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          earcons.play('ready');
           announceTapToStart('Ready.');
         }
 
@@ -2700,7 +2797,7 @@ function AppInner(): React.JSX.Element {
         // device. Leave it off and let the next destination continue on the
         // live session (or an explicit stop tear it down).
         setIsCameraActive(!arSessionAliveRef.current);
-        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        earcons.play('ready');
         announceTapToStart('Ready.');
         return true;
       }
@@ -2714,14 +2811,16 @@ function AppInner(): React.JSX.Element {
         setIsReaching(false);
         setIsProcessing(false);
         setIsCameraActive(true);
-        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        earcons.play('ready');
         announceTapToStart('Ready.');
         return true;
       }
 
-      const shouldPlaySFX = !screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera;
-      if (shouldPlaySFX) {
-        playThinkingStarted();
+      // Glasses mode is the only reason to stay silent here; see the note in
+      // handleVoiceCommand. A VoiceOver user waiting on object detection needs
+      // this cue more than anyone, not less.
+      if (!settingsRef.current.useWearablesCamera) {
+        earcons.play('thinking');
       }
 
       let reachingResult: any;
@@ -2761,7 +2860,7 @@ function AppInner(): React.JSX.Element {
         setIsReaching(false);
         setIsProcessing(false);
         setIsCameraActive(true);
-        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        earcons.play('ready');
         announceTapToStart('Ready.');
         return true;
       }
@@ -2794,7 +2893,7 @@ function AppInner(): React.JSX.Element {
         setIsReaching(false);
         setIsProcessing(false);
         setIsCameraActive(true);
-        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        earcons.play('ready');
         announceTapToStart('Ready.');
       }
 
@@ -2860,7 +2959,7 @@ function AppInner(): React.JSX.Element {
     setIsReaching(false);
     setIsProcessing(false);
     setIsSpeaking(false);
-    if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+    earcons.play('ready');
     announceTapToStart('Ready.');
     return true;
   }, [
@@ -2892,6 +2991,9 @@ function AppInner(): React.JSX.Element {
     // Kill the spatial cue on the interrupt itself. Waiting for the loop's
     // cleanup block would leave it beeping through the in-flight request.
     await stopTrackerSensors();
+    // The native screen is coming down, and the stop confirmation this path is
+    // about to play is the one cue a user who just interrupted must hear.
+    earcons.setNativeSessionActive(false);
     arSessionAliveRef.current = false;
     try { await ARKitNavigationBridge.stopNavigation(); } catch { }
 
@@ -2912,11 +3014,13 @@ function AppInner(): React.JSX.Element {
     isContinuousModeRunning.current = false;
     setIsCameraActive(true);
 
-    if (!screenReaderEnabledRef.current) { 
-      audioFeedback.playEarcon('cancel'); 
-      if (wasContinuous) {
-        await playStopReachingSound();
-      }
+    // The mode-exit cue is the answer to "did my stop actually land?" — the
+    // single most-asked question in the pilot sessions, and one VoiceOver
+    // cannot answer while the screen it would read is being torn down.
+    if (wasContinuous) {
+      await earcons.playAndWait('modeExit');
+    } else {
+      earcons.play('ready');
     }
     announceTapToStart('Stopped.');
   }, [announceTapToStart, isNavigation, isReaching, resetContinuousSpeechQueue, stopRtabFeed, stopTrackerSensors]);
@@ -2924,6 +3028,9 @@ function AppInner(): React.JSX.Element {
   const stopNavigation = useCallback(async () => {
     navigationLoopAbortRef.current = true;
     stopRtabFeed();
+    // The native screen is coming down, and the stop confirmation this path is
+    // about to play is the one cue a user who just interrupted must hear.
+    earcons.setNativeSessionActive(false);
     arSessionAliveRef.current = false;
     try { await ARKitNavigationBridge.stopNavigation(); } catch { }
     if (abortControllerRef.current) { abortControllerRef.current.abort(); abortControllerRef.current = null; }
@@ -2937,18 +3044,46 @@ function AppInner(): React.JSX.Element {
     setIsSpeaking(false);
     isNavigationLoopRunning.current = false;
     setIsCameraActive(true);
-    if (!screenReaderEnabledRef.current) { 
-      audioFeedback.playEarcon('cancel'); 
-      await playStopReachingSound();
-    }
+    await earcons.playAndWait('modeExit');
     announceTapToStart('Navigation stopped.');
   }, [announceTapToStart, resetContinuousSpeechQueue, stopRtabFeed]);
 
   // ============================================================================
   // Handle Voice Command  ← defined BEFORE handleAutoSubmit so ref is stable
   // ============================================================================
-  const handleVoiceCommand = useCallback(async (command: string, photoPath: string) => {
+  const handleVoiceCommand = useCallback(async (rawCommand: string, photoPath: string) => {
     if (isProcessingRef.current || isEmergencyStopped.current) return;
+
+    // ── Canonicalize a menu-driven request ────────────────────────────────
+    //
+    // When the user reached this turn through a menu row, the intent is
+    // already known — they pressed a button that says so — and only the
+    // argument had to be spoken. Wrapping the transcript in a fixed sentence
+    // hands the classifier a request whose shape is constant and whose only
+    // variable is the object name.
+    //
+    // This matters more than it looks. "Cereal" on its own is an utterance the
+    // classifier has to guess at, and the intent prompt's own rules send a
+    // bare noun to `chat` — so pressing "Find an object" and saying "cereal"
+    // used to return a *description* of the cereal rather than guidance to it.
+    // "Guide my hand to the cereal" cannot route anywhere else.
+    //
+    // The row is consumed here rather than at the button, because the user can
+    // abandon a listening session and the next one must not inherit an intent
+    // they never re-chose.
+    const menuAction = pendingActionRef.current;
+    pendingActionRef.current = null;
+    const command =
+      menuAction === 'find'
+        ? canonicalizeMenuCommand(
+          rawCommand,
+          strings().commands.findObject,
+          getAppLanguage(),
+        )
+        : rawCommand;
+    if (menuAction) {
+      console.log(`🎛️ [menu] "${rawCommand}" → "${command}" (row: ${menuAction})`);
+    }
 
     if (isContinuousModeActive()) {
       const sid = resetSessionId();
@@ -2975,32 +3110,50 @@ function AppInner(): React.JSX.Element {
       );
       markTurnProgressRef.current('stt cancelled');
 
-      // Skip earcons/SFX when VoiceOver is on — audio session conflicts.
-      // Also skip in glasses mode — the audio session is locked by BluetoothHFP
-      // for the glasses mic. Playing sounds via react-native-sound calls
-      // Sound.setCategory('Playback') which corrupts the HFP session, leaving
-      // the latency sound in a zombie state that s.stop() can't silence.
-      const shouldPlaySFX = !screenReaderEnabledRef.current && !settingsRef.current.useWearablesCamera;
-      if (shouldPlaySFX) {
+      // ── Audio session vs. sound cues: two different questions ──────────
+      //
+      // These used to be one flag, and collapsing them is why blind users
+      // heard nothing. They are not the same decision:
+      //
+      //   • configurePlaybackSession() takes the audio session EXCLUSIVELY
+      //     (setActive(true) on .playAndRecord). That genuinely does interrupt
+      //     VoiceOver, so it stays gated — VoiceOver's own session is already
+      //     configured for output and does not need our help.
+      //
+      //   • The cues themselves now request a MIXABLE session (see
+      //     setScreenReaderMode in utils/soundEffects.ts), so they play
+      //     alongside VoiceOver instead of fighting it. Suppressing them was
+      //     collateral damage from sharing a flag with the line above.
+      //
+      // Glasses mode still suppresses both: BluetoothHFP owns the session for
+      // the glasses microphone, and any setCategory call corrupts it, leaving
+      // the latency loop in a zombie state that .stop() cannot silence.
+      const wearablesActive = settingsRef.current.useWearablesCamera;
+      const canTakeExclusiveSession = !screenReaderEnabledRef.current && !wearablesActive;
+      const shouldPlaySFX = !wearablesActive;
+
+      if (canTakeExclusiveSession) {
         // FIX: Restore full-volume audio session after STT's Record+Measurement
         //
         // Bounded: an AVAudioSession category switch can block indefinitely
         // when another process (or the glasses' HFP link) holds the session.
         // Losing the earcon is a cosmetic failure; hanging here was a fatal one.
         await nativeCall(
-          () => configurePlaybackSession(!settingsRef.current.useWearablesCamera),
+          () => configurePlaybackSession(!wearablesActive),
           WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
           'configurePlaybackSession',
           undefined,
         );
+      }
 
+      if (shouldPlaySFX) {
         await nativeCall(
           () => stopListenSound(),
           WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
           'stopListenSound',
           undefined,
         );
-        playThinkingStarted();
+        earcons.play('thinking');
       }
       markTurnProgressRef.current('audio session ready');
 
@@ -3014,7 +3167,7 @@ function AppInner(): React.JSX.Element {
         }
 
         console.warn('⚠️ No photo — voice-only mode');
-        AccessibilityInfo.announceForAccessibility(strings().speech.processingWithoutPhoto);
+        Announcer.announceStatus(strings().speech.processingWithoutPhoto);
       }
 
       if (isEmergencyStopped.current) return;
@@ -3069,11 +3222,19 @@ function AppInner(): React.JSX.Element {
       setIsProcessing(false);
       let introSpeechPromise: Promise<void> | undefined;
       if (result.text) {
+        // Retained so "Repeat that" can replay it with no network, no model,
+        // and no camera. Blind users ask for a repeat constantly — an answer
+        // heard once, over a PA system or a passing trolley, is an answer half
+        // received — and until now the only way to get one was to run the
+        // entire pipeline again and hope it returned the same thing.
+        lastAnswerRef.current = result.text;
+        setLastAnswer(result.text);
         setIsSpeaking(true);
-        // Skip earcon when VoiceOver is on — it would overlap with TTS response
-        if (!screenReaderEnabledRef.current) {
-          audioFeedback.playEarcon('speaking');
-        }
+        // Haptic only under VoiceOver: an answer is about to be spoken, and a
+        // chime immediately before speech is the one cue that genuinely does
+        // collide with it. The buzz says "answer incoming" without competing
+        // for the same channel the answer arrives on.
+        earcons.play(screenReaderEnabledRef.current ? 'ready' : 'success');
 
         // ── Bug 1 fix: When VoiceOver is on, wait for VoiceOver to ─────
         // finish speaking its 'Thinking' announcement before starting TTS.
@@ -3086,7 +3247,11 @@ function AppInner(): React.JSX.Element {
         introSpeechPromise = (
           screenReaderEnabledRef.current
             ? new Promise<void>(resolve => {
-              AccessibilityInfo.announceForAccessibility(result.text);
+              // `force`: an answer must always be spoken. Asking the same
+              // question twice and getting the same answer is a legitimate
+              // repeat, and the duplicate filter would eat the second one —
+              // leaving the user with a turn that appears to have done nothing.
+              Announcer.announce(result.text, { priority: 'status', force: true });
               setTimeout(resolve, Math.min(6500, Math.max(1200, result.text.length * 55)));
             })
             : speachesSentenceChunker.synthesizeSpeechChunked(result.text)
@@ -3180,7 +3345,7 @@ function AppInner(): React.JSX.Element {
 
       // ── Normal (no continuous mode) ────────────────────────────────────
       setIsCameraActive(true);
-      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      earcons.play('ready');
       announceTapToStart('Ready.');
 
       // Resume wake word listening if in glasses mode
@@ -3205,23 +3370,20 @@ function AppInner(): React.JSX.Element {
         console.error('❌ Error detail:', error?.message, error?.code);
 
         await stopLatencyLoop();
-        if (!screenReaderEnabledRef.current) {
-          audioFeedback.playEarcon('cancel');
-          // FIX: await the error sound so AVSpeechSynthesizer can't steal
-          // the audio session mid-playback and cut the sound short.
-          // The sound's natural duration replaces the old 600ms timeout.
-          await playErrorSound();
-        }
+        // Awaited so AVSpeechSynthesizer cannot steal the audio session
+        // mid-playback and cut the cue short; the sound's natural duration
+        // replaces the old 600ms timeout.
+        await earcons.playAndWait('error');
 
         const errorMessage = strings().speech.requestFailed;
         if (screenReaderEnabledRef.current) {
-          AccessibilityInfo.announceForAccessibility(errorMessage);
+          Announcer.announceCritical(errorMessage);
         } else {
           await speachesSentenceChunker.synthesizeSpeechChunked(errorMessage);
         }
 
         setIsCameraActive(true);
-        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        earcons.play('ready');
         announceTapToStart('Ready.');
 
         // Resume wake word listening if in glasses mode
@@ -3277,7 +3439,7 @@ function AppInner(): React.JSX.Element {
       isProcessingRef.current = false;
       isCapturingPhotoRef.current = false;
       setIsCameraActive(true);
-      AccessibilityInfo.announceForAccessibility(strings().speech.noVoiceInput);
+      Announcer.announceStatus(strings().speech.noVoiceInput);
       if (!screenReaderEnabledRef.current) { playErrorSound(); }
       announceTapToStart('');
       return;
@@ -3358,7 +3520,7 @@ function AppInner(): React.JSX.Element {
     if (!postureOk) {
       setIsProcessing(false);
       isCapturingPhotoRef.current = false;
-      if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+      earcons.play('ready');
       announceTapToStart('Ready.');
       return;
     }
@@ -3405,7 +3567,7 @@ function AppInner(): React.JSX.Element {
           finalTranscriptRef.current = '';
           // Reset to ready state so the next tap starts fresh.
           setIsCameraActive(true);
-          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          earcons.play('ready');
           announceTapToStart('Ready.');
           return;
         }
@@ -3414,7 +3576,7 @@ function AppInner(): React.JSX.Element {
 
       if (!photoPath && !settingsRef.current.useWearablesCamera) {
         // Voice-only fallback only applies when iPhone camera is selected.
-        AccessibilityInfo.announceForAccessibility(strings().speech.photoCaptureFailed);
+        Announcer.announceCritical(strings().speech.photoCaptureFailed);
       }
 
       if (isEmergencyStopped.current) {
@@ -3428,7 +3590,7 @@ function AppInner(): React.JSX.Element {
 
     } catch (error: any) {
       console.error('❌ Auto-submit error:', error);
-      AccessibilityInfo.announceForAccessibility(`Error: ${error.message || error}`);
+      Announcer.announceCritical(`Error: ${error.message || error}`);
       setIsProcessing(false);
     } finally {
       isCapturingPhotoRef.current = false;
@@ -3542,7 +3704,7 @@ function AppInner(): React.JSX.Element {
           isCapturingPhotoRef.current = false;
           finalTranscriptRef.current = '';
           setIsCameraActive(true);
-          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          earcons.play('ready');
           // Resume wake word listening after error
           wakeWordResumeRef.current?.();
           return;
@@ -3561,7 +3723,7 @@ function AppInner(): React.JSX.Element {
 
     } catch (error: any) {
       console.error('❌ [WakeWord] Auto-submit error:', error);
-      AccessibilityInfo.announceForAccessibility(`Error: ${error.message || error}`);
+      Announcer.announceCritical(`Error: ${error.message || error}`);
       setIsProcessing(false);
     } finally {
       isCapturingPhotoRef.current = false;
@@ -3642,35 +3804,49 @@ function AppInner(): React.JSX.Element {
       await stopTTS();
       finalTranscriptRef.current = '';
 
-      // ── Audio feedback: Skip earcon/SFX when VoiceOver is on ──────────
-      // VoiceOver owns the iOS audio session. Playing earcon sounds causes
-      // audio session conflicts ("Failed to set properties, error: '!pri'")
-      // producing glitchy/screamy artifacts. VoiceOver announcements replace
-      // earcon feedback for blind users.
+      // ── Audio feedback ────────────────────────────────────────────────
+      //
+      // The listening cue is the single most important sound the app makes:
+      // it is the "speak now" signal, and the whole turn depends on the user
+      // starting to talk at the right moment. It used to be skipped entirely
+      // whenever VoiceOver was on, which left blind users guessing — the very
+      // users who cannot see the visualizer that was standing in for it.
+      //
+      // Only the EXCLUSIVE session grab is still gated. configurePlaybackSession
+      // calls setActive(true), which cuts VoiceOver off mid-word and produced
+      // the "!pri" errors and glitchy artifacts that motivated the original
+      // suppression. The cue itself now requests a mixable session (see
+      // setScreenReaderMode in utils/soundEffects.ts) and coexists with
+      // VoiceOver instead of fighting it for ownership.
       if (!screenReaderEnabled) {
         // FIX: After STT leaves the audio session in Record+Measurement mode,
         // react-native-sound's setCategory alone doesn't restore full volume.
         // This native call sets .playback + .default mode + setActive + speaker
         // route — matching the reaching pipeline's audio config.
         await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
-
-        // Single 215ms tone. Users start speaking on it, and the mic is not
-        // open until this promise resolves + the settle delay below — so the
-        // cue asset must never grow back into a multi-tone earcon.
-        // See playListenSound() in utils/soundEffects.ts.
-        await playListenSound();
-
-        // The listening cue is finished now; switch to recording for STT.
-        prepareForRecording();
       }
 
-      // Delay to let audio session reconfigure after category switch.
-      // Was 100ms and raised to 350ms to fix category-switch failures — this
-      // is the largest remaining chunk of beep→mic latency, so retune it only
-      // with on-device verification.
-      if (!screenReaderEnabled) {
-        await new Promise<void>(resolve => setTimeout(() => resolve(), 350));
-      }
+      // Single 215ms tone. Users start speaking on it, and the mic is not
+      // open until this promise resolves + the settle delay below — so the
+      // cue asset must never grow back into a multi-tone earcon.
+      // See playListenSound() in utils/soundEffects.ts.
+      await earcons.playAndWait('listenStart');
+
+      // The listening cue is finished now; switch to recording for STT.
+      prepareForRecording();
+
+      // Delay to let the audio session reconfigure after the category switch.
+      //
+      // 350ms was tuned against configurePlaybackSession, which performs a
+      // full native category + mode + setActive + route override. Under
+      // VoiceOver that call is skipped and the only switch is
+      // react-native-sound's much lighter setCategory, so charging the same
+      // delay would add a third of a second of dead microphone to the users
+      // who already wait longest — they also sit through the 800ms VoiceOver
+      // settle above. Retune either number only with on-device verification.
+      await new Promise<void>(resolve =>
+        setTimeout(() => resolve(), screenReaderEnabled ? 150 : 350),
+      );
 
       // ── Start STT with a short VoiceOver grace window ─────────────────
       // VoiceOver speaks "Listening"; the mic can catch the tail end.
@@ -3683,7 +3859,7 @@ function AppInner(): React.JSX.Element {
     } catch (error) {
       console.error('❌ Start listening error:', error);
       if (screenReaderEnabled) {
-        AccessibilityInfo.announceForAccessibility(strings().speech.errorStartingVoice);
+        Announcer.announceCritical(strings().speech.errorStartingVoice);
       }
     } finally {
       isStartingRef.current = false;
@@ -3711,7 +3887,7 @@ function AppInner(): React.JSX.Element {
 
       const postureOk = await waitForGoodPosture('capture');
       if (!postureOk) {
-        if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+        earcons.play('ready');
         announceTapToStart('Ready.');
         return;
       }
@@ -3734,7 +3910,7 @@ function AppInner(): React.JSX.Element {
           setIsProcessing(false);
           isProcessingRef.current = false;
           setIsCameraActive(true);
-          if (!screenReaderEnabledRef.current) { audioFeedback.playEarcon('ready'); }
+          earcons.play('ready');
           announceTapToStart('Ready.');
           return;
         }
@@ -3773,10 +3949,19 @@ function AppInner(): React.JSX.Element {
     // Clearing synchronously first means the app is responsive again the
     // instant the user taps, whatever native does afterwards.
     releaseInputGates('emergency stop');
+    // Queued announcements describe a session that is over. Speaking them now
+    // would talk over the stop confirmation and describe a state the app is
+    // no longer in — which is how "it kept talking after I stopped it" gets
+    // reported as the app ignoring the stop.
+    Announcer.reset();
+    pendingActionRef.current = null;
     isEmergencyStopped.current = true;
     isStartingRef.current = false; // ← release re-entry guard
     continuousModeAbortRef.current = true;
     arSessionAliveRef.current = false;
+    // Whatever native screen was up is going away, and the stop confirmation
+    // below is the one cue a user who just interrupted must hear.
+    earcons.setNativeSessionActive(false);
     continuousTtsGenerationRef.current++;
 
     setIsProcessing(false);
@@ -3839,10 +4024,10 @@ function AppInner(): React.JSX.Element {
     // Clearing it here allows in-flight async ops (photo capture in
     // handleAutoSubmit) to resume and restart the latency loop.
 
-    // Skip earcon when VoiceOver is on — audio session conflict
-    if (!screenReaderEnabled) {
-      audioFeedback.playEarcon('ready');
-    }
+    // Emergency stop is where the confirmation cue matters most: the user
+    // reached for it because they had lost confidence in what the app was
+    // doing, and silence in response is the worst possible answer.
+    earcons.play('modeExit');
     announceTapToStart('Stopped.');
 
     // Resume wake word listening after emergency stop
@@ -3923,7 +4108,7 @@ function AppInner(): React.JSX.Element {
       // thing they must not have to do is guess whether the app is alive.
       const message = strings().speech.requestFailed;
       if (screenReaderEnabledRef.current) {
-        AccessibilityInfo.announceForAccessibility(message);
+        Announcer.announceStatus(message);
       } else {
         await nativeCall(
           () => speachesSentenceChunker.synthesizeSpeechChunked(message),
@@ -3931,7 +4116,7 @@ function AppInner(): React.JSX.Element {
           'watchdog recovery speech',
           undefined,
         );
-        audioFeedback.playEarcon('ready');
+        earcons.play('ready');
       }
       announceTapToStart('Ready.');
 
@@ -4141,6 +4326,39 @@ function AppInner(): React.JSX.Element {
     return '';
   };
 
+  // ── Persistent activity status ─────────────────────────────────────────
+  //
+  // The same information the visualizer draws, in a form VoiceOver can focus.
+  // `activityStatus` is preferred wherever it is set because it names the
+  // TARGET as well as the state — "Finding the cereal" answers a question that
+  // "Thinking" leaves open, and mid-session the target is the thing users
+  // most often lost track of.
+  const overlayStatus = (() => {
+    const flow = strings().flow;
+    if (isReaching || isNavigation) return activityStatus || flow.statusThinking;
+    if (isSpeaking) return flow.statusSpeaking;
+    if (isProcessing) return activityStatus || flow.statusThinking;
+    if (isListening || isWakeWordCapturing) return flow.statusListening;
+    return activityStatus || flow.statusReady;
+  })();
+
+  // Clear the turn-scoped status once everything settles, so a stale target
+  // name cannot be read back during the next, unrelated turn.
+  useEffect(() => {
+    if (
+      !isListening &&
+      !isProcessing &&
+      !isSpeaking &&
+      !isNavigation &&
+      !isReaching &&
+      !isWakeWordCapturing
+    ) {
+      setActivityStatus('');
+      pendingActionRef.current = null;
+      setPendingAction(null);
+    }
+  }, [isListening, isProcessing, isSpeaking, isNavigation, isReaching, isWakeWordCapturing]);
+
   // ============================================================================
   // Handle Tap
   // ============================================================================
@@ -4152,7 +4370,7 @@ function AppInner(): React.JSX.Element {
       // Bug 1/2 fix: Skip announcement when VoiceOver is on to avoid
       // consuming the next double-tap gesture.
       if (!screenReaderEnabledRef.current) {
-        AccessibilityInfo.announceForAccessibility(strings().speech.stoppingMode(mode));
+        Announcer.announceStatus(strings().speech.stoppingMode(mode));
       }
       await stopContinuousModeLoop();
       // Resume wake word after stopping continuous mode
@@ -4167,7 +4385,7 @@ function AppInner(): React.JSX.Element {
       // VoiceOver reading 'Stopping' consumes the next double-tap gesture,
       // making the user tap additional times to reach the Ready state.
       if (!screenReaderEnabledRef.current) {
-        AccessibilityInfo.announceForAccessibility(strings().speech.stopping);
+        Announcer.announceStatus(strings().speech.stopping);
       }
       await emergencyStop();
       return;
@@ -4176,7 +4394,7 @@ function AppInner(): React.JSX.Element {
     if (isListening) {
       // Bug 1/2 fix: VoiceOver reads the label change to 'Thinking' automatically.
       if (!screenReaderEnabledRef.current) {
-        AccessibilityInfo.announceForAccessibility(strings().speech.thinking);
+        Announcer.announceStatus(strings().speech.thinking);
       }
       await stopListeningManually();
       return;
@@ -4189,8 +4407,291 @@ function AppInner(): React.JSX.Element {
       return;
     }
 
+    // A bare tap is an open-ended request. If a menu row opened a previous
+    // listening session that was abandoned before it reached the pipeline,
+    // its intent must not survive to wrap this unrelated utterance — the user
+    // would ask a question and be sent hand-guidance instead.
+    pendingActionRef.current = null;
+    setPendingAction(null);
+
     await startListening();
   };
+
+  // `startListening` and `handleScreenTap` are plain functions, re-created on
+  // every render. Mirroring them the way `waitForGoodPostureRef` does lets the
+  // menu handlers below be genuinely []-memoized instead of listing a
+  // dependency that changes every render — which would make every callback
+  // handed to ActionMenu a new identity and re-render the whole menu on any
+  // state change, including ones that have nothing to do with it.
+  const startListeningRef = useRef(startListening);
+  const handleScreenTapRef = useRef(handleScreenTap);
+  useEffect(() => {
+    startListeningRef.current = startListening;
+    handleScreenTapRef.current = handleScreenTap;
+  });
+
+  // ============================================================================
+  // Menu actions
+  // ============================================================================
+  //
+  // Every handler below is a complete path from a button press to a running
+  // pipeline. None of them consults an intent classifier, and four of the six
+  // never open the microphone. That is the point: the app's capabilities stop
+  // depending on whether a sentence was heard and understood correctly.
+
+  /** True while a turn owns the input gates and a new one must not start. */
+  const isTurnRunning = useCallback(
+    () =>
+      isProcessingRef.current ||
+      isCapturingPhotoRef.current ||
+      isNavigationRef.current ||
+      isReachingRef.current ||
+      isContinuousModeRunning.current,
+    [],
+  );
+
+  /** Speak an answer through whichever channel the user is actually hearing. */
+  const speakAnswer = useCallback(async (text: string) => {
+    if (screenReaderEnabledRef.current) {
+      // `force` because a repeat is deliberately the same words as last time,
+      // which is exactly what the duplicate filter is built to drop.
+      Announcer.announce(text, { priority: 'status', force: true });
+      return;
+    }
+    try {
+      await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+      await speachesSentenceChunker.synthesizeSpeechChunked(text);
+    } catch (e: any) {
+      if (!e?.message?.includes('cancel') && !e?.message?.includes('stop')) {
+        console.warn('⚠️ speakAnswer failed:', e?.message || e);
+      }
+    }
+  }, []);
+
+  /**
+   * Capture a frame and run a fixed command — no speech recognition anywhere
+   * in the path.
+   *
+   * Mirrors `stopListeningManually` exactly from the posture gate onward. It
+   * deliberately does not share code with it: that function's first half is
+   * all microphone teardown and transcript validation, and threading a
+   * "there is no transcript" flag through it would put a branch in the most
+   * heavily-patched control flow in the app to save a dozen lines here.
+   */
+  const runDirectCommand = useCallback(async (command: string, status: string) => {
+    if (isTurnRunning()) {
+      Announcer.announce(strings().flow.busy, { priority: 'status' });
+      return;
+    }
+
+    setActivityStatus(status);
+    Announcer.announce(status, { priority: 'status' });
+    isEmergencyStopped.current = false;
+
+    // Claim the capture latch BEFORE the posture wait, not after it. The
+    // posture gate can hold for several seconds while the user re-aims the
+    // phone, and a press during that window passed `isTurnRunning()` and
+    // started a second capture on top of the first.
+    //
+    // `setIsProcessing` sets the React state only — never `isProcessingRef` —
+    // because `handleVoiceCommand` returns early when that ref is already set,
+    // so setting it here would make the turn we are about to start refuse to
+    // run. Same split as `handleAutoSubmit`. Setting the state does flip the
+    // screen out of idle, which is what puts a Stop button in reach while the
+    // camera is still waking.
+    isCapturingPhotoRef.current = true;
+    setIsProcessing(true);
+    markTurnProgressRef.current('direct command accepted');
+
+    // Started before the capture, not after, because the camera takes most of
+    // a second to wake and hand back a frame. Without a cue filling that gap
+    // the press produces silence, and a user who gets silence presses again —
+    // which cancels the turn they just started. That was the single most
+    // common self-inflicted failure in the pilot.
+    earcons.play('thinking');
+
+    const postureOk = await waitForGoodPostureRef.current('capture');
+    if (!postureOk) {
+      // The loop plays until something stops it. Every early return from here
+      // on has to stop it, or the app is left buzzing at a user who has been
+      // told to reposition the phone and has no idea the app gave up.
+      await stopLatencyLoop();
+      isCapturingPhotoRef.current = false;
+      setIsProcessing(false);
+      setActivityStatus('');
+      earcons.play('ready');
+      return;
+    }
+
+    let photoPath = '';
+    try {
+      photoPath = await reactivateCameraAndCaptureRef.current({ enableShutterSound: false });
+      markTurnProgressRef.current('direct command photo captured');
+    } catch (e: any) {
+      console.error('❌ Camera error (direct command):', e);
+      isCapturingPhotoRef.current = false;
+      await stopLatencyLoop();
+      if (isWearablesCaptureError(e)) {
+        await speakWearablesError(e);
+      } else {
+        Announcer.announceCritical(strings().speech.photoCaptureFailed);
+      }
+      setActivityStatus('');
+      setIsProcessing(false);
+      isProcessingRef.current = false;
+      setIsCameraActive(true);
+      earcons.play('error');
+      return;
+    }
+    isCapturingPhotoRef.current = false;
+
+    if (isEmergencyStopped.current) {
+      // The user stopped while the camera was busy. Release the state this
+      // function claimed — emergencyStop cleared the refs, but the React
+      // `isProcessing` set above is ours to undo, and leaving it true holds
+      // the screen off the menu with nothing running behind it.
+      await stopLatencyLoop();
+      setIsProcessing(false);
+      setActivityStatus('');
+      return;
+    }
+
+    await handleVoiceCommandRef.current(command, photoPath);
+  }, [isTurnRunning]);
+
+  /**
+   * Start listening on behalf of a menu row.
+   *
+   * The prompt is spoken before the microphone opens rather than after,
+   * because the listening cue is the signal to start talking: a user who
+   * hears "What should I find?" *after* the cue has already spoken over the
+   * first word of their answer.
+   */
+  const startListeningFor = useCallback(async (action: MenuActionId, prompt: string) => {
+    if (isTurnRunning()) {
+      Announcer.announce(strings().flow.busy, { priority: 'status' });
+      return;
+    }
+    pendingActionRef.current = action;
+    setPendingAction(action);
+    setActivityStatus(strings().flow.statusListening);
+    Announcer.announce(prompt, { priority: 'status' });
+    await startListeningRef.current();
+  }, [isTurnRunning]);
+
+  /**
+   * Fire-and-forget a menu action, but never silently.
+   *
+   * `onPress` cannot await, so these promises are unobserved by definition. An
+   * unobserved rejection here would leave the user holding a phone that made a
+   * selection sound and then did nothing at all — the exact failure mode this
+   * whole screen exists to eliminate. So a failure gets an error cue, which is
+   * the one thing a blind user can act on.
+   */
+  const runWithFailureCue = useCallback((work: Promise<unknown>) => {
+    work.catch((error: any) => {
+      console.error('❌ [menu] action failed:', error);
+      earcons.play('error');
+      Announcer.announceCritical(strings().speech.requestFailed);
+      setActivityStatus('');
+    });
+  }, []);
+
+  const handleMenuAction = useCallback((action: MenuActionId) => {
+    const t = strings();
+    switch (action) {
+      case 'ask':
+        runWithFailureCue(startListeningFor('ask', t.flow.askPrompt));
+        return;
+      case 'find':
+        runWithFailureCue(startListeningFor('find', t.flow.findPrompt));
+        return;
+      case 'describe':
+        runWithFailureCue(
+          runDirectCommand(t.commands.describeScene, t.flow.statusDescribing),
+        );
+        return;
+      case 'navigate':
+        setHomeView('destinations');
+        return;
+      case 'repeat': {
+        const answer = lastAnswerRef.current;
+        if (!answer) {
+          Announcer.announce(t.flow.nothingToRepeat, { priority: 'status' });
+          return;
+        }
+        runWithFailureCue(speakAnswer(answer));
+        return;
+      }
+    }
+  }, [runDirectCommand, runWithFailureCue, speakAnswer, startListeningFor]);
+
+  /**
+   * Launch route guidance to a destination the user picked from the list.
+   *
+   * The synthesized result stands in for a backend response, so this reuses
+   * the identical, already-tested code path a spoken request takes — the only
+   * difference is that `navigation_target` is an exact saved label rather
+   * than a transcription that then has to be fuzzy-matched back to one.
+   */
+  const handleDestinationSelected = useCallback(async (entry: {
+    label: string; mapId: string; mapName: string;
+  }) => {
+    if (isTurnRunning()) {
+      Announcer.announce(strings().flow.busy, { priority: 'status' });
+      return;
+    }
+
+    isEmergencyStopped.current = false;
+    setActivityStatus(strings().flow.statusNavigating(entry.label));
+    earcons.play('modeEnter');
+
+    // The picker stays mounted until navigation resolves. Returning to the
+    // menu first looks harmless but is not: ActionMenu moves VoiceOver focus
+    // to its first row on mount, so the user who just chose a destination
+    // would be thrown back to "Ask a question" while the route was still
+    // loading — reading, to them, as if their choice had been discarded.
+    try {
+      const handled = await handleARKitNavigation(
+        {
+          navigation: true,
+          navigation_pipeline: 'arkit',
+          navigation_target: entry.label,
+          route_map_id: entry.mapId,
+          route_map_name: entry.mapName,
+        },
+        { requestedText: entry.label },
+      );
+
+      if (!handled) {
+        // Route guidance is an ARKit-only capability. On a device or a
+        // settings combination where it does not resolve, say so plainly
+        // instead of returning the user to a menu that silently did nothing.
+        Announcer.announceCritical(strings().navigation.unavailableFallback);
+        earcons.play('error');
+      }
+    } catch (error: any) {
+      // Nothing awaits this handler — it is a button's onPress — so an
+      // unhandled rejection would strand the user on a picker that has stopped
+      // responding with no indication why.
+      console.error('❌ [menu] destination launch failed:', error);
+      Announcer.announceCritical(strings().navigation.endedWithError);
+      earcons.play('error');
+    } finally {
+      setActivityStatus('');
+      setHomeView('menu');
+    }
+  }, [handleARKitNavigation, isTurnRunning]);
+
+  /** The Stop button in ActivityOverlay. Same semantics as tapping the screen. */
+  const handleStopPressed = useCallback(async () => {
+    Announcer.reset();
+    earcons.play('modeExit');
+    setActivityStatus('');
+    pendingActionRef.current = null;
+    setPendingAction(null);
+    await handleScreenTapRef.current();
+  }, []);
 
   // ============================================================================
   // Render
@@ -4241,6 +4742,71 @@ function AppInner(): React.JSX.Element {
       <View style={styles.container}>
         <StatusBar barStyle="light-content" backgroundColor="#0A0A0F" />
         <SettingsScreen onClose={() => setShowSettings(false)} />
+        {settings.developerMode && <DebugOverlay />}
+      </View>
+    );
+  }
+
+  // ── Home surfaces (menu / destinations) ───────────────────────────────────
+  //
+  // Shown only while nothing is running. An active turn always takes the
+  // screen, so the user can never be looking at a menu while the app is
+  // mid-session — which was a real source of confusion when the only visible
+  // difference between the two was a word in the middle of the display.
+  //
+  // The wake-word wait is treated as idle on purpose: in glasses mode the app
+  // sits there for minutes at a time, and hiding every capability behind that
+  // wait would mean the phone in the user's hand can do nothing while the
+  // glasses listen.
+  const isIdle =
+    !isListening &&
+    !isProcessing &&
+    !isSpeaking &&
+    !isNavigation &&
+    !isReaching &&
+    !isWakeWordCapturing;
+
+  const useMenuHome = settings.homeScreenLayout === 'menu';
+
+  if (useMenuHome && isIdle) {
+    return (
+      <View style={styles.container}>
+        <StatusBar barStyle="light-content" backgroundColor="#111A2E" />
+
+        {/*
+          Kept mounted behind the opaque menu. "Describe surroundings" and
+          "Read text" capture the instant they are pressed, and a camera that
+          has to cold-start first adds roughly a second of dead air between
+          the press and any sign that something happened — long enough that
+          pilot users pressed again, which cancelled the turn they had just
+          started.
+        */}
+        {!settings.useWearablesCamera && device && (
+          <Camera
+            ref={cameraRef}
+            style={StyleSheet.absoluteFill}
+            device={device}
+            isActive={isCameraActive}
+            photo={true}
+            accessible={false}
+            accessibilityElementsHidden={true}
+            importantForAccessibility="no-hide-descendants"
+          />
+        )}
+
+        {homeView === 'destinations' ? (
+          <DestinationPicker
+            onSelect={handleDestinationSelected}
+            onCancel={() => setHomeView('menu')}
+          />
+        ) : (
+          <ActionMenu
+            onAction={handleMenuAction}
+            onOpenSettings={() => setShowSettings(true)}
+            canRepeat={Boolean(lastAnswer)}
+          />
+        )}
+
         {settings.developerMode && <DebugOverlay />}
       </View>
     );
@@ -4312,6 +4878,27 @@ function AppInner(): React.JSX.Element {
         </View>
       </TouchableWithoutFeedback>
 
+      {/* ── Persistent activity readout ──
+          A sibling of the tap surface, never a child — inside it every element
+          is absorbed into the screen-wide accessibility element and VoiceOver
+          can never reach the Stop button. Declared after the tap surface so it
+          paints on top, and before the gear so VoiceOver reads Stop first.
+
+          Its banners are pointer-transparent, so the existing "tap anywhere to
+          stop" gesture is unchanged for users who are not running VoiceOver. */}
+      <ActivityOverlay
+        status={overlayStatus}
+        onStop={handleStopPressed}
+        showStop={!isIdle}
+        // The settings gear is absolutely positioned over this same strip, so
+        // the status pill has to stop short of it. Without the inset the pill
+        // stretched the full width and the gear sat on top of the text —
+        // visible in the "Listening" screenshot, and worse under large text
+        // where the label runs right up to the gear's edge.
+        // 44pt button + 20pt right offset + 10pt breathing room.
+        trailingInset={74}
+      />
+
       {/* ── Settings Gear Button (top-right) ──
           Sibling of the tap surface, never a child: inside it the gear is swallowed
           by the screen-wide accessibility element and cannot be reached by VoiceOver
@@ -4325,10 +4912,18 @@ function AppInner(): React.JSX.Element {
         }}
         accessible={true}
         accessibilityRole="button"
-        accessibilityLabel="Open settings"
-        accessibilityHint="Double tap to open settings for voice speed and reaching pipeline"
+        accessibilityLabel={strings().menu.settingsLabel}
+        accessibilityHint={strings().menu.settingsHint}
+        hitSlop={{ top: 10, bottom: 10, left: 10, right: 10 }}
       >
-        <Text style={styles.settingsGear} accessible={false}>⚙</Text>
+        {/*
+          A drawn icon, not the U+2699 character. iOS renders that codepoint
+          from the emoji font — a small colour picture that ignores the
+          surrounding text colour, blurs when scaled, and does not respond to
+          Increase Contrast or Smart Invert. The SVG inherits the palette and
+          stays crisp at any size.
+        */}
+        <GearIcon size={22} color="rgba(255,255,255,0.92)" />
       </TouchableOpacity>
 
       {/* ── Debug Overlay (outside TouchableWithoutFeedback so touches work) ── */}
@@ -4400,9 +4995,5 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
     zIndex: 100,
-  },
-  settingsGear: {
-    color: 'rgba(255,255,255,0.7)',
-    fontSize: 20,
   },
 });

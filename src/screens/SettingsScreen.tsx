@@ -262,6 +262,8 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
     updateNavigationClockFaceDirections,
     updateNavigationDistanceUnit,
     updateLanguage,
+    updateHomeScreenLayout,
+    updateSoundCues,
     effectiveReachingPipeline,
   } =
     useSettings();
@@ -1448,6 +1450,69 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
         </Section>
 
         {/* ══════════════════════════════════════════
+            SECTION — Accessibility
+        ══════════════════════════════════════════ */}
+        <Section title="Accessibility">
+          <Text style={styles.settingDescription}>
+            How the home screen is laid out, and whether the app confirms what
+            it is doing with sounds and vibration.
+          </Text>
+
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabelBlock}>
+              <Text style={styles.settingLabel}>Action Menu</Text>
+              <Text style={styles.settingSubLabel}>
+                {settings.homeScreenLayout === 'menu'
+                  ? 'Home screen lists every action as its own button'
+                  : 'Home screen is a single tap-anywhere target'}
+              </Text>
+            </View>
+            <Switch
+              value={settings.homeScreenLayout === 'menu'}
+              onValueChange={async (value: boolean) => {
+                await updateHomeScreenLayout(value ? 'menu' : 'tapAnywhere');
+              }}
+              // Without an explicit label a bare RN Switch is announced as
+              // "switch button, off" — the name lives in a sibling <Text> that
+              // VoiceOver reads as unrelated static text, so the user hears a
+              // control with no idea what it controls. The same applies to
+              // every Switch on this screen.
+              accessible={true}
+              accessibilityRole="switch"
+              accessibilityLabel="Action menu home screen"
+              accessibilityHint="Off replaces the menu with the original tap-anywhere screen"
+              trackColor={{ false: C.border, true: C.primary }}
+              thumbColor={settings.homeScreenLayout === 'menu' ? C.primary : C.sliderThumb}
+              ios_backgroundColor={C.border}
+            />
+          </View>
+
+          <View style={styles.settingRow}>
+            <View style={styles.settingLabelBlock}>
+              <Text style={styles.settingLabel}>Sound &amp; Vibration Cues</Text>
+              <Text style={styles.settingSubLabel}>
+                {settings.soundCues
+                  ? 'Confirms listening, working, done, and errors'
+                  : 'Silent — spoken feedback only'}
+              </Text>
+            </View>
+            <Switch
+              value={settings.soundCues}
+              onValueChange={async (value: boolean) => {
+                await updateSoundCues(value);
+              }}
+              accessible={true}
+              accessibilityRole="switch"
+              accessibilityLabel="Sound and vibration cues"
+              accessibilityHint="Off leaves only spoken feedback"
+              trackColor={{ false: C.border, true: C.primary }}
+              thumbColor={settings.soundCues ? C.primary : C.sliderThumb}
+              ios_backgroundColor={C.border}
+            />
+          </View>
+        </Section>
+
+        {/* ══════════════════════════════════════════
             SECTION 3 — Developer Options
         ══════════════════════════════════════════ */}
         <Section title="Developer Options">
@@ -1469,6 +1534,11 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
               onValueChange={async (value: boolean) => {
                 await updateDeveloperMode(value);
               }}
+              accessible={true}
+              accessibilityRole="switch"
+              accessibilityLabel="Developer mode"
+              accessibilityHint="Shows the debug overlay during testing"
+
               trackColor={{ false: C.border, true: C.primary }}
               thumbColor={settings.developerMode ? C.primary : C.sliderThumb}
               ios_backgroundColor={C.border}

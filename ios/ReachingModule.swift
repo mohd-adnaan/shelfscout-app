@@ -243,6 +243,13 @@ class ReachingModule: NSObject {
     // below — it is the fallback if the inherited session turns out to be
     // dead or untracked by the time reaching attaches to it.
     let inheritedSession = liveSession ?? ARLiveSessionHandoff.shared.claim(mapID: routeMapId)
+    // `claim` records the loan itself. The manual arrival path hands the
+    // session over as a call argument instead, so record it here — without a
+    // loan record the reaching screen cannot offer the session back at the end
+    // and the return leg falls back to a cold relocalization.
+    if let liveSession {
+      ARLiveSessionHandoff.shared.noteLoan(session: liveSession, mapID: routeMapId)
+    }
 
     var resolvedWorldMap: ARWorldMap?
     var resolvedTargetPosition: simd_float3? = targetWorldPosition

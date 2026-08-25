@@ -147,6 +147,112 @@ export const en = {
     pointCameraFirst: 'Point your camera at what you want described, then ask again.',
   },
 
+  // ── Action menu ──────────────────────────────────────────────────────────
+  //
+  // These labels ARE the interface for a VoiceOver user: swiping the home
+  // screen reads exactly this list, and it is the only place the app's
+  // capabilities are enumerated. Three rules they have to keep:
+  //
+  //   1. Start with the VERB. VoiceOver reads left to right with no preview,
+  //      so "Find an object" tells the user what the row does one word in,
+  //      while "Object finder" makes them wait for the end of the phrase.
+  //   2. No brand words, no mode names. "Reaching" and "spatial target" are
+  //      our vocabulary, not the user's.
+  //   3. The hint says what happens NEXT, because the cost of a wrong guess
+  //      is a cancelled session: rows that open the microphone say so, rows
+  //      that act immediately say that instead.
+  menu: {
+    title: 'ShelfScout',
+    settingsLabel: 'Settings',
+    settingsHint: 'Opens language, voice speed, and guidance options',
+    items: {
+      describe: {
+        label: 'Describe my surroundings',
+        hint: 'Describes what is in front of you right away, including any text. No speaking needed',
+      },
+      ask: {
+        label: 'Ask a question',
+        hint: 'Starts listening, then answers your question about what the camera sees',
+      },
+      find: {
+        label: 'Find an object',
+        hint: 'Starts listening for the object name, then guides your hand to it',
+      },
+      navigate: {
+        label: 'Take me somewhere',
+        hint: 'Opens the list of saved destinations to choose from',
+      },
+      repeat: {
+        label: 'Repeat that',
+        hint: 'Says the last answer again',
+      },
+    },
+  },
+
+  // ── Persistent activity readout ──────────────────────────────────────────
+  overlay: {
+    stopLabel: 'Stop',
+    stopHint: 'Ends what the app is doing and returns to the menu',
+    /**
+     * Prefixed so the element identifies itself when the user swipes onto it
+     * mid-session. Without the prefix, focusing it reads a bare fragment like
+     * "Finding the cereal" that is indistinguishable from an announcement.
+     */
+    statusLabel: (status: string) => `Status: ${status}`,
+  },
+
+  // ── Saved destination picker ─────────────────────────────────────────────
+  destinations: {
+    title: 'Take me somewhere',
+    loading: 'Loading saved destinations.',
+    /**
+     * Spoken once the list resolves. The count is the useful part: it tells
+     * the user how far they can swipe before they have run out, which is the
+     * question a list with no visible length always raises.
+     */
+    countAnnouncement: (count: number) =>
+      count === 1
+        ? 'One saved destination. Swipe to hear it, then double tap to go there.'
+        : `${count} saved destinations. Swipe through them, then double tap to go there.`,
+    empty:
+      'No saved destinations yet. Open Settings, then Manage AR Route Maps, to map a route first.',
+    loadFailed: 'I could not load your saved destinations. Please try again.',
+    rowHint: 'Double tap to start guidance to this destination',
+    backLabel: 'Back',
+    backHint: 'Returns to the menu without choosing a destination',
+  },
+
+  // ── Canonical commands for the no-speech menu actions ────────────────────
+  //
+  // "Describe surroundings" and "Read text" send these fixed strings straight
+  // into the pipeline in place of a transcript. That is the entire reliability
+  // argument for those two rows: the request text is a constant, so it cannot
+  // be misheard, and the intent classifier sees the same sentence every time
+  // and therefore routes it the same way every time. Changing this wording
+  // changes routing behaviour — treat it as configuration, not as copy.
+  commands: {
+    describeScene: 'What is in front of me?',
+    findObject: (target: string) => `Guide my hand to ${target}.`,
+  },
+
+  // ── Menu-driven flow prompts and statuses ────────────────────────────────
+  flow: {
+    askPrompt: 'What would you like to know?',
+    findPrompt: 'What should I find?',
+    statusListening: 'Listening',
+    statusThinking: 'Working on it',
+    statusSpeaking: 'Answering',
+    statusDescribing: 'Describing what is in front of you',
+    statusFinding: (target: string) => `Finding the ${target}`,
+    statusNavigating: (target: string) => `Going to ${target}`,
+    statusReady: 'Ready',
+    nothingToRepeat: 'There is no answer to repeat yet.',
+    repeating: 'Repeating the last answer.',
+    cancelled: 'Cancelled.',
+    /** Spoken when a menu row is pressed while a turn is already running. */
+    busy: 'Still working. Use Stop first.',
+  },
+
   // ── Settings: language section ───────────────────────────────────────────
   settings: {
     languageSection: 'Language',

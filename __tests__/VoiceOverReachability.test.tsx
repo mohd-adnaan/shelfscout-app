@@ -1,16 +1,27 @@
 /**
- * VoiceOver reachability of the main screen's controls.
+ * VoiceOver reachability of the home screen's controls.
  *
- * The main screen is deliberately ONE screen-wide VoiceOver button ("Ready.
- * Tap to speak"), built with TouchableWithoutFeedback. That Touchable clones
- * its child and force-sets `accessible: true` on it, which on iOS turns the
- * whole subtree into a single accessibility element — every descendant is
- * absorbed and can never take VoiceOver focus.
+ * ── The invariant being guarded ────────────────────────────────────────────
+ * `TouchableWithoutFeedback` clones its child and force-sets `accessible:
+ * true` on it. On iOS that collapses the entire subtree into ONE accessibility
+ * element: every descendant is absorbed and can never take VoiceOver focus.
  *
- * The settings gear therefore has to be a SIBLING of the tap surface. When it
- * was nested inside, a blind participant could not reach Settings at all (no
- * way to change language or speech rate). This test fails if anyone moves it
- * back under an `accessible` ancestor.
+ * That is intentional for the tap-anywhere surface, which is meant to be a
+ * single screen-wide button. It is fatal for anything else placed inside it.
+ * A settings gear nested under that surface was, for one pilot build, simply
+ * unreachable — a blind participant had no way to change language or speech
+ * rate at all, and nothing on screen indicated the control existed.
+ *
+ * So every interactive control must be a SIBLING of the tap surface, never a
+ * child. These tests fail if anyone moves one back inside.
+ *
+ * ── What changed ───────────────────────────────────────────────────────────
+ * The home screen is now an action menu rather than a bare tap target, so the
+ * same invariant is checked against a longer list of controls: each menu row
+ * must be independently focusable, because the menu's whole purpose is that a
+ * VoiceOver user can enumerate the app by swiping through it. A menu that
+ * collapsed into one element would be strictly worse than the screen it
+ * replaced.
  *
  * @format
  */
@@ -19,17 +30,33 @@ import React from 'react';
 import ReactTestRenderer from 'react-test-renderer';
 import type { ReactTestInstance } from 'react-test-renderer';
 import App from '../App';
+import { en } from '../src/i18n/strings/en';
 
 // Must outlast STARTUP_LOADER_MIN_MS (1800ms) so we get past the branded
-// loader screen and render the real main tree.
+// loader screen and render the real home tree.
 const PAST_STARTUP_LOADER_MS = 3000;
-
-const SETTINGS_LABEL = 'Open settings';
 
 /** Only host ("string type") nodes reach the native accessibility tree. */
 const isHost = (node: ReactTestInstance): boolean => typeof node.type === 'string';
 
-async function renderMainScreen() {
+const byLabel = (renderer: ReactTestRenderer.ReactTestRenderer, label: string) =>
+  renderer.root.findAll(
+    node => isHost(node) && node.props?.accessibilityLabel === label,
+    { deep: true },
+  );
+
+/** Labels of every `accessible` host ancestor above `node`. */
+const swallowingAncestors = (node: ReactTestInstance): string[] => {
+  const found: string[] = [];
+  for (let current = node.parent; current; current = current.parent) {
+    if (isHost(current) && current.props?.accessible === true) {
+      found.push(String(current.props?.accessibilityLabel ?? current.type));
+    }
+  }
+  return found;
+};
+
+async function renderHomeScreen() {
   let renderer: ReactTestRenderer.ReactTestRenderer | undefined;
 
   await ReactTestRenderer.act(async () => {
@@ -44,7 +71,7 @@ async function renderMainScreen() {
   return renderer!;
 }
 
-describe('main screen VoiceOver reachability', () => {
+describe('home screen VoiceOver reachability', () => {
   beforeEach(() => {
     jest.useFakeTimers();
   });
@@ -53,41 +80,75 @@ describe('main screen VoiceOver reachability', () => {
     jest.useRealTimers();
   });
 
-  it('exposes the settings gear as its own accessibility element', async () => {
-    const renderer = await renderMainScreen();
+  // Order matters: this is the order VoiceOver reads them in, and "Describe"
+  // leads because it is the one row that needs nothing but a press.
+  const MENU_LABELS = [
+    en.menu.items.describe.label,
+    en.menu.items.ask.label,
+    en.menu.items.find.label,
+    en.menu.items.navigate.label,
+    en.menu.items.repeat.label,
+  ];
 
-    const gears = renderer.root.findAll(
-      node => isHost(node) && node.props?.accessibilityLabel === SETTINGS_LABEL,
-      { deep: true },
-    );
+  it('exposes every menu action as its own accessibility element', async () => {
+    const renderer = await renderHomeScreen();
 
-    expect(gears.length).toBeGreaterThan(0);
+    for (const label of MENU_LABELS) {
+      const matches = byLabel(renderer, label);
+      expect({ label, count: matches.length }).toEqual({ label, count: 1 });
+      expect(matches[0].props.accessibilityRole).toBe('button');
+      // A hint is not decoration here: it is the only place the UI says
+      // whether the row will open the microphone or act immediately, which is
+      // the difference between waiting to speak and missing the moment.
+      expect(String(matches[0].props.accessibilityHint ?? '')).not.toBe('');
+    }
 
     await ReactTestRenderer.act(() => {
       renderer.unmount();
     });
   });
 
-  it('does not nest the settings gear inside an accessible ancestor', async () => {
-    const renderer = await renderMainScreen();
+  it('does not nest any menu action inside an accessible ancestor', async () => {
+    const renderer = await renderHomeScreen();
 
-    const [gear] = renderer.root.findAll(
-      node => isHost(node) && node.props?.accessibilityLabel === SETTINGS_LABEL,
-      { deep: true },
-    );
-
-    // Walk up the host ancestry. Any ancestor with accessible===true would
-    // swallow the gear into itself and hide it from VoiceOver.
-    const swallowingAncestors: string[] = [];
-    for (let node = gear.parent; node; node = node.parent) {
-      if (isHost(node) && node.props?.accessible === true) {
-        swallowingAncestors.push(
-          String(node.props?.accessibilityLabel ?? node.type),
-        );
-      }
+    for (const label of MENU_LABELS) {
+      const [row] = byLabel(renderer, label);
+      expect(row).toBeDefined();
+      expect({ label, ancestors: swallowingAncestors(row) }).toEqual({
+        label,
+        ancestors: [],
+      });
     }
 
-    expect(swallowingAncestors).toEqual([]);
+    await ReactTestRenderer.act(() => {
+      renderer.unmount();
+    });
+  });
+
+  it('exposes the settings gear as its own reachable element', async () => {
+    const renderer = await renderHomeScreen();
+
+    const gears = byLabel(renderer, en.menu.settingsLabel);
+    expect(gears.length).toBeGreaterThan(0);
+    expect(swallowingAncestors(gears[0])).toEqual([]);
+
+    await ReactTestRenderer.act(() => {
+      renderer.unmount();
+    });
+  });
+
+  it('hides the camera preview from the accessibility tree', async () => {
+    const renderer = await renderHomeScreen();
+
+    // The camera is mounted behind the menu so a no-speech action can capture
+    // immediately. It must never become a focusable element: a VoiceOver user
+    // swiping the menu would hit an unlabelled view between two rows and have
+    // no way to tell what it was.
+    const cameras = renderer.root.findAll(
+      node => isHost(node) && node.props?.accessibilityElementsHidden === true,
+      { deep: true },
+    );
+    expect(cameras.length).toBeGreaterThan(0);
 
     await ReactTestRenderer.act(() => {
       renderer.unmount();

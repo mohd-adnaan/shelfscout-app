@@ -31,6 +31,18 @@ export type NavigationPipeline = 'rtab' | 'arkit';
 export type ReachingPipeline = 'visionBox' | 'spatialTarget' | 'standard';
 /** Mirrors `NavigationDistanceUnit` in `ios/Localization.swift`. */
 export type NavigationDistanceUnit = 'meters' | 'feet' | 'steps';
+/**
+ * Home-screen layout.
+ *
+ * `menu`        — one large labelled button per capability. VoiceOver can
+ *                 enumerate the app by swiping, and each action runs without
+ *                 an intent classifier in the path.
+ * `tapAnywhere` — the original full-screen tap target. Kept so a study
+ *                 already in progress can be finished on the layout it
+ *                 started on, and so the menu can be rolled back on a device
+ *                 in the field without a rebuild.
+ */
+export type HomeScreenLayout = 'menu' | 'tapAnywhere';
 
 export interface AppSettings {
   /**
@@ -94,6 +106,18 @@ export interface AppSettings {
    * prompts, and UI copy.
    */
   language: AppLanguage;
+  /** Home-screen layout. See `HomeScreenLayout`. */
+  homeScreenLayout: HomeScreenLayout;
+  /**
+   * Sound cues (earcons) and haptics for state changes.
+   *
+   * These used to be suppressed whenever VoiceOver was running, to avoid an
+   * audio-session conflict. They are now mixed into the session instead of
+   * taking it exclusively, so they coexist with VoiceOver — but a user who
+   * genuinely prefers silence, or a device where the mixed session still
+   * misbehaves, needs a switch that does not require a rebuild.
+   */
+  soundCues: boolean;
 }
 
 interface SettingsContextValue {
@@ -114,6 +138,8 @@ interface SettingsContextValue {
   updateNavigationClockFaceDirections: (value: boolean) => Promise<void>;
   updateNavigationDistanceUnit: (unit: NavigationDistanceUnit) => Promise<void>;
   updateLanguage: (language: AppLanguage) => Promise<void>;
+  updateHomeScreenLayout: (layout: HomeScreenLayout) => Promise<void>;
+  updateSoundCues: (value: boolean) => Promise<void>;
   /**
    * Given the backend flags, decide which reaching pipeline to use.
    * Returns 'spatialTarget' | 'arkit' | 'standard' | 'none'.
@@ -160,6 +186,8 @@ const DEFAULT_SETTINGS: AppSettings = {
   // Seeded from the device on first launch (and on upgrade from a build that
   // predates this setting); an explicit choice in Settings overrides it.
   language: detectDeviceLanguage(),
+  homeScreenLayout: 'menu',
+  soundCues: true,
 };
 
 const STORAGE_KEY = '@cybersight_settings_v1';
@@ -359,6 +387,26 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     [settings, persist],
   );
 
+  const updateHomeScreenLayout = useCallback(
+    async (layout: HomeScreenLayout) => {
+      const next = { ...settings, homeScreenLayout: layout };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Home screen → ${layout}`);
+    },
+    [settings, persist],
+  );
+
+  const updateSoundCues = useCallback(
+    async (value: boolean) => {
+      const next = { ...settings, soundCues: value };
+      setSettings(next);
+      await persist(next);
+      console.log(`[Settings] Sound cues → ${value ? 'ON' : 'OFF'}`);
+    },
+    [settings, persist],
+  );
+
   const updateReachingMode = useCallback(
     async (mode: 'handFree' | 'withHand') => {
       const next = { ...settings, reachingMode: mode };
@@ -517,6 +565,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
     updateNavigationClockFaceDirections,
     updateNavigationDistanceUnit,
     updateLanguage,
+    updateHomeScreenLayout,
+    updateSoundCues,
     resolveReachingPipeline,
     resolveNavigationPipeline,
     effectiveNavigationPipeline: settings.inDeviceMode ? 'arkit' : settings.navigationPipeline,

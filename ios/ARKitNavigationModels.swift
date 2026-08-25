@@ -198,13 +198,19 @@ struct ARKitNavigationNativeResult {
     /// result, so the next leg can be started with `continueNavigation`
     /// and skip relocalization entirely.
     var sessionAlive: Bool = false
+    /// True when this screen has ALREADY spoken `message` and waited for it to
+    /// finish. JS must not say it again: both layers speaking the same line is
+    /// what cut the arrival announcement in half — the second start interrupts
+    /// the first, and the user hears neither.
+    var messageSpoken: Bool = false
     let message: String?
 
     func dictionary() -> [String: Any] {
         var output: [String: Any] = [
             "success": success,
             "reason": reason,
-            "sessionAlive": sessionAlive
+            "sessionAlive": sessionAlive,
+            "messageSpoken": messageSpoken
         ]
         if let targetName { output["targetName"] = targetName }
         if let routeMapId { output["routeMapId"] = routeMapId }

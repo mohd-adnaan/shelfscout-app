@@ -74,6 +74,14 @@ export interface ARKitNavigationResult {
    * pose instead of relocalizing from scratch.
    */
   sessionAlive?: boolean;
+  /**
+   * Native already spoke `message` and waited for it to finish. Speaking it
+   * again here is what cut the arrival announcement in half: two TTS paths
+   * starting the same sentence a fraction of a second apart, the second
+   * interrupting the first, and the user hearing neither before reaching took
+   * over the screen.
+   */
+  messageSpoken?: boolean;
   message?: string;
 }
 

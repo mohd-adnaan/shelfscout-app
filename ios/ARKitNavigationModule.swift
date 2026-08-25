@@ -383,6 +383,11 @@ final class ARKitNavigationModule: NSObject {
     ) {
         DispatchQueue.main.async {
             self.dismissPresentedController(resolveCancelledNavigation: true)
+            // Reaching can leave its session up for the next leg to adopt, and
+            // that session is still holding the camera. This is JS saying it is
+            // done with AR — usually because it is about to open the RN camera,
+            // which would then fight the one still running. Let it go.
+            ARLiveSessionHandoff.shared.discard(pauseSession: true)
             resolve(nil)
         }
     }
@@ -401,13 +406,13 @@ final class ARKitNavigationModule: NSObject {
             let arrivedWarm = result.success &&
                 result.reason == "arrived" &&
                 result.reachingObjectName == nil
-            // A relocalization attempt that timed out but is still searching:
-            // keeping the screen mounted is the whole point, because tearing
-            // it down would reset tracking and make the retry start cold.
-            let searchingWarm = result.reason == "relocalization_failed" && result.sessionAlive
-
+            // A slow relocalization no longer reports itself as a failure at
+            // all: the screen keeps searching and starts the route itself when
+            // it lands (see `tickAutomatedRelocalizationWatchdog`). So by the
+            // time `relocalization_failed` reaches here the search is genuinely
+            // over and there is nothing left to stay warm for.
             let canStayWarm = self.keepSessionAlive &&
-                (arrivedWarm || searchingWarm) &&
+                arrivedWarm &&
                 self.presentedController != nil
 
             if canStayWarm {

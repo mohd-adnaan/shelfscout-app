@@ -5,6 +5,11 @@ import UIKit
 
 struct ARViewContainer: UIViewRepresentable {
     var session: ARSession
+    /// Changes when the manager swaps its `ARSession` object — which it does on
+    /// the return leg, adopting the live session reaching handed back instead of
+    /// relocalizing a fresh one. `session` is captured at `makeUIView`, so
+    /// without re-pointing here the view would render a session nobody drives.
+    var sessionRevision: Int
     var isSessionActive: Bool
     var showsCoaching: Bool
     /// AR-world positions of the remaining route polyline. Non-empty while
@@ -35,6 +40,10 @@ struct ARViewContainer: UIViewRepresentable {
 
     func updateUIView(_ uiView: ARSCNView, context: Context) {
         uiView.debugOptions = []
+        if uiView.session !== session {
+            uiView.session = session
+            context.coordinator.repointCoachingOverlay(to: session)
+        }
         context.coordinator.update(showsCoaching: showsCoaching && isSessionActive)
         applyRouteOverlay(via: context.coordinator)
     }
@@ -75,6 +84,12 @@ struct ARViewContainer: UIViewRepresentable {
                 coachingOverlay.topAnchor.constraint(equalTo: arView.topAnchor),
                 coachingOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor)
             ])
+        }
+
+        /// Follows an adopted session. The overlay holds its own reference and
+        /// would otherwise keep coaching against the session that was replaced.
+        func repointCoachingOverlay(to session: ARSession) {
+            coachingOverlay.session = session
         }
 
         func update(showsCoaching: Bool) {
@@ -338,9 +353,22 @@ struct ARMappingView: View {
     @State private var didStartAutomatedGuidance: Bool = false
     @State private var didResolveAutomation: Bool = false
     @State private var didTriggerReachingHandoff: Bool = false
+    /// True once the user has tapped out of an automated run. The arrival wait
+    /// is the one thing that can still be in flight when they do, and resolving
+    /// an arrival into a screen they have already left is at best pointless.
+    @State private var didRequestGuidanceExit: Bool = false
+    /// True once the arrival resolution is waiting on the arrival announcement.
+    /// The phase can be republished while that wait is in flight, and a second
+    /// waiter would resolve the automation the moment the first one did.
+    @State private var didScheduleArrivalResolve: Bool = false
     @State private var automatedRelocalizationStartedAt: Date?
     @State private var lastRelocalizationVoiceCueAt: Date?
     @State private var relocalizationVoiceCueCount: Int = 0
+    /// True once the "still looking" checkpoint has been spoken for this
+    /// attempt. Said once, not on repeat: past it the escalating coaching cues
+    /// are the ones carrying the search, and a status line repeating over them
+    /// would only crowd out the instruction the user can act on.
+    @State private var didReportSlowRelocalization: Bool = false
     /// When this mounted screen first started searching for the saved map.
     /// Unlike `automatedRelocalizationStartedAt` it survives a retarget, so it
     /// bounds the total warm search rather than one attempt.
@@ -348,6 +376,30 @@ struct ARMappingView: View {
     /// AR world map whose async load has been requested but not yet reflected
     /// in `mappingManager.activeMapID`.
     @State private var requestedARMapLoadID: String?
+
+    /// The destination this app run last confirmed the user reached.
+    ///
+    /// Static for the same reason `hasCoachedRelocalization` is: a journey hops
+    /// from leg to leg through separate mounts of this screen, and what the
+    /// previous mount PROVED about where the user is standing is still true in
+    /// the next one. Used only to say so out loud while the next leg relocalizes
+    /// — never to assume a pose. Cleared the moment guidance starts, because
+    /// from then on the user is walking away from it.
+    private static var lastConfirmedPlaceName: String?
+    /// When that arrival was confirmed. "You are at 421" is a safe thing to say
+    /// a minute after arriving there and a wrong thing to say an hour later,
+    /// after the phone has been in a pocket — the app has no way to know the
+    /// user did not walk off. Past `lastConfirmedPlaceMaxAgeSeconds` the claim
+    /// is dropped and the ordinary coaching cue speaks instead.
+    private static var lastConfirmedPlaceAt: Date?
+    private static let lastConfirmedPlaceMaxAgeSeconds: TimeInterval = 600
+
+    /// The place the user is standing in, if the app still has grounds to say so.
+    private static var freshConfirmedPlaceName: String? {
+        guard let name = lastConfirmedPlaceName, let at = lastConfirmedPlaceAt else { return nil }
+        guard Date().timeIntervalSince(at) <= lastConfirmedPlaceMaxAgeSeconds else { return nil }
+        return name
+    }
 
     /// Whether the full posture-and-pan coaching has been spoken already in
     /// this app run.
@@ -359,6 +411,12 @@ struct ARMappingView: View {
     /// relocalizations open on the short form, and only if the search is
     /// actually running long; the fast ones now finish in silence.
     private static var hasCoachedRelocalization = false
+
+    /// Longest the automated arrival waits for "Arrived at X" to be spoken
+    /// before handing off anyway. Comfortably past the longest arrival line in
+    /// either language at the slowest speech rate, so it is a failure bound
+    /// rather than a normal cut-off.
+    private let arrivalSpeechMaxWaitSeconds: TimeInterval = 6.0
 
     /// The coaching overlay is visual-only; a blind user standing in silence
     /// while the map searches gets spoken guidance instead, then a hard
@@ -448,9 +506,12 @@ struct ARMappingView: View {
         didResolveAutomation = false
         didStartAutomatedGuidance = false
         didTriggerReachingHandoff = false
+        didScheduleArrivalResolve = false
+        didRequestGuidanceExit = false
         automatedRelocalizationStartedAt = nil
         lastRelocalizationVoiceCueAt = nil
         relocalizationVoiceCueCount = 0
+        didReportSlowRelocalization = false
         // The route map for the new target may differ from the current one,
         // so route selection re-runs; the AR world map stays loaded.
         didAttemptAutomatedRouteSelection = false
@@ -472,6 +533,7 @@ struct ARMappingView: View {
         let scene = ZStack {
             ARViewContainer(
                 session: mappingManager.session,
+                sessionRevision: mappingManager.sessionRevision,
                 isSessionActive: mappingManager.sessionMode != .idle,
                 showsCoaching: mappingManager.isMapping || (mappingManager.isRelocalizing && !mappingManager.isLocalized),
                 routeOverlayPoints: routeOverlayWorldPoints,
@@ -533,6 +595,7 @@ struct ARMappingView: View {
     /// Manual end of an automated guidance run, from anywhere on the screen.
     private func requestGuidanceExit() {
         guard isAutomatedNavigation, let onExitRequested else { return }
+        didRequestGuidanceExit = true
         NavigationTrace.shared.log("nav.exit.tap", [
             "target": automatedTargetName ?? launchTargetName ?? "",
             "phase": String(describing: semanticNavigator.phase)
@@ -667,19 +730,95 @@ struct ARMappingView: View {
     private func handleNavigationPhaseChange(_ phase: SemanticNavigationPhase) {
         if phase == .navigating || phase == .recovering {
             didTriggerReachingHandoff = false
+            didScheduleArrivalResolve = false
         }
         guard phase == .arrived else { return }
 
+        // Where the user is now, for the next leg to open on. `targetName` is
+        // the navigator's resolved label, so it is the name the user was just
+        // told they arrived at rather than whatever they said to get here.
+        let arrivedAt = semanticNavigator.targetName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !arrivedAt.isEmpty {
+            Self.lastConfirmedPlaceName = arrivedAt
+            Self.lastConfirmedPlaceAt = Date()
+        }
+
         if launchTargetName != nil {
-            resolveAutomation(
-                success: true,
-                reason: "arrived",
-                message: semanticNavigator.currentInstruction
-            )
+            resolveAutomatedArrivalWhenSpoken()
             return
         }
 
         triggerManualReachingHandoffIfNeeded()
+    }
+
+    /// Hold the automation open until "Arrived at X" has actually been said.
+    ///
+    /// Resolving the instant the phase flips is what made arrival inaudible.
+    /// The trace of the 25 Aug 2026 lab test has the arrival cue at t=228.96
+    /// and the session handoff at t=228.97: this screen enqueued the sentence
+    /// and was torn down 10 ms later, so the utterance was cancelled a syllable
+    /// in and reaching simply began. The participant's report was that they
+    /// never learned they had arrived — it "just directly shifted to reaching".
+    ///
+    /// The manual path has always given it a beat (`triggerManualReachingHandoff
+    /// IfNeeded`); this is the same idea measured against the synthesizer
+    /// instead of a guessed constant, so a long arrival line in either language
+    /// gets the time it actually needs and a short one costs nothing.
+    private func resolveAutomatedArrivalWhenSpoken() {
+        guard didScheduleArrivalResolve == false,
+              didResolveAutomation == false,
+              didRequestGuidanceExit == false else { return }
+        didScheduleArrivalResolve = true
+
+        let message = semanticNavigator.currentInstruction
+
+        // Two cases cannot be measured: VoiceOver owns the utterance and
+        // reports nothing back about it, and a disabled synthesizer never
+        // reports starting at all. Both estimate instead, on the same basis as
+        // Announcer's queue pacing on the JS side.
+        guard !launchVoiceOverEnabled, ttsManager.ttsState.isEnabled else {
+            let estimate = min(
+                arrivalSpeechMaxWaitSeconds,
+                max(1.6, Double(message.count) * 0.055)
+            )
+            DispatchQueue.main.asyncAfter(deadline: .now() + estimate) {
+                guard didRequestGuidanceExit == false else { return }
+                resolveArrivedAutomation(message: message)
+            }
+            return
+        }
+
+        awaitArrivalSpeech(message: message, deadline: Date().addingTimeInterval(arrivalSpeechMaxWaitSeconds))
+    }
+
+    /// Polls the synthesizer until the arrival line has been spoken.
+    ///
+    /// Polling rather than sampling once: the cue is enqueued by a *different*
+    /// `onChange` handler (`handleSpeechCueChanged`) on the same runloop turn as
+    /// the phase change, and SwiftUI does not order the two — reading
+    /// `isSpeaking` immediately can catch the moment before it starts and
+    /// mistake "not yet" for "done". The deadline bounds it so a TTS failure
+    /// costs a few seconds, never the arrival.
+    private func awaitArrivalSpeech(message: String, deadline: Date) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            guard didResolveAutomation == false, didRequestGuidanceExit == false else { return }
+            let state = ttsManager.ttsState
+            let startedThisLine = state.lastSpokenText == message
+            if (startedThisLine && !state.isSpeaking) || Date() >= deadline {
+                resolveArrivedAutomation(message: message)
+                return
+            }
+            awaitArrivalSpeech(message: message, deadline: deadline)
+        }
+    }
+
+    private func resolveArrivedAutomation(message: String) {
+        resolveAutomation(
+            success: true,
+            reason: "arrived",
+            message: message,
+            messageSpoken: true
+        )
     }
 
     /// Route-manager testing flow: after a manual guidance run arrives at a
@@ -843,6 +982,7 @@ struct ARMappingView: View {
             automatedRelocalizationStartedAt = nil
             lastRelocalizationVoiceCueAt = nil
             relocalizationVoiceCueCount = 0
+            didReportSlowRelocalization = false
             return
         }
 
@@ -856,22 +996,40 @@ struct ARMappingView: View {
             return
         }
 
-        if now.timeIntervalSince(startedAt) >= automatedRelocalizationTimeoutSeconds {
-            // Report the attempt so the user is not left standing in silence,
-            // but leave ARKit searching: the retry retargets this session and
-            // continues the same relocalization instead of resetting tracking
-            // and starting cold. Past the total budget, give up for real.
-            let searchedFor = now.timeIntervalSince(relocalizationSearchStartedAt ?? now)
-            let staysWarm = searchedFor < automatedRelocalizationWarmBudgetSeconds
-            if !staysWarm {
-                navigationSession.isSearching = false
-            }
+        let searchedFor = now.timeIntervalSince(relocalizationSearchStartedAt ?? now)
+
+        // Out of patience for real. Nothing is left to search with, so end the
+        // automation and let the screen come down.
+        if searchedFor >= automatedRelocalizationWarmBudgetSeconds {
+            navigationSession.isSearching = false
             resolveAutomation(
                 success: false,
                 reason: "relocalization_failed",
-                message: staysWarm ? NavLoc.relocStillSearchingMessage() : NavLoc.relocFailedMessage(),
-                keepSessionAlive: staysWarm
+                message: NavLoc.relocFailedMessage()
             )
+            return
+        }
+
+        // ⚠️ This used to RESOLVE the automation here, as a failure, while
+        // deliberately leaving ARKit searching — the idea being that the user
+        // would ask again and retarget the warm session. Resolving latches
+        // `didResolveAutomation`, and that latch is what
+        // `attemptAutomatedNavigationIfNeeded` checks first, so the search we
+        // had just kept alive could no longer start anything. The 25 Aug 2026
+        // lab test hit exactly that, twice: the timeout fired at 35 s and ARKit
+        // localized 2.8 s and 0.85 s later, both times into a screen that would
+        // no longer build a route. The trace shows `ar.localized` with no
+        // `nav.start` after it, and the participant standing at 421 being told
+        // to turn in a full circle until they tapped out.
+        //
+        // So it only SPEAKS now. The session stays searching, the automation
+        // stays live, and a relocalization that lands one second past the mark
+        // starts the journey the way one that landed a second before it would.
+        if now.timeIntervalSince(startedAt) >= automatedRelocalizationTimeoutSeconds,
+           didReportSlowRelocalization == false {
+            didReportSlowRelocalization = true
+            announceAutomatedStatus(NavLoc.relocStillSearchingMessage())
+            lastRelocalizationVoiceCueAt = now
             return
         }
 
@@ -888,6 +1046,23 @@ struct ARMappingView: View {
         let cue: String
         if let recognized = mappingManager.recognizedPlaceName {
             cue = NavLoc.relocRecognizedPlaceCue(recognized)
+        } else if relocalizationVoiceCueCount == 1,
+                  let origin = Self.freshConfirmedPlaceName,
+                  let destination = automatedTargetName,
+                  origin.caseInsensitiveCompare(destination) != .orderedSame {
+            // The app is not starting from nothing here and should not sound
+            // like it is. This leg begins where the last one ended — the user
+            // was told "Arrived at 421" a minute ago and has not walked away —
+            // so the opening cue states that, names where they asked to go, and
+            // only then asks for the pan. "Pan left and right" with no subject
+            // was the participant's complaint on 25 Aug 2026: the app plainly
+            // knew where they were standing and gave no sign of it.
+            //
+            // What it does NOT do is skip the relocalization. Knowing the place
+            // is not the same as holding the map frame, and assuming the pose
+            // is how a route ends up built from somewhere the user is not.
+            cue = NavLoc.relocResumingFromCue(origin: origin, destination: destination)
+            Self.hasCoachedRelocalization = true
         } else if Self.hasCoachedRelocalization {
             // Already coached earlier in this run. The first interval passes in
             // silence — a relocalization that resolves inside it never needed
@@ -1069,6 +1244,9 @@ struct ARMappingView: View {
 
         if didStart {
             didStartAutomatedGuidance = true
+            // They are about to walk away from it.
+            Self.lastConfirmedPlaceName = nil
+            Self.lastConfirmedPlaceAt = nil
         } else {
             let lower = semanticNavigator.currentInstruction.lowercased()
             let reason: String
@@ -1238,7 +1416,7 @@ struct ARMappingView: View {
         reason: String,
         routeName: String? = nil,
         message: String? = nil,
-        keepSessionAlive: Bool = false
+        messageSpoken: Bool = false
     ) {
         guard didResolveAutomation == false else { return }
         didResolveAutomation = true
@@ -1256,7 +1434,10 @@ struct ARMappingView: View {
             reachingObjectWorldPosition: reachingObjectName.flatMap { reachingObjectWorldPosition(for: $0) },
             message: message
         )
-        result.sessionAlive = keepSessionAlive
+        // Whether the session survives this result is `ARKitNavigationModule`'s
+        // call, not this screen's: it owns the JS-supplied `keepSessionAlive`
+        // config and the presented-controller state that decides it.
+        result.messageSpoken = messageSpoken
 
         // Automated arrival with a reaching object: this screen is about to be
         // torn down, JS speaks the switch-over line, and only then calls back

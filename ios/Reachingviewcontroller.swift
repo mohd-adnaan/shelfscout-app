@@ -141,6 +141,17 @@ class ReachingViewController: UIViewController {
   var inheritedSessionWatchdog: DispatchWorkItem?
   /// How long an attached session gets to deliver a normally-tracked frame.
   let inheritedSessionProofTimeoutSec: TimeInterval = 3.0
+  /// True once the AR session has been released — offered back for the next
+  /// navigation leg, or paused. Every teardown path calls `releaseARSession()`
+  /// and several of them run in sequence (`handleSuccess` → `cleanup`), so it
+  /// has to be idempotent: a second call must not pause a session the first
+  /// call just put up for adoption.
+  private var didReleaseARSession = false
+  /// True when `releaseARSession()` handed the session on rather than pausing
+  /// it, so the AR camera is still live and the next navigation leg can adopt
+  /// it. Reported to JS as `sessionAlive` — JS must leave the RN camera off
+  /// while it is true, or the two fight for the device.
+  private(set) var didReturnLiveSession = false
   let spatialTargetWorldPosition: simd_float3?
   let spatialTargetMapName: String?
   /// true = POI was pinned on the object surface (LiDAR/raycast at mapping
@@ -826,6 +837,45 @@ class ReachingViewController: UIViewController {
   // MARK: - Cancel / Success / Cleanup
   // ═══════════════════════════════════════════════════════════════════════════
 
+  /// Let go of the AR session — by handing it on, if it is worth handing on.
+  ///
+  /// Reaching used to `pause()` here unconditionally, which made the arrival
+  /// handoff one-way: the next leg had to cold-load the ARWorldMap and
+  /// relocalize from the destination, which is the hardest place to do it. The
+  /// 25 Aug 2026 lab test measured 36.7 s and 39.1 s for that, both of them
+  /// longer than the automation was willing to wait, so the return route was
+  /// never built and the user just heard "turn slowly in a full circle" until
+  /// they gave up.
+  ///
+  /// A session we PROVED is tracking normally is worth handing on. A cold one
+  /// is not (navigation would have to relocalize it anyway), and neither is one
+  /// whose inheritance failed and fell back — `startColdARSession` clears
+  /// `inheritedSessionActive` and `inheritedSessionProven` exactly for that.
+  ///
+  /// `offerBack` declines any session that was not on loan from the handoff
+  /// holder, and then this pauses it as before.
+  func releaseARSession() {
+    guard !didReleaseARSession else { return }
+    didReleaseARSession = true
+    guard let session = sceneView?.session else { return }
+    // Ours either way: nothing here should keep receiving frames.
+    session.delegate = nil
+    guard canReturnLiveSession, ARLiveSessionHandoff.shared.offerBack(session: session) else {
+      session.pause()
+      return
+    }
+    didReturnLiveSession = true
+  }
+
+  /// True when this session is worth handing back to navigation, so the caller
+  /// can tell JS to keep the RN camera off and continue the journey on it.
+  ///
+  /// A session with no current frame is dead however good the flags look —
+  /// holding the camera for it would cost battery and buy nothing.
+  var canReturnLiveSession: Bool {
+    inheritedSessionActive && inheritedSessionProven && sceneView?.session.currentFrame != nil
+  }
+
   @objc func cancelTapped() {
     guard !hasCompleted else { return }
     // Manual exit = user confirms they have the object (or wants to stop)
@@ -838,7 +888,7 @@ class ReachingViewController: UIViewController {
     running = false; hasCompleted = true
     NSLog("🎉 [ReachingVC] SUCCESS – reached %@", objectName)
 
-    sceneView.session.pause()
+    releaseARSession()
     beepTimer?.cancel(); beepTimer = nil
     playSuccessTone(); triggerHaptic(1.0)
 
@@ -866,6 +916,7 @@ class ReachingViewController: UIViewController {
                      "reason": "reached", "mode": self.mode.rawValue,
                      "hasLiDAR": self.hasLiDAR,
                      "acquisitionChecks": self.acquisitionCheckCount,
+                     "sessionAlive": self.didReturnLiveSession,
                      "message": "\(self.objectName) reached!"])
       }
     }
@@ -874,7 +925,7 @@ class ReachingViewController: UIViewController {
   func finishWith(success: Bool, reason: String) {
     guard !hasDismissed else { return }
     hasDismissed = true; running = false
-    sceneView.session.pause()
+    releaseARSession()
     cleanup()
     let msg = reason == "user_confirmed"
       ? "Reaching complete."
@@ -887,6 +938,7 @@ class ReachingViewController: UIViewController {
                      "mode": self.mode.rawValue,
                      "hasLiDAR": self.hasLiDAR,
                      "acquisitionChecks": self.acquisitionCheckCount,
+                     "sessionAlive": self.didReturnLiveSession,
                      "message": msg])
       }
     }
@@ -900,7 +952,7 @@ class ReachingViewController: UIViewController {
     playerNode?.stop(); audioEngine?.stop(); audioEngine = nil
     hapticEngine?.stop(); hapticEngine = nil
     synth.stopSpeaking(at: .immediate)
-    sceneView?.session.pause()
+    releaseARSession()
     // Reset acquisition polling state
     isPollingAcquisition = false
     acquisitionTriggered = false

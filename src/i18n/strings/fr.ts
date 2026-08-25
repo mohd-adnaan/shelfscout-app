@@ -162,6 +162,94 @@ export const fr: StringCatalog = {
       'Pointez la caméra vers ce que vous voulez faire décrire, puis redemandez.',
   },
 
+  // ── Menu d’actions ───────────────────────────────────────────────────────
+  //
+  // Ces libellés SONT l’interface pour une personne qui utilise VoiceOver :
+  // balayer l’écran d’accueil lit exactement cette liste. Mêmes règles qu’en
+  // anglais : le verbe d’abord, aucun terme interne (« reaching », « cible
+  // spatiale »), et l’indice décrit ce qui se passe ENSUITE — les rangées qui
+  // ouvrent le micro le disent, les autres disent qu’elles agissent tout de
+  // suite.
+  menu: {
+    title: 'ShelfScout',
+    settingsLabel: 'Réglages',
+    settingsHint: 'Ouvre la langue, la vitesse de la voix et les options de guidage',
+    items: {
+      describe: {
+        label: 'Décrire mon environnement',
+        hint: 'Décrit tout de suite ce qui est devant vous, y compris le texte. Rien à dire',
+      },
+      ask: {
+        label: 'Poser une question',
+        hint: 'Démarre l’écoute, puis répond à votre question sur ce que voit la caméra',
+      },
+      find: {
+        label: 'Trouver un objet',
+        hint: 'Écoute le nom de l’objet, puis guide votre main jusqu’à lui',
+      },
+      navigate: {
+        label: 'M’amener quelque part',
+        hint: 'Ouvre la liste des destinations enregistrées',
+      },
+      repeat: {
+        label: 'Répéter',
+        hint: 'Redit la dernière réponse',
+      },
+    },
+  },
+
+  // ── Affichage d’état persistant ──────────────────────────────────────────
+  overlay: {
+    stopLabel: 'Arrêter',
+    stopHint: 'Met fin à l’action en cours et revient au menu',
+    statusLabel: (status: string) => `État : ${status}`,
+  },
+
+  // ── Sélecteur de destinations enregistrées ───────────────────────────────
+  destinations: {
+    title: 'M’amener quelque part',
+    loading: 'Chargement des destinations enregistrées.',
+    countAnnouncement: (count: number) =>
+      count === 1
+        ? 'Une destination enregistrée. Balayez pour l’entendre, puis touchez deux fois pour y aller.'
+        : `${count} destinations enregistrées. Balayez pour les parcourir, puis touchez deux fois pour y aller.`,
+    empty:
+      'Aucune destination enregistrée. Ouvrez Réglages, puis Gérer les cartes de trajet AR, pour cartographier un trajet.',
+    loadFailed: 'Je n’ai pas pu charger vos destinations enregistrées. Réessayez.',
+    rowHint: 'Touchez deux fois pour lancer le guidage vers cette destination',
+    backLabel: 'Retour',
+    backHint: 'Revient au menu sans choisir de destination',
+  },
+
+  // ── Commandes canoniques des actions sans parole ─────────────────────────
+  //
+  // Ces phrases remplacent la transcription pour « Décrire l’environnement » et
+  // « Lire le texte ». Elles restent en français parce que le classificateur
+  // d’intention a un prompt français : une phrase anglaise ici serait classée
+  // par le mauvais jeu d’exemples. C’est de la configuration, pas du texte
+  // d’interface — les modifier change le routage.
+  commands: {
+    describeScene: 'Qu’est-ce qu’il y a devant moi ?',
+    findObject: (target: string) => `Guide ma main vers ${target}.`,
+  },
+
+  // ── Invites et états des parcours lancés depuis le menu ──────────────────
+  flow: {
+    askPrompt: 'Que voulez-vous savoir ?',
+    findPrompt: 'Que dois-je trouver ?',
+    statusListening: 'À l’écoute',
+    statusThinking: 'Je m’en occupe',
+    statusSpeaking: 'Réponse',
+    statusDescribing: 'Description de ce qui est devant vous',
+    statusFinding: (target: string) => `Recherche de ${target}`,
+    statusNavigating: (target: string) => `En route vers ${target}`,
+    statusReady: 'Prêt',
+    nothingToRepeat: 'Il n’y a pas encore de réponse à répéter.',
+    repeating: 'Je répète la dernière réponse.',
+    cancelled: 'Annulé.',
+    busy: 'Toujours en cours. Utilisez Arrêter d’abord.',
+  },
+
   settings: {
     languageSection: 'Langue',
     languageDescription:

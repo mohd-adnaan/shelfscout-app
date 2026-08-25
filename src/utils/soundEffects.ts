@@ -62,10 +62,42 @@ export const setWearablesMode = (enabled: boolean): void => {
   _wearablesMode = enabled;
 };
 
-/** Safe wrapper: only calls setCategory when NOT in glasses mode. */
+// ── Screen-reader (VoiceOver) mode ────────────────────────────────────────
+//
+// This flag decides ONE thing: the `mixWithOthers` argument to setCategory.
+// That single boolean is why blind users heard no sound cues at all.
+//
+// `Sound.setCategory('Playback', false)` requests an EXCLUSIVE playback
+// session. Taking the session exclusively interrupts VoiceOver mid-sentence,
+// and the resulting churn is what produced the "!pri" errors and the glitchy,
+// screamy artifacts in the logs. The response at the time was to stop playing
+// earcons whenever VoiceOver was on — which left the app's primary audience,
+// the users who cannot see the screen, with no audio cues whatsoever while
+// sighted users got the full set.
+//
+// `Sound.setCategory('Playback', true)` requests a MIXABLE session instead.
+// Short cues then play *alongside* VoiceOver rather than fighting it for the
+// session, so the suppression is no longer needed. Playback (rather than
+// Ambient) keeps the cues audible with the ring/silent switch set to silent —
+// a blind user commonly leaves it there, and an accessibility cue that goes
+// silent with the ringer is worse than no cue at all.
+let _screenReaderMode = false;
+
+/**
+ * Keep in sync with `AccessibilityInfo.isScreenReaderEnabled()`, including the
+ * `screenReaderChanged` listener — VoiceOver can be toggled mid-session.
+ */
+export const setScreenReaderMode = (enabled: boolean): void => {
+  _screenReaderMode = enabled;
+};
+
+/**
+ * Safe wrapper: skips setCategory entirely in glasses mode (where BluetoothHFP
+ * owns the session), and mixes rather than interrupts when VoiceOver is on.
+ */
 const _safeSetPlaybackCategory = (): void => {
   if (_wearablesMode) return;
-  Sound.setCategory('Playback', false);
+  Sound.setCategory('Playback', _screenReaderMode);
 };
 
 // ── Configure sound to play through the speaker, not earpiece ─────────────
@@ -305,7 +337,10 @@ export const playStopReachingSound = (): Promise<void> => {
  * the session in exclusive-playback mode, which blocks recording.
  */
 export const prepareForRecording = (): void => {
-  Sound.setCategory('PlayAndRecord', false);
+  // mixWithOthers follows screen-reader mode for the same reason the playback
+  // category does: taking the session exclusively cuts VoiceOver off mid-word,
+  // and the recogniser does not need exclusivity to hear the user.
+  Sound.setCategory('PlayAndRecord', _screenReaderMode);
 };
 
 /**
