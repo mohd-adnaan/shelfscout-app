@@ -760,7 +760,7 @@ export default function SettingsScreen({ onClose }: SettingsScreenProps) {
           <Text style={styles.settingDescription}>
             <Text style={styles.emphasisText}>In-Device Mode</Text> runs navigation and
             reaching fully on your phone with ARKit — no network needed. Turn it off to use
-            the online backend (Kasra navigation and backend reaching).
+            the online backend.
           </Text>
 
           <View style={styles.settingRow}>

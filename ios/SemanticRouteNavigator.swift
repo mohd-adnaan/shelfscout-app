@@ -634,6 +634,28 @@ final class SemanticRouteNavigator: ObservableObject {
     /// AR contradicts a pending step completion.
     private var lastTrustedARRemainingMeters: Double?
     private var lastRouteRebuildAttemptAt: Date?
+    /// Edge whose leg-context phrase ("toward the next turn", "toward 436")
+    /// has already been spoken.
+    ///
+    /// The context belongs to the leg, not to every sentence about it. Said on
+    /// each cue it became the thing a participant heard most: "20 meters toward
+    /// the next turn" then "19 meters toward the next turn" then "Turn right.
+    /// Walk 20 meters toward the next turn" — their words on 25 Aug 2026 were
+    /// that after the first one it should just count "16, 14, 3, 2, 1". Once
+    /// this matches the active edge, distance cues on it drop to the bare
+    /// number; a new leg clears it by simply having a different edge id.
+    private var spokenLegContextEdgeID: String?
+    /// When ARKit last moved the world frame under the route.
+    private var arFrameRealignedAt: Date?
+    /// Throttle for the visual-arrival veto trace. The veto is a decision, not
+    /// a sample, so it uses `log` rather than the droppable `tick` — but a
+    /// persistent lookalike match re-tests it several times a second, and a
+    /// decision worth reading is one that has not been written a hundred times.
+    private var lastVisualArrivalVetoTraceAt: Date?
+    /// How long after a frame realignment corrective heading cues stay quiet.
+    /// Long enough for the yaw watch to take a fresh baseline, short enough
+    /// that a genuinely misfacing user is not left walking.
+    private let alignmentCueFrameSettleSeconds: TimeInterval = 2.5
     private var stillnessStartedAt: Date?
     private var lastStillnessRepromptAt: Date?
     /// When the user first stopped moving while standing near the destination —
@@ -838,6 +860,21 @@ final class SemanticRouteNavigator: ObservableObject {
     /// looping the same recovery cue.
     private let beliefRebuildAfterSeconds: TimeInterval = 12.0
     private let routeRebuildRetrySeconds: TimeInterval = 4.0
+    /// Quiet window after a step advance during which no realignment may
+    /// re-plan the route.
+    ///
+    /// A step advance is the freshest and most specific evidence the navigator
+    /// has about where the user is: it fired because the pose reached a node.
+    /// A realignment 0.3 s later re-resolves from a pose the advance has
+    /// already superseded, and on 25 Aug 2026 one resolved back onto the leg
+    /// just finished and re-announced the same turn — which is how a turn cue
+    /// arrives AFTER the user has walked into the wall it was meant to save
+    /// them from.
+    private let routeRebuildAfterAdvanceSeconds: TimeInterval = 2.5
+    /// How far a realignment may move progress on the SAME leg and still count
+    /// as "nothing the user needs to hear". Inside this, the pose correction is
+    /// applied silently.
+    private let routeRealignSilentProgressMeters = 1.5
     /// Extra walking a rebuild may add before it reads as a wrong-edge
     /// resolution rather than a correction. Scaled against the remaining route
     /// as well, so short final legs are not judged by an absolute metre count.
@@ -915,6 +952,22 @@ final class SemanticRouteNavigator: ObservableObject {
     private let visualRouteSnapConfidence = 0.72
     private let visualRouteArrivalConfidence = 0.76
     private let visualRouteAmbiguousGap = 0.20
+    /// How far the live AR pose may still be from the destination node while a
+    /// visual match is allowed to declare arrival.
+    ///
+    /// A visual match is pose-INDEPENDENT. That is what makes it useful when
+    /// the pose is lost, and it is exactly what makes it dangerous when the
+    /// pose is good: on a route walked in both directions the enrichment pass
+    /// captured the destination's surroundings from the opposite heading, so a
+    /// camera 16 m short of 436 can genuinely match a keyframe belonging to it.
+    /// On 25 Aug 2026 that is what happened — "Arrived at 436" with the AR pose
+    /// reading 4.9 m into a 20.6 m leg, cross-track 0.23 m, localized and
+    /// steady. A pose that good is not outvoted by a photograph.
+    ///
+    /// Generous rather than tight, because the shortcut still has a real job:
+    /// dead-reckoned progress lags after a turn, and a user standing at the
+    /// shelf must not be told to keep walking.
+    private let visualArrivalMaxARRemainingMeters = 3.0
     /// How far apart two near-tied visual matches may sit and still describe
     /// one place. Keyframes are captured about a third of a metre apart, so
     /// several always land inside it.
@@ -2405,6 +2458,7 @@ final class SemanticRouteNavigator: ObservableObject {
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
         lastRouteRebuildAttemptAt = nil
+        spokenLegContextEdgeID = nil
         stillnessStartedAt = nil
         lastStillnessRepromptAt = nil
         movementStoppedAt = nil
@@ -2515,6 +2569,7 @@ final class SemanticRouteNavigator: ObservableObject {
         // turn. Destinations with no reaching object attached are told so
         // directly rather than by a generic hint bolted onto every journey.
         emitCue(currentInstruction, priority: .critical)
+        noteLegContextSpoken(on: steps[0])
         rebuildRAGContext()
         return true
     }
@@ -4001,6 +4056,14 @@ final class SemanticRouteNavigator: ObservableObject {
            now.timeIntervalSince(last) < routeRebuildRetrySeconds {
             return false
         }
+        // A step advance outranks a frame realignment. See
+        // `routeRebuildAfterAdvanceSeconds`: re-planning on the heels of one
+        // argues with the best evidence the navigator has and speaks the turn
+        // a second time, seconds after the user has taken it.
+        if let lastRouteAdvanceAt,
+           now.timeIntervalSince(lastRouteAdvanceAt) < routeRebuildAfterAdvanceSeconds {
+            return false
+        }
         lastRouteRebuildAttemptAt = now
         return rebuildRouteFromCurrentPose(
             arPosition: arPosition,
@@ -4062,6 +4125,28 @@ final class SemanticRouteNavigator: ObservableObject {
             return false
         }
 
+        // ── Realignment that changes nothing ────────────────────────────
+        // The frame moved; the plan did not. Same leg, same remaining legs,
+        // same place on it — so there is no instruction to give, and giving one
+        // anyway is what produced eighteen spoken rebuilds in a ninety-second
+        // walk on 25 Aug 2026, most of them the identical sentence. Take the
+        // pose correction, say nothing, and leave the leg's cue schedule alone
+        // so the countdown keeps descending instead of restarting.
+        if let currentStep = activeStep,
+           firstStep.edge.id == currentStep.edge.id,
+           steps.map(\.edge.id) == remainingEdgeIDs(),
+           abs(proposedProgress - segmentProgressMeters) <= routeRealignSilentProgressMeters {
+            segmentProgressMeters = proposedProgress
+            segmentRemainingMeters = max(0, firstStep.edge.distanceMeters - proposedProgress)
+            NavigationTrace.shared.log("nav.rebuildSilent", traceState(extra: [
+                "reason": "plan_unchanged",
+                "proposedProgressM": proposedProgress,
+                "nodePath": start.nodePath
+            ]))
+            rebuildRAGContext()
+            return true
+        }
+
         routeSteps = steps
         arrivalFacing = shaped.arrivalFacing
         currentStepIndex = 0
@@ -4108,6 +4193,7 @@ final class SemanticRouteNavigator: ObservableObject {
             "legs": traceLegs()
         ]))
         emitCue(spokenInstruction, priority: .critical)
+        noteLegContextSpoken(on: firstStep)
         // The realignment cue carries the new direction, so it claims the turn
         // slot: an alignment nudge on the very next tick would stack a second
         // turn command onto it.
@@ -4139,12 +4225,43 @@ final class SemanticRouteNavigator: ObservableObject {
             to: step.edge.bearingDegrees,
             style: turnPhrasing
         )
-        return NavLoc.turnThenWalkLeg(
+        // The turn still has to be spoken — it is the actionable half — but the
+        // leg context after it is a repeat once the leg has already been named.
+        let cue = NavLoc.turnThenWalkLeg(
             prefix: "",
             turn: Self.withoutTrailingPeriod(command.text),
             distance: Self.formatDistance(segmentRemainingMeters),
-            context: walkContext(for: step)
+            context: spokenLegContextEdgeID == step.edge.id ? "" : walkContext(for: step)
         )
+        return Self.tidiedSpacing(cue)
+    }
+
+    /// Records that this leg's context phrase has now been spoken.
+    ///
+    /// Called only where a cue carrying it was actually EMITTED — never from
+    /// `updateInstruction`, which recomputes the banner every tick without
+    /// speaking. Claiming it there would let the banner silently consume the
+    /// one announcement the leg gets, and a leg reached by a rebuild would be
+    /// introduced as "Turn right. Walk 20 meters." with no idea what is at the
+    /// end of it.
+    private func noteLegContextSpoken(on step: SemanticRouteStep) {
+        spokenLegContextEdgeID = step.edge.id
+    }
+
+    /// Collapses the double space and the space-before-period left behind when
+    /// a leg context is dropped from a template that expected one.
+    private static func tidiedSpacing(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: "  ", with: " ")
+            .replacingOccurrences(of: " .", with: ".")
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Edge ids of the legs still to be walked, current one first. The shape a
+    /// rebuild has to reproduce to count as "the same plan".
+    private func remainingEdgeIDs() -> [String] {
+        guard currentStepIndex < routeSteps.count else { return [] }
+        return routeSteps[currentStepIndex...].map(\.edge.id)
     }
 
     private static func withoutTrailingPeriod(_ text: String) -> String {
@@ -4481,6 +4598,17 @@ final class SemanticRouteNavigator: ObservableObject {
         guard shouldEnableErrorRecovery else { return false }
         guard phase == .navigating else { return false }
         guard headingError >= routeTurnAlignmentThresholdDegrees else { return false }
+        // The frame this error was measured in has just moved. See
+        // `noteARFrameRealigned`.
+        if let arFrameRealignedAt,
+           Date().timeIntervalSince(arFrameRealignedAt) < alignmentCueFrameSettleSeconds {
+            NavigationTrace.shared.tick("nav.alignmentCue.deferred", [
+                "reason": "frame_realigning",
+                "liveHeading": liveHeading,
+                "targetBearing": step.edge.bearingDegrees
+            ])
+            return false
+        }
         // Facing along a dropped leading stub is facing the route: the heading
         // error against the post-stub leg is the turn that comes LATER, at the
         // stub's far end. Nagging it now told users who had already turned the
@@ -4509,8 +4637,18 @@ final class SemanticRouteNavigator: ObservableObject {
         let nearStepStart = segmentProgressMeters <= routeAlignmentProgressWindowMeters
         guard nearStepStart || recentlyAdvanced || recentlyRecovered else { return false }
 
-        let instruction = Self.routeAlignmentInstruction(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing)
-        let key = "align_\(Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing).key)_\(currentStepIndex)"
+        // ⚠️ This cue and the turn at a mapped node are the SAME sentence — a
+        // bare "Turn right." — so a walker cannot tell "the corner is here"
+        // from "you have drifted off the line". A 25 Aug 2026 tester walking
+        // with his eyes shut took a corrective one for a corner and turned into
+        // a wall. The distinguishing clause ("… to face the route") was removed
+        // on reviewer instruction on 15 Aug 2026 for being too wordy, so
+        // reinstating it is the reviewer's call, not this code's; what IS fixed
+        // here is the frame-settle guard above, which is what let a corrective
+        // cue fire off a map frame that had just rotated 90°.
+        let command = Self.relativeTurnCommand(from: liveHeading, to: step.edge.bearingDegrees, style: turnPhrasing)
+        let instruction = command.text
+        let key = "align_\(command.key)_\(currentStepIndex)"
         let now = Date()
         let cueChanged = !Self.isSameSpokenCorrection(key, as: lastHeadingAlignmentCueKey)
         let cueAge = lastHeadingAlignmentCueAt.map { now.timeIntervalSince($0) } ?? .greatestFiniteMagnitude
@@ -5603,6 +5741,9 @@ final class SemanticRouteNavigator: ObservableObject {
                     context: nextContext
                 )
         )
+        // This is the leg's opening cue and the one place its context belongs.
+        // Every later distance on it counts down bare.
+        noteLegContextSpoken(on: next)
         emitCue(currentInstruction, priority: .critical)
         // This already told them which way to turn, so the alignment cue must
         // not repeat it a tick later while they are still turning.
@@ -5917,7 +6058,14 @@ final class SemanticRouteNavigator: ObservableObject {
             // has taken a step, one of which was about a shelf they were
             // already standing at. Pilot feedback, 11 Aug 2026: too much text
             // at the start.
-            currentInstruction = NavLoc.legDistance(distance: Self.formatDistance(cueRemainingMeters), context: context)
+            // The context is the leg's, not this sentence's. Once it has been
+            // said for this edge every later cue on it is a bare number, which
+            // is what turns "20 meters toward the next turn / 19 meters toward
+            // the next turn / 16 meters toward the next turn" into "20 meters
+            // toward the next turn / 19 / 16".
+            currentInstruction = spokenLegContextEdgeID == step.edge.id
+                ? NavLoc.distanceOnly(Self.formatDistance(cueRemainingMeters))
+                : NavLoc.legDistance(distance: Self.formatDistance(cueRemainingMeters), context: context)
         }
 
         let pastIntroProtection = guidanceIntroProtectedUntil.map { Date() >= $0 } ?? true
@@ -6681,6 +6829,14 @@ final class SemanticRouteNavigator: ObservableObject {
     /// worse, or replaced — so the bias goes back to zero and the keyframes
     /// re-measure against whatever frame is now live, ungated until one lands.
     func noteARFrameRealigned() {
+        // Whatever the heading error reads right now, it was measured against a
+        // map frame ARKit has just rotated. On 25 Aug 2026 those rotations came
+        // in at 28°, 42°, 90° and −161° inside a few seconds, and the alignment
+        // cue read each of them as the user facing the wrong way and said
+        // "Turn right." mid-corridor. That is the cue the professor followed
+        // into a wall with his eyes shut. Hold corrective heading cues until
+        // the frame has stood still long enough to measure against.
+        arFrameRealignedAt = Date()
         guard mapFrameYawBiasDegrees != 0 || !visualYawResiduals.isEmpty
             || didCorroborateHeadingVisually else { return }
         NavigationTrace.shared.log("nav.frameYawBiasCleared", [
@@ -7040,6 +7196,35 @@ final class SemanticRouteNavigator: ObservableObject {
               let visualMatch,
               visualMatch.stepIndex == currentStepIndex,
               visualMatch.confidence >= visualRouteArrivalConfidence else {
+            return false
+        }
+
+        // The live pose has the final say on WHERE, always.
+        //
+        // Both branches below decide arrival from a photograph, and a
+        // photograph cannot tell 436-seen-from-here from 436-seen-from-16 m-
+        // back-down-the-same-corridor — the enrichment walk deliberately
+        // captured both. When a localized pose is available and says the
+        // destination is still metres away, it is the pose that is right.
+        // Without this, one lookalike frame ended a 20.6 m leg 16 m early with
+        // "Arrived at 436" (25 Aug 2026), which for a blind walker is not a
+        // missed cue but a wrong one: it stops them in the middle of a
+        // corridor and hands them to reaching for an object that is not there.
+        if let arRemaining = lastTrustedARRemainingMeters ?? lastARNodeDistanceMeters,
+           arRemaining > visualArrivalMaxARRemainingMeters {
+            let now = Date()
+            let sinceTrace = lastVisualArrivalVetoTraceAt.map { now.timeIntervalSince($0) }
+                ?? .greatestFiniteMagnitude
+            if sinceTrace >= 1.0 {
+                lastVisualArrivalVetoTraceAt = now
+                NavigationTrace.shared.log("nav.visualArrivalVetoed", traceState(extra: [
+                    "arRemainingM": arRemaining,
+                    "allowedM": visualArrivalMaxARRemainingMeters,
+                    "visualProgressM": visualMatch.progressMeters,
+                    "visualConfidence": visualMatch.confidence,
+                    "landmarkID": visualMatch.landmarkID ?? NSNull()
+                ]))
+            }
             return false
         }
 

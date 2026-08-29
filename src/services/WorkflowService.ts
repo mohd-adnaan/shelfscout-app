@@ -17,6 +17,7 @@ import {
 import { AccessibilityService } from './AccessibilityService';
 import { debugLogger } from './DebugLogger';
 import { mobileOrchestrator } from './MobileOrchestrator';
+import { trimSpokenAnswer } from '../utils/spokenAnswer';
 import { strings, getAppLanguage } from '../i18n';
 
 // =============================================================================
@@ -553,12 +554,27 @@ const sendToBackendWorkflow = async (
 export const sendToWorkflow = async (
   request: WorkflowRequest,
   signal?: AbortSignal
-): Promise<WorkflowResponse> => (
-  mobileOrchestrator.process(request, signal, {
+): Promise<WorkflowResponse> => {
+  const response = await mobileOrchestrator.process(request, signal, {
     backendWorkflowProvider: sendToBackendWorkflow,
     getSessionId,
-  })
-);
+  });
+
+  // Single spoken-length gate for every pipeline. `GroqVisionClient` asks its
+  // own model to compress and gives up gracefully when it will not; the n8n
+  // backend has no cap at all. Neither guarantee survives contact with a model
+  // that decides to be thorough, and on 25 Aug 2026 a description ran close to
+  // a minute of unskippable speech. Enforcing it here means it holds for
+  // whatever answered, and holds in code rather than in a prompt.
+  const spoken = trimSpokenAnswer(response.text || '');
+  if (spoken !== response.text) {
+    console.log(
+      `✂️ [Workflow] Spoken answer trimmed for length: ${response.text.length} → ${spoken.length} chars`,
+    );
+    return { ...response, text: spoken };
+  }
+  return response;
+};
 
 // =============================================================================
 // SMART GUIDANCE (tracker-driven reaching)
