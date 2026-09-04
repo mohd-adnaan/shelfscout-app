@@ -81,14 +81,44 @@ class ReachingViewController: UIViewController {
   // MARK: - With-Hand Phase Control
   // ═══════════════════════════════════════════════════════════════════════════
 
-  /// Distance (meters) at which with-hand switches from Phase 1 (navigation)
-  /// to Phase 2 (hand guidance). 0.50m gives user time to raise hand before
-  /// acquisition threshold (0.40m).
-  let handGuidanceThreshold: Float = 0.50
+  /// Distance (metres) at which with-hand switches from Phase 1 (navigation)
+  /// to Phase 2 (hand guidance).
+  ///
+  /// ⚠️ This is measured PHONE-to-object, not hand-to-object, and that is why
+  /// 0.50 m was wrong. A blind user does not walk until the phone is half a
+  /// metre from a doorknob; they stop where guidance told them they had
+  /// arrived — commonly a metre out — and then reach with the free hand while
+  /// the phone stays at chest height. At 0.50 m entry, Phase 2 simply never
+  /// fired, so with-hand mode behaved as hand-free with no hand tracking at
+  /// all (3 Sep 2026 report: "reaching ran, but never switched to hand
+  /// guidance"). 0.85 m is where the object comes within an outstretched arm
+  /// of someone standing still, i.e. the first moment "raise your hand" is an
+  /// instruction they can act on.
+  ///
+  /// Entering early is cheap: Phase 2 asks for the hand when it cannot see one
+  /// (`noHandLimit`), which is the correct prompt at this distance anyway.
+  let handGuidanceThreshold: Float = 0.85
   /// Hysteresis: must exceed this to drop BACK to Phase 1 (prevents oscillation)
-  let handGuidanceExitThreshold: Float = 0.65
+  let handGuidanceExitThreshold: Float = 1.05
+  /// Widest range at which a user who has STOPPED closing the distance is
+  /// treated as having arrived and ready to reach.
+  ///
+  /// The radius above still assumes the user walks close enough. The signal
+  /// that actually marks the transition is that they stopped walking — they
+  /// believe they are there. Someone who halts at 1.2 m and starts feeling for
+  /// a door handle needs hand guidance, not another "walk forward" cue.
+  let handGuidanceStallRadius: Float = 1.4
+  /// How long the distance must hold steady inside that radius before Phase 2
+  /// takes over anyway.
+  let handGuidanceStallSeconds: TimeInterval = 2.0
+  /// How much the distance may drift and still count as "not closing".
+  let handGuidanceStallToleranceMeters: Float = 0.12
   /// Phase 2 is currently active — hand tracking running
   var handGuidanceActive = false
+  /// When the user stopped closing on the object, and the distance they
+  /// stopped at. Drives the stall trigger above.
+  var handGuidanceStallSince: TimeInterval?
+  var handGuidanceStallDistance: Float?
   /// Transition announcement has been made ("Raise your hand")
   var handGuidanceAnnounced = false
 
@@ -959,6 +989,8 @@ class ReachingViewController: UIViewController {
     // Reset with-hand phase state
     handGuidanceActive = false
     handGuidanceAnnounced = false
+    handGuidanceStallSince = nil
+    handGuidanceStallDistance = nil
     // Reset tracker state — fresh handler on next session
     cancelTracker()
     trackingActive = false

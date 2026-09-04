@@ -52,6 +52,8 @@ extension ReachingViewController {
       // User backed away — drop to Phase 1
       handGuidanceActive = false
       handGuidanceAnnounced = false
+      handGuidanceStallSince = nil
+      handGuidanceStallDistance = nil
       noHandFrames = 0; successFrames = 0; depthConfirmedFrames = 0
       say(ReachLoc.movedAwayResumingNavigation())
       NSLog("🤚 [WithHand] Phase 2 → Phase 1 (dist=%.2fm > %.2fm)", dist, handGuidanceExitThreshold)
@@ -62,10 +64,38 @@ extension ReachingViewController {
       }
     }
 
-    if !handGuidanceActive && dist < handGuidanceThreshold {
+    // ── Stalled approach: they have stopped, so they think they are there ──
+    // The radius alone assumes the user keeps walking until the PHONE is close.
+    // They do not — they stop where guidance said they had arrived and start
+    // feeling for the object, and a metre out that left with-hand mode stuck in
+    // Phase 1 forever. Standing still inside reach range IS the transition.
+    let stalled: Bool
+    if !handGuidanceActive, dist < handGuidanceStallRadius {
+      let now = ProcessInfo.processInfo.systemUptime
+      if let since = handGuidanceStallSince,
+         let at = handGuidanceStallDistance,
+         abs(dist - at) <= handGuidanceStallToleranceMeters {
+        stalled = (now - since) >= handGuidanceStallSeconds
+      } else {
+        // First frame in range, or they are still closing — restart the clock
+        // from here so only a genuine pause counts.
+        handGuidanceStallSince = now
+        handGuidanceStallDistance = dist
+        stalled = false
+      }
+    } else {
+      handGuidanceStallSince = nil
+      handGuidanceStallDistance = nil
+      stalled = false
+    }
+
+    if !handGuidanceActive && (dist < handGuidanceThreshold || stalled) {
       // Enter Phase 2
       handGuidanceActive = true
-      NSLog("🤚 [WithHand] Phase 1 → Phase 2 (dist=%.2fm < %.2fm)", dist, handGuidanceThreshold)
+      handGuidanceStallSince = nil
+      handGuidanceStallDistance = nil
+      NSLog("🤚 [WithHand] Phase 1 → Phase 2 (dist=%.2fm, threshold=%.2fm, viaStall=%@)",
+            dist, handGuidanceThreshold, stalled ? "YES" : "NO")
       if !handGuidanceAnnounced {
         handGuidanceAnnounced = true
         say(ReachLoc.closeEnoughRaiseHand(objectName))

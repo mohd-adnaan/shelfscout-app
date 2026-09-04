@@ -462,7 +462,7 @@ class MobileOrchestrator {
       intent === 'chat' ||
       (localIntent.json?.needsImage === true && Boolean(request.imageUri))
     ) {
-      const answer = await this.visionAnswerInDevice(request, intent, trace);
+      const answer = await this.visionAnswerInDevice(request, intent, trace, memory.lastObject);
       if (answer) {
         return this.neutralInDeviceResponse(sessionId, trace, answer);
       }
@@ -479,7 +479,7 @@ class MobileOrchestrator {
     // strictly better than telling a user whose speech was transcribed
     // perfectly that they were not heard.
     if (request.imageUri && looksLikeQuestion(request.text)) {
-      const answer = await this.visionAnswerInDevice(request, 'chat', trace);
+      const answer = await this.visionAnswerInDevice(request, 'chat', trace, memory.lastObject);
       if (answer) {
         return this.neutralInDeviceResponse(sessionId, trace, answer);
       }
@@ -491,10 +491,20 @@ class MobileOrchestrator {
 
   // Scene → full-surroundings description; chat/other → question answered
   // against the current frame. Returns spoken text or null on failure.
+  /// `subject` is the thing the session is currently about — the object the
+  /// user was last guided to or told to reach for.
+  ///
+  /// Without it a verification question is unanswerable as asked. "Is this the
+  /// correct object?" names nothing: the model is handed a photo of a doorknob
+  /// and a question about "the correct object", and can only describe what it
+  /// sees and hope. The app already knows the answer to "which object" —
+  /// `memory.lastObject` is set from whatever reaching was launched for — so
+  /// the question the model gets is the question the user meant.
   private async visionAnswerInDevice(
     request: WorkflowRequest,
     intent: IntentClassification['intent'] | undefined,
     trace: ProviderTraceEntry[],
+    subject?: string,
   ): Promise<string | null> {
     if (!request.imageUri || !groqVisionClient.isConfigured()) {
       trace.push({
@@ -510,7 +520,11 @@ class MobileOrchestrator {
     const result =
       intent === 'scene'
         ? await groqVisionClient.describeScene(request.imageUri, request.text)
-        : await groqVisionClient.answerQuestion(request.imageUri, request.text || '');
+        : await groqVisionClient.answerQuestion(
+            request.imageUri,
+            request.text || '',
+            (request.object || subject || '').trim() || undefined,
+          );
 
     trace.push({
       provider: 'groq_vision',

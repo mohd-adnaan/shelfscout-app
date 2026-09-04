@@ -17,6 +17,15 @@ export interface WorkflowRequest {
     K_row_major?: number[];
     raw_capture?: unknown;
   };
+  /// What this session is currently ABOUT — the destination just guided to, or
+  /// the object reaching was launched for.
+  ///
+  /// Carries the subject of a question that does not name one. "Is this the
+  /// correct object?" is unanswerable without it: the model gets a photo and a
+  /// pronoun. The orchestrator keeps its own `lastObject`, but the arrival →
+  /// reaching handoff never passes through the orchestrator, so the live value
+  /// has to come from the app.
+  object?: string;
   navigation?: boolean;
   navigation_pipeline?: 'rtab' | 'arkit';
   navigation_ios_preferred?: boolean;

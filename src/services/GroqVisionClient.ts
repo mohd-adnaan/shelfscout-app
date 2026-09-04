@@ -86,7 +86,7 @@ Return a JSON object with exactly these keys:
 // ordering and the hard sentence cap are the two that matter most — length is
 // not controlled by asking for "concise", only by a number the model can count.
 const USR_SCENE =
-  "You are helping a blind shopper understand their immediate surroundings. Describe ONLY what is clearly visible in the image. Hard rules: - AT MOST 3 short sentences. Stop there even if more is visible. - NEAREST FIRST: start with what is within arm's reach or a step away, then anything further. Never open with the far end of the aisle. - Lead with the sentence that would change what the user does next. - State position (left, right, ahead, behind) and distance in metres or steps for anything you name. - Name products and fixtures only when you can identify them. If you cannot tell what something is, leave it out — do not describe it as unclear, vague, or possible. - Never describe floors, lighting, colours, signage style, or general ambience. - No preamble, no summary sentence, no offers of further help. Start with the object.";
+  "You are helping a blind person understand what is in front of them right now. Describe ONLY what is clearly visible. Hard rules: - AT MOST 2 short sentences. One is better. Stop there even if more is visible. - Say only what changes what they do next: what is in their path, what is within reach, and where it is. Everything else is noise — leave it out. - NEAREST FIRST. Never open with the far end of the room. - State side (left, right, ahead) and distance in metres or steps for anything you name. - Name a thing only if you can identify it. If you cannot tell what it is, say nothing about it — never \"unclear\", \"possible\", or \"appears to be\". - Never mention floors, lighting, colours, signage style, or ambience. - No preamble, no summary, no offer of help. First word is the thing itself.";
 
 const SYS_CHAT = `${TRAIT_VISION_PROFILE}
 
@@ -102,8 +102,15 @@ Return a JSON object with exactly these keys:
 // milk bag?"). A user holding the item wants the verdict first and can stop
 // listening there; a description that eventually implies the verdict makes them
 // wait through it and then infer it.
-const USR_CHAT = (transcript: string) =>
-  `You are a virtual AI assistant for a blind or low-vision user. Answer in AT MOST 2 short sentences, spoken aloud. Answer the question and nothing else — no preamble, no restating the question, no offer of further help. If the question can be answered yes or no, the FIRST word is "Yes" or "No"; then name what you actually see, and if it is not what they asked about, say what it is instead. Avoid lighting, colours, layout and other detail unless it is what was asked about. If the image cannot answer the question, say so in one sentence.\n\nAnswer this question by the user: "${transcript}".`;
+const USR_CHAT = (transcript: string, subject?: string) => {
+  // The subject clause is what makes a verification question answerable at
+  // all. "Is this the correct object?" names nothing — without it the model
+  // is handed a photo and a pronoun. See `visionAnswerInDevice`.
+  const subjectClause = subject
+    ? `In this session the user is looking for: "${subject}". Any "this", "it", "the object" or "the correct one" in their question means "${subject}".\n\n`
+    : '';
+  return `You are answering out loud for a blind user who is standing still, waiting. Every word costs them time.\n\n${subjectClause}Hard rules: - ONE short sentence. Two only if the second one is genuinely needed. - Answer the question asked and nothing else. No preamble, no restating the question, no offer of help. - Yes/no question: the FIRST word is "Yes" or "No". If No, say what it actually is in the same sentence. - If the image does not show what was asked about, say that plainly and briefly — for a price, "No price tag is visible." — and stop. Do not guess, do not describe the packaging instead, do not explain why you cannot tell. - Mention colour, lighting or layout only if that is what was asked about.\n\nThe user asked: "${transcript}".`;
+};
 
 // The "phrased EXACTLY as received" rule is a behavioral contract, not a style
 // note: clock positions, distances and sequence markers are what the reaching
@@ -125,7 +132,7 @@ RULES:
 - Responses that deal with locating an object must be phrased EXACTLY as received with no processing (preserve clock positions, distances, and sequence markers exactly).
 For other responses:
 - Use natural language. No JSON or technical jargon in the output.
-- AT MOST 3 short sentences, and stop. This is spoken aloud to someone standing in a store aisle: a minute of speech is a minute they cannot move.
+- AT MOST 2 short sentences, and stop. One is better. This is spoken aloud to someone standing still waiting for it: a minute of speech is a minute they cannot move.
 - Nearest first. What is within reach outranks what is at the end of the aisle.
 - Drop anything the input hedges about. If the data is unsure what something is, it does not get said at all.
 - No preamble ("Here is what I can see…"), no closing offer of help, no restating the question.`;
@@ -177,7 +184,7 @@ Retourne un objet JSON avec exactement ces clés. Les NOMS DES CLÉS restent en 
 - "environment_summary" : un résumé factuel et dense de ce que contient le lieu.`;
 
 const USR_SCENE_FR =
-  'Tu aides une personne aveugle à comprendre ce qui l’entoure immédiatement. Décris UNIQUEMENT ce qui est clairement visible sur l’image. Règles strictes : - AU PLUS 3 phrases courtes. Arrête-toi là, même s’il reste des choses visibles. - LE PLUS PRÈS D’ABORD : commence par ce qui est à portée de main ou à un pas, puis seulement ce qui est plus loin. Ne commence jamais par le fond de l’allée. - Mets en premier la phrase qui change ce que la personne fera ensuite. - Indique la position (à gauche, à droite, devant, derrière) et la distance en mètres ou en pas pour chaque chose que tu nommes. - Ne nomme un produit ou un meuble que si tu peux l’identifier. Si tu n’arrives pas à dire ce que c’est, ne le mentionne pas : n’écris pas que c’est flou, vague ou possible. - Ne décris jamais le plancher, l’éclairage, les couleurs, l’allure des affiches ni l’ambiance générale. - Aucune introduction, aucune phrase de conclusion, aucune offre d’aide supplémentaire. Commence directement par l’objet.';
+  'Tu aides une personne aveugle à comprendre ce qu’il y a devant elle en ce moment. Décris UNIQUEMENT ce qui est clairement visible. Règles strictes : - AU PLUS 2 phrases courtes. Une seule, c’est mieux. Arrête-toi là, même s’il reste des choses visibles. - Ne dis que ce qui change ce que la personne fera ensuite : ce qui se trouve sur son chemin, ce qui est à portée de main, et où. Le reste est du bruit : écarte-le. - LE PLUS PRÈS D’ABORD. Ne commence jamais par le fond de la pièce. - Indique le côté (à gauche, à droite, devant) et la distance en mètres ou en pas pour chaque chose que tu nommes. - Ne nomme une chose que si tu peux l’identifier. Sinon, n’en parle pas du tout : jamais « flou », « possible » ni « on dirait ». - Ne mentionne jamais le plancher, l’éclairage, les couleurs, l’allure des affiches ni l’ambiance. - Aucune introduction, aucune conclusion, aucune offre d’aide. Le premier mot est la chose elle-même.';
 
 const SYS_CHAT_FR = `${TRAIT_VISION_PROFILE_FR}
 
@@ -189,8 +196,12 @@ Retourne un objet JSON avec exactement ces clés. Les NOMS DES CLÉS restent en 
 - "pointers" : une réponse brève à la question de l’utilisateur, en t’appuyant sur l’image au besoin.
 - "visual_data" : une description objective et détaillée des éléments visuels pertinents pour la question.`;
 
-const USR_CHAT_FR = (transcript: string) =>
-  `Tu es un assistant pour une personne aveugle ou malvoyante. Réponds en AU PLUS 2 phrases courtes, lues à voix haute. Réponds à la question et rien d’autre : aucune introduction, aucune reformulation de la question, aucune offre d’aide à la fin. Si la question appelle une réponse par oui ou non, le PREMIER mot est « Oui » ou « Non » ; nomme ensuite ce que tu vois vraiment, et si ce n’est pas ce qu’on te demandait, dis ce que c’est à la place. Évite l’éclairage, les couleurs, l’agencement et les autres détails, sauf si c’est précisément ce qu’on te demande. Si l’image ne permet pas de répondre, dis-le en une phrase.\n\nRéponds à cette question de l’utilisateur : « ${transcript} ».`;
+const USR_CHAT_FR = (transcript: string, subject?: string) => {
+  const subjectClause = subject
+    ? `Dans cette session, l’utilisateur cherche : « ${subject} ». Tout « ceci », « ça », « l’objet » ou « le bon » dans sa question désigne « ${subject} ».\n\n`
+    : '';
+  return `Tu réponds à voix haute à une personne aveugle qui est debout, immobile, en train d’attendre. Chaque mot lui coûte du temps.\n\n${subjectClause}Règles strictes : - UNE phrase courte. Deux seulement si la seconde est vraiment nécessaire. - Réponds à la question posée et à rien d’autre. Aucune introduction, aucune reformulation, aucune offre d’aide. - Question par oui ou non : le PREMIER mot est « Oui » ou « Non ». Si c’est « Non », dis dans la même phrase ce que c’est réellement. - Si l’image ne montre pas ce qu’on te demande, dis-le simplement et brièvement — pour un prix : « Aucune étiquette de prix n’est visible. » — puis arrête-toi. Ne devine pas, ne décris pas l’emballage à la place, n’explique pas pourquoi tu ne peux pas voir. - Ne parle de couleur, d’éclairage ou d’agencement que si c’est précisément ce qu’on te demande.\n\nL’utilisateur a demandé : « ${transcript} ».`;
+};
 
 const SYS_SYNTHESIZE_FR = `${TRAIT_COMM_STYLE_FR}
 
@@ -210,7 +221,7 @@ RÈGLES :
 - Les réponses qui situent un objet doivent reprendre EXACTEMENT la formulation reçue, sans retraitement : conserve telles quelles les positions horaires, les distances et les marqueurs de séquence.
 Pour les autres réponses :
 - Emploie un langage naturel. Aucun JSON ni jargon technique dans la sortie.
-- AU PLUS 3 phrases courtes, puis arrête-toi. C’est lu à voix haute à quelqu’un debout dans une allée : une minute de parole, c’est une minute sans bouger.
+- AU PLUS 2 phrases courtes, puis arrête-toi. Une seule, c’est mieux. C’est lu à voix haute à quelqu’un qui attend debout : une minute de parole, c’est une minute sans bouger.
 - Le plus près d’abord. Ce qui est à portée de main passe avant le fond de l’allée.
 - Écarte tout ce dont les données ne sont pas sûres. Si l’entrée hésite sur ce qu’est un objet, il ne se dit pas du tout.
 - Aucune introduction (« Voici ce que je vois… »), aucune offre d’aide à la fin, aucune reformulation de la question.`;
@@ -241,7 +252,7 @@ const SYS_CHAT_BY_LANGUAGE: Record<AppLanguage, string> = {
   en: SYS_CHAT,
   fr: SYS_CHAT_FR,
 };
-const USR_CHAT_BY_LANGUAGE: Record<AppLanguage, (transcript: string) => string> = {
+const USR_CHAT_BY_LANGUAGE: Record<AppLanguage, (transcript: string, subject?: string) => string> = {
   en: USR_CHAT,
   fr: USR_CHAT_FR,
 };
@@ -341,11 +352,19 @@ class GroqVisionClient {
     return this.runPasses(SYS_SCENE_BY_LANGUAGE[language], userText, imageUri, transcript || '');
   }
 
-  async answerQuestion(imageUri: string, transcript: string): Promise<GroqVisionResult> {
+  /// `subject` names the thing the session is about, so a question that only
+  /// says "this" or "the correct object" resolves to something. Optional: a
+  /// question asked cold has no subject, and the prompt then omits the clause
+  /// rather than inventing one.
+  async answerQuestion(
+    imageUri: string,
+    transcript: string,
+    subject?: string,
+  ): Promise<GroqVisionResult> {
     const language = getAppLanguage();
     return this.runPasses(
       SYS_CHAT_BY_LANGUAGE[language],
-      USR_CHAT_BY_LANGUAGE[language](transcript.trim()),
+      USR_CHAT_BY_LANGUAGE[language](transcript.trim(), subject?.trim() || undefined),
       imageUri,
       transcript,
     );

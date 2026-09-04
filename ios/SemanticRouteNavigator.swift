@@ -6352,9 +6352,19 @@ final class SemanticRouteNavigator: ObservableObject {
                 .map { min(step.edge.distanceMeters, max(segmentRemainingMeters, $0)) }
                 ?? segmentRemainingMeters
         )
-        guard currentInstruction == NavLoc.legDistance(distance: distance, context: context) else {
-            return currentInstruction
-        }
+        // A routine leg cue now has TWO shapes, not one: the leg's opening cue
+        // carries its context ("8 meters toward the next turn."), and every
+        // later cue on the same edge is the bare number ("8 meters.") once
+        // `spokenLegContextEdgeID` has claimed it. Matching only the first
+        // shape meant that for nearly the whole of every leg this guard fell
+        // through and handed the countdown beat straight back — so the three
+        // resumptions spoke "Good. 8 meters." where the verb is the entire
+        // point of the cue. That is the exact failure this function was
+        // written to prevent: pilot participants finished a corrective turn
+        // and stood still, waiting for something to tell them to walk.
+        let isRoutineLegCue = currentInstruction == NavLoc.legDistance(distance: distance, context: context)
+            || currentInstruction == NavLoc.distanceOnly(distance)
+        guard isRoutineLegCue else { return currentInstruction }
         return NavLoc.walkDistance(distance)
     }
 

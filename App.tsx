@@ -1671,6 +1671,12 @@ function AppInner(): React.JSX.Element {
 
       Announcer.announceStatus(strings().reaching.guidingTo(targetName));
 
+      // This is now what the session is about. An arrival handoff reaches this
+      // point without ever passing through the orchestrator, so nothing else
+      // would record it — and the next "is this the correct object?" would
+      // have no subject.
+      rtabLastObjectRef.current = targetName;
+
       setIsCameraActive(false);
       setIsReaching(true);
       await new Promise<void>(resolve => setTimeout(() => resolve(), 500));
@@ -3175,6 +3181,10 @@ function AppInner(): React.JSX.Element {
       const result = await sendToWorkflow(
         {
           text: command,
+          // What the session is about, so a question that only says "this" or
+          // "the correct object" resolves to the thing the user was just
+          // guided to or told to reach for.
+          object: rtabLastObjectRef.current || undefined,
           imageUri: photoPath || '',
           imageWidth: lastImageDimensions.current.width,
           imageHeight: lastImageDimensions.current.height,

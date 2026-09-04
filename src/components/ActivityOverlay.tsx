@@ -226,6 +226,13 @@ const styles = StyleSheet.create({
     color: '#FFFFFF',
     fontSize: 20,
     fontWeight: '700',
+    // Centred, not leading. The pill sits between the 56pt stop-button slot on
+    // one side and the 74pt gear inset on the other, so it is already centred
+    // on screen; a leading-aligned label inside it read as pushed to one side
+    // and off-balance against the gear. Also holds up better for the short
+    // statuses this shows most of the time — "Ready", "Listening" — which left
+    // most of the pill empty to their right.
+    textAlign: 'center',
   },
   guidanceBanner: {
     flexDirection: 'row',

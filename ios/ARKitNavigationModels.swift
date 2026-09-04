@@ -162,7 +162,19 @@ struct TTSState {
     var isEnabled: Bool
     var voiceOverCompatibilityEnabled: Bool
     var isSpeaking: Bool
+    /// Text of the cue most recently STARTED. Says nothing about whether it
+    /// was finished — a critical cue arriving mid-sentence cancels whatever is
+    /// speaking, and the cancellation can take the replacement with it.
     var lastSpokenText: String
+    /// Text of the cue most recently spoken RIGHT THROUGH to the end.
+    ///
+    /// The only honest answer to "has the user heard this yet". Waiting on
+    /// `lastSpokenText` plus `!isSpeaking` looks equivalent and is not: an
+    /// utterance swallowed by a still-draining `stopSpeaking` satisfies both
+    /// while never having reached the user's ear, which is how the arrival
+    /// announcement was still being cut off after the screen was taught to
+    /// wait for it (25 Aug and 3 Sep 2026).
+    var lastCompletedText: String
     var lastSpeechTime: Date?
 
     init(
@@ -171,6 +183,7 @@ struct TTSState {
         voiceOverCompatibilityEnabled: Bool = false,
         isSpeaking: Bool = false,
         lastSpokenText: String = "",
+        lastCompletedText: String = "",
         lastSpeechTime: Date? = nil
     ) {
         self.isReady = isReady
@@ -178,6 +191,7 @@ struct TTSState {
         self.voiceOverCompatibilityEnabled = voiceOverCompatibilityEnabled
         self.isSpeaking = isSpeaking
         self.lastSpokenText = lastSpokenText
+        self.lastCompletedText = lastCompletedText
         self.lastSpeechTime = lastSpeechTime
     }
 }

@@ -23,7 +23,21 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         let text: String
         let priority: SpeechPriority
         let createdAt: Date
+        /// How many times this item has been put back after being cancelled
+        /// before it spoke. Capped at one so a synthesizer that refuses an
+        /// utterance cannot loop.
+        var respeakCount: Int = 0
     }
+
+    /// True once AVSpeechSynthesizer reports that the current item actually
+    /// began. An item cancelled before this is an item nobody heard.
+    private var currentItemDidBegin = false
+    /// True once any utterance of the current item ran to its natural end.
+    /// A cue is spoken as one utterance per sentence, and a multi-sentence cue
+    /// whose tail is cut still reached the user — so this is what
+    /// `lastCompletedText` is published from, not the fate of the last
+    /// utterance alone.
+    private var currentItemDidComplete = false
 
     /// Silence inserted at a sentence boundary inside one cue.
     ///
@@ -62,6 +76,8 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
     func stop() {
         queue.removeAll()
         currentItem = nil
+        currentItemDidBegin = false
+        currentItemDidComplete = false
         outstandingUtterances.removeAll()
         synthesizer.stopSpeaking(at: .immediate)
         ttsState.isSpeaking = false
@@ -140,6 +156,8 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
             return utterance
         }
         outstandingUtterances = utterances
+        currentItemDidBegin = false
+        currentItemDidComplete = false
         ttsState.lastSpokenText = item.text
         ttsState.lastSpeechTime = Date()
         ttsState.isSpeaking = true
@@ -172,18 +190,54 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         return parts.isEmpty ? [text] : parts
     }
 
-    private func finish(_ utterance: AVSpeechUtterance) {
+    private func finish(_ utterance: AVSpeechUtterance, completed: Bool) {
+        if completed { currentItemDidComplete = true }
         outstandingUtterances.removeAll { $0 === utterance }
         guard outstandingUtterances.isEmpty else { return }
+
+        let finished = currentItem
         currentItem = nil
+
+        if currentItemDidComplete, let finished {
+            ttsState.lastCompletedText = finished.text
+        } else if let finished, !currentItemDidBegin {
+            // Cancelled before a single word of it was spoken.
+            //
+            // Usually that is deliberate: a critical cue preempts a lower one,
+            // and the preempted cue is supposed to die. But `stopSpeaking` is
+            // asynchronous and cancels the whole queue, so an utterance handed
+            // to the synthesizer while a stop is still draining gets taken with
+            // it — and the thing most likely to be in that position is the
+            // critical cue that ordered the stop. That is how "Arrived at 437,
+            // on your right" was cut off a syllable in on 3 Sep 2026, after the
+            // AR screen had already been taught to wait for it: it satisfied
+            // "started, and no longer speaking" without ever being audible.
+            //
+            // So: put it back, but only when nothing at least as important is
+            // waiting. If something is, this cancellation was the preemption
+            // working as designed.
+            let outrankedByQueue = queue.contains { $0.priority.rawValue >= finished.priority.rawValue }
+            if !outrankedByQueue, finished.respeakCount < 1 {
+                var retry = finished
+                retry.respeakCount += 1
+                queue.insert(retry, at: 0)
+            }
+        }
+
+        currentItemDidBegin = false
+        currentItemDidComplete = false
         speakNextIfNeeded()
     }
 
+    func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
+        currentItemDidBegin = true
+    }
+
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        finish(utterance)
+        finish(utterance, completed: true)
     }
 
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        finish(utterance)
+        finish(utterance, completed: false)
     }
 }

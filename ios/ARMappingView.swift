@@ -791,20 +791,27 @@ struct ARMappingView: View {
         awaitArrivalSpeech(message: message, deadline: Date().addingTimeInterval(arrivalSpeechMaxWaitSeconds))
     }
 
-    /// Polls the synthesizer until the arrival line has been spoken.
+    /// Polls the synthesizer until the arrival line has been spoken THROUGH.
     ///
     /// Polling rather than sampling once: the cue is enqueued by a *different*
     /// `onChange` handler (`handleSpeechCueChanged`) on the same runloop turn as
-    /// the phase change, and SwiftUI does not order the two — reading
-    /// `isSpeaking` immediately can catch the moment before it starts and
-    /// mistake "not yet" for "done". The deadline bounds it so a TTS failure
-    /// costs a few seconds, never the arrival.
+    /// the phase change, and SwiftUI does not order the two — reading state
+    /// immediately can catch the moment before it starts and mistake "not yet"
+    /// for "done". The deadline bounds it so a TTS failure costs a few seconds,
+    /// never the arrival.
+    ///
+    /// ⚠️ Waits on `lastCompletedText`, not on `lastSpokenText && !isSpeaking`.
+    /// Those look equivalent and are not. The arrival cue is critical, so it
+    /// preempts the approach cue by calling `stopSpeaking` — and that stop is
+    /// asynchronous and cancels the whole queue, so it can take the arrival
+    /// utterance with it. The result satisfies "started, and no longer
+    /// speaking" while never having been audible, which is exactly what this
+    /// wait was added to prevent and what it still let through on 3 Sep 2026:
+    /// cue at t=60.48, handoff at t=61.10, 0.62 s for a two-second sentence.
     private func awaitArrivalSpeech(message: String, deadline: Date) {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
             guard didResolveAutomation == false, didRequestGuidanceExit == false else { return }
-            let state = ttsManager.ttsState
-            let startedThisLine = state.lastSpokenText == message
-            if (startedThisLine && !state.isSpeaking) || Date() >= deadline {
+            if ttsManager.ttsState.lastCompletedText == message || Date() >= deadline {
                 resolveArrivedAutomation(message: message)
                 return
             }

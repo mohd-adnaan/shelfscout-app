@@ -292,13 +292,46 @@ describe('MobileOrchestrator', () => {
       );
 
       expect(backendWorkflowProvider).not.toHaveBeenCalled();
-      expect(answerQuestion).toHaveBeenCalledWith('file:///tmp/frame.jpg', 'Is this the milk bag?');
+      // No subject yet: nothing has been reached for in this session, so the
+      // prompt gets no subject clause rather than an invented one.
+      expect(answerQuestion).toHaveBeenCalledWith(
+        'file:///tmp/frame.jpg',
+        'Is this the milk bag?',
+        undefined,
+      );
       expect(result.text).toBe('Yes, that is a bag of milk.');
       expect(result.reaching_ios).toBe(false);
       expect(result.navigation).toBe(false);
       expect(
         result.provider_trace?.some((entry: any) => entry.provider === 'verification_question'),
       ).toBe(true);
+    });
+
+    it('tells the vision model WHICH object "is this the correct one?" is about', async () => {
+      // The question names nothing. Without a subject the model is handed a
+      // photo and a pronoun, and can only describe what it sees and hope —
+      // which is what a 3 Sep 2026 tester heard back. The app knows: it is
+      // whatever was last navigated to or reached for. It travels on the
+      // request because the arrival → reaching handoff never passes through
+      // the orchestrator, so the orchestrator's own `lastObject` can be a
+      // destination behind the object actually in hand.
+      const { mobileOrchestrator, answerQuestion } = loadInDevice();
+
+      await mobileOrchestrator.process(
+        {
+          text: 'Is this the right one?',
+          imageUri: 'file:///tmp/c.jpg',
+          object: 'Round Doorknob',
+        },
+        undefined,
+        { backendWorkflowProvider, getSessionId: () => 'session-live-subject' },
+      );
+
+      expect(answerQuestion).toHaveBeenCalledWith(
+        'file:///tmp/c.jpg',
+        'Is this the right one?',
+        'Round Doorknob',
+      );
     });
 
     it('does not launch reaching when the classifier reads a verification question as a grab', async () => {
