@@ -1621,4 +1621,28 @@ enum ReachLoc {
         case .fr: return "Suivi rétabli"
         }
     }
+
+    /// Said once when the user is facing a saved spot from roughly the opposite
+    /// side to the one it was recorded from.
+    ///
+    /// A saved POI is a coordinate plus the direction it was looked at from —
+    /// nothing more. Guidance to it is confident whichever side you stand on,
+    /// because nothing in the pipeline can see that a door, a shelf back or a
+    /// wall is now between you and it. A reviewer asked the obvious question on
+    /// 3 Sep 2026: what happens if someone reaches for the door handle from the
+    /// other side of the door? It guides them into the door, and says nothing.
+    ///
+    /// This does not pretend to detect the door. It states the one thing the
+    /// map actually knows — that this viewpoint was never recorded — and lets
+    /// the user judge. Deliberately not a refusal: walking round to the far
+    /// side of an open doorway is a normal thing to do, and being silently
+    /// wrong is the only outcome worth ruling out.
+    static func reachingUnmappedApproachSide(_ objectName: String) -> String {
+        switch lang {
+        case .en:
+            return "Heads up: \(objectName) was recorded from the other side. If something is in the way, come round to it."
+        case .fr:
+            return "Attention : \(objectName) a été enregistré depuis l’autre côté. Si quelque chose bloque, contournez-le."
+        }
+    }
 }

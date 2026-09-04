@@ -40,6 +40,7 @@ extension ReachingViewController {
 
     if spatialTargetWorldPosition != nil {
       followSpatialPOIAnchor(frame)
+      warnIfApproachingFromUnmappedSide(frame)
       refineSpatialAnchorOnApproach(frame)
       tryRefineSpatialTargetExtent(frame)
     }
@@ -302,6 +303,69 @@ extension ReachingViewController {
   /// Deltas are applied on top of the current target so surface-snap and
   /// extent corrections are preserved; a large refinement re-arms both
   /// passes since their evidence was gathered against the old position.
+  /// Say once when the user is facing the saved spot from roughly the opposite
+  /// side to the one it was recorded from.
+  ///
+  /// ## What this is really about
+  ///
+  /// A spatial target is a memorised world coordinate. Guidance to it is
+  /// equally confident from every side, because nothing in this pipeline can
+  /// see that a door, a shelf back or a wall is now between the user and it —
+  /// the reaching config carries no scene depth and no plane detection, and
+  /// even `refineSpatialAnchorOnApproach` reads a nearer surface as pin
+  /// overshoot to be corrected rather than as an obstruction. Reach for a door
+  /// handle from the wrong side of the door and the system walks you into the
+  /// door, confidently, in silence.
+  ///
+  /// This does NOT detect the door. It reports the one thing the map genuinely
+  /// knows: `surfacePOITransform` pins the anchor with the mapping-time camera
+  /// transform, so the anchor's own forward axis is the direction it was
+  /// looked at from. Facing it from the opposite hemisphere means this
+  /// viewpoint was never recorded, and the pin's relationship to whatever is
+  /// physically in front of the user is unverified.
+  ///
+  /// Deliberately advisory, and deliberately once. Walking round to the far
+  /// side of an open doorway is normal; refusing there would be wrong. Being
+  /// silently wrong is the only outcome worth ruling out.
+  private func warnIfApproachingFromUnmappedSide(_ frame: ARFrame) {
+    guard !didWarnUnmappedApproachSide,
+          anchorPlaced,
+          guidanceAudioEnabled,
+          case .normal = frame.camera.trackingState,
+          let anchorPos = objectWorldPosition,
+          let poiAnchor = restoredSpatialPOIAnchor(in: frame) else { return }
+
+    // A camera-pose pin marks where the mapper STOOD, not the object, so its
+    // orientation says nothing about which side the object was seen from.
+    guard spatialTargetIsSurfacePlacement else { return }
+
+    let camPos = simd_make_float3(frame.camera.transform.columns.3)
+    let toAnchor = anchorPos - camPos
+    let distance = simd_length(toAnchor)
+    // Close enough that the approach side is decided, far enough that the
+    // direction is still meaningful.
+    guard distance > 0.35, distance <= unmappedApproachWarnRadius else { return }
+
+    // Both flattened: a user holding the phone low is not approaching from
+    // underneath, and pitch would swamp the sign we actually want.
+    let approach = simd_normalize(simd_float3(toAnchor.x, 0, toAnchor.z))
+    let mapped = -simd_make_float3(poiAnchor.transform.columns.2)
+    let mappedFlat = simd_float3(mapped.x, 0, mapped.z)
+    guard simd_length(mappedFlat) > 0.1 else { return }
+    let mappedDir = simd_normalize(mappedFlat)
+
+    // The mapper looked ALONG `mappedDir` at the object; a user approaching
+    // from the same side is travelling in the same direction. Opposed means
+    // they are on the far side of it.
+    let agreement = simd_dot(approach, mappedDir)
+    guard agreement < unmappedApproachDotThreshold else { return }
+
+    didWarnUnmappedApproachSide = true
+    NSLog("◎ [SpatialTarget] ⚠️ Approaching %@ from an unmapped side (dot=%.2f, dist=%.2fm)",
+          objectName, agreement, distance)
+    say(ReachLoc.reachingUnmappedApproachSide(objectName))
+  }
+
   private func followSpatialPOIAnchor(_ frame: ARFrame) {
     guard anchorPlaced else { return }
     guard let poiAnchor = restoredSpatialPOIAnchor(in: frame),

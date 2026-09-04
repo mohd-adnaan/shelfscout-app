@@ -105,9 +105,17 @@ class ReachingViewController: UIViewController {
   ///
   /// The radius above still assumes the user walks close enough. The signal
   /// that actually marks the transition is that they stopped walking — they
-  /// believe they are there. Someone who halts at 1.2 m and starts feeling for
-  /// a door handle needs hand guidance, not another "walk forward" cue.
-  let handGuidanceStallRadius: Float = 1.4
+  /// believe they are there. Someone who halts at a metre and starts feeling
+  /// for a door handle needs hand guidance, not another "walk forward" cue.
+  ///
+  /// ⚠️ MUST stay below `handGuidanceExitThreshold`. It was first written as
+  /// 1.4 m, above the 1.05 m exit: a stall at 1.2 m would have entered Phase 2
+  /// and been thrown straight back out on the very next frame, so the user
+  /// would have heard "close enough, raise your hand" and "you moved away,
+  /// resuming navigation" back to back, on repeat, without moving at all.
+  /// Keeping it inside the exit band is what makes the transition stick — and
+  /// at a metre "raise your hand" is also true, which it would not be at 1.4.
+  let handGuidanceStallRadius: Float = 1.0
   /// How long the distance must hold steady inside that radius before Phase 2
   /// takes over anyway.
   let handGuidanceStallSeconds: TimeInterval = 2.0
@@ -121,6 +129,17 @@ class ReachingViewController: UIViewController {
   var handGuidanceStallDistance: Float?
   /// Transition announcement has been made ("Raise your hand")
   var handGuidanceAnnounced = false
+
+  // ── Unmapped approach side ─────────────────────────────────────────────
+  /// Said at most once per session — see `warnIfApproachingFromUnmappedSide`.
+  var didWarnUnmappedApproachSide = false
+  /// Range within which the approach side is judged. Beyond it the user is
+  /// still walking in and the bearing is not yet their approach.
+  let unmappedApproachWarnRadius: Float = 2.5
+  /// How opposed the approach must be before it counts as the far side.
+  /// −0.34 is about 110° — comfortably past "at an angle to it" and into
+  /// "looking at it from behind".
+  let unmappedApproachDotThreshold: Float = -0.34
 
   // ═══════════════════════════════════════════════════════════════════════════
   // MARK: - Acquisition Validation (Auto-Exit — both modes)
@@ -991,6 +1010,7 @@ class ReachingViewController: UIViewController {
     handGuidanceAnnounced = false
     handGuidanceStallSince = nil
     handGuidanceStallDistance = nil
+    didWarnUnmappedApproachSide = false
     // Reset tracker state — fresh handler on next session
     cancelTracker()
     trackingActive = false

@@ -27,7 +27,38 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         /// before it spoke. Capped at one so a synthesizer that refuses an
         /// utterance cannot loop.
         var respeakCount: Int = 0
+        /// This item cut another one off, and a tone was played to say so.
+        /// Buys the tone a beat of silence before the sentence lands on it.
+        var announcedAsInterruption: Bool = false
     }
+
+    // ── Interruption tone ──────────────────────────────────────────────────
+    //
+    // A critical cue cuts the sentence in progress off mid-word. Reviewer,
+    // 3 Sep 2026: "walk 4 m toward the next turn in about 1 [interrupt] turn
+    // right … it could be confusing to many users without some sort of audio
+    // cue to make clear that the distance countdown is being interrupted by
+    // the important immediate turn instruction." Without one there is nothing
+    // to distinguish a deliberate cut from the app glitching or the speech
+    // dropping out — and the whole point of the cut is that what follows
+    // matters more than what was being said.
+    //
+    // Navigation plays no other native sound, so one short blip is
+    // unambiguous. Under VoiceOver nothing is needed: announcements there are
+    // QUEUED rather than interrupting, so there is no cut to signal.
+    private lazy var interruptTonePlayer: AVAudioPlayer? = {
+        guard let url = Bundle.main.url(forResource: "bip", withExtension: "wav"),
+              let player = try? AVAudioPlayer(contentsOf: url) else {
+            NSLog("⚠️ [TTS] bip.wav unavailable — interruptions will not be signalled")
+            return nil
+        }
+        player.volume = 0.6
+        player.prepareToPlay()
+        return player
+    }()
+    /// Silence in front of an interrupting cue, so the tone is heard as its own
+    /// event rather than under the first syllable.
+    private let interruptToneLeadSeconds: TimeInterval = 0.32
 
     /// True once AVSpeechSynthesizer reports that the current item actually
     /// began. An item cancelled before this is an item nobody heard.
@@ -96,8 +127,15 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         switch priority {
         case .critical:
             queue.removeAll()
-            queue.insert(item, at: 0)
-            if currentItem != nil, currentItem?.priority != .critical {
+            let isCuttingSomeoneOff = currentItem != nil && currentItem?.priority != .critical
+            var queued = item
+            queued.announcedAsInterruption = isCuttingSomeoneOff
+            queue.insert(queued, at: 0)
+            if isCuttingSomeoneOff {
+                // Say that a cut is happening BEFORE it happens, so the
+                // half-finished sentence reads as interrupted rather than
+                // broken. See `interruptTonePlayer`.
+                playInterruptTone()
                 // Cut the current cue short and let the cancellation callback
                 // start this one; speaking it from here would overlap.
                 synthesizer.stopSpeaking(at: .word)
@@ -111,6 +149,12 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
             queue.append(item)
         }
         speakNextIfNeeded()
+    }
+
+    private func playInterruptTone() {
+        guard ttsState.isEnabled, let player = interruptTonePlayer else { return }
+        player.currentTime = 0
+        player.play()
     }
 
     private func speakNextIfNeeded() {
@@ -152,6 +196,9 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
             utterance.voice = AVSpeechSynthesisVoice(language: AppLocale.current.speechLocale)
             if index < parts.count - 1 {
                 utterance.postUtteranceDelay = interSentencePauseSeconds
+            }
+            if index == 0, item.announcedAsInterruption {
+                utterance.preUtteranceDelay = interruptToneLeadSeconds
             }
             return utterance
         }

@@ -456,9 +456,8 @@ final class SemanticRouteNavigator: ObservableObject {
     /// closer, so one value is the whole schedule: everything larger is behind
     /// the user and spent.
     private var lastSpokenApproachGateMeters: Double?
-    /// Last progress-beat boundary spoken on this leg; see
-    /// `speakWalkProgressCueIfDue`.
-    private var lastSpokenProgressBeatMeters: Double?
+    /// True once this leg's single mid-walk beat has been spoken.
+    private var spokenLegProgressBeat = false
     /// When routine walking speech last went out — the pacing floor that keeps
     /// approach, landmark and reassurance cues from stacking on each other.
     private var lastRoutineCueAt: Date?
@@ -743,40 +742,42 @@ final class SemanticRouteNavigator: ObservableObject {
     /// deletion; more headroom would push the 3 m gate off every leg under 5 m,
     /// which is most of them.
     private let approachGateHeadroomMeters = 1.0
-    /// Spacing of the bare-distance beats that carry the walk *above* the
-    /// approach gates.
+    /// The single bare-distance beat that carries the walk *above* the approach
+    /// gates — one per leg, near its midpoint.
     ///
-    /// Between a leg opening ("Onions, 8 meters, toward the next turn") and the
-    /// 3 m gate there was no cue at all. The only thing covering that stretch
-    /// was the 20 s quiet-period backstop, and 5 m of walking takes well under
-    /// 20 s, so the backstop never fired and the user walked the whole approach
-    /// in silence — "only stated 8m ahead and then turn right in 3m, nothing in
-    /// between" (pilot, 20 Aug 2026).
+    /// ── Two pieces of feedback pulling opposite ways ────────────────────
+    /// 20 Aug 2026, blind pilot participant: a leg opened with "8 meters toward
+    /// the next turn" and said nothing again until "turn right in 3 meters" —
+    /// "nothing in between". The 20 s quiet backstop never fired because 5 m of
+    /// walking takes well under 20 s. So beats were added every 2 m.
+    /// 3 Sep 2026, reviewer: on a 23 m leg that produced "23 … 21 … 18 … 15 …
+    /// 11 … 8 … in 3 meters, turn left" — "just extra noise that the user is
+    /// being forced to hear".
     ///
-    /// These are deliberately NOT approach gates. A gate above 3 m would be the
-    /// first gate crossed on the leg and would therefore take over the
-    /// maneuver-naming cue, which is the exact regression a reviewer rejected
-    /// on 15 Aug 2026 — advance notice spent metres before the turn, leaving
-    /// the turn itself unheralded. A progress beat speaks the remaining
-    /// distance and nothing else, so the naming cue stays where it belongs at
-    /// 3 m.
-    private let walkProgressBeatIntervalMeters = 2.0
-    /// Progress beats stop here and hand over to the approach gates.
+    /// Both are right about their own leg. The mistake was measuring the
+    /// cadence with a ruler: a fixed 2 m interval gives one beat on a short leg
+    /// and six on a long one, when what the user needs is the same thing in
+    /// both cases — one confirmation, partway, that the system still has them.
+    /// So the count is fixed at one and its POSITION scales with the leg.
     ///
-    /// Set a full interval clear of the top gate (3 m) rather than flush
-    /// against it. A beat landing at 4 m starts the pacing window barely a
-    /// second before the 3 m gate comes due, and the naming cue — which does
-    /// observe a short floor so it cannot land on another cue's heels — then
-    /// slid to 2.4 m. "Turn right in 3 meters" arriving at 2.4 m is precisely
-    /// the late advance notice the 15 Aug 2026 review was about, so the beats
-    /// give the gate room instead.
+    /// This is deliberately NOT an approach gate. A gate above 3 m would be the
+    /// first gate crossed on the leg and would take over the maneuver-naming
+    /// cue, which is the regression a reviewer rejected on 15 Aug 2026 —
+    /// advance notice spent metres before the turn, leaving the turn itself
+    /// unheralded. A beat speaks the remaining distance and nothing else.
+    private let walkProgressBeatCount = 1
+    /// Beats stop here and hand over to the approach gates.
+    ///
+    /// A full interval clear of the top gate (3 m) rather than flush against
+    /// it: a beat landing at 4 m starts the pacing window barely a second
+    /// before the 3 m gate comes due, and the naming cue then slid to 2.4 m.
+    /// "Turn right in 3 meters" arriving at 2.4 m is precisely the late advance
+    /// notice the 15 Aug 2026 review was about.
     private let walkProgressBeatFloorMeters = 5.0
-    /// Pacing floor for progress beats.
-    ///
-    /// Shorter than `routineCueMinimumSpacingSeconds` because a beat is one or
-    /// two words rather than a sentence, and at walking pace a 2 m interval
-    /// comes round every three seconds or so — on the 6 s routine floor every
-    /// other beat would be dropped and the cadence would read as random.
+    /// Shortest leg that gets a beat at all. Below this the leg-start cue and
+    /// the 3 m gate are already close enough together to carry it.
+    private let walkProgressBeatMinimumLegMeters = 7.0
+    /// Pacing floor for the beat, so it cannot land on another cue's heels.
     private let walkProgressBeatMinimumSpacingSeconds: TimeInterval = 3.0
     /// Floor under the maneuver-naming cue specifically.
     ///
@@ -6108,8 +6109,19 @@ final class SemanticRouteNavigator: ObservableObject {
 
         if speakDestinationApproachIfDue(remainingMeters: cueRemainingMeters) { return }
         if speakApproachCueIfDue(on: step, remainingMeters: cueRemainingMeters) { return }
-        // Above the approach gates, keep the walk narrated rather than silent.
         if speakWalkProgressCueIfDue(on: step, remainingMeters: cueRemainingMeters) { return }
+        // ⚠️ Exactly one distance beat per leg now, from the call above.
+        //
+        // There used to be one every 2 m above the 5 m floor, which on a 23 m
+        // leg spoke "23 meters toward the next turn", then 21, 18, 15, 11, 8,
+        // then "in 3 meters, turn left". A reviewer's verdict on 3 Sep 2026:
+        // everything between the first and the last of those is noise the user
+        // is forced to listen to. They are not decisions — the leg was already
+        // named, and the turn is announced at 3 m regardless.
+        // Anything longer than that is carried by the 20 s quiet-period
+        // backstop, which counts seconds rather than metres — so a slow walker
+        // on a very long leg still gets told the system has them, and a brisk
+        // one is not read a list of numbers.
         speakQuietPeriodReassuranceIfDue(remainingMeters: cueRemainingMeters)
     }
 
@@ -6249,37 +6261,30 @@ final class SemanticRouteNavigator: ObservableObject {
         return true
     }
 
-    /// Carries the walk between the leg-start instruction and the 3 m approach
-    /// gate, speaking the bare remaining distance every couple of metres.
+    /// One bare-distance confirmation, partway along the leg.
     ///
-    /// A beat is due once the remaining distance has closed by a full interval
-    /// since the last one, seeded from the leg's own length so the first beat
-    /// is one interval below the distance the leg-start cue just announced.
-    /// On an 8 m leg that gives "8 meters" (leg start), "6", "4", and then the
-    /// approach gates take over with "Turn right in 3 meters", "2", "1".
-    ///
-    /// Measuring from the last beat rather than from absolute multiples is
-    /// what keeps a beat from landing on top of the opening cue: at 7.9 m
-    /// remaining the nearest lower multiple of 2 is 6, but the user has not
-    /// walked to 6 yet and the honest thing to say there is nothing.
+    /// Placed by proportion rather than by a fixed interval — see
+    /// `walkProgressBeatCount` for the two pieces of field feedback that
+    /// forced that. On an 8 m leg it lands around 6 m; on a 23 m leg around
+    /// 13 m; on either it is the ONLY thing said between the leg's opening
+    /// instruction and the 3 m turn announcement.
     ///
     /// The phrase always carries the live distance, so a beat delayed by the
     /// pacing floor still states what the user actually has left.
     private func speakWalkProgressCueIfDue(on step: SemanticRouteStep, remainingMeters: Double) -> Bool {
-        guard phase == .navigating else { return false }
+        guard phase == .navigating, !spokenLegProgressBeat else { return false }
         // Below the floor the approach gates own the cadence.
         guard remainingMeters > walkProgressBeatFloorMeters else { return false }
 
-        let interval = walkProgressBeatIntervalMeters
-        guard interval > 0 else { return false }
+        let legDistance = step.edge.distanceMeters
+        guard legDistance >= walkProgressBeatMinimumLegMeters else { return false }
 
-        let reference = lastSpokenProgressBeatMeters ?? step.edge.distanceMeters
-        let threshold = reference - interval
-        // Strictly decreasing, so standing still or drifting backwards cannot
-        // re-announce a distance already spoken.
-        guard threshold > walkProgressBeatFloorMeters, remainingMeters <= threshold else {
-            return false
-        }
+        // Evenly spaced between the leg's start and the floor. With a count of
+        // one that is the midpoint of the walkable stretch.
+        let span = legDistance - walkProgressBeatFloorMeters
+        guard span > 0 else { return false }
+        let dueAt = walkProgressBeatFloorMeters + span * Double(walkProgressBeatCount) / Double(walkProgressBeatCount + 1)
+        guard remainingMeters <= dueAt else { return false }
 
         if let last = lastRoutineCueAt,
            Date().timeIntervalSince(last) < walkProgressBeatMinimumSpacingSeconds {
@@ -6288,7 +6293,7 @@ final class SemanticRouteNavigator: ObservableObject {
             return false
         }
 
-        lastSpokenProgressBeatMeters = threshold
+        spokenLegProgressBeat = true
         emitCue(NavLoc.distanceOnly(Self.formatDistance(remainingMeters)), priority: .regular)
         return true
     }
@@ -6372,7 +6377,7 @@ final class SemanticRouteNavigator: ObservableObject {
     /// its own gates from the top.
     private func resetLegCueSchedule() {
         lastSpokenApproachGateMeters = nil
-        lastSpokenProgressBeatMeters = nil
+        spokenLegProgressBeat = false
         spokenDestinationApproachCue = false
         spokenLegManeuverCue = false
         destinationOvershootStartedAt = nil
