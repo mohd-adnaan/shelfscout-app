@@ -1083,7 +1083,13 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         // One correction cue, not a fresh journey announcement — restarting
         // re-resolves the start edge and can speak a different turn each time.
         XCTAssertFalse(navigator.currentInstruction.hasPrefix("Onions is"))
-        XCTAssertEqual(navigator.speechCue?.text, navigator.currentInstruction)
+        // The banner keeps the "Route realigned…" prefix; speech deliberately
+        // drops it (a realignment is bookkeeping the user cannot act on). So
+        // these are NOT equal, and asserting they were is what left this test
+        // red — the code is right, the expectation predates the split.
+        XCTAssertEqual(navigator.speechCue?.text, navigator.currentInstruction.replacingOccurrences(
+            of: "Route realigned from your position. ", with: ""
+        ))
         // Re-resolved from where they actually are, not from the route start.
         XCTAssertNotEqual(navigator.routeSteps.first?.from.name, "Cereals")
 
@@ -1477,7 +1483,87 @@ final class SemanticRouteNavigatorTests: XCTestCase {
         navigator.update(imuState: Self.imu(bearing: 90), arPosition: nil, arHeading: 90, arLocalized: false)
 
         XCTAssertEqual(navigator.currentStepIndex, 2)
-        XCTAssertTrue(navigator.currentInstruction.hasPrefix("Turn left. Walk "))
+        // The maneuver is announced ALONE. The walk that follows it is released
+        // once the user has actually come round — see
+        // `testTurnIsAnnouncedAloneAndTheWalkFollowsTheTurn`.
+        XCTAssertEqual(navigator.currentInstruction, "Turn left.")
+    }
+
+    // MARK: - Two-phase turn (reviewer feedback, 4 Sep 2026)
+
+    /// "Turn left. Walk 6 meters toward the next turn." asserts two things at
+    /// once, and the second is only true if the first was obeyed correctly. A
+    /// tester turned the wrong way and was confidently told to walk 6 m in it.
+    /// The maneuver is now spoken alone and the walk waits for the turn.
+    func testTurnIsAnnouncedAloneAndTheWalkFollowsTheTurn() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+
+        // Reach the turn node: the maneuver is called, and nothing else.
+        navigator.setRouteProgressForTesting(stepIndex: 1, progressMeters: 0, markRecentAdvance: true)
+        navigator.speechCue = nil
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+
+        // Still facing the OLD leg: no distance has been spoken at it.
+        XCTAssertFalse(
+            navigator.currentInstruction.contains("Walk "),
+            "the walk must not be asserted against a facing that contradicts it, got: \(navigator.currentInstruction)"
+        )
+
+        // Now the user actually turns onto the new leg (90°).
+        navigator.speechCue = nil
+        navigator.expireCuePacingWindowForTesting()
+        navigator.update(imuState: Self.imu(bearing: 90), arPosition: nil, arHeading: 90, arLocalized: false)
+
+        XCTAssertNotNil(navigator.speechCue, "the walk instruction is owed once the turn is made")
+        XCTAssertTrue(
+            navigator.speechCue?.text.contains("meters") ?? false,
+            "expected the leg distance, got: \(navigator.speechCue?.text ?? "nil")"
+        )
+    }
+
+    /// The 11 Aug 2026 pilot failure this must never re-create: participants
+    /// completed a turn and stood still, because nothing told them to move.
+    ///
+    /// The gap is the PARTIAL turn: 45° off the new leg is too little for the
+    /// alignment cue to nag about (55° threshold) and too much to count as
+    /// turned (20°), so nothing at all would speak. A user in that state has
+    /// turned, believes they are done, and is waiting. The timeout releases
+    /// the walk. A user who has not turned at all is a different case and is
+    /// handled by the alignment cue, which correctly owns that moment.
+    func testWalkInstructionArrivesEvenIfTheTurnIsNeverConfirmed() {
+        let navigator = SemanticRouteNavigator()
+        navigator.replaceMapsForTesting([Self.lTurnARMap()])
+        XCTAssertTrue(navigator.startNavigation(
+            to: "Checkout",
+            arPosition: simd_float3(0, 0, 0),
+            imuState: Self.imu(bearing: 0),
+            speakLandmarks: false,
+            arHeading: 0
+        ))
+        navigator.expireGuidanceIntroProtectionForTesting()
+        navigator.setRouteProgressForTesting(stepIndex: 1, progressMeters: 0, markRecentAdvance: true)
+        navigator.update(imuState: Self.imu(bearing: 0), arPosition: nil, arHeading: 0, arLocalized: false)
+
+        // Turns most of the way — 45° short of the leg. Below the alignment
+        // cue's threshold, above the "turned" one: nothing else will speak.
+        navigator.expirePostTurnLegCueWaitForTesting()
+        navigator.speechCue = nil
+        navigator.expireCuePacingWindowForTesting()
+        navigator.update(imuState: Self.imu(bearing: 45), arPosition: nil, arHeading: 45, arLocalized: false)
+
+        XCTAssertTrue(
+            navigator.currentInstruction.contains("meters"),
+            "a turn that is never confirmed must still release the walk, got: \(navigator.currentInstruction)"
+        )
     }
 
     // MARK: - Clock-face phrasing (reviewer feedback, 15 Aug 2026)
@@ -1982,10 +2068,13 @@ final class SemanticRouteNavigatorTests: XCTestCase {
             arLocalized: true
         )
         XCTAssertEqual(navigator.currentStepIndex, 1)
-        XCTAssertTrue(
-            navigator.currentInstruction.contains("Walk "),
-            "the turn cue must restart the walk, got: \(navigator.currentInstruction)"
-        )
+        // The maneuver is announced alone now (4 Sep 2026 review); the walk it
+        // owes is released once the user has turned onto the leg, which
+        // `testTurnIsAnnouncedAloneAndTheWalkFollowsTheTurn` covers. What this
+        // test still guards is that reaching the node CALLS THE TURN at all —
+        // it went red when a localized pose standing on the node was made to
+        // wait for dead reckoning to agree.
+        XCTAssertEqual(navigator.currentInstruction, "Turn right.")
 
         // Mid-leg, walking the new leg: the verb is spent and does not repeat.
         navigator.update(

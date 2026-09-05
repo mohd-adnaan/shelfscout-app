@@ -89,6 +89,8 @@ export const fr: StringCatalog = {
     reached: (object: string) => `Vous avez atteint ${object}!`,
     ended: 'Guidage terminé.',
     error: (detail: string) => `Erreur de guidage : ${detail}`,
+    notInMappedRoutes: (target: string) =>
+      `${target} n’est pas dans la carte enregistrée.`,
     unknownError: 'erreur inconnue',
     // "tablette", not "étagère": in a Quebec grocery store the shelf a shopper
     // reaches for is a tablette; étagère reads as a piece of furniture.

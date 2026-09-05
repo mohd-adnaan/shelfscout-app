@@ -79,6 +79,12 @@ export const en = {
     reached: (object: string) => `${object} reached!`,
     ended: 'Reaching guidance ended.',
     error: (detail: string) => `Reaching error: ${detail}`,
+    /// Asked for something the saved map has never heard of. Names the thing
+    /// and stops — the user needs to know it is not there, not how to fix the
+    /// map. Said out loud rather than dropped: silence reads as the app not
+    /// having heard the request at all (tester, 4 Sep 2026).
+    notInMappedRoutes: (target: string) =>
+      `${target} isn't in the saved map.`,
     unknownError: 'Unknown error',
     relocalizationTimeout:
       'I could not match the saved map here. Move closer to the mapped shelf and try again.',

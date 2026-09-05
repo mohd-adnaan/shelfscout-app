@@ -369,6 +369,15 @@ struct ARMappingView: View {
     /// are the ones carrying the search, and a status line repeating over them
     /// would only crowd out the instruction the user can act on.
     @State private var didReportSlowRelocalization: Bool = false
+    /// True once this attempt has told the user WHY the start is slow. Said
+    /// once — an explanation repeated is noise, and it also switches the later
+    /// cues from rotation commands to bare reassurance.
+    @State private var didExplainSlowRelocalization: Bool = false
+    /// True while the user has been asked to hold still for the current settle
+    /// episode. Cleared when the episode ends, so a second settle later in the
+    /// same search asks again.
+    @State private var didAskForRelocalizationStillness: Bool = false
+    @State private var lastStillnessAskAt: Date?
     /// When this mounted screen first started searching for the saved map.
     /// Unlike `automatedRelocalizationStartedAt` it survives a retarget, so it
     /// bounds the total warm search rather than one attempt.
@@ -422,6 +431,12 @@ struct ARMappingView: View {
     /// while the map searches gets spoken guidance instead, then a hard
     /// timeout so the JS side can recover rather than waiting forever.
     private let relocalizationVoiceCueIntervalSeconds: TimeInterval = 8.0
+    /// Cue spacing after the user has been told why the start is slow.
+    private let relocalizationExplainedCueIntervalSeconds: TimeInterval = 16.0
+    /// Floor between two "hold still" asks. The settle veto fires in bursts,
+    /// and repeating the instruction between them would be the nagging this
+    /// change exists to remove.
+    private let stillnessAskRepeatSeconds: TimeInterval = 6.0
     private let automatedRelocalizationTimeoutSeconds: TimeInterval = 35.0
     /// Total time this mounted screen may keep an unlocalized ARKit session
     /// searching across retries before it is genuinely given up on. Each
@@ -512,6 +527,9 @@ struct ARMappingView: View {
         lastRelocalizationVoiceCueAt = nil
         relocalizationVoiceCueCount = 0
         didReportSlowRelocalization = false
+        didExplainSlowRelocalization = false
+        didAskForRelocalizationStillness = false
+        lastStillnessAskAt = nil
         // The route map for the new target may differ from the current one,
         // so route selection re-runs; the AR world map stays loaded.
         didAttemptAutomatedRouteSelection = false
@@ -971,7 +989,8 @@ struct ARMappingView: View {
             arPosition: mappingManager.cameraMapPosition,
             arHeading: mappingManager.arHeadingDegrees,
             arLocalized: mappingManager.isLocalized || mappingManager.isMapping,
-            capturedImage: currentCapturedImage
+            capturedImage: currentCapturedImage,
+            headingUsedTiltFallback: mappingManager.arHeadingUsedTiltFallback
         )
     }
 
@@ -990,6 +1009,9 @@ struct ARMappingView: View {
             lastRelocalizationVoiceCueAt = nil
             relocalizationVoiceCueCount = 0
             didReportSlowRelocalization = false
+            didExplainSlowRelocalization = false
+            didAskForRelocalizationStillness = false
+            lastStillnessAskAt = nil
             return
         }
 
@@ -1040,9 +1062,39 @@ struct ARMappingView: View {
             return
         }
 
+        // ── Stillness beats the clock ───────────────────────────────────
+        // ARKit has matched and only our own confirmation is outstanding. This
+        // is the one moment where the right instruction is the opposite of
+        // every other cue here, and it is worth interrupting the cadence for:
+        // waiting out the 8 s interval means eight more seconds of the user
+        // turning, which is what prevents the confirmation from landing.
+        if mappingManager.relocalizationDiagnosis == .settling {
+            // Once per episode, and never twice inside the repeat floor: the
+            // veto can fire in bursts with gaps between them, and "hold still"
+            // on a loop is the same nagging this whole change is removing.
+            let sinceAsk = lastStillnessAskAt.map { now.timeIntervalSince($0) }
+                ?? .greatestFiniteMagnitude
+            if !didAskForRelocalizationStillness, sinceAsk >= stillnessAskRepeatSeconds {
+                didAskForRelocalizationStillness = true
+                lastStillnessAskAt = now
+                lastRelocalizationVoiceCueAt = now
+                announceAutomatedStatus(NavLoc.relocHoldStillCue())
+            }
+            // And say nothing else while it settles. Every other cue in this
+            // ladder asks the user to move.
+            return
+        }
+        didAskForRelocalizationStillness = false
+
         let sinceCue = lastRelocalizationVoiceCueAt.map { now.timeIntervalSince($0) }
             ?? .greatestFiniteMagnitude
-        guard sinceCue >= relocalizationVoiceCueIntervalSeconds else { return }
+        // Once the reason has been given, back off. The complaint was not that
+        // the cues were unhelpful, it was that they kept coming — a new
+        // instruction every eight seconds reads as the app panicking.
+        let interval = didExplainSlowRelocalization
+            ? relocalizationExplainedCueIntervalSeconds
+            : relocalizationVoiceCueIntervalSeconds
+        guard sinceCue >= interval else { return }
         lastRelocalizationVoiceCueAt = now
         relocalizationVoiceCueCount += 1
 
@@ -1051,7 +1103,12 @@ struct ARMappingView: View {
         // is the difference between "it knows where I am, keep going" and
         // standing in a store being told to pan at nothing.
         let cue: String
-        if let recognized = mappingManager.recognizedPlaceName {
+        if mappingManager.cameraLikelyCovered {
+            // Nothing else here is actionable with a blocked lens: every other
+            // cue asks the user to point the camera somewhere, and it is
+            // already pointed at their hand.
+            cue = NavLoc.cameraCoveredCue()
+        } else if let recognized = mappingManager.recognizedPlaceName {
             cue = NavLoc.relocRecognizedPlaceCue(recognized)
         } else if relocalizationVoiceCueCount == 1,
                   let origin = Self.freshConfirmedPlaceName,
@@ -1070,11 +1127,23 @@ struct ARMappingView: View {
             // is how a route ends up built from somewhere the user is not.
             cue = NavLoc.relocResumingFromCue(origin: origin, destination: destination)
             Self.hasCoachedRelocalization = true
+        } else if let explanation = relocalizationExplanationIfDue() {
+            // ── Say WHY, once, instead of the next rotation command ────────
+            // A slow start is not a failure and the user cannot tell the
+            // difference from the outside. Testers on 4 Sep 2026 called it
+            // "cumbersome and stress inducing": escalating instructions to
+            // turn in circles, no reason given, so it read as the app being
+            // unable to find them. The system usually knows more than that —
+            // ARKit says when it cannot see enough detail, and a long search
+            // with no visual recognition is what people and carts standing in
+            // the mapped view look like.
+            cue = explanation
+            didExplainSlowRelocalization = true
+            Self.hasCoachedRelocalization = true
         } else if Self.hasCoachedRelocalization {
             // Already coached earlier in this run. The first interval passes in
             // silence — a relocalization that resolves inside it never needed
-            // narrating — and anything after it escalates straight to the cues
-            // that ask for something new.
+            // narrating.
             switch relocalizationVoiceCueCount {
             case 1:
                 return
@@ -1083,7 +1152,13 @@ struct ARMappingView: View {
             case 3:
                 cue = NavLoc.relocTurnFullCircleCue()
             default:
-                cue = NavLoc.relocStepAndTurnCue()
+                // Past the explanation the user has been told what to do and
+                // why. Repeating "turn in a full circle" a fourth time adds
+                // nothing and is the part they found stressful; this only
+                // confirms the search is still running.
+                cue = didExplainSlowRelocalization
+                    ? NavLoc.relocStillWorkingCue()
+                    : NavLoc.relocStepAndTurnCue()
             }
         } else {
             switch relocalizationVoiceCueCount {
@@ -1097,6 +1172,44 @@ struct ARMappingView: View {
             }
         }
         announceAutomatedStatus(cue)
+    }
+
+    /// The one-line reason a start is taking longer than usual, if there is a
+    /// reason worth giving and it has not been given yet.
+    ///
+    /// Deliberately once per attempt: it is an explanation, not an
+    /// instruction, and an explanation repeated is just more noise. Withheld
+    /// until the second cue — a relocalization that lands in the first ten
+    /// seconds never needed explaining, and most of them do.
+    private func relocalizationExplanationIfDue() -> String? {
+        guard !didExplainSlowRelocalization, relocalizationVoiceCueCount >= 2 else { return nil }
+        switch mappingManager.relocalizationDiagnosis {
+        case .insufficientDetail:
+            return NavLoc.relocInsufficientDetailCue()
+        case .sceneUnfamiliar:
+            return NavLoc.relocSceneUnfamiliarCue(anchors: anchoredEndpointNames())
+        case .searching, .cameraCovered, .recognizedNearby, .settling:
+            // Nothing to add: the first two are already handled above by their
+            // own cues, and `searching` means there is genuinely nothing to
+            // report beyond what the coaching already says.
+            return nil
+        }
+    }
+
+    /// Names of the map's anchored endpoints — the spots the mapper stood at
+    /// and turned a full circle, which are the only places relocalization is
+    /// reliably quick. Capped at two: a spoken list longer than that stops
+    /// being a suggestion and becomes something to memorise.
+    private func anchoredEndpointNames() -> [String] {
+        guard let map = semanticNavigator.activeMap,
+              let anchored = map.anchoredNodeIds, !anchored.isEmpty else { return [] }
+        let ids = Set(anchored)
+        return map.nodes
+            .filter { ids.contains($0.id) }
+            .map(\.name)
+            .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
+            .prefix(2)
+            .map { $0 }
     }
 
     /// Speaks automation status through the same VoiceOver-aware channel as

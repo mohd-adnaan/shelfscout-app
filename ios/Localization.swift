@@ -828,8 +828,8 @@ enum NavLoc {
     /// while they stood waiting to be told what to do.
     static func relocLoadingCue() -> String {
         switch lang {
-        case .en: return "Hold the phone at chest height and slowly pan left and right."
-        case .fr: return "Tenez le téléphone à hauteur de poitrine et balayez lentement de gauche à droite."
+        case .en: return "Hold the phone up and pan slowly."
+        case .fr: return "Tenez le téléphone levé et balayez lentement."
         }
     }
 
@@ -849,15 +849,15 @@ enum NavLoc {
     /// turning around does.
     static func relocTurnFullCircleCue() -> String {
         switch lang {
-        case .en: return "Still matching the map. Turn slowly in a full circle, keeping the phone at chest height."
-        case .fr: return "Je cherche encore la carte. Tournez lentement sur vous-même, un tour complet, en gardant le téléphone à hauteur de poitrine."
+        case .en: return "Turn slowly all the way around."
+        case .fr: return "Tournez lentement sur vous-même."
         }
     }
 
     static func relocStepAndTurnCue() -> String {
         switch lang {
-        case .en: return "Still searching. Take a small step forward, then turn slowly in a circle again."
-        case .fr: return "Je cherche toujours. Faites un petit pas en avant, puis tournez lentement sur vous-même encore une fois."
+        case .en: return "Take a step forward, then turn again."
+        case .fr: return "Faites un pas en avant, puis tournez encore."
         }
     }
 
@@ -871,9 +871,110 @@ enum NavLoc {
     static func relocResumingFromCue(origin: String, destination: String) -> String {
         switch lang {
         case .en:
-            return "Starting from \(origin). Finding the route to \(destination) — hold the phone at chest height and pan slowly left and right."
+            return "From \(origin) to \(destination). Pan slowly."
         case .fr:
-            return "Départ de \(origin). Je cherche le trajet vers \(destination) — tenez le téléphone à hauteur de poitrine et balayez lentement de gauche à droite."
+            return "De \(origin) à \(destination). Balayez lentement."
+        }
+    }
+
+    /// The phone is pitched too far to know which way the user is facing.
+    ///
+    /// Not "tracking limited" and not a direction — a direction is exactly what
+    /// cannot be given here. Says the one thing that fixes it.
+    static func holdPhoneUpForHeading() -> String {
+        switch lang {
+        case .en: return "Hold the phone up at chest height."
+        case .fr: return "Tenez le téléphone à hauteur de poitrine."
+        }
+    }
+
+    /// The lens is blocked. Said instead of the pan coaching, which is advice
+    /// the user cannot act on while it is.
+    static func cameraCoveredCue() -> String {
+        switch lang {
+        case .en: return "Uncover the camera."
+        case .fr: return "Dégagez la caméra."
+        }
+    }
+
+    // ── While the start is taking a while ──────────────────────────────────
+    //
+    // ⚠️ EVERY string in this section is an INSTRUCTION, not an explanation.
+    //
+    // These are spoken to someone standing still, waiting, who cannot skip
+    // ahead and cannot see what is wrong. Testers on 4 Sep 2026 called the
+    // start "cumbersome and stress inducing", so the first attempt at a fix
+    // was to explain the cause — and that made it worse, because a longer
+    // sentence is a longer wait: "they don't care about why it doesn't work,
+    // they are more interested in making it work". The diagnosis still runs
+    // (`ARMappingManager.relocalizationDiagnosis`) and is still traced; what
+    // reaches the ear is only the action it implies.
+    //
+    // The rule for anything added here: say the ACTION, in under about eight
+    // words, and stop. No cause, no reassurance clause, no apology.
+
+    /// ARKit has the map and only the pose confirmation is outstanding.
+    ///
+    /// The single highest-value sentence in this file. It is spoken at the one
+    /// moment when the correct action is the OPPOSITE of everything else here:
+    /// stop turning. Across the 4 Sep 2026 traces our own confirmation gates
+    /// added 2.5–25 s on top of ARKit's match, and three of twelve
+    /// relocalizations spent the full 12 s settle budget and gave up — because
+    /// the coaching was telling the user to keep turning the whole time, and a
+    /// turning phone is exactly what stops the yaw offset holding still.
+    static func relocHoldStillCue() -> String {
+        switch lang {
+        case .en: return "Hold still. Almost there."
+        case .fr: return "Ne bougez plus. J’y suis presque."
+        }
+    }
+
+    /// ARKit reports it cannot find enough texture to match against.
+    static func relocInsufficientDetailCue() -> String {
+        switch lang {
+        case .en:
+            return "Face an open space."
+        case .fr:
+            return "Orientez-vous vers un espace dégagé."
+        }
+    }
+
+    /// A long search with no visual recognition: the view does not resemble
+    /// what was recorded here. People and carts standing in it look exactly
+    /// like this, and so does a spot between the mapped points.
+    /// `anchors` names the places the map was recorded FROM — the endpoints
+    /// where the mapper stood and turned a full circle. Relocalization is
+    /// reliably fast at those and slow anywhere else, so naming them turns
+    /// "this is taking a while" into something the user can act on.
+    static func relocSceneUnfamiliarCue(anchors: [String]) -> String {
+        let names = spokenList(anchors)
+        switch lang {
+        case .en:
+            return names.map { "Try walking to \($0)." } ?? "Still looking."
+        case .fr:
+            return names.map { "Essayez d’aller à \($0)." } ?? "Je cherche toujours."
+        }
+    }
+
+    /// "436", "436 or 421", "436, 421 or the Exit" — spoken, not comma-listed.
+    /// Returns nil for an empty list so the caller can drop the whole clause
+    /// rather than say "walk to ." at someone.
+    private static func spokenList(_ items: [String]) -> String? {
+        let cleaned = items
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        guard !cleaned.isEmpty else { return nil }
+        if cleaned.count == 1 { return cleaned[0] }
+        let conjunction = lang == .en ? "or" : "ou"
+        return cleaned.dropLast().joined(separator: ", ") + " \(conjunction) " + cleaned[cleaned.count - 1]
+    }
+
+    /// Sparse reassurance after the explanation. Not another instruction —
+    /// the user has already been told what to do and why.
+    static func relocStillWorkingCue() -> String {
+        switch lang {
+        case .en: return "Still looking."
+        case .fr: return "Je cherche toujours."
         }
     }
 
@@ -885,15 +986,15 @@ enum NavLoc {
     /// the app is already doing.
     static func relocStillSearchingMessage() -> String {
         switch lang {
-        case .en: return "Still looking for your position. Keep the phone up and keep turning slowly — I will start the route as soon as I find it."
-        case .fr: return "Je cherche encore votre position. Gardez le téléphone levé et continuez à tourner lentement — je lancerai le trajet dès que je l’aurai trouvée."
+        case .en: return "Still looking. Keep turning slowly."
+        case .fr: return "Je cherche encore. Continuez à tourner lentement."
         }
     }
 
     static func relocFailedMessage() -> String {
         switch lang {
-        case .en: return "I could not match the saved route map from here. Walk to a spot on the mapped route, hold the phone at chest height, and try again."
-        case .fr: return "Je n’ai pas pu reconnaître la carte du trajet d’ici. Placez-vous sur le trajet cartographié, tenez le téléphone à hauteur de poitrine, et réessayez."
+        case .en: return "I couldn't find you here. Try again from the start or the destination."
+        case .fr: return "Je ne vous trouve pas ici. Réessayez depuis le départ ou la destination."
         }
     }
 
@@ -923,8 +1024,8 @@ enum NavLoc {
     /// app knows roughly where they are instead of coaching a blind pan.
     static func relocRecognizedPlaceCue(_ placeName: String) -> String {
         switch lang {
-        case .en: return "I can see \(placeName). Keep turning slowly, lining up the map."
-        case .fr: return "Je reconnais \(placeName). Continuez à tourner lentement, j’aligne la carte."
+        case .en: return "I can see \(placeName). Keep turning slowly."
+        case .fr: return "Je reconnais \(placeName). Continuez à tourner lentement."
         }
     }
 

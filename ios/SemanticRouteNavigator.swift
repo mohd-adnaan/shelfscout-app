@@ -646,6 +646,19 @@ final class SemanticRouteNavigator: ObservableObject {
     private var spokenLegContextEdgeID: String?
     /// When ARKit last moved the world frame under the route.
     private var arFrameRealignedAt: Date?
+    /// True while the live heading came from the tilt fallback — the phone is
+    /// pitched at the floor or the ceiling and its forward vector no longer
+    /// says which way the user faces.
+    private var headingIsTiltDerived = false
+    /// When the "hold the phone up" prompt last went out.
+    private var lastHeadingPosturePromptAt: Date?
+    /// How long the phone must stay pitched before saying anything. Glancing
+    /// down for a moment is normal and must not be narrated.
+    private let headingPostureGraceSeconds: TimeInterval = 2.0
+    /// Pacing floor for the prompt itself.
+    private let headingPostureRepeatSeconds: TimeInterval = 8.0
+    /// When the phone first went past the pitch limit in this stretch.
+    private var headingTiltStartedAt: Date?
     /// Throttle for the visual-arrival veto trace. The veto is a decision, not
     /// a sample, so it uses `log` rather than the droppable `tick` — but a
     /// persistent lookalike match re-tests it several times a second, and a
@@ -662,6 +675,30 @@ final class SemanticRouteNavigator: ObservableObject {
     /// be satisfied after a sharp turn into a short final segment.
     private var destinationStillnessSince: Date?
     private var pendingAlignmentResumeCue = false
+    /// A turn was announced ON ITS OWN and the leg's walk instruction is owed
+    /// once the user has actually turned onto it.
+    ///
+    /// ── Why the cue is split ────────────────────────────────────────────
+    /// "Turn left. Walk 6 meters toward the next turn." asserts two things at
+    /// once, and the second is only true if the first was obeyed correctly. A
+    /// 4 Sep 2026 tester turned the wrong way and the app confidently told
+    /// them to walk 6 m in it — the recovery afterwards was fine, but it had
+    /// already sent them off in the wrong direction with full confidence.
+    /// Naming the maneuver, waiting for it, and only then releasing the walk
+    /// means the distance is never spoken against a facing that contradicts
+    /// it, and a wrong turn is caught before a step is taken rather than
+    /// after several.
+    ///
+    /// The 11 Aug 2026 pilot finding this must not undo: participants
+    /// completed a turn and stood still, because nothing told them to move
+    /// again. It still does — `postTurnLegCueMaxWaitSeconds` guarantees the
+    /// walk instruction arrives whether or not the turn is ever detected.
+    private var pendingPostTurnLegCueStepIndex: Int?
+    private var pendingPostTurnLegCueArmedAt: Date?
+    /// Longest the walk instruction waits for a turn that may never register —
+    /// a user who turns wide, a heading on the tilt fallback, a stationary
+    /// user thinking about it. Past this it is spoken regardless.
+    private let postTurnLegCueMaxWaitSeconds: TimeInterval = 5.0
     private var didRebuildRouteThisUpdate = false
     private var turnPhrasing: SemanticTurnPhrasing = .leftRight
     /// Heading buckets faced while standing at an endpoint (destination or start),
@@ -2373,9 +2410,16 @@ final class SemanticRouteNavigator: ObservableObject {
             return false
         }
         let targetNode = resolved.node
-        // A fuzzy resolution ("serial" → cereal) adopts the mapped label so
-        // every later announcement speaks the real destination name.
-        let spokenTarget = resolved.isExact ? trimmed : Self.sanitizedSpokenLabel(targetNode.name, fallback: trimmed)
+        // Always the MAPPED label, never the user's wording.
+        //
+        // This used to adopt the map's name only when the match was inexact,
+        // but `resolveTargetDetailed` reports a normalized hit ("onion" for
+        // "Onions", "400 lounge room" for "400 Lounge") as EXACT — so the app
+        // spent the rest of the journey repeating the user's approximation
+        // back at them. Speaking the mapped name is also how the user learns
+        // what the place is actually called, which is what they have to say
+        // next time.
+        let spokenTarget = Self.sanitizedSpokenLabel(targetNode.name, fallback: trimmed)
         turnPhrasing = clockFaceDirections ? .clockFace : .leftRight
         guard let start = resolveNavigationStart(
             in: map,
@@ -2460,10 +2504,14 @@ final class SemanticRouteNavigator: ObservableObject {
         lastTrustedARRemainingMeters = nil
         lastRouteRebuildAttemptAt = nil
         spokenLegContextEdgeID = nil
+        headingTiltStartedAt = nil
+        lastHeadingPosturePromptAt = nil
         stillnessStartedAt = nil
         lastStillnessRepromptAt = nil
         movementStoppedAt = nil
         pendingAlignmentResumeCue = false
+        pendingPostTurnLegCueStepIndex = nil
+        pendingPostTurnLegCueArmedAt = nil
         resetRouteCorrectionGuards()
         resetCourseCorrectionState()
         resetRouteBelief(status: .initializing)
@@ -2615,6 +2663,8 @@ final class SemanticRouteNavigator: ObservableObject {
         stillnessStartedAt = nil
         lastStillnessRepromptAt = nil
         pendingAlignmentResumeCue = false
+        pendingPostTurnLegCueStepIndex = nil
+        pendingPostTurnLegCueArmedAt = nil
         leadingStubBearingDegrees = nil
         leadingStubMeters = 0
         resetRouteCorrectionGuards()
@@ -2641,8 +2691,14 @@ final class SemanticRouteNavigator: ObservableObject {
         arPosition: simd_float3?,
         arHeading rawARHeading: Double?,
         arLocalized: Bool,
-        capturedImage: CVPixelBuffer? = nil
+        capturedImage: CVPixelBuffer? = nil,
+        /// True when `arHeading` was derived from the camera's UP vector
+        /// because the phone is pitched too far to use its forward vector.
+        /// The value is still a number; it is not a facing. See
+        /// `ARMappingManager.arHeadingUsedTiltFallback`.
+        headingUsedTiltFallback: Bool = false
     ) {
+        headingIsTiltDerived = headingUsedTiltFallback
         // Everything below this line works in the MAP's frame. The ARKit world
         // frame can be rotated relative to it — see `mapFrameYawBiasDegrees` —
         // and correcting once at the ingress is what keeps guidance, the
@@ -3038,11 +3094,24 @@ final class SemanticRouteNavigator: ObservableObject {
             return
         }
 
+        // The walk instruction a solo turn cue left owed. Runs before the
+        // resume cue below so the two cannot both speak on the same tick.
+        //
+        // Deliberately NOT followed by an early return while it is still
+        // pending. Blocking the rest of this function for up to five seconds
+        // would also block the step advance, the visual decision point and the
+        // whole recovery path — trading a cue-ordering nicety for a stalled
+        // route. The alignment cue above already runs first, so a user who
+        // turns the WRONG way is corrected while this waits.
+        releasePostTurnLegCueIfDue(headingError: headingError)
+
         if pendingAlignmentResumeCue, headingError <= routeStartAlignmentThresholdDegrees, phase == .navigating {
             // The corrective turn just completed. Without an explicit "walk"
             // resumption the user stands still waiting for permission to
             // move — the pilot heard only turn cues after pausing.
             pendingAlignmentResumeCue = false
+        pendingPostTurnLegCueStepIndex = nil
+        pendingPostTurnLegCueArmedAt = nil
             updateInstruction(forceSpeech: false)
             currentInstruction = NavLoc.goodPrefix() + resumeWalkCue()
             emitCue(currentInstruction, priority: .priority)
@@ -4237,6 +4306,33 @@ final class SemanticRouteNavigator: ObservableObject {
         return Self.tidiedSpacing(cue)
     }
 
+    /// "Hold the phone at chest height" — the one thing that fixes an
+    /// unusable heading.
+    ///
+    /// Held for `headingPostureGraceSeconds` first: glancing down at the phone
+    /// is normal and must not be narrated. Paced by
+    /// `headingPostureRepeatSeconds` so a user who keeps it low hears it
+    /// occasionally rather than continuously.
+    private func promptHeadingPostureIfDue() {
+        guard phase == .navigating || phase == .recovering else { return }
+        let now = Date()
+        guard let since = headingTiltStartedAt else {
+            headingTiltStartedAt = now
+            return
+        }
+        guard now.timeIntervalSince(since) >= headingPostureGraceSeconds else { return }
+        if let last = lastHeadingPosturePromptAt,
+           now.timeIntervalSince(last) < headingPostureRepeatSeconds {
+            return
+        }
+        lastHeadingPosturePromptAt = now
+        currentInstruction = NavLoc.holdPhoneUpForHeading()
+        emitCue(currentInstruction, priority: .priority)
+        NavigationTrace.shared.log("nav.headingPosturePrompt", traceState(extra: [
+            "sinceSeconds": now.timeIntervalSince(since)
+        ]))
+    }
+
     /// Records that this leg's context phrase has now been spoken.
     ///
     /// Called only where a cue carrying it was actually EMITTED — never from
@@ -4387,6 +4483,8 @@ final class SemanticRouteNavigator: ObservableObject {
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
         pendingAlignmentResumeCue = false
+        pendingPostTurnLegCueStepIndex = nil
+        pendingPostTurnLegCueArmedAt = nil
         resetRouteCorrectionGuards()
         resetRouteBelief(status: .initializing)
         phase = .navigating
@@ -4599,6 +4697,23 @@ final class SemanticRouteNavigator: ObservableObject {
         guard shouldEnableErrorRecovery else { return false }
         guard phase == .navigating else { return false }
         guard headingError >= routeTurnAlignmentThresholdDegrees else { return false }
+        // ── The heading is not a facing right now ───────────────────────────
+        // Past ~73° of pitch the forward vector's horizontal component is
+        // noise, so the heading falls back to the camera's UP vector — which
+        // only equals the real facing at zero roll. Steering a blind user by
+        // it is worse than saying nothing: on 4 Sep 2026 a tester on a
+        // STRAIGHT leg pointed the phone at the floor and was told to turn
+        // left. Say what would actually fix it instead.
+        if headingIsTiltDerived {
+            promptHeadingPostureIfDue()
+            NavigationTrace.shared.tick("nav.alignmentCue.deferred", [
+                "reason": "heading_tilt_unreliable",
+                "liveHeading": liveHeading,
+                "targetBearing": step.edge.bearingDegrees
+            ])
+            return false
+        }
+        headingTiltStartedAt = nil
         // The frame this error was measured in has just moved. See
         // `noteARFrameRealigned`.
         if let arFrameRealignedAt,
@@ -4658,7 +4773,12 @@ final class SemanticRouteNavigator: ObservableObject {
         confidence = min(confidence, 0.48)
         recoveryReason = nil
         guidanceIntroProtectedUntil = nil
-        NavigationTrace.shared.log("nav.alignmentCue", traceState(extra: [
+        // `tick`, not `log`: this fires on every evaluation, not every cue. The
+        // 4 Sep 2026 session wrote 6,085 of them plus 5,771 deferrals — twelve
+        // thousand unthrottled disk writes during a walk, which both cost I/O
+        // on the guidance path and crowd the decisions out of the trace. The
+        // cue that actually SPEAKS is already recorded by `emitCue`.
+        NavigationTrace.shared.tick("nav.alignmentCue", traceState(extra: [
             "instruction": instruction,
             "key": key,
             "targetBearing": step.edge.bearingDegrees,
@@ -4767,7 +4887,11 @@ final class SemanticRouteNavigator: ObservableObject {
         }
         // A sweeping heading is not a course. Same reasoning as the alignment
         // cue: a correction computed mid-sweep argues with a facing the user
-        // has already left.
+        // has already left. A tilt-derived one is not a facing at all.
+        guard !headingIsTiltDerived else {
+            courseCorrectionSince = nil
+            return false
+        }
         guard isLiveHeadingSettled() else { return false }
 
         let targetBearing = pose.bearingDegrees(
@@ -5115,6 +5239,27 @@ final class SemanticRouteNavigator: ObservableObject {
         visualMatch: VisualRouteMatch?
     ) -> Bool {
         if segmentRemainingMeters <= routeAdvanceMaxUnconfirmedRemainingMeters {
+            pendingRouteAdvance = nil
+            return true
+        }
+
+        // A localized pose standing ON the node, square on the route line, is a
+        // direct measurement of where the user is. Dead reckoning is an
+        // estimate of the same thing, and when the two disagree the measurement
+        // wins — asking a photograph to break the tie means the turn is not
+        // called until the estimate catches up, which is how a turn cue arrives
+        // after the user has already walked into the corner. That is the
+        // "postarrival" half of the 3 Sep 2026 wall-collision report, and it
+        // had a red test (`testTurnCueTellsTheUserToWalkAndLaterCuesDoNot`)
+        // sitting on it.
+        //
+        // `lastTrustedARRemainingMeters` is only set while AR is localized AND
+        // the cross-track is inside the leg's corridor, so this cannot fire for
+        // a pose that is merely near the node in open space; and the caller has
+        // already checked the node radius. `isAtFinalDestination` has always
+        // trusted the pose alone on the more consequential decision — arrival —
+        // so requiring a second witness only here was never consistent.
+        if lastTrustedARRemainingMeters != nil {
             pendingRouteAdvance = nil
             return true
         }
@@ -5705,6 +5850,8 @@ final class SemanticRouteNavigator: ObservableObject {
         lastARNodeDistanceMeters = nil
         lastTrustedARRemainingMeters = nil
         pendingAlignmentResumeCue = false
+        pendingPostTurnLegCueStepIndex = nil
+        pendingPostTurnLegCueArmedAt = nil
         stillnessStartedAt = nil
         lastStillnessRepromptAt = nil
         if phase == .recovering { phase = .navigating }
@@ -5732,19 +5879,31 @@ final class SemanticRouteNavigator: ObservableObject {
         // information. So it does, and it conveys BOTH turns: the second one is
         // a second away, and springing it on a user already mid-stride is how
         // the same reviewer ended up turning before anything had told them to.
-        currentInstruction = landmarkPrefix + (
-            next.edge.distanceMeters <= microLegMaxMeters
-                ? doglegInstruction(turn: turn, acrossHopTo: next)
-                : NavLoc.turnThenWalkLeg(
-                    prefix: "",
-                    turn: Self.sentenceCased(turn),
-                    distance: Self.formatDistance(next.edge.distanceMeters),
-                    context: nextContext
-                )
-        )
-        // This is the leg's opening cue and the one place its context belongs.
-        // Every later distance on it counts down bare.
-        noteLegContextSpoken(on: next)
+        // A real maneuver is announced ALONE and the walk follows once it has
+        // been made — see `pendingPostTurnLegCueStepIndex`. A dogleg keeps its
+        // combined form (both ends are one instruction), and a leg entered
+        // straight-on has no maneuver to wait for, so it keeps the walk.
+        let isRealTurn = next.edge.distanceMeters > microLegMaxMeters
+            && !Self.isStraightAheadInstruction(turn)
+        if isRealTurn {
+            currentInstruction = landmarkPrefix + "\(Self.sentenceCased(turn))."
+            pendingPostTurnLegCueStepIndex = currentStepIndex
+            pendingPostTurnLegCueArmedAt = Date()
+        } else {
+            currentInstruction = landmarkPrefix + (
+                next.edge.distanceMeters <= microLegMaxMeters
+                    ? doglegInstruction(turn: turn, acrossHopTo: next)
+                    : NavLoc.turnThenWalkLeg(
+                        prefix: "",
+                        turn: Self.sentenceCased(turn),
+                        distance: Self.formatDistance(next.edge.distanceMeters),
+                        context: nextContext
+                    )
+            )
+            // This is the leg's opening cue and the one place its context
+            // belongs. Every later distance on it counts down bare.
+            noteLegContextSpoken(on: next)
+        }
         emitCue(currentInstruction, priority: .critical)
         // This already told them which way to turn, so the alignment cue must
         // not repeat it a tick later while they are still turning.
@@ -5783,6 +5942,59 @@ final class SemanticRouteNavigator: ObservableObject {
 
     /// Uppercases only the first letter — String.capitalized would title-case
     /// every word of multi-word instructions ("Take A Slight Left…").
+    /// True when a maneuver phrase is really "keep going" rather than a turn.
+    ///
+    /// Compared against the localized straight-ahead phrases rather than
+    /// matched on English words, so French behaves identically.
+    private static func isStraightAheadInstruction(_ turn: String) -> Bool {
+        let normalized = turn
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        guard !normalized.isEmpty else { return true }
+        return [NavLoc.continueStraight(), NavLoc.goStraight()]
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() }
+            .contains(normalized)
+    }
+
+    /// Releases the walk instruction that a solo turn cue left owed.
+    ///
+    /// Fires when the user has actually come round onto the new leg, or when
+    /// `postTurnLegCueMaxWaitSeconds` expires — whichever first. The timeout is
+    /// what keeps the 11 Aug 2026 failure (turn completed, user standing still
+    /// waiting for permission to move) from coming back on a turn the heading
+    /// never confirms.
+    private func releasePostTurnLegCueIfDue(headingError: Double?) {
+        guard let armedStep = pendingPostTurnLegCueStepIndex,
+              let armedAt = pendingPostTurnLegCueArmedAt,
+              let step = activeStep else { return }
+        // The leg moved on without it — a rebuild, an advance, an arrival.
+        guard armedStep == currentStepIndex else {
+            pendingPostTurnLegCueStepIndex = nil
+            pendingPostTurnLegCueArmedAt = nil
+            return
+        }
+        guard phase == .navigating else { return }
+
+        let turned = (headingError.map { $0 <= routeStartAlignmentThresholdDegrees } ?? false)
+            && !headingIsTiltDerived
+        let waited = Date().timeIntervalSince(armedAt) >= postTurnLegCueMaxWaitSeconds
+        guard turned || waited else { return }
+
+        pendingPostTurnLegCueStepIndex = nil
+        pendingPostTurnLegCueArmedAt = nil
+        currentInstruction = NavLoc.legDistance(
+            distance: Self.formatDistance(segmentRemainingMeters),
+            context: walkContext(for: step)
+        )
+        noteLegContextSpoken(on: step)
+        emitCue(currentInstruction, priority: .critical)
+        NavigationTrace.shared.log("nav.postTurnLegCue", traceState(extra: [
+            "releasedBy": turned ? "turn_completed" : "timeout",
+            "headingErrDeg": headingError ?? NSNull(),
+            "waitedSeconds": Date().timeIntervalSince(armedAt)
+        ]))
+    }
+
     private static func sentenceCased(_ raw: String) -> String {
         guard let first = raw.first else { return raw }
         return first.uppercased() + raw.dropFirst()
@@ -6034,8 +6246,13 @@ final class SemanticRouteNavigator: ObservableObject {
                 // the user was already standing in.
                 currentInstruction = "\(Self.sentenceCased(turn))."
             } else {
+                // Bare fragment, NOT sentence-cased. `turnInDistance` leads
+                // with the distance, so the capital belongs to that — this site
+                // was producing "In 3 meters, Turn right." with a stray capital
+                // mid-sentence while `approachCuePhrase` produced the correct
+                // form for the identical cue.
                 currentInstruction = NavLoc.turnInDistance(
-                    turn: Self.sentenceCased(turn),
+                    turn: turn,
                     distance: Self.formatDistance(cueRemainingMeters)
                 )
             }
@@ -9265,6 +9482,13 @@ extension SemanticRouteNavigator {
     /// so a test can reach the next countdown cue without waiting two real
     /// seconds — and without reaching the twenty-second quiet backstop, which
     /// would speak a cue of its own and mask what is being asserted.
+    /// Ages the post-turn wait past `postTurnLegCueMaxWaitSeconds` so a test
+    /// can assert the timeout releases the walk instruction without sleeping.
+    func expirePostTurnLegCueWaitForTesting() {
+        guard pendingPostTurnLegCueArmedAt != nil else { return }
+        pendingPostTurnLegCueArmedAt = Date().addingTimeInterval(-postTurnLegCueMaxWaitSeconds - 1)
+    }
+
     func expireCuePacingWindowForTesting() {
         lastRoutineCueAt = Date().addingTimeInterval(-(approachCueMinimumSpacingSeconds + 0.1))
     }

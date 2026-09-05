@@ -209,14 +209,23 @@ class AnnouncerClass {
       return;
     }
 
+    // Dedupe BEFORE either delivery path. It used to sit below the sink
+    // dispatch, so a re-render that fired the same announcement twice was
+    // filtered for VoiceOver users and spoken twice for everyone else.
+    if (!options.force && this.isDuplicate(text, priority)) return;
+
     if (!this.screenReaderEnabled) {
       // No screen reader: announceForAccessibility reaches nobody. Hand the
       // message to the app's TTS instead, if one is wired up.
+      //
+      // ⚠️ Until 4 Sep 2026 nothing ever called `setSpeechSink`, so this was a
+      // silent drop — roughly thirty status and error messages a
+      // VoiceOver-off user was supposed to hear and never did, including "that
+      // object is not in the saved map". The module was built to END
+      // suppression and had quietly become the suppression.
       this.speechSink?.(text, priority);
       return;
     }
-
-    if (!options.force && this.isDuplicate(text, priority)) return;
 
     if (priority === 'chatter' && (this.queue.length > 0 || this.draining)) {
       // Something more important is already speaking or waiting. Progress

@@ -60,6 +60,28 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
     /// event rather than under the first syllable.
     private let interruptToneLeadSeconds: TimeInterval = 0.32
 
+    // ── Liveness ───────────────────────────────────────────────────────────
+    //
+    // AVSpeechSynthesizer is not guaranteed to call back. An audio-session
+    // interruption, a route change, or another owner grabbing the session can
+    // swallow an utterance with neither `didFinish` nor `didCancel` — and this
+    // queue is gated on `currentItem == nil`, so one lost callback silences
+    // guidance for the rest of the session. Nothing else looks broken: the
+    // beeps come from a separate player and the banner keeps updating, which
+    // is precisely how it was reported on 4 Sep 2026 — "app stops saying
+    // instructions in between navigating, but it was not hung, I could hear
+    // the beeps and see the instructions on screen".
+    //
+    // Same class of bug as the JS input latches (see `src/utils/asyncWatchdog.ts`):
+    // not a performance problem, a liveness one. Nothing guaranteed forward
+    // progress. These two guards do.
+    private var itemWatchdog: DispatchWorkItem?
+    /// Consecutive 50 ms deferrals while waiting for the synthesizer to go
+    /// quiet. `synthesizer.isSpeaking` can stick true after an interrupted
+    /// session, and this loop had no bound — it would spin forever, silently.
+    private var drainRetries = 0
+    private let maxDrainRetries = 40  // 2 s
+
     /// True once AVSpeechSynthesizer reports that the current item actually
     /// began. An item cancelled before this is an item nobody heard.
     private var currentItemDidBegin = false
@@ -105,6 +127,9 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
     }
 
     func stop() {
+        itemWatchdog?.cancel()
+        itemWatchdog = nil
+        drainRetries = 0
         queue.removeAll()
         currentItem = nil
         currentItemDidBegin = false
@@ -151,6 +176,37 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         speakNextIfNeeded()
     }
 
+    /// Force-finishes an item whose callbacks never arrived.
+    ///
+    /// The deadline is deliberately far longer than the utterance can possibly
+    /// take — this exists to convert "forever" into "eventually", not to clip
+    /// speech the user is still listening to. A cue that genuinely takes
+    /// longer than this estimate is already a bug of a different kind.
+    private func armItemWatchdog(for item: SpeechItem, utteranceCount: Int) {
+        itemWatchdog?.cancel()
+        let deadline = min(
+            30.0,
+            2.0 + Double(item.text.count) / 6.0 + 0.7 * Double(max(1, utteranceCount))
+        )
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, let stuck = self.currentItem, stuck.text == item.text else { return }
+            NSLog("⚠️ [TTS] No callback for %.1fs on \"%@\" — force-draining the queue",
+                  deadline, String(stuck.text.prefix(48)))
+            // Whatever state the synthesizer is in, it is not one we can
+            // reason about. Reset it, drop the item, and keep the queue moving.
+            self.synthesizer.stopSpeaking(at: .immediate)
+            self.outstandingUtterances.removeAll()
+            self.currentItem = nil
+            self.currentItemDidBegin = false
+            self.currentItemDidComplete = false
+            self.drainRetries = 0
+            self.itemWatchdog = nil
+            self.speakNextIfNeeded()
+        }
+        itemWatchdog = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + deadline, execute: work)
+    }
+
     private func playInterruptTone() {
         guard ttsState.isEnabled, let player = interruptTonePlayer else { return }
         player.currentTime = 0
@@ -173,12 +229,22 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         // turn is worse than one that never arrives. One-cue-at-a-time is
         // already enforced by `currentItem`, so wait a beat and retry instead of
         // dropping the work on the floor.
-        guard !synthesizer.isSpeaking else {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
-                self?.speakNextIfNeeded()
+        if synthesizer.isSpeaking {
+            if drainRetries < maxDrainRetries {
+                drainRetries += 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) { [weak self] in
+                    self?.speakNextIfNeeded()
+                }
+                return
             }
-            return
+            // It has claimed to be speaking for two seconds with nothing of
+            // ours outstanding. That is a stuck synthesizer, not a busy one —
+            // waiting longer is how guidance goes quiet for good. Reset it and
+            // speak over the top.
+            NSLog("⚠️ [TTS] Synthesizer stuck reporting isSpeaking — resetting and continuing")
+            synthesizer.stopSpeaking(at: .immediate)
         }
+        drainRetries = 0
         queue.removeFirst()
         speak(next)
     }
@@ -208,6 +274,7 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         ttsState.lastSpokenText = item.text
         ttsState.lastSpeechTime = Date()
         ttsState.isSpeaking = true
+        armItemWatchdog(for: item, utteranceCount: utterances.count)
         utterances.forEach { synthesizer.speak($0) }
     }
 
@@ -242,6 +309,9 @@ final class TTSManager: NSObject, ObservableObject, AVSpeechSynthesizerDelegate 
         outstandingUtterances.removeAll { $0 === utterance }
         guard outstandingUtterances.isEmpty else { return }
 
+        itemWatchdog?.cancel()
+        itemWatchdog = nil
+        drainRetries = 0
         let finished = currentItem
         currentItem = nil
 

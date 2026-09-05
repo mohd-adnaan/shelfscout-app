@@ -172,6 +172,18 @@ class EarconsClass {
   }
 
   /**
+   * True while a native AR screen is presented over the RN UI.
+   *
+   * Exposed so the Announcer's speech bridge can stay quiet then: native
+   * guidance speaks through AVSpeechSynthesizer and this layer speaks through
+   * the TTS chunker, and the two share no queue — talking at the same time is
+   * two voices at once, not a conversation.
+   */
+  isNativeSessionActive(): boolean {
+    return this.nativeSessionActive;
+  }
+
+  /**
    * Play a cue. Never throws and never blocks the caller: a failed cue is a
    * cosmetic problem, and the pipelines that call this are ones where an
    * unhandled rejection or a hung await would cost the user their session.

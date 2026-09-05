@@ -82,6 +82,7 @@ import {
 import { speachesSentenceChunker } from './src/services/SpeachesSentenceChunker';
 import { CONFIG, NAVIGATION_CONFIG, DETECTION_URL, ACQUISITION_URL } from './src/utils/constants';
 import { WATCHDOG_TIMEOUTS, nativeCall, withTimeout } from './src/utils/asyncWatchdog';
+import { isClaimFresh, isLatchStale } from './src/utils/inputLiveness';
 import { fixImageOrientation } from './src/services/fixImageOrientation';
 import {
   CameraIntrinsicsPayload,
@@ -107,6 +108,44 @@ const TTS_COMPLETION_BUFFER_MS = 500;
 const STARTUP_LOADER_MIN_MS = 1800;
 const VOICEOVER_LISTENING_ANNOUNCE_DELAY_MS = 800;
 const VOICEOVER_LISTENING_GRACE_MS = 600;
+/**
+ * Longest the `startListening` re-entry latch can legitimately be held.
+ *
+ * Sum of the bounded steps inside it — VoiceOver settle, two audio-control
+ * calls, the listen earcon, the session settle, and the STT start — with a
+ * wide margin. Past this the latch is a leak, not a start in progress, and
+ * every tap it swallows is a tap the user made and the app ignored.
+ */
+const START_LISTENING_MAX_HOLD_MS = 20_000;
+/** How long an announcement waits for a pipeline utterance to finish. */
+const ANNOUNCEMENT_SPEECH_WAIT_MS = 6_000;
+/**
+ * How long a `sessionAlive` claim from native is believed.
+ *
+ * Native holds an offered AR session for at most 120 s
+ * (`ARLiveSessionHandoff.returnHoldSeconds`) and then pauses it without
+ * telling JS. Past that the claim is stale, and believing a stale one keeps
+ * the turn watchdog switched off for the rest of the process.
+ */
+const AR_SESSION_ALIVE_TTL_MS = 150_000;
+/**
+ * Consecutive taps that produce nothing before the app resets itself.
+ *
+ * The backstop of last resort, and the only one that does not depend on having
+ * found every latch. Whatever is stuck — one of today's, or one added next
+ * month — the user's way out is the same gesture they were already making, and
+ * it costs them two taps instead of a relaunch.
+ */
+const TAPS_BEFORE_HARD_RESET = 2;
+/**
+ * How long the ignored taps must span before the reset fires.
+ *
+ * Rapid taps are normal — a VoiceOver double-tap arrives as two in a few
+ * hundred milliseconds, and a frustrated user taps faster, not slower. What
+ * separates a dead app from a busy one is that the dead one is still ignoring
+ * taps a couple of seconds later.
+ */
+const TAP_STRIKE_MIN_SPAN_MS = 1_500;
 const POSTURE_WARNING_COOLDOWN_MS = 6000;
 const POSTURE_MAX_WAIT_MS = 6500;
 const POSTURE_POLL_INTERVAL_MS = 250;
@@ -485,7 +524,38 @@ function AppInner(): React.JSX.Element {
   const rtabSubmittedFrameQueueRef = useRef<string[]>([]);
   /** The native ARKit navigation screen is still mounted and localized, so
    *  the next destination can continue on it instead of relocalizing. */
+  // ⚠️ A CLAIM about native state, not a mirror of it — and the most dangerous
+  // ref in this file, because the turn watchdog exempts a turn entirely while
+  // it is true. Native holds an offered session for at most
+  // `ARLiveSessionHandoff.returnHoldSeconds` (120 s) and then pauses it on its
+  // own, and nothing tells JS when that happens. So a stale `true` here used to
+  // disable the ONLY thing that recovers a stuck turn — permanently, for the
+  // rest of the process. Screen reads "Ready", every tap is swallowed, and
+  // relaunching the app is the only fix. That is the long-standing hang.
+  //
+  // Read it through `isARSessionPlausiblyAlive()`, never directly.
   const arSessionAliveRef = useRef(false);
+  const arSessionAliveAtRef = useRef(0);
+  // ── Re-entry guard for startListening ──
+  //
+  // ⚠️ This latch is the app's most dangerous kind of state: while it is true
+  // every tap is silently swallowed, and NOTHING on screen says so — the
+  // status pill still reads "Ready" because none of the display flags are set.
+  // That is the 4 Sep 2026 report, verbatim: "stuck in the ready state, user
+  // keeps on tapping but it's hanged."
+  //
+  // It is cleared in a `finally`, which is only as reliable as the awaits
+  // inside the `try`. `startSTT` is a native bridge call, and a native promise
+  // settles only when native calls its resolver — a speech recogniser that
+  // never calls back leaves the `finally` unreached and the latch stuck
+  // forever. Exactly the failure `src/utils/asyncWatchdog.ts` was written for;
+  // this call path simply never got the treatment.
+  //
+  // Two guards now: every native await inside is bounded, and the timestamp
+  // below lets the turn watchdog clear a latch that survived anyway.
+  const isStartingRef = useRef(false);
+  const startListeningAtRef = useRef<number>(0);
+
   // Ref so handleAutoSubmit can call handleVoiceCommand without circular dep
   const handleVoiceCommandRef = useRef<(command: string, photoPath: string) => Promise<void>>(async () => { });
   // Ref so handleAutoSubmit (stable [] deps) can check screen reader state
@@ -547,6 +617,21 @@ function AppInner(): React.JSX.Element {
    * gates themselves, but a loop flag left set makes the *next* turn refuse to
    * start its loop, which reads to the user as the same silent unresponsiveness.
    */
+  /**
+   * Whether the `sessionAlive` claim from native can still be true.
+   *
+   * Never read `arSessionAliveRef` directly — see its declaration.
+   */
+  const isARSessionPlausiblyAlive = useCallback(
+    () => arSessionAliveRef.current && isClaimFresh(arSessionAliveAtRef.current, AR_SESSION_ALIVE_TTL_MS),
+    [],
+  );
+
+  const isARSessionPlausiblyAliveRef = useRef(isARSessionPlausiblyAlive);
+  useEffect(() => {
+    isARSessionPlausiblyAliveRef.current = isARSessionPlausiblyAlive;
+  }, [isARSessionPlausiblyAlive]);
+
   const releaseInputGates = useCallback((reason: string) => {
     console.log(`🔓 Releasing input gates: ${reason}`);
 
@@ -555,6 +640,10 @@ function AppInner(): React.JSX.Element {
     isCapturingPhotoRef.current = false;
     isCapturingRef.current = false;
     finalTranscriptRef.current = '';
+    // Both of these block input and neither was released here. `isStartingRef`
+    // swallows taps outright; `arSessionAliveRef` disables the turn watchdog.
+    isStartingRef.current = false;
+    arSessionAliveRef.current = false;
 
     // Loop ownership.
     isContinuousModeRunning.current = false;
@@ -612,6 +701,67 @@ function AppInner(): React.JSX.Element {
       }
     }, 1000);
     return () => clearTimeout(timer);
+  }, []);
+
+  // ── Announcer → speech bridge ──────────────────────────────────────────
+  //
+  // `Announcer` posts through VoiceOver when a screen reader is running, and
+  // hands everything else to this sink. Nothing was wired to it, so for a
+  // VoiceOver-OFF user every status and error announcement in the app went
+  // nowhere — including the one a 4 Sep 2026 tester asked for by name, "that
+  // object is not in the mapped database".
+  //
+  // ⚠️ It cannot simply call the chunker. `synthesizeSpeechChunked` PREEMPTS:
+  // it bumps its session id and stops whatever is playing. Calling it from
+  // here while an answer is being read would truncate the answer — the exact
+  // failure the native arrival cue had. So announcements are serialized
+  // against each other AND yield to a pipeline utterance already in progress.
+  const announcementChainRef = useRef<Promise<unknown>>(Promise.resolve());
+  useEffect(() => {
+    Announcer.setSpeechSink((text, priority) => {
+      // ⚠️ CRITICAL ONLY, deliberately.
+      //
+      // The bug being fixed is messages the user MUST hear vanishing — "that
+      // object isn't in the saved map", a failed capture, a reaching session
+      // that could not start. Those are all `critical`.
+      //
+      // Routing `status` here as well would newly speak about twenty lines
+      // that are currently silent for a VoiceOver-off user — "Thinking.",
+      // "Stopping.", "Guiding to X.", and "Ready. Tap to speak." after every
+      // single turn — each of which already has an earcon. This app has been
+      // told twice that it says too much; adding twenty lines to fix a silence
+      // would trade one complaint for a worse one.
+      if (priority !== 'critical') return;
+
+      // Native AR guidance speaks through AVSpeechSynthesizer and this speaks
+      // through the TTS chunker. They share no queue, so speaking here while
+      // a native screen is up is simply two voices at once.
+      if (earcons.isNativeSessionActive()) {
+        console.log(`🔇 [Announcer] Held back behind native AR audio: "${text.slice(0, 40)}"`);
+        return;
+      }
+
+      announcementChainRef.current = announcementChainRef.current
+        .then(async () => {
+          if (isEmergencyStopped.current) return;
+
+          const deadline = Date.now() + ANNOUNCEMENT_SPEECH_WAIT_MS;
+          while (speachesSentenceChunker.isCurrentlyPlaying() && Date.now() < deadline) {
+            await new Promise<void>(resolve => setTimeout(() => resolve(), 150));
+          }
+          // Past the wait it speaks regardless: everything reaching this
+          // point is critical, and an error the user never hears is the
+          // failure mode this bridge exists to remove.
+          await speachesSentenceChunker.synthesizeSpeechChunked(text);
+        })
+        .catch(error => {
+          const message = String(error?.message || error);
+          if (!message.includes('cancel') && !message.includes('stop')) {
+            console.warn('⚠️ [Announcer] speech sink failed:', message);
+          }
+        });
+    });
+    return () => Announcer.setSpeechSink(null);
   }, []);
 
   // ── Menu-state mirrors ─────────────────────────────────────────────────
@@ -1738,6 +1888,7 @@ function AppInner(): React.JSX.Element {
           // It is also still holding the camera, so the RN camera has to stay
           // off until something releases it (see reactivateCameraAndCapture).
           arSessionAliveRef.current = reachingResult?.sessionAlive === true;
+          arSessionAliveAtRef.current = Date.now();
 
           const msg = reachingResult?.reason === 'user_confirmed'
             ? 'Reaching complete.'
@@ -1755,11 +1906,14 @@ function AppInner(): React.JSX.Element {
         console.error('❌ [SpatialTarget] Native module error:', e);
         const code = e?.code || e?.name;
         const message = code === 'TARGET_NOT_IN_MAP'
-          ? `${targetName} is not pinned in the saved AR map. Add it as a POI and save the map first.`
+          // Concise and user-facing. The old wording told the user to "add it
+          // as a POI and save the map first" — instructions for whoever built
+          // the map, not for the person standing in the room holding the phone.
+          ? strings().reaching.notInMappedRoutes(targetName)
           : code === 'MAP_NOT_FOUND'
             ? strings().reaching.mapNotFound
             : strings().reaching.error(e.message || strings().reaching.unknownError);
-        Announcer.announceStatus(message);
+        Announcer.announceCritical(message);
       }
 
       earcons.setNativeSessionActive(false);
@@ -2704,7 +2858,7 @@ function AppInner(): React.JSX.Element {
       // when it finished. Continuing on either is what makes a
       // destination-to-destination hop skip relocalization: the step that
       // fails when the user stands at a destination facing the way they came.
-      navResult = arSessionAliveRef.current
+      navResult = isARSessionPlausiblyAliveRef.current()
         ? await ARKitNavigationBridge.continueNavigation(navConfig)
         : await ARKitNavigationBridge.startNavigation(navConfig);
     } catch (e: any) {
@@ -2719,6 +2873,7 @@ function AppInner(): React.JSX.Element {
     }
 
     arSessionAliveRef.current = navResult?.sessionAlive === true;
+    arSessionAliveAtRef.current = Date.now();
 
     console.log('🧭 [ARKitNavigation] Native result:', navResult);
 
@@ -3767,21 +3922,134 @@ function AppInner(): React.JSX.Element {
     wakeWordResumeRef.current = resumeWakeWord;
   }, [pauseWakeWord, resumeWakeWord]);
 
-  // ── Re-entry guard for startListening ─────────────────────────────────────
-  const isStartingRef = useRef(false);
+  // ── Backstop of last resort: taps that do nothing ────────────────────────
+  //
+  // Every hang this app has had looks identical from the outside: the status
+  // reads "Ready", the user taps, and nothing happens. The causes have all
+  // been different — a latch cleared in a `finally` that was never reached, a
+  // stale claim about native state, an unbounded bridge call. Chasing them one
+  // at a time has not been enough, and a study cannot be run on "we think we
+  // got the last one".
+  //
+  // So this does not try to know why. It counts taps that produced no effect,
+  // and on the second one it resets everything. Whatever is stuck — including
+  // something added long after this was written — the way out is the gesture
+  // the user is already making, and it costs two taps rather than a relaunch.
+  const ignoredTapsRef = useRef(0);
+  const firstIgnoredTapAtRef = useRef(0);
+
+  /** A tap did something. Clears the strike count. */
+  const noteTapHandled = useCallback(() => {
+    ignoredTapsRef.current = 0;
+    firstIgnoredTapAtRef.current = 0;
+  }, []);
+
+  /**
+   * Force the app back to a state that accepts input.
+   *
+   * Synchronous first, deliberately: every latch is dropped before a single
+   * `await`, so even if the bounded teardown below hangs, the next tap is
+   * already accepted. Nothing here may be unbounded.
+   */
+  const hardResetInput = useCallback(async (reason: string) => {
+    console.warn(`🚑 [hard-reset] ${reason} — forcing input back open`);
+    debugLogger.logAPI('🚑 Hard input reset', reason);
+
+    // ── Synchronous: everything that can block a tap ──
+    releaseInputGates(`hard reset: ${reason}`);
+    isStartingRef.current = false;
+    isEmergencyStopped.current = false;
+    arSessionAliveRef.current = false;
+    turnWatchdogRecoveringRef.current = false;
+    pendingActionRef.current = null;
+    continuousModeAbortRef.current = true;
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+    earcons.setNativeSessionActive(false);
+    setIsProcessing(false);
+    setIsSpeaking(false);
+    setIsNavigation(false);
+    setIsReaching(false);
+    setPendingAction(null);
+    setActivityStatus('');
+    setIsCameraActive(true);
+
+    // ── Bounded: native teardown. A failure here must not undo the above. ──
+    await nativeCall(() => stopLatencyLoop(), WATCHDOG_TIMEOUTS.AUDIO_CONTROL, 'stopLatencyLoop (reset)', undefined);
+    await nativeCall(() => speachesSentenceChunker.stop(), WATCHDOG_TIMEOUTS.AUDIO_CONTROL, 'chunker.stop (reset)', undefined);
+    await nativeCall(() => cancelSTT(), WATCHDOG_TIMEOUTS.STT_CONTROL, 'cancelSTT (reset)', undefined);
+    await nativeCall(() => ARKitNavigationBridge.stopNavigation(), WATCHDOG_TIMEOUTS.AR_TEARDOWN, 'stopNavigation (reset)', undefined);
+
+    lastTurnProgressAtRef.current = Date.now();
+    ignoredTapsRef.current = 0;
+    firstIgnoredTapAtRef.current = 0;
+    earcons.play('ready');
+    // Spoken, not just an earcon. The user reached this point by tapping at an
+    // app that was ignoring them; `ready` is a haptic with no sound, and
+    // `announceTapToStart` is status-priority so the speech bridge drops it.
+    // They need to hear that it is listening again, once, in one word.
+    Announcer.announceCritical(strings().flow.statusReady);
+    announceTapToStart('Ready.');
+  }, [announceTapToStart, cancelSTT, releaseInputGates]);
+
+  const hardResetInputRef = useRef(hardResetInput);
+  useEffect(() => { hardResetInputRef.current = hardResetInput; });
+
+  /**
+   * A tap produced nothing.
+   *
+   * Two strikes AND a span of real time before resetting, because the two
+   * conditions rule out opposite mistakes. Count alone would fire on a rapid
+   * VoiceOver double-tap — the very thing `isStartingRef` exists to absorb —
+   * and reset the app in the middle of a perfectly healthy turn. Elapsed time
+   * alone would fire on a single stray tap during a long, legitimate wait.
+   * A user tapping at a genuinely dead app satisfies both within a second or
+   * two; nothing healthy satisfies both.
+   */
+  const noteTapIgnored = useCallback((why: string) => {
+    const now = Date.now();
+    if (ignoredTapsRef.current === 0) firstIgnoredTapAtRef.current = now;
+    ignoredTapsRef.current += 1;
+
+    const spanMs = now - firstIgnoredTapAtRef.current;
+    console.warn(
+      `👆 Tap produced nothing (${why}) — strike ${ignoredTapsRef.current} over ${spanMs}ms`,
+    );
+
+    if (ignoredTapsRef.current >= TAPS_BEFORE_HARD_RESET && spanMs >= TAP_STRIKE_MIN_SPAN_MS) {
+      void hardResetInputRef.current(
+        `${ignoredTapsRef.current} taps ignored over ${Math.round(spanMs / 1000)}s (${why})`,
+      );
+    }
+  }, []);
+
+  // `isStartingRef` / `startListeningAtRef` are declared with the other
+  // input gates near the top of the component.
 
   // ============================================================================
   // Start Listening
   // ============================================================================
-  const startListening = async () => {
+  /** Returns true when the microphone actually opened. */
+  const startListening = async (): Promise<boolean> => {
     // ── Re-entry guard: prevent multiple concurrent calls ────────────────
     // VoiceOver double-tap can fire handleScreenTap multiple times if the
     // user taps rapidly. Without this guard, each tap queues a startSTT().
     if (isStartingRef.current) {
-      console.log('⚠️ startListening already in progress — ignoring');
-      return;
+      // Self-healing: a latch older than the sum of every bounded step inside
+      // cannot be a real in-flight start, so it is a leak. Take it rather than
+      // swallowing another tap.
+      const heldMs = Date.now() - startListeningAtRef.current;
+      if (!isLatchStale(startListeningAtRef.current, START_LISTENING_MAX_HOLD_MS)) {
+        console.log('⚠️ startListening already in progress — ignoring');
+        noteTapIgnored('startListening latch');
+        return false;
+      }
+      console.warn(
+        `🚑 [startListening] Latch held ${Math.round(heldMs / 1000)}s — releasing and retrying`,
+      );
     }
     isStartingRef.current = true;
+    startListeningAtRef.current = Date.now();
 
     const voiceOverEnabled = screenReaderEnabledRef.current;
     if (voiceOverEnabled) {
@@ -3798,20 +4066,21 @@ function AppInner(): React.JSX.Element {
     }
 
     try {
-      await stopLatencyLoop(); // ensure no stale thinking loop continues into listening
+      // ensure no stale thinking loop continues into listening
+      await nativeCall(() => stopLatencyLoop(), WATCHDOG_TIMEOUTS.AUDIO_CONTROL, 'stopLatencyLoop (listen)', undefined);
       if (Platform.OS === 'android') {
         const granted = await PermissionsAndroid.request(
           PermissionsAndroid.PERMISSIONS.RECORD_AUDIO
         );
         if (granted !== PermissionsAndroid.RESULTS.GRANTED) {
           Alert.alert('Permission Required', 'Microphone access is required.');
-          return;
+          return false;
         }
       }
 
       isEmergencyStopped.current = false;
       isCapturingPhotoRef.current = false;
-      await stopTTS();
+      await nativeCall(() => stopTTS(), WATCHDOG_TIMEOUTS.AUDIO_CONTROL, 'stopTTS (listen)', undefined);
       finalTranscriptRef.current = '';
 
       // ── Audio feedback ────────────────────────────────────────────────
@@ -3833,14 +4102,24 @@ function AppInner(): React.JSX.Element {
         // react-native-sound's setCategory alone doesn't restore full volume.
         // This native call sets .playback + .default mode + setActive + speaker
         // route — matching the reaching pipeline's audio config.
-        await configurePlaybackSession(!settingsRef.current.useWearablesCamera);
+        await nativeCall(
+          () => configurePlaybackSession(!settingsRef.current.useWearablesCamera),
+          WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+          'configurePlaybackSession (listen)',
+          undefined,
+        );
       }
 
       // Single 215ms tone. Users start speaking on it, and the mic is not
       // open until this promise resolves + the settle delay below — so the
       // cue asset must never grow back into a multi-tone earcon.
       // See playListenSound() in utils/soundEffects.ts.
-      await earcons.playAndWait('listenStart');
+      await nativeCall(
+        () => earcons.playAndWait('listenStart'),
+        WATCHDOG_TIMEOUTS.AUDIO_CONTROL,
+        'listenStart earcon',
+        undefined,
+      );
 
       // The listening cue is finished now; switch to recording for STT.
       prepareForRecording();
@@ -3864,13 +4143,23 @@ function AppInner(): React.JSX.Element {
       // while keeping the app responsive for the user.
       const gracePeriodMs = voiceOverEnabled ? VOICEOVER_LISTENING_GRACE_MS : 0;
 
-      await startSTT(gracePeriodMs);
+      // The one that actually hung. Bounded, and loud about it: a recogniser
+      // that never calls back must not cost the user their session.
+      await withTimeout(
+        startSTT(gracePeriodMs),
+        WATCHDOG_TIMEOUTS.STT_CONTROL,
+        'startSTT',
+      );
       console.log('✅ Voice recognition started');
+      noteTapHandled();
+      return true;
     } catch (error) {
       console.error('❌ Start listening error:', error);
-      if (screenReaderEnabled) {
-        Announcer.announceCritical(strings().speech.errorStartingVoice);
-      }
+      // Bounded now, so this is reachable — and a failure to open the mic is
+      // exactly the case where the user must not be left tapping at nothing.
+      Announcer.announceCritical(strings().speech.errorStartingVoice);
+      noteTapIgnored('startListening threw');
+      return false;
     } finally {
       isStartingRef.current = false;
     }
@@ -3881,7 +4170,12 @@ function AppInner(): React.JSX.Element {
   // ============================================================================
   const stopListeningManually = async () => {
     try {
-      if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) return;
+      if (isCapturingPhotoRef.current || isProcessingRef.current || isEmergencyStopped.current) {
+        // The user tapped to submit and the app did nothing with it. If a
+        // latch is stuck, this is where it becomes visible.
+        noteTapIgnored('stopListeningManually gated');
+        return;
+      }
 
       const finalTranscript = await stopSTT();
       let finalText = finalTranscript.trim();
@@ -3969,6 +4263,7 @@ function AppInner(): React.JSX.Element {
     isStartingRef.current = false; // ← release re-entry guard
     continuousModeAbortRef.current = true;
     arSessionAliveRef.current = false;
+    isStartingRef.current = false;
     // Whatever native screen was up is going away, and the stop confirmation
     // below is the one cue a user who just interrupted must hear.
     earcons.setNativeSessionActive(false);
@@ -4180,6 +4475,19 @@ function AppInner(): React.JSX.Element {
         lastSpeechMarker = '';
       }
 
+      // A stuck listen latch looks exactly like idle from here — none of the
+      // turn flags are set — so it needs its own check or it is invisible.
+      // This is the "Ready, but every tap does nothing" hang.
+      if (
+        isStartingRef.current &&
+        isLatchStale(startListeningAtRef.current, START_LISTENING_MAX_HOLD_MS)
+      ) {
+        console.warn('🚑 [turn-watchdog] startListening latch stuck — releasing');
+        isStartingRef.current = false;
+        setIsCameraActive(true);
+        announceTapToStart('Ready.');
+      }
+
       const gated = isProcessingRef.current || isCapturingPhotoRef.current;
       if (!gated) {
         // Idle: keep the clock fresh so the next turn starts from now.
@@ -4188,10 +4496,16 @@ function AppInner(): React.JSX.Element {
       }
 
       // A live AR session is allowed to take as long as the walk takes.
+      //
+      // ⚠️ `isNavigationRef` / `isReachingRef` are mirrored from React state by
+      // effects, so they cannot diverge for long. `arSessionAliveRef` is a
+      // CLAIM about native state that nothing ever refutes, so it is read
+      // through its TTL — an unbounded exemption here is what turned a single
+      // stuck turn into a dead app until relaunch.
       if (
         isNavigationRef.current ||
         isReachingRef.current ||
-        arSessionAliveRef.current
+        isARSessionPlausiblyAliveRef.current()
       ) {
         lastTurnProgressAtRef.current = Date.now();
         return;
@@ -4382,6 +4696,7 @@ function AppInner(): React.JSX.Element {
       if (!screenReaderEnabledRef.current) {
         Announcer.announceStatus(strings().speech.stoppingMode(mode));
       }
+      noteTapHandled();
       await stopContinuousModeLoop();
       // Resume wake word after stopping continuous mode
       if (settingsRef.current.useWearablesCamera) {
@@ -4397,6 +4712,7 @@ function AppInner(): React.JSX.Element {
       if (!screenReaderEnabledRef.current) {
         Announcer.announceStatus(strings().speech.stopping);
       }
+      noteTapHandled();
       await emergencyStop();
       return;
     }
@@ -4406,6 +4722,7 @@ function AppInner(): React.JSX.Element {
       if (!screenReaderEnabledRef.current) {
         Announcer.announceStatus(strings().speech.thinking);
       }
+      noteTapHandled();
       await stopListeningManually();
       return;
     }

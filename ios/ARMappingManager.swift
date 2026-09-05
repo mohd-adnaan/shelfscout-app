@@ -33,6 +33,101 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
     @Published var cameraMapPosition: simd_float3?
     @Published var cameraMapForward: simd_float3?
     @Published var arHeadingDegrees: Double?
+    /// Why relocalization is taking as long as it is.
+    ///
+    /// ── Why this exists ────────────────────────────────────────────────
+    /// The 4 Sep 2026 traces show relocalization taking anywhere from 4.5 s to
+    /// 505 s, and **nothing in the log explains the difference** — the only
+    /// tracking states ever recorded were `initializing` and `relocalizing`,
+    /// and the visual-match evidence is only traced during navigation. So a
+    /// slow start could not be diagnosed after the fact, and the user could
+    /// not be told anything about it either. They got escalating instructions
+    /// to turn in circles and no reason, which testers described as stressful
+    /// and as the system failing to find them.
+    ///
+    /// The system usually DOES know something. ARKit reports insufficient
+    /// visual detail directly; a visual place match says "I recognise where
+    /// you are, the world map just has not locked yet"; and a long search with
+    /// no place match at all says the view does not resemble what was mapped —
+    /// which is what people and shopping carts standing in it look like.
+    enum RelocalizationDiagnosis: String {
+        /// Normal: searching, nothing unusual to report.
+        case searching
+        /// The lens is blocked.
+        case cameraCovered
+        /// ARKit cannot find enough texture — a blank wall, a person filling
+        /// the frame, or a view with nothing in it to match against.
+        case insufficientDetail
+        /// ARKit HAS matched the map and the pose is being confirmed. The one
+        /// state where the right thing to do is stand still — and the one the
+        /// spoken coaching used to actively fight.
+        case settling
+        /// Recognised the place visually; only the world-map lock is missing.
+        case recognizedNearby
+        /// Searching a while with no visual recognition at all: either the
+        /// scene has changed since it was mapped, or this spot was never
+        /// covered well — mid-route rather than at an anchored endpoint.
+        case sceneUnfamiliar
+    }
+
+    @Published private(set) var relocalizationDiagnosis: RelocalizationDiagnosis = .searching
+    /// When the current relocalization attempt began.
+    private var relocalizationStartedAt: Date?
+    /// Most recent limited-tracking reason, whatever it was.
+    private var lastLimitedTrackingReason: ARCamera.TrackingState.Reason?
+    private var lastLimitedTrackingAt: Date?
+    /// When a promotion was last held back for a reason that STANDING STILL
+    /// fixes — the yaw offset still swinging, or the pose still jumping.
+    ///
+    /// ⚠️ This is the half of the delay we actually control. Measured across
+    /// the 4 Sep 2026 traces, ARKit's own match took 1.9–31 s while OUR gates
+    /// added 2.5–25 s on top, and three of twelve relocalizations burned the
+    /// full 12 s `relocalizationYawSettleMaxWaitSeconds` and then gave up on
+    /// settling anyway. The reason they never settled is that the spoken
+    /// coaching was telling the user to "turn slowly all the way around" the
+    /// whole time — and a turning phone is precisely what keeps the AR↔device
+    /// yaw offset from holding still. The code already knew the answer and put
+    /// it in `statusMessage`, which a blind user cannot see.
+    private var lastStillnessNeededAt: Date?
+    /// How recently that must have happened for stillness to be the headline.
+    private let stillnessNeededRecencySeconds: TimeInterval = 1.5
+    /// How long with no visual place recognition before the scene counts as
+    /// unfamiliar rather than merely not-yet-matched.
+    private let unfamiliarSceneAfterSeconds: TimeInterval = 12.0
+    /// How recently ARKit must have complained about detail for that to be
+    /// the headline.
+    private let insufficientDetailRecencySeconds: TimeInterval = 3.0
+
+    /// True once the camera has been dark and featureless for long enough that
+    /// a covering hand or pocket is the only sensible explanation.
+    ///
+    /// Relocalization cannot succeed with a covered lens, and the coaching it
+    /// falls back to — "pan slowly left and right" — is advice the user cannot
+    /// act on and will never resolve, so they stand there panning at nothing.
+    /// Naming the actual problem costs one sentence.
+    @Published private(set) var cameraLikelyCovered = false
+    /// Consecutive throttled frames whose luma says the lens is blocked.
+    private var coveredCameraFrames = 0
+    /// About two seconds at the frame throttle — long enough that a hand
+    /// passing over the lens, or a dark doorway, is not reported.
+    private let coveredCameraFrameThreshold = 8
+    /// Video-range luma floor. Black clips around 16, not 0.
+    private let coveredCameraMaxMeanLuma = 26
+    /// Spread below which the frame carries no structure at all.
+    private let coveredCameraMaxLumaSpread = 12
+
+    /// True while `arHeadingDegrees` came from the camera's UP vector rather
+    /// than its forward vector — i.e. the phone is pitched so far (past ~73°,
+    /// looking at the floor or the ceiling) that the forward vector's
+    /// horizontal component is noise.
+    ///
+    /// The fallback keeps a heading available, but it is only equal to the
+    /// real facing at zero roll, so it is NOT a heading to steer a blind user
+    /// by. Guidance reads this and stays quiet about direction while it is
+    /// true — a 4 Sep 2026 tester pointed the phone at the floor on a straight
+    /// leg and was told to turn left. The 3.2 % of frames in that session's
+    /// trace with the fallback active carried 8 of the 63 spoken heading cues.
+    @Published var arHeadingUsedTiltFallback: Bool = false
     @Published var poiInspectionList: [ARMapPOIInspection] = []
     @Published var localizationCandidates: [ARLocalizationCandidate] = []
     /// Bumped when the already-localized pose jumps by more than
@@ -691,6 +786,11 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                     // survives; every named anchor from here is the map's.
                     self.locallyCreatedAnchorIDs.removeAll()
                     self.lastTracedVetoReason = nil
+                    self.relocalizationDiagnosis = .searching
+                    self.relocalizationStartedAt = nil
+                    self.lastLimitedTrackingReason = nil
+                    self.lastLimitedTrackingAt = nil
+                    self.lastStillnessNeededAt = nil
                     self.reclaimSessionAfterHandoff()
 
                     // The return leg of a journey. Reaching gave its live,
@@ -1055,6 +1155,9 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         let headingUsedTiltFallback = headingReading?.usedTiltFallback ?? false
         let displayHeading = arHeading ?? Double(yaw)
         let liveFeatureSnapshot = isMapping ? sampledFeaturePoints(from: frame.rawFeaturePoints) : nil
+        // Covered-lens detection. Cheap, and only meaningful while we are
+        // asking the user to point the camera at something.
+        let obstructed = (isRelocalizing || isMapping) && isCameraObstructed(frame.capturedImage)
         let poiMatchResult = bestPOIMatch(
             cameraTransform: transform,
             capturedImage: frame.capturedImage,
@@ -1098,6 +1201,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 cameraPosition: cameraPosition,
                 cameraForward: cameraForward,
                 arHeading: arHeading,
+                headingUsedTiltFallback: headingUsedTiltFallback,
                 mappingStatus: mappingStatus,
                 hasRestoredMapAnchors: hasRestoredMapAnchors
             )
@@ -1106,6 +1210,14 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
             self.cameraMapPosition = cameraPosition
             self.cameraMapForward = cameraForward
             self.arHeadingDegrees = arHeading
+            self.arHeadingUsedTiltFallback = headingUsedTiltFallback
+            self.coveredCameraFrames = obstructed ? self.coveredCameraFrames + 1 : 0
+            let covered = self.coveredCameraFrames >= self.coveredCameraFrameThreshold
+            if covered != self.cameraLikelyCovered {
+                self.cameraLikelyCovered = covered
+                NavigationTrace.shared.log("ar.cameraCovered", ["covered": covered])
+            }
+            self.updateRelocalizationDiagnosis(visuallyRecognized: visuallyRecognizedPlace)
             if let liveFeatureSnapshot {
                 self.mapFeaturePoints = liveFeatureSnapshot.points
                 self.mapFeaturePointCount = liveFeatureSnapshot.totalCount
@@ -1253,6 +1365,12 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                         self.statusMessage = "Matching the saved map..."
                     }
                 default:
+                    if case .limited(let reason) = camera.trackingState {
+                        // The one first-party signal that says WHY, and it was
+                        // being thrown away.
+                        self.lastLimitedTrackingReason = reason
+                        self.lastLimitedTrackingAt = Date()
+                    }
                     self.relocalizationNormalSince = nil
                     self.yawSettleVetoSince = nil
                     self.yawSettleVetoExpired = false
@@ -1302,6 +1420,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         cameraPosition: simd_float3,
         cameraForward: simd_float3,
         arHeading: Double?,
+        headingUsedTiltFallback: Bool,
         mappingStatus: ARFrame.WorldMappingStatus,
         hasRestoredMapAnchors: Bool
     ) {
@@ -1364,6 +1483,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
            simd_distance(previous, cameraPosition) > postLocalizationJumpMeters {
             relocalizationNormalSince = Date()
             preLocalizationPosition = cameraPosition
+            lastStillnessNeededAt = Date()
             traceRelocalizationVeto("pose_still_jumping", detail: [
                 "jumpM": Double(simd_distance(previous, cameraPosition))
             ])
@@ -1401,6 +1521,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
                 relocalizationNormalSince = Date()
                 let waiting = "Matching the saved map. Hold the camera steady."
                 if statusMessage != waiting { statusMessage = waiting }
+                lastStillnessNeededAt = Date()
                 traceRelocalizationVeto("frame_yaw_still_settling", detail: [
                     "offsetSpreadDeg": yawSpread,
                     "allowedDeg": relocalizationYawSettleDegrees,
@@ -1460,6 +1581,7 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         cameraMapPosition = cameraPosition
         cameraMapForward = cameraForward
         arHeadingDegrees = arHeading
+        arHeadingUsedTiltFallback = headingUsedTiltFallback
         previousPublishedPosition = cameraPosition
         localizedAt = Date()
         lastLocalizationCorrectionAt = nil
@@ -2892,6 +3014,96 @@ final class ARMappingManager: NSObject, ObservableObject, ARSessionDelegate, @un
         /// True when the pitch was steep enough that the camera's UP vector,
         /// not its forward vector, supplied the horizontal reference.
         let usedTiltFallback: Bool
+    }
+
+    /// Classifies why relocalization has not landed yet, from evidence the
+    /// system already has and was discarding.
+    ///
+    /// Ordered by how actionable the answer is, not by confidence: a covered
+    /// lens or a featureless view is something the user can fix in a second,
+    /// so it outranks "the scene looks unfamiliar", which they can only wait
+    /// out or walk away from.
+    private func updateRelocalizationDiagnosis(visuallyRecognized: String?) {
+        guard isRelocalizing, !isLocalized else {
+            if relocalizationDiagnosis != .searching {
+                relocalizationDiagnosis = .searching
+            }
+            relocalizationStartedAt = nil
+            return
+        }
+
+        let now = Date()
+        let since = relocalizationStartedAt ?? now
+        if relocalizationStartedAt == nil { relocalizationStartedAt = now }
+
+        let detailComplaintIsFresh = lastLimitedTrackingReason == .insufficientFeatures
+            && (lastLimitedTrackingAt.map { now.timeIntervalSince($0) <= insufficientDetailRecencySeconds } ?? false)
+
+        let needsStillness = lastStillnessNeededAt
+            .map { now.timeIntervalSince($0) <= stillnessNeededRecencySeconds } ?? false
+
+        let diagnosis: RelocalizationDiagnosis
+        if cameraLikelyCovered {
+            diagnosis = .cameraCovered
+        } else if needsStillness {
+            // ARKit has the map; only our confirmation is outstanding. Nothing
+            // else is worth saying, and "keep turning" is actively wrong here.
+            diagnosis = .settling
+        } else if detailComplaintIsFresh {
+            diagnosis = .insufficientDetail
+        } else if visuallyRecognized != nil {
+            diagnosis = .recognizedNearby
+        } else if now.timeIntervalSince(since) >= unfamiliarSceneAfterSeconds {
+            diagnosis = .sceneUnfamiliar
+        } else {
+            diagnosis = .searching
+        }
+
+        guard diagnosis != relocalizationDiagnosis else { return }
+        relocalizationDiagnosis = diagnosis
+        NavigationTrace.shared.log("ar.relocalizationDiagnosis", [
+            "diagnosis": diagnosis.rawValue,
+            "searchedSeconds": now.timeIntervalSince(since),
+            "limitedReason": lastLimitedTrackingReason.map { "\($0)" } ?? NSNull(),
+            "visuallyRecognized": visuallyRecognized ?? NSNull()
+        ])
+    }
+
+    /// Mean and spread of the luma plane, coarsely sampled.
+    ///
+    /// A covered lens is not merely dark — a dark ROOM is dark too, and still
+    /// has structure. It is dark AND flat: almost no variation between
+    /// samples. Requiring both is what keeps this from firing every time the
+    /// user walks past an unlit aisle.
+    ///
+    /// Reads the Y plane of ARKit's 420f biplanar buffer at a coarse stride,
+    /// so it costs a few hundred byte reads per throttled frame.
+    private func isCameraObstructed(_ pixelBuffer: CVPixelBuffer) -> Bool {
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0) else { return false }
+        let width = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let height = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let rowBytes = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        guard width > 16, height > 16 else { return false }
+
+        let bytes = base.assumingMemoryBound(to: UInt8.self)
+        let steps = 16
+        var total = 0
+        var minimum = 255
+        var maximum = 0
+        for yi in 0..<steps {
+            let y = height * yi / steps
+            for xi in 0..<steps {
+                let x = width * xi / steps
+                let value = Int(bytes[y * rowBytes + x])
+                total += value
+                minimum = min(minimum, value)
+                maximum = max(maximum, value)
+            }
+        }
+        let mean = total / (steps * steps)
+        return mean <= coveredCameraMaxMeanLuma && (maximum - minimum) <= coveredCameraMaxLumaSpread
     }
 
     private func headingReading(
